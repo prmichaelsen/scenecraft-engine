@@ -207,30 +207,66 @@ milestones:
         dependencies:
           - task-14
 
+  - id: M6
+    title: Sustained Effects & Color Grading
+    file: agent/milestones/milestone-6-sustained-effects.md
+    status: not_started
+    estimated_weeks: 1
+    tasks_total: 3
+    tasks_completed: 0
+    tasks:
+      - id: task-16
+        title: Hold Keyframes & ColorCorrector Node
+        file: agent/tasks/milestone-6-sustained-effects/task-16-hold-keyframes-colorcorrector.md
+        status: not_started
+        estimated_hours: 2
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-15
+      - id: task-17
+        title: Sustained Effects in Generator & Plan
+        file: agent/tasks/milestone-6-sustained-effects/task-17-sustained-generator.md
+        status: not_started
+        estimated_hours: 3
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-16
+      - id: task-18
+        title: AI Color Grading Prompt
+        file: agent/tasks/milestone-6-sustained-effects/task-18-ai-color-prompt.md
+        status: not_started
+        estimated_hours: 2
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-17
+
 documentation:
   design_documents: 2
-  milestone_documents: 5
+  milestone_documents: 6
   pattern_documents: 0
-  task_documents: 15
+  task_documents: 18
 
 progress:
   planning: 100
-  implementation: 87
-  overall: 87
+  implementation: 72
+  overall: 72
 
 recent_work:
   - date: 2026-03-23
-    description: "M5 complete — AI Effect Director with --ai and --prompt flags. 13/15 tasks done. Also fixed .setting trailing commas and intensity floor."
+    description: "M6 planned — sustained effects & color grading. 3 tasks for hold keyframes, ColorCorrector, AI color prompt."
 
 next_steps:
-  - "Test --ai flag with ANTHROPIC_API_KEY on real audio"
-  - "Test .setting import in Resolve (comma fix)"
-  - "M4 (Resolve integration) available if desired"
+  - "Start M6: Task 16 — Hold Keyframes & ColorCorrector Node"
+  - "Test .setting import in Resolve with comma fix"
 
 notes:
-  - "Total estimated: ~40 hours across 15 tasks"
+  - "Total estimated: ~47 hours across 18 tasks"
   - "MVP (M1+M2) complete"
   - "M4 (Resolve integration) deferred — nice-to-have"
   - "M5 requires anthropic SDK as optional dependency"
+  - "M6 adds sustained section-level effects + full color grading"
 
 current_blockers: []
