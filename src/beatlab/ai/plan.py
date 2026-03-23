@@ -53,14 +53,20 @@ def parse_effect_plan(text: str) -> EffectPlan:
 
     sections = []
     for s in data["sections"]:
-        sections.append(SectionPlan(
-            section_index=s.get("section_index", 0),
-            presets=s.get("presets", []),
-            custom_effects=s.get("custom_effects", []),
-            intensity_curve=s.get("intensity_curve", "linear"),
-            attack_frames=s.get("attack_frames"),
-            release_frames=s.get("release_frames"),
-        ))
+        # Support grouped sections: "section_indices": [0, 1, 2]
+        indices = s.get("section_indices", None)
+        if indices is None:
+            indices = [s.get("section_index", 0)]
+
+        for idx in indices:
+            sections.append(SectionPlan(
+                section_index=idx,
+                presets=s.get("presets", []),
+                custom_effects=s.get("custom_effects", []),
+                intensity_curve=s.get("intensity_curve", "linear"),
+                attack_frames=s.get("attack_frames"),
+                release_frames=s.get("release_frames"),
+            ))
 
     return EffectPlan(sections=sections)
 

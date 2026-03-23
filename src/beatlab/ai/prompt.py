@@ -63,7 +63,9 @@ Respond with ONLY a JSON object (no markdown, no explanation). The JSON must fol
 }}
 ```
 
-Every section in the input must have a corresponding entry in your output."""
+Every section in the input must have a corresponding entry in your output.
+
+IMPORTANT: If there are many sections (>20), you may group consecutive sections of the same type into one entry by listing multiple section indices. Use "section_indices": [0, 1, 2] instead of "section_index" for grouped entries. This keeps the output compact."""
 
 
 def build_user_prompt(

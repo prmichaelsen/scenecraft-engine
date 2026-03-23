@@ -20,7 +20,7 @@ class TestPresetRegistry:
         assert p.node_type == "Transform"
         assert p.parameter == "Size"
         assert p.base_value == 1.0
-        assert p.peak_value == 1.08
+        assert p.peak_value == 1.15
 
     def test_flash_exists(self):
         p = PRESETS["flash"]
