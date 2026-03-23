@@ -10,17 +10,20 @@ milestones:
   - id: M1
     title: Audio Analysis Pipeline
     file: agent/milestones/milestone-1-audio-analysis-pipeline.md
-    status: not_started
+    status: in_progress
+    started: 2026-03-23
     estimated_weeks: 1.5
     tasks_total: 3
-    tasks_completed: 0
+    tasks_completed: 1
     tasks:
       - id: task-1
         title: Project Setup & Audio Loader
         file: agent/tasks/milestone-1-audio-analysis-pipeline/task-1-project-setup.md
-        status: not_started
+        status: completed
         estimated_hours: 2
-        started: null
+        started: 2026-03-23T20:40:00Z
+        completed_date: 2026-03-23T20:45:00Z
+        actual_hours: 0.1
         actual_hours: null
       - id: task-2
         title: Beat Detection & Analysis

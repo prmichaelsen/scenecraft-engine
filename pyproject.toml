@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "davinci-beat-lab"
+version = "0.1.0"
+description = "AI-powered beat detection and auto-generated visual effects for DaVinci Resolve"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "librosa>=0.10.0",
+    "soundfile>=0.12.0",
+    "numpy>=1.24.0",
+    "click>=8.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+beatlab = "beatlab.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
