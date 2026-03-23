@@ -1,0 +1,33 @@
+project:
+  name: davinci-beat-lab
+  version: 0.1.0
+  started: 2026-03-23
+  status: in_progress
+  description: |
+    AI-powered beat detection and auto-generated visual effects plugin for DaVinci Resolve
+
+milestones: []
+
+tasks: {}
+
+documentation:
+  design_documents: 0
+  milestone_documents: 0
+  pattern_documents: 0
+  task_documents: 0
+
+progress:
+  planning: 0
+  implementation: 0
+  overall: 0
+
+recent_work: []
+
+next_steps:
+  - Define project requirements in agent/design/requirements.md
+  - Plan milestones and tasks with @acp.plan
+  - Start development with @acp.proceed
+
+notes: []
+
+current_blockers: []
