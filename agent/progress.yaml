@@ -6,28 +6,164 @@ project:
   description: |
     AI-powered beat detection and auto-generated visual effects plugin for DaVinci Resolve
 
-milestones: []
+milestones:
+  - id: M1
+    title: Audio Analysis Pipeline
+    file: agent/milestones/milestone-1-audio-analysis-pipeline.md
+    status: not_started
+    estimated_weeks: 1.5
+    tasks_total: 3
+    tasks_completed: 0
+    tasks:
+      - id: task-1
+        title: Project Setup & Audio Loader
+        file: agent/tasks/milestone-1-audio-analysis-pipeline/task-1-project-setup.md
+        status: not_started
+        estimated_hours: 2
+        started: null
+        actual_hours: null
+      - id: task-2
+        title: Beat Detection & Analysis
+        file: agent/tasks/milestone-1-audio-analysis-pipeline/task-2-beat-detection.md
+        status: not_started
+        estimated_hours: 3
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-1
+      - id: task-3
+        title: Beat Map Generation & CLI
+        file: agent/tasks/milestone-1-audio-analysis-pipeline/task-3-beat-map-cli.md
+        status: not_started
+        estimated_hours: 2
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-2
 
-tasks: {}
+  - id: M2
+    title: Fusion Comp Generation
+    file: agent/milestones/milestone-2-fusion-comp-generation.md
+    status: not_started
+    estimated_weeks: 1.5
+    tasks_total: 3
+    tasks_completed: 0
+    tasks:
+      - id: task-4
+        title: Fusion .setting Format Research
+        file: agent/tasks/milestone-2-fusion-comp-generation/task-4-fusion-format-research.md
+        status: not_started
+        estimated_hours: 3
+        started: null
+        actual_hours: null
+      - id: task-5
+        title: Fusion Comp Generator
+        file: agent/tasks/milestone-2-fusion-comp-generation/task-5-fusion-comp-generator.md
+        status: not_started
+        estimated_hours: 4
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-4
+      - id: task-6
+        title: End-to-End Pipeline & CLI
+        file: agent/tasks/milestone-2-fusion-comp-generation/task-6-end-to-end-pipeline.md
+        status: not_started
+        estimated_hours: 2
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-3
+          - task-5
+
+  - id: M3
+    title: Effect Library & Intelligence
+    file: agent/milestones/milestone-3-effect-library.md
+    status: not_started
+    estimated_weeks: 1.5
+    tasks_total: 3
+    tasks_completed: 0
+    tasks:
+      - id: task-7
+        title: Effect Preset Library
+        file: agent/tasks/milestone-3-effect-library/task-7-effect-presets.md
+        status: not_started
+        estimated_hours: 3
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-5
+      - id: task-8
+        title: Intensity Mapping & Section Detection
+        file: agent/tasks/milestone-3-effect-library/task-8-intensity-and-sections.md
+        status: not_started
+        estimated_hours: 4
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-2
+          - task-7
+      - id: task-9
+        title: Spline Curves & Polish
+        file: agent/tasks/milestone-3-effect-library/task-9-spline-curves.md
+        status: not_started
+        estimated_hours: 2
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-5
+          - task-7
+
+  - id: M4
+    title: Resolve Integration & Distribution
+    file: agent/milestones/milestone-4-resolve-integration.md
+    status: not_started
+    estimated_weeks: 1
+    tasks_total: 2
+    tasks_completed: 0
+    tasks:
+      - id: task-10
+        title: Resolve Script Packaging
+        file: agent/tasks/milestone-4-resolve-integration/task-10-resolve-script.md
+        status: not_started
+        estimated_hours: 3
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-6
+      - id: task-11
+        title: Documentation & Distribution
+        file: agent/tasks/milestone-4-resolve-integration/task-11-documentation.md
+        status: not_started
+        estimated_hours: 2
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-10
 
 documentation:
-  design_documents: 0
-  milestone_documents: 0
+  design_documents: 1
+  milestone_documents: 4
   pattern_documents: 0
-  task_documents: 0
+  task_documents: 11
 
 progress:
-  planning: 0
+  planning: 100
   implementation: 0
-  overall: 0
+  overall: 5
 
-recent_work: []
+recent_work:
+  - date: 2026-03-23
+    description: "Project initialized, requirements defined, 4 milestones and 11 tasks planned"
 
 next_steps:
-  - Define project requirements in agent/design/requirements.md
-  - Plan milestones and tasks with @acp.plan
-  - Start development with @acp.proceed
+  - "Start M1: Task 1 — Project Setup & Audio Loader"
+  - "Task 4 (Fusion format research) can start in parallel with M1"
+  - "MVP complete at end of M2 (Task 6)"
 
-notes: []
+notes:
+  - "Total estimated: ~30 hours across 11 tasks"
+  - "MVP (M1+M2) estimated: ~16 hours across 6 tasks"
+  - "Task 4 has no dependency on M1 — can be done in parallel"
 
 current_blockers: []
