@@ -16,6 +16,7 @@ class SectionPlan:
     section_index: int
     presets: list[str] = field(default_factory=list)
     custom_effects: list[dict] = field(default_factory=list)
+    sustained_effects: list[dict] = field(default_factory=list)
     intensity_curve: str = "linear"
     attack_frames: int | None = None
     release_frames: int | None = None
@@ -63,6 +64,7 @@ def parse_effect_plan(text: str) -> EffectPlan:
                 section_index=idx,
                 presets=s.get("presets", []),
                 custom_effects=s.get("custom_effects", []),
+                sustained_effects=s.get("sustained_effects", []),
                 intensity_curve=s.get("intensity_curve", "linear"),
                 attack_frames=s.get("attack_frames"),
                 release_frames=s.get("release_frames"),

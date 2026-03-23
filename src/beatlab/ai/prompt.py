@@ -35,6 +35,27 @@ You may also define custom effects beyond the preset catalog. A custom effect ha
 - release_frames: frames to return to base
 - curve: "linear", "smooth", or "step"
 
+## Color Grading (Sustained Effects)
+
+Sustained effects hold for an entire section — they set the mood/look, not the rhythm. Use them for color grading.
+
+Available ColorCorrector parameters (all are optional — only set what you want to change):
+- MasterGain (float, default 1.0): Overall brightness. >1 brighter, <1 darker.
+- MasterLift (float, default 0.0): Black point / shadows. Negative = crushed blacks, dramatic.
+- MasterGamma (float, default 1.0): Midtones. >1 lifts mids, <1 darkens mids.
+- MasterContrast (float, default 0.0): Contrast boost. 0.1-0.2 = punchy, 0.3+ = dramatic.
+- MasterSaturation (float, default 1.0): Color intensity. >1 vivid, <1 desaturated, 0 = B&W.
+- MasterHueAngle (float, default 0.0): Hue rotation in degrees. 10-20 = warm shift, -10 to -20 = cool shift.
+- GainR/GainG/GainB (float, default 1.0): Per-channel brightness. GainR=1.15 = warmer tones.
+- LiftR/LiftG/LiftB (float, default 0.0): Per-channel shadows. LiftB=0.02 = blue-tinted shadows.
+
+Keep values subtle — small changes create visible looks:
+- Dark/moody: MasterGain=0.85, MasterContrast=0.2, MasterLift=-0.02, MasterSaturation=0.8
+- Warm/energetic: GainR=1.1, MasterSaturation=1.2, MasterGamma=1.05
+- Cool/ethereal: GainB=1.1, LiftB=0.01, MasterSaturation=0.9
+- Dramatic drop: MasterContrast=0.3, MasterSaturation=1.3, MasterGain=1.1
+- Desaturated intro: MasterSaturation=0.6, MasterLift=-0.01
+
 ## Creative Guidelines
 
 1. **Match effects to energy**: Use subtle effects (zoom_pulse, glow_swell) for low-energy sections, intense effects (flash, hard_cut, zoom_bounce) for high-energy sections.
@@ -43,6 +64,8 @@ You may also define custom effects beyond the preset catalog. A custom effect ha
 4. **Vary on repeats**: If a section type repeats (e.g. second chorus), introduce subtle variation — add an extra layered effect, adjust parameters slightly, or use a different curve.
 5. **Use spectral data**: High spectral centroid suggests bright/aggressive music, low centroid suggests mellow/warm. Use this to inform effect choices.
 6. **Intensity curves**: Use "exponential" for sections where you want beats to hit harder. Use "logarithmic" for sections where even quiet beats should be visible. Use "linear" as the default.
+7. **Color grading**: Use sustained_effects to set the mood per section. Different sections should have different color treatments. Transitions between sections are automatic and smooth.
+8. **Combine pulse + sustained**: Beat-pulse effects (presets) handle rhythm. Sustained effects (color grading) handle mood. Use both together for the best result.
 
 ## Output Format
 
@@ -55,6 +78,17 @@ Respond with ONLY a JSON object (no markdown, no explanation). The JSON must fol
       "section_index": 0,
       "presets": ["preset_name"],
       "custom_effects": [],
+      "sustained_effects": [
+        {{
+          "node_type": "ColorCorrector",
+          "parameters": {{
+            "MasterSaturation": 0.8,
+            "MasterLift": -0.02,
+            "MasterContrast": 0.15
+          }},
+          "transition_frames": 15
+        }}
+      ],
       "intensity_curve": "linear",
       "attack_frames": 2,
       "release_frames": 4
@@ -63,7 +97,7 @@ Respond with ONLY a JSON object (no markdown, no explanation). The JSON must fol
 }}
 ```
 
-Every section in the input must have a corresponding entry in your output.
+Every section in the input must have a corresponding entry in your output. Include sustained_effects for sections where color grading would enhance the mood.
 
 IMPORTANT: If there are many sections (>20), you may group consecutive sections of the same type into one entry by listing multiple section indices. Use "section_indices": [0, 1, 2] instead of "section_index" for grouped entries. This keeps the output compact."""
 
@@ -71,6 +105,7 @@ IMPORTANT: If there are many sections (>20), you may group consecutive sections 
 def build_user_prompt(
     beat_map: dict,
     user_prompt: str | None = None,
+    audio_descriptions: list[str] | None = None,
 ) -> str:
     """Build the user prompt from beat map data and optional creative direction."""
     sections = beat_map.get("sections", [])
@@ -119,6 +154,9 @@ def build_user_prompt(
                 f"rolloff={spectral.get('rolloff', 0):.2f}, "
                 f"contrast={spectral.get('contrast', 0):.2f}"
             )
+
+        if audio_descriptions and i < len(audio_descriptions):
+            line += f"\n- Audio: {audio_descriptions[i]}"
 
         lines.append(line)
         lines.append("")

@@ -115,6 +115,22 @@ def make_brightness_contrast(
     )
 
 
+def make_color_corrector(
+    name: str = "ColorCorrector1",
+    source_op: str | None = None,
+    pos_x: float = 440,
+) -> FusionNode:
+    """Create a ColorCorrector node for color grading.
+
+    Keyframeable params: MasterGain, MasterLift, MasterGamma, MasterContrast,
+    MasterSaturation, MasterHueAngle, GainR, GainG, GainB, LiftR, LiftG, LiftB.
+    """
+    inputs: dict = {}
+    if source_op:
+        inputs["Input"] = {"SourceOp": source_op, "Source": "Output"}
+    return FusionNode(name=name, tool_type="ColorCorrector", inputs=inputs, pos_x=pos_x)
+
+
 def make_glow(
     name: str = "Glow1",
     source_op: str | None = None,

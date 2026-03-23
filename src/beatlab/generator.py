@@ -6,7 +6,10 @@ from beatlab.beat_map import load_beat_map
 from beatlab.fusion.keyframes import KeyframeTrack
 from beatlab.fusion.nodes import (
     make_brightness_contrast,
+    make_color_corrector,
     make_glow,
+    make_media_in,
+    make_media_out,
     make_transform,
     FusionNode,
 )
@@ -18,6 +21,7 @@ NODE_MAKERS = {
     "Transform": make_transform,
     "BrightnessContrast": make_brightness_contrast,
     "Glow": make_glow,
+    "ColorCorrector": make_color_corrector,
 }
 
 
@@ -84,11 +88,19 @@ def generate_comp(
     beats = beat_map["beats"]
     sections = beat_map.get("sections", [])
 
+    # Start pipeline with MediaIn
+    media_in = make_media_in()
+    comp.add_node(media_in)
+
     if effect_plan is not None:
-        _generate_from_plan(comp, beats, sections, effect_plan)
+        _generate_from_plan(comp, beats, sections, effect_plan, media_in.name)
+        # Cap with MediaOut connected to last node
+        last_node = comp.nodes[-1].name
+        comp.add_node(make_media_out(source_op=last_node, pos_x=comp.nodes[-1].pos_x + 110))
+        comp.active_tool = last_node
         return comp
 
-    prev_node_name: str | None = None
+    prev_node_name: str | None = media_in.name
     pos_x = 0.0
 
     # Resolve which presets to use
@@ -107,6 +119,7 @@ def generate_comp(
         _generate_section_aware(
             comp, beats, sections, presets, intensity_curve,
             attack_frames, release_frames, overshoot,
+            first_source=prev_node_name,
         )
     else:
         for preset in presets:
@@ -134,6 +147,8 @@ def generate_comp(
             prev_node_name = node.name
             pos_x += 110
 
+    # Cap pipeline with MediaOut
+    comp.add_node(make_media_out(source_op=prev_node_name, pos_x=pos_x + 110))
     comp.active_tool = prev_node_name
     return comp
 
@@ -143,6 +158,7 @@ def _generate_from_plan(
     beats: list[dict],
     sections: list[dict],
     effect_plan: object,
+    first_source: str | None = None,
 ) -> None:
     """Generate nodes from an AI effect plan."""
     # Build a map of section_index → SectionPlan
@@ -168,7 +184,7 @@ def _generate_from_plan(
             grouped[key] = []
         grouped[key].append(pname)
 
-    prev_node_name: str | None = None
+    prev_node_name: str | None = first_source
     pos_x = 0.0
 
     for (node_type, parameter), preset_names_group in grouped.items():
@@ -213,7 +229,104 @@ def _generate_from_plan(
         prev_node_name = node.name
         pos_x += 110
 
-    comp.active_tool = prev_node_name
+    # ── Sustained effects (section-level holds) ──
+    _generate_sustained_effects(comp, sections, effect_plan, prev_node_name, pos_x)
+
+    # Update active tool to last node
+    if comp.nodes:
+        comp.active_tool = comp.nodes[-1].name
+
+
+def _generate_sustained_effects(
+    comp: FusionComp,
+    sections: list[dict],
+    effect_plan: object,
+    prev_node_name: str | None,
+    start_pos_x: float,
+) -> None:
+    """Generate sustained (hold) effect nodes from the plan."""
+    from beatlab.beat_map import time_to_frame
+
+    # Collect all sustained params across all sections, grouped by node_type
+    # node_type → param_name → list of (section, value, transition_frames)
+    sustained_by_node: dict[str, dict[str, list[tuple[dict, float, int]]]] = {}
+
+    fps = 30.0  # Will be overridden from section frame data if available
+
+    for sp in effect_plan.sections:
+        sustained = getattr(sp, "sustained_effects", None) or []
+        if not sustained:
+            continue
+
+        # Find the matching section from the beat map
+        sec = None
+        for s in sections:
+            # Match by index
+            idx = sections.index(s)
+            if idx == sp.section_index:
+                sec = s
+                break
+        if sec is None:
+            continue
+
+        for seff in sustained:
+            node_type = seff.get("node_type", "ColorCorrector")
+            params = seff.get("parameters", {})
+            trans_frames = seff.get("transition_frames", 15)
+
+            if node_type not in sustained_by_node:
+                sustained_by_node[node_type] = {}
+
+            for param_name, value in params.items():
+                if param_name not in sustained_by_node[node_type]:
+                    sustained_by_node[node_type][param_name] = []
+                sustained_by_node[node_type][param_name].append((sec, value, trans_frames))
+
+    if not sustained_by_node:
+        return
+
+    pos_x = start_pos_x
+
+    for node_type, params in sustained_by_node.items():
+        maker = NODE_MAKERS.get(node_type)
+        if maker is None:
+            continue
+
+        node_name = f"AI{node_type.replace('Corrector', '').replace('Brightness', 'BC')}"
+        node = maker(name=node_name, source_op=prev_node_name, pos_x=pos_x)
+
+        for param_name, section_values in params.items():
+            track = KeyframeTrack()
+
+            # Default base values for known params
+            base_defaults = {
+                "MasterGain": 1.0, "MasterLift": 0.0, "MasterGamma": 1.0,
+                "MasterContrast": 0.0, "MasterSaturation": 1.0, "MasterHueAngle": 0.0,
+                "GainR": 1.0, "GainG": 1.0, "GainB": 1.0,
+                "LiftR": 0.0, "LiftG": 0.0, "LiftB": 0.0,
+            }
+            base = base_defaults.get(param_name, 0.0)
+
+            for sec, value, trans_frames in section_values:
+                start_time = sec.get("start_time", 0)
+                end_time = sec.get("end_time", 0)
+                # Use start_frame/end_frame if available, otherwise compute from time
+                start_frame = sec.get("start_frame", time_to_frame(start_time, fps))
+                end_frame = sec.get("end_frame", time_to_frame(end_time, fps))
+
+                track.add_hold(
+                    start_frame=start_frame,
+                    end_frame=end_frame,
+                    value=value,
+                    base_value=base,
+                    transition_frames=trans_frames,
+                )
+
+            node.animated[param_name] = track
+
+        comp.add_node(node)
+        prev_node_name = node.name
+        pos_x += 110
 
 
 def _generate_section_aware(
@@ -225,6 +338,7 @@ def _generate_section_aware(
     attack_frames: int | None,
     release_frames: int | None,
     overshoot: bool,
+    first_source: str | None = None,
 ) -> None:
     """Generate nodes with section-aware preset switching."""
     all_presets: dict[str, EffectPreset] = {}
@@ -242,7 +356,7 @@ def _generate_section_aware(
             grouped[key] = []
         grouped[key].append(p)
 
-    prev_node_name: str | None = None
+    prev_node_name: str | None = first_source
     pos_x = 0.0
 
     for (node_type, parameter), preset_group in grouped.items():

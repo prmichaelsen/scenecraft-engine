@@ -74,6 +74,30 @@ class KeyframeTrack:
         self.add(beat_frame, peak_value, interpolation)
         self.add(beat_frame + release_frames, base_value, interpolation)
 
+    def add_hold(
+        self,
+        start_frame: int,
+        end_frame: int,
+        value: float,
+        base_value: float = 0.0,
+        transition_frames: int = 15,
+        interpolation: str = "smooth",
+    ) -> None:
+        """Hold a value for a section duration with smooth transitions.
+
+        Creates: base → transition in → hold → transition out → base
+        """
+        trans = min(transition_frames, (end_frame - start_frame) // 3)
+        if trans < 1:
+            trans = 1
+
+        # Transition in
+        self.add(start_frame, base_value, interpolation)
+        self.add(start_frame + trans, value, interpolation)
+        # Transition out
+        self.add(max(start_frame + trans + 1, end_frame - trans), value, interpolation)
+        self.add(end_frame, base_value, interpolation)
+
     def to_lua_entries(self) -> list[str]:
         """Serialize all keyframes to Lua entries."""
         sorted_kfs = sorted(self.keyframes, key=lambda k: k.frame)
