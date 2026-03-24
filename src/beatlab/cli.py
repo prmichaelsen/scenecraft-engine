@@ -202,13 +202,14 @@ def run(
 @click.option("--model", default="sd_xl_base_1.0.safetensors", type=str, help="SD model name")
 @click.option("--local-comfyui", default=None, type=str, help="Local ComfyUI URL (e.g. http://localhost:8188)")
 @click.option("--sr", default=22050, type=int, help="Sample rate for analysis")
+@click.option("--beats-out", default=None, type=click.Path(), help="Save beat map JSON for reuse")
 @click.option("--dry-run/--no-dry-run", default=False, help="Show cost estimate without rendering")
 @click.option("--destroy/--keep-alive", default=False, help="Destroy instance after render (default: keep alive for reuse)")
 def render(
     video_file: str, beats: str | None, fps: float | None, style: str,
     ai: bool, prompt: str | None, output: str, base_denoise: float,
     beat_denoise: float, model: str, local_comfyui: str | None,
-    sr: int, dry_run: bool, destroy: bool,
+    sr: int, beats_out: str | None, dry_run: bool, destroy: bool,
 ):
     """Render AI-stylized video: extract frames → SD img2img → reassemble."""
     import tempfile
@@ -242,6 +243,11 @@ def render(
             f"Sections: {len(beat_map.get('sections', []))}",
             err=True,
         )
+
+    if beats_out:
+        from beatlab.beat_map import save_beat_map
+        save_beat_map(beat_map, beats_out)
+        click.echo(f"  Beat map saved to: {beats_out}", err=True)
 
     # 3. Get AI plan with style_prompts if --ai
     section_styles: dict[int, str] = {}
