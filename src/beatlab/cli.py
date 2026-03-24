@@ -280,7 +280,6 @@ def render(
             click.echo("  AI plan: using cached", err=True)
             plan_data = work.load_plan()
             from beatlab.ai.plan import parse_effect_plan
-            import json
             plan = parse_effect_plan(json.dumps(plan_data))
         else:
             plan = _get_ai_plan(beat_map, prompt)
@@ -337,7 +336,7 @@ def render(
             section_styles=section_styles,
             default_style=prompt or style,
         )
-        with open(keyframes_path, "w") as f:
+        with open(str(keyframes_path), "w") as f:
             json.dump(keyframe_list, f, indent=2)
 
     click.echo(
