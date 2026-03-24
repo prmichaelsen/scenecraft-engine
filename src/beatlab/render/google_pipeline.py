@@ -173,12 +173,63 @@ def render_google_pipeline(
         if progress_callback:
             progress_callback("veo", i + 1, num_segments)
 
+    # ── Phase 3.5: Time-remap segments to match actual section durations ──
+    _log("Phase 3.5: Time-remapping segments to match section durations...")
+    remapped_dir = work / "google_remapped"
+    remapped_dir.mkdir(parents=True, exist_ok=True)
+    remapped_paths: list[str] = []
+
+    for i in range(num_segments):
+        # Target duration = time span from section i start to section i+1 start
+        sec_a_start = sections[i].get("start_time", 0)
+        sec_b_start = sections[i + 1].get("start_time", 0)
+        target_duration = sec_b_start - sec_a_start
+
+        if target_duration <= 0:
+            target_duration = 8.0  # fallback
+
+        remapped_path = str(remapped_dir / f"remapped_{i:03d}.mp4")
+
+        if Path(remapped_path).exists():
+            remapped_paths.append(remapped_path)
+            continue
+
+        # Get actual duration of Veo clip
+        probe = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", segment_paths[i]],
+            capture_output=True, text=True,
+        )
+        try:
+            actual_duration = float(probe.stdout.strip())
+        except ValueError:
+            actual_duration = 8.0
+
+        speed_factor = actual_duration / target_duration
+
+        if abs(speed_factor - 1.0) < 0.05:
+            # Close enough — no remap needed
+            import shutil
+            shutil.copy2(segment_paths[i], remapped_path)
+        else:
+            _log(f"  Segment {i}: {actual_duration:.1f}s → {target_duration:.1f}s ({speed_factor:.2f}x)")
+            # Use setpts for video speed, atempo for audio (if any)
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", segment_paths[i],
+                 "-filter:v", f"setpts={1.0/speed_factor:.4f}*PTS",
+                 "-an",  # drop audio from Veo clips — we mux original audio later
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                 remapped_path],
+                capture_output=True, check=True,
+            )
+
+        remapped_paths.append(remapped_path)
+
     # ── Phase 4: Concatenate with crossfade and mux audio ──
     _log("Phase 4: Assembling with 8-frame crossfades...")
 
     concat_output = str(work / "google_concat.mp4")
     from beatlab.render.crossfade import concat_with_crossfade
-    concat_with_crossfade(segment_paths, concat_output, crossfade_frames=8, fps=video_fps)
+    concat_with_crossfade(remapped_paths, concat_output, crossfade_frames=8, fps=video_fps)
 
     # Mux audio from original video
     muxed_output = str(work / "google_muxed.mp4")
