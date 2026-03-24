@@ -94,7 +94,7 @@ class VastAIManager:
     def create_instance(
         self,
         offer_id: int,
-        image: str = "vastai/comfy",
+        image: str = "vastai/comfy:v0.18.0-cuda-13.1-py312",
         disk_gb: int = 50,
     ) -> str:
         """Create an instance from an offer. Returns instance ID."""
