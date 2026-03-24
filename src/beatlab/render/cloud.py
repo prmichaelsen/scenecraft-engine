@@ -223,6 +223,8 @@ class VastAIManager:
         """Upload files to instance via rsync."""
         host, port = self.get_ssh_info(instance_id)
         ssh_opts = self._ssh_opts(port)
+        # Ensure remote directory exists
+        self.ssh_run(instance_id, f"mkdir -p {remote_dir}")
         subprocess.run(
             [
                 "rsync", "-avz", "--progress",
@@ -237,6 +239,7 @@ class VastAIManager:
         """Download files from instance via rsync."""
         host, port = self.get_ssh_info(instance_id)
         ssh_opts = self._ssh_opts(port)
+        self.ssh_run(instance_id, f"mkdir -p {remote_dir}")
         Path(local_dir).mkdir(parents=True, exist_ok=True)
         subprocess.run(
             [
