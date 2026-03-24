@@ -136,9 +136,10 @@ def concat_with_crossfade(
 
     _log(f"  Chunked crossfade: {len(segment_paths)} segments → {total_chunks - 1} chunks + final merge")
 
-    # Create temp dir for chunks
+    # Create temp dir for chunks — named after output to avoid collision on recursive calls
     out_dir = Path(output_path).parent
-    chunk_dir = out_dir / "_xfade_chunks"
+    out_stem = Path(output_path).stem  # e.g. "google_concat"
+    chunk_dir = out_dir / f"_xfade_chunks_{out_stem}"
     chunk_dir.mkdir(parents=True, exist_ok=True)
 
     chunk_paths = []
@@ -207,9 +208,12 @@ def concat_with_crossfade(
             )
         _log(f"    Done in {_time.time() - merge_start:.1f}s")
     else:
-        # Recursive chunking (unlikely but handles huge videos)
+        # Recursive chunking — use distinct intermediate path to avoid chunk dir collision
         _log(f"  Recursive chunking: {len(chunk_paths)} chunks")
-        concat_with_crossfade(chunk_paths, output_path, crossfade_frames, fps, chunk_size)
+        intermediate = str(Path(output_path).with_stem(Path(output_path).stem + "_merge"))
+        concat_with_crossfade(chunk_paths, intermediate, crossfade_frames, fps, chunk_size)
+        import shutil as _shutil
+        _shutil.move(intermediate, output_path)
 
     # Keep chunks cached for reuse — only stale if source segments change
 
