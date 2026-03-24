@@ -113,9 +113,14 @@ class GoogleVideoClient:
             output_path
         """
         from google.genai import types
-        from PIL import Image
 
-        img = Image.open(image_path)
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+
+        ext = Path(image_path).suffix.lower()
+        mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(ext, "image/png")
+
+        img = types.Image(image_bytes=image_bytes, mime_type=mime)
 
         operation = self.client.models.generate_videos(
             model=model,
@@ -164,10 +169,18 @@ class GoogleVideoClient:
             output_path
         """
         from google.genai import types
-        from PIL import Image
 
-        start_img = Image.open(start_frame_path)
-        end_img = Image.open(end_frame_path)
+        with open(start_frame_path, "rb") as f:
+            start_bytes = f.read()
+        with open(end_frame_path, "rb") as f:
+            end_bytes = f.read()
+
+        ext_a = Path(start_frame_path).suffix.lower()
+        ext_b = Path(end_frame_path).suffix.lower()
+        mime_map = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
+
+        start_img = types.Image(image_bytes=start_bytes, mime_type=mime_map.get(ext_a, "image/png"))
+        end_img = types.Image(image_bytes=end_bytes, mime_type=mime_map.get(ext_b, "image/png"))
 
         operation = self.client.models.generate_videos(
             model=model,
