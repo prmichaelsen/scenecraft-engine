@@ -105,9 +105,10 @@ def concat_with_crossfade(
     if len(segment_paths) <= chunk_size:
         if _xfade_group(segment_paths, output_path, xfade_duration):
             return output_path
-        _log(f"  xfade failed for {len(segment_paths)} segments, falling back to hard concat")
-        _hard_concat(segment_paths, output_path)
-        return output_path
+        raise RuntimeError(
+            f"Crossfade failed for {len(segment_paths)} segments. "
+            f"Check for corrupt segments: {[Path(s).name for s in segment_paths]}"
+        )
 
     # Chunked processing
     _log(f"  Chunked crossfade: {len(segment_paths)} segments in chunks of {chunk_size}")
@@ -133,9 +134,23 @@ def concat_with_crossfade(
 
         if not Path(chunk_path).exists():
             _log(f"  Chunk {chunk_idx}: segments {i}-{end-1} ({len(chunk)} segments)")
+
+            # Validate all segments in chunk before attempting xfade
+            for seg in chunk:
+                if not Path(seg).exists():
+                    raise RuntimeError(f"Crossfade failed: segment missing: {seg}")
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", seg],
+                    capture_output=True, text=True,
+                )
+                if not probe.stdout.strip():
+                    raise RuntimeError(f"Crossfade failed: segment corrupt or unreadable: {seg}")
+
             if not _xfade_group(chunk, chunk_path, xfade_duration):
-                _log(f"  Chunk {chunk_idx} xfade failed, using hard concat")
-                _hard_concat(chunk, chunk_path)
+                raise RuntimeError(
+                    f"Crossfade failed on chunk {chunk_idx} (segments {i}-{end-1}). "
+                    f"Segments: {[Path(s).name for s in chunk]}"
+                )
 
         chunk_paths.append(chunk_path)
         chunk_idx += 1
@@ -149,8 +164,10 @@ def concat_with_crossfade(
     if len(chunk_paths) <= chunk_size:
         _log(f"  Final pass: crossfading {len(chunk_paths)} chunks")
         if not _xfade_group(chunk_paths, output_path, xfade_duration):
-            _log(f"  Final xfade failed, using hard concat")
-            _hard_concat(chunk_paths, output_path)
+            raise RuntimeError(
+                f"Final crossfade failed on {len(chunk_paths)} chunks. "
+                f"Check for corrupt segments."
+            )
     else:
         # Recursive chunking (unlikely but handles huge videos)
         _log(f"  Recursive chunking: {len(chunk_paths)} chunks")
