@@ -116,7 +116,7 @@ class GoogleVideoClient:
         response = self.client.models.generate_content(
             model=model,
             contents=[
-                types.Content(parts=[
+                types.Content(role="user", parts=[
                     types.Part.from_bytes(data=image_bytes, mime_type=mime),
                     types.Part(text=f"Restyle this image in the following style, keeping the composition and subject intact: {style_prompt}"),
                 ]),
