@@ -112,7 +112,8 @@ Respond with ONLY a JSON object (no markdown, no explanation). The JSON must fol
       "release_frames": 4,
       "style_prompt": "dark ethereal watercolor, muted tones, cinematic",
       "wan_denoise": 0.35,
-      "transition_frames": 15
+      "transition_frames": 15,
+      "transition_action": "camera plunges through shattering stained glass into dark water, gears dissolving into coral"
     }}
   ]
 }}
@@ -172,6 +173,32 @@ Guidelines:
 - Breakdown → buildup: 15-20 frames (gradual morph)
 - Buildup → drop: 2-3 frames (snap into new look)
 - First section: 0 (no transition before the first section)
+
+## Transition Actions (transition_action)
+
+ALWAYS include a `transition_action` for every section except the first. This describes what HAPPENS visually during the transition INTO this section — not just a style morph, but an EVENT, a dramatic action that connects two worlds.
+
+**Think like a music video director.** The transition is a moment of drama. Something breaks, transforms, explodes, dissolves, emerges, or collides.
+
+Guidelines:
+- Describe a PHYSICAL EVENT, not a color change: "walls crack and crumble revealing..." not "colors shift from blue to red"
+- Use the music: if the audio transitions from quiet to loud, the visual should EXPLODE. If loud to quiet, it should DISSOLVE or FADE
+- Reference both worlds: the previous section's visual elements should transform INTO the next section's elements
+- Camera movement matters: "camera punches through", "pulls back to reveal", "falls through floor into"
+- Keep it under 30 words — vivid and specific
+
+Examples of GOOD transition_actions:
+- "camera smashes through frozen glass wall, shards become glowing embers floating in volcanic darkness"
+- "ocean surface shatters upward as massive mechanical whale breaches, water turns to sparks"
+- "everything collapses inward to a singularity point, then explodes outward as crystalline fractals"
+- "ink bleeds across the frame consuming the scene, then clears to reveal an alien landscape"
+- "floor gives way, camera freefalls through layers of earth, stone, magma, emerging into starfield"
+- First section: null (no transition before the first section)
+
+Examples of BAD transition_actions:
+- "smooth transition from dark to light" — boring, no event
+- "colors shift gradually" — that's just a crossfade
+- "the scene changes" — not descriptive
 
 IMPORTANT: If there are many sections (>20), you may group consecutive sections of the same type into one entry by listing multiple section indices. Use "section_indices": [0, 1, 2] instead of "section_index" for grouped entries. This keeps the output compact."""
 

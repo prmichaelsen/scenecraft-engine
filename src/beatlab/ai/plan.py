@@ -23,6 +23,7 @@ class SectionPlan:
     style_prompt: str | None = None  # SD style for video render mode
     wan_denoise: float | None = None  # Wan2.1 denoising strength (0.0-1.0)
     transition_frames: int | None = None  # FILM transition frames at section boundary (2-30)
+    transition_action: str | None = None  # Describes what HAPPENS visually during the transition INTO this section
 
 
 @dataclass
@@ -74,6 +75,7 @@ def parse_effect_plan(text: str) -> EffectPlan:
                 style_prompt=s.get("style_prompt"),
                 wan_denoise=s.get("wan_denoise"),
                 transition_frames=s.get("transition_frames"),
+                transition_action=s.get("transition_action"),
             ))
 
     return EffectPlan(sections=sections)

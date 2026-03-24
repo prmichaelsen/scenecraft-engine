@@ -135,12 +135,16 @@ def render_google_pipeline(
         label_a = sec_a.get("label", "")
         label_b = sec_b.get("label", "")
 
-        # Build prompt describing the visual journey between sections
-        prompt_parts = [f"Cinematic video transitioning from {style_a} ({label_a}) into {style_b} ({label_b})."]
+        # Build prompt — use transition_action if Claude provided one
+        action = (sp_b.transition_action if sp_b and sp_b.transition_action else None)
+        if action:
+            prompt_parts = [f"Cinematic video: {action}"]
+            prompt_parts.append(f"Starting visual: {style_a}. Ending visual: {style_b}.")
+        else:
+            prompt_parts = [f"Cinematic video transitioning from {style_a} ({label_a}) into {style_b} ({label_b})."]
+
         if motion_prompt:
             prompt_parts.append(f"Camera and motion: {motion_prompt}.")
-        else:
-            prompt_parts.append("Smooth, flowing motion. The visual style gradually transforms.")
 
         if audio_descriptions:
             desc_a = audio_descriptions[i] if i < len(audio_descriptions) else ""
