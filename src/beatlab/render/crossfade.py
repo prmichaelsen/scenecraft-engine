@@ -126,29 +126,48 @@ def concat_with_crossfade(
         )
 
     # Chunked processing
-    _log(f"  Chunked crossfade: {len(segment_paths)} segments in chunks of {chunk_size}")
+    import time as _time
+
+    # Calculate total chunks upfront
+    step = chunk_size - 1  # overlap by 1
+    total_chunks = 0
+    _i = 0
+    while _i < len(segment_paths):
+        total_chunks += 1
+        _i += step
+        if _i >= len(segment_paths) - 1:
+            break
+    total_chunks += 1  # final pass to merge chunks
+
+    _log(f"  Chunked crossfade: {len(segment_paths)} segments → {total_chunks - 1} chunks + final merge")
 
     # Create temp dir for chunks
     out_dir = Path(output_path).parent
     chunk_dir = out_dir / "_xfade_chunks"
     chunk_dir.mkdir(parents=True, exist_ok=True)
 
-    # Split into chunks with 1-segment overlap for seamless crossfading
-    # Chunk 0: segments 0..9
-    # Chunk 1: segments 9..18  (segment 9 overlaps — crossfade handles it)
-    # Chunk 2: segments 18..27
     chunk_paths = []
-    step = chunk_size - 1  # overlap by 1
+    chunk_times: list[float] = []
 
     i = 0
     chunk_idx = 0
+    chunks_done = 0
     while i < len(segment_paths):
         end = min(i + chunk_size, len(segment_paths))
         chunk = segment_paths[i:end]
         chunk_path = str(chunk_dir / f"chunk_{chunk_idx:03d}.mp4")
 
         if not Path(chunk_path).exists():
-            _log(f"  Chunk {chunk_idx}: segments {i}-{end-1} ({len(chunk)} segments)")
+            # Time estimate
+            if chunk_times:
+                avg_time = sum(chunk_times) / len(chunk_times)
+                remaining = (total_chunks - 1 - chunks_done) * avg_time
+                eta_min = remaining / 60
+                _log(f"  Chunk {chunk_idx + 1}/{total_chunks - 1}: segments {i}-{end-1} ({len(chunk)} segs) — ETA {eta_min:.1f}m")
+            else:
+                _log(f"  Chunk {chunk_idx + 1}/{total_chunks - 1}: segments {i}-{end-1} ({len(chunk)} segs)")
+
+            chunk_start = _time.time()
 
             # Validate all segments in chunk before attempting xfade
             for seg in chunk:
@@ -162,6 +181,9 @@ def concat_with_crossfade(
                     raise RuntimeError(f"Crossfade failed: segment corrupt or unreadable: {seg}")
 
             ok, stderr = _xfade_group(chunk, chunk_path, xfade_duration)
+            chunk_elapsed = _time.time() - chunk_start
+            chunk_times.append(chunk_elapsed)
+
             if not ok:
                 raise RuntimeError(
                     f"Crossfade failed on chunk {chunk_idx} (segments {i}-{end-1}). "
@@ -169,6 +191,11 @@ def concat_with_crossfade(
                     f"ffmpeg stderr: {stderr[-500:]}"
                 )
 
+            _log(f"    Done in {chunk_elapsed:.1f}s")
+        else:
+            _log(f"  Chunk {chunk_idx + 1}/{total_chunks - 1}: cached")
+
+        chunks_done += 1
         chunk_paths.append(chunk_path)
         chunk_idx += 1
         i += step
@@ -179,13 +206,15 @@ def concat_with_crossfade(
 
     # Now crossfade the chunks together
     if len(chunk_paths) <= chunk_size:
-        _log(f"  Final pass: crossfading {len(chunk_paths)} chunks")
+        _log(f"  Final merge: crossfading {len(chunk_paths)} chunks ({total_chunks}/{total_chunks})")
+        merge_start = _time.time()
         ok, stderr = _xfade_group(chunk_paths, output_path, xfade_duration)
         if not ok:
             raise RuntimeError(
                 f"Final crossfade failed on {len(chunk_paths)} chunks.\n"
                 f"ffmpeg stderr: {stderr[-500:]}"
             )
+        _log(f"    Done in {_time.time() - merge_start:.1f}s")
     else:
         # Recursive chunking (unlikely but handles huge videos)
         _log(f"  Recursive chunking: {len(chunk_paths)} chunks")
