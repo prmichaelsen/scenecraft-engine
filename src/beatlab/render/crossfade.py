@@ -196,24 +196,16 @@ def concat_with_crossfade(
         chunk_idx += 1
         i += step
 
-    # Now crossfade the chunks together
-    if len(chunk_paths) <= chunk_size:
-        _log(f"  Final merge: crossfading {len(chunk_paths)} chunks ({total_chunks}/{total_chunks})")
-        merge_start = _time.time()
-        ok, stderr = _xfade_group(chunk_paths, output_path, xfade_duration)
-        if not ok:
-            raise RuntimeError(
-                f"Final crossfade failed on {len(chunk_paths)} chunks.\n"
-                f"ffmpeg stderr: {stderr[-500:]}"
-            )
-        _log(f"    Done in {_time.time() - merge_start:.1f}s")
-    else:
-        # Recursive chunking — use distinct intermediate path to avoid chunk dir collision
-        _log(f"  Recursive chunking: {len(chunk_paths)} chunks")
-        intermediate = str(Path(output_path).with_stem(Path(output_path).stem + "_merge"))
-        concat_with_crossfade(chunk_paths, intermediate, crossfade_frames, fps, chunk_size)
-        import shutil as _shutil
-        _shutil.move(intermediate, output_path)
+    # Now crossfade the chunks together — allow up to 50 chunks in final merge
+    _log(f"  Final merge: crossfading {len(chunk_paths)} chunks")
+    merge_start = _time.time()
+    ok, stderr = _xfade_group(chunk_paths, output_path, xfade_duration)
+    if not ok:
+        raise RuntimeError(
+            f"Final crossfade failed on {len(chunk_paths)} chunks.\n"
+            f"ffmpeg stderr: {stderr[-500:]}"
+        )
+    _log(f"    Done in {_time.time() - merge_start:.1f}s")
 
     # Keep chunks cached for reuse — only stale if source segments change
 
