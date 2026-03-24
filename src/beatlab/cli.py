@@ -348,25 +348,22 @@ def render(
     if engine == "wan":
         from beatlab.render.wan_pipeline import render_wan_pipeline
 
-        comfyui_url = local_comfyui or "127.0.0.1:8188"
-        host, port = comfyui_url.replace("http://", "").split(":")
-
         def _wan_progress(stage, done, total):
             _log(f"  [{stage}] {done}/{total}")
 
-        _log(f"  Wan2.1 engine: {'preview 512x512' if preview else 'full 1280x720'}")
+        mode = "local" if local_comfyui else "cloud (Vast.ai)"
+        _log(f"  Wan2.1 engine: {mode}, {'preview 512x512' if preview else 'full 1280x720'}")
         result = render_wan_pipeline(
             video_file=video_file,
             beat_map=beat_map,
             effect_plan=plan if ai else None,
             work_dir=str(work.root),
-            comfyui_host=host,
-            comfyui_port=int(port),
             fps=actual_fps,
             preview=preview,
             model=model,
             default_style=prompt or style,
             progress_callback=_wan_progress,
+            local_comfyui=local_comfyui,
         )
 
         # Move to final output
