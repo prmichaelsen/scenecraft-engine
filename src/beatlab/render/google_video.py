@@ -60,15 +60,19 @@ class GoogleVideoClient:
             output_path
         """
         from google.genai import types
-        from PIL import Image
 
-        img = Image.open(image_path)
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+
+        # Detect mime type
+        ext = Path(image_path).suffix.lower()
+        mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(ext, "image/png")
 
         response = self.client.models.generate_content(
             model=model,
             contents=[
                 types.Content(parts=[
-                    types.Part.from_image(img),
+                    types.Part.from_bytes(data=image_bytes, mime_type=mime),
                     types.Part(text=f"Restyle this image in the following style, keeping the composition and subject intact: {style_prompt}"),
                 ]),
             ],
@@ -132,7 +136,7 @@ class GoogleVideoClient:
 
         generated = operation.result.generated_videos[0]
         self.client.files.download(file=generated.video)
-        generated.video.save(output_path)
+        generated.video.save(output_path, overwrite=True)
         return output_path
 
     def generate_video_transition(
@@ -174,7 +178,7 @@ class GoogleVideoClient:
                 number_of_videos=1,
                 duration_seconds=duration_seconds,
                 person_generation="allow_all",
-                last_frame=types.Image.from_image(end_img),
+                last_frame=end_img,
             ),
         )
 
@@ -184,5 +188,5 @@ class GoogleVideoClient:
 
         generated = operation.result.generated_videos[0]
         self.client.files.download(file=generated.video)
-        generated.video.save(output_path)
+        generated.video.save(output_path, overwrite=True)
         return output_path
