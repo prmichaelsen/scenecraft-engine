@@ -109,11 +109,11 @@ def burn_section_labels(
 
     for seg_path, idx in zip(segment_paths, section_indices):
         out_path = str(Path(output_dir) / f"labeled_{idx:03d}.mp4")
+        # Escape colons in text for ffmpeg drawtext
         text = f"Section {idx}"
-        # Bottom-right, white text with black outline, small font
         drawtext = (
             f"drawtext=text='{text}'"
-            f":fontsize=18"
+            f":fontsize=24"
             f":fontcolor=white"
             f":borderw=2"
             f":bordercolor=black"
@@ -125,13 +125,12 @@ def burn_section_labels(
                 "ffmpeg", "-y", "-i", seg_path,
                 "-vf", drawtext,
                 "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                "-c:a", "copy",
                 out_path,
             ],
             capture_output=True, text=True,
         )
         if result.returncode != 0:
-            _log(f"  Label burn failed for section {idx}, using unlabeled")
+            _log(f"  Label burn failed for section {idx}: {result.stderr[-200:]}")
             labeled.append(seg_path)
         else:
             labeled.append(out_path)
