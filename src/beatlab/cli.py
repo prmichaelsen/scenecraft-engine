@@ -214,12 +214,14 @@ def run(
 @click.option("--preview/--no-preview", default=False, help="Render at 512x512 for fast preview (Wan2.1 only)")
 @click.option("--describe", default=None, is_flag=False, flag_value="generate", help="Describe sections with Gemini. Pass a .md file to reuse existing descriptions.")
 @click.option("--vertex/--no-vertex", default=False, help="Use Vertex AI instead of AI Studio (higher rate limits, requires GCP project)")
+@click.option("--audio-prompt/--no-audio-prompt", default=False, help="Include audio descriptions in Veo video generation prompts")
 def render(
     video_file: str, beats: str | None, fps: float | None, style: str,
     ai: bool, prompt: str | None, output: str, base_denoise: float,
     beat_denoise: float, model: str, local_comfyui: str | None,
     sr: int, dry_run: bool, destroy: bool, fresh: bool, work_dir: str,
     engine: str, preview: bool, describe: str | None, vertex: bool,
+    audio_prompt: bool,
 ):
     """Render AI-stylized video: extract frames → SD img2img → reassemble.
 
@@ -391,6 +393,7 @@ def render(
             default_style=prompt or style,
             progress_callback=_google_progress,
             vertex=vertex,
+            audio_descriptions=audio_descriptions if audio_prompt else None,
         )
 
         import shutil

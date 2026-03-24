@@ -25,6 +25,7 @@ def render_google_pipeline(
     default_style: str = "artistic stylized",
     progress_callback: Callable[[str, int, int], None] | None = None,
     vertex: bool = False,
+    audio_descriptions: list[str] | None = None,
 ) -> str:
     """Run the full Nano Banana + Veo pipeline.
 
@@ -127,11 +128,17 @@ def render_google_pipeline(
         label_b = sec_b.get("label", "")
 
         # Build prompt describing the visual journey between sections
-        prompt_parts = []
-        if default_style and default_style != "artistic stylized":
-            prompt_parts.append(f"Creative vision: {default_style}.")
-        prompt_parts.append(f"Cinematic video transitioning from {style_a} ({label_a}) into {style_b} ({label_b}).")
+        prompt_parts = [f"Cinematic video transitioning from {style_a} ({label_a}) into {style_b} ({label_b})."]
         prompt_parts.append("Smooth, flowing motion. The visual style gradually transforms.")
+
+        if audio_descriptions:
+            desc_a = audio_descriptions[i] if i < len(audio_descriptions) else ""
+            desc_b = audio_descriptions[i + 1] if i + 1 < len(audio_descriptions) else ""
+            if desc_a:
+                prompt_parts.append(f"The music starts with: {desc_a[:200]}")
+            if desc_b:
+                prompt_parts.append(f"And transitions into: {desc_b[:200]}")
+
         prompt = " ".join(prompt_parts)
 
         _log(f"  [{i+1}/{num_segments}] Segment {i}→{i+1}: {label_a}→{label_b} (8s)...")
