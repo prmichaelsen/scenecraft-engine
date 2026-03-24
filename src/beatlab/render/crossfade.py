@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import shutil
 import subprocess
 import sys
@@ -129,14 +130,8 @@ def concat_with_crossfade(
     import time as _time
 
     # Calculate total chunks upfront
-    step = chunk_size - 1  # overlap by 1
-    total_chunks = 0
-    _i = 0
-    while _i < len(segment_paths):
-        total_chunks += 1
-        _i += step
-        if _i >= len(segment_paths) - 1:
-            break
+    step = chunk_size
+    total_chunks = math.ceil(len(segment_paths) / chunk_size)
     total_chunks += 1  # final pass to merge chunks
 
     _log(f"  Chunked crossfade: {len(segment_paths)} segments → {total_chunks - 1} chunks + final merge")
@@ -199,10 +194,6 @@ def concat_with_crossfade(
         chunk_paths.append(chunk_path)
         chunk_idx += 1
         i += step
-
-        # If we'd start a chunk with only 1 segment left, include it in the last chunk
-        if i >= len(segment_paths) - 1:
-            break
 
     # Now crossfade the chunks together
     if len(chunk_paths) <= chunk_size:
