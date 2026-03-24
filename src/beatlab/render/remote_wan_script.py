@@ -185,12 +185,18 @@ def build_img2img_workflow(image_name, prompt, negative_prompt, denoise, seed, m
 
 
 def build_video_workflow(video_name, prompt, negative_prompt, denoise, seed, model):
-    """Wan2.1 / VHS video-to-video workflow."""
+    """VHS video-to-video workflow using SD img2img on video frames."""
     return {
         "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": model}},
         "2": {"class_type": "VHS_LoadVideo", "inputs": {
-            "video": video_name, "force_rate": 0, "force_size": "Disabled",
-            "frame_load_cap": 0, "skip_first_frames": 0}},
+            "video": video_name,
+            "force_rate": 0,
+            "custom_width": 0,
+            "custom_height": 0,
+            "frame_load_cap": 0,
+            "skip_first_frames": 0,
+            "select_every_nth": 1,
+        }},
         "3": {"class_type": "VAEEncode", "inputs": {"pixels": ["2", 0], "vae": ["1", 2]}},
         "4": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["1", 1]}},
         "5": {"class_type": "CLIPTextEncode", "inputs": {"text": negative_prompt, "clip": ["1", 1]}},
