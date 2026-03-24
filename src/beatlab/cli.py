@@ -592,6 +592,104 @@ def destroy_gpu():
         _clear_instance_state()
 
 
+@main.command()
+@click.argument("file_path", type=click.Path())
+@click.option("--work-dir", default=".beatlab_work", type=str, help="Work directory (default: .beatlab_work)")
+def delete(file_path: str, work_dir: str):
+    """Delete a cached file and cascade-delete all downstream artifacts.
+
+    Examples:
+        beatlab delete google_styled/styled_042.png
+        beatlab delete google_segments/segment_042_043.mp4
+        beatlab delete google_remapped/remapped_042.mp4
+
+    Cascading logic:
+        styled_NNN.png → deletes segments using that section, remapped, concat, muxed, output
+        segment_NNN_MMM.mp4 → deletes remapped, concat, muxed, output
+        remapped_NNN.mp4 → deletes concat, muxed, output
+    """
+    import glob
+    import re
+
+    # Find the work dir — could be multiple video subdirs
+    work_base = Path(work_dir)
+    if not work_base.exists():
+        _log(f"Work dir not found: {work_dir}")
+        return
+
+    # Search all video work dirs for the file
+    deleted = []
+    for video_dir in work_base.iterdir():
+        if not video_dir.is_dir():
+            continue
+
+        target = video_dir / file_path
+        if not target.exists():
+            continue
+
+        _log(f"Found: {target}")
+
+        # Determine what to cascade based on the file
+        name = target.name
+        cascade = []
+
+        # styled_NNN.png → segments + remapped + assembly
+        m = re.match(r"styled_(\d+)\.png", name)
+        if m:
+            idx = int(m.group(1))
+            # Segments that use this section as start or end
+            seg_dir = video_dir / "google_segments"
+            if seg_dir.exists():
+                for seg in seg_dir.glob(f"segment_{idx:03d}_*.mp4"):
+                    cascade.append(seg)
+                if idx > 0:
+                    for seg in seg_dir.glob(f"segment_*_{idx:03d}.mp4"):
+                        cascade.append(seg)
+            # Corresponding remapped
+            remap_dir = video_dir / "google_remapped"
+            if remap_dir.exists():
+                for r in remap_dir.glob(f"remapped_{idx:03d}.mp4"):
+                    cascade.append(r)
+                if idx > 0:
+                    for r in remap_dir.glob(f"remapped_{idx-1:03d}.mp4"):
+                        cascade.append(r)
+
+        # segment_NNN_MMM.mp4 → remapped + assembly
+        m = re.match(r"segment_(\d+)_(\d+)\.mp4", name)
+        if m:
+            idx = int(m.group(1))
+            remap_dir = video_dir / "google_remapped"
+            if remap_dir.exists():
+                for r in remap_dir.glob(f"remapped_{idx:03d}.mp4"):
+                    cascade.append(r)
+
+        # Always delete assembly artifacts
+        for assembly_file in [
+            "google_concat.mp4", "google_muxed.mp4", "google_output.mp4",
+            "kling_concat.mp4", "kling_muxed.mp4", "kling_output.mp4",
+        ]:
+            af = video_dir / assembly_file
+            if af.exists():
+                cascade.append(af)
+
+        # Delete target
+        target.unlink()
+        deleted.append(str(target))
+        _log(f"  Deleted: {target}")
+
+        # Delete cascade
+        for cf in cascade:
+            if cf.exists():
+                cf.unlink()
+                deleted.append(str(cf))
+                _log(f"  Cascade: {cf}")
+
+    if not deleted:
+        _log(f"File not found in any work dir: {file_path}")
+    else:
+        _log(f"Deleted {len(deleted)} files total. Re-run render to regenerate.")
+
+
 def _load_descriptions(md_path: str, num_sections: int) -> list[str]:
     """Load audio descriptions from a previously generated markdown file."""
     import re
