@@ -227,7 +227,7 @@ class VastAIManager:
         self.ssh_run(instance_id, f"mkdir -p {remote_dir}")
         subprocess.run(
             [
-                "rsync", "-avz", "--progress",
+                "rsync", "-avz", "--delete", "--progress",
                 "-e", ssh_opts,
                 f"{local_dir}/",
                 f"root@{host}:{remote_dir}/",

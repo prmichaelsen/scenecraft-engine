@@ -396,7 +396,8 @@ def render(
                 shell=True, check=True,
             )
 
-            # Upload frames + params
+            # Clean remote output from previous runs and upload frames
+            vast.ssh_run(instance_id, "rm -rf /workspace/output && mkdir -p /workspace/output")
             click.echo(f"  Uploading {frame_count} frames...", err=True)
             vast.upload_files(instance_id, frames_dir, "/workspace/input")
 
