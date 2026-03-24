@@ -248,30 +248,73 @@ milestones:
         dependencies:
           - task-17
 
+  - id: M7
+    title: AI Video Stylization
+    file: agent/milestones/milestone-7-ai-video-stylization.md
+    status: not_started
+    estimated_weeks: 2.5
+    tasks_total: 4
+    tasks_completed: 0
+    tasks:
+      - id: task-19
+        title: Frame Extraction & Reassembly
+        file: agent/tasks/milestone-7-ai-video-stylization/task-19-frame-pipeline.md
+        status: not_started
+        estimated_hours: 2
+        started: null
+        actual_hours: null
+      - id: task-20
+        title: SD Render Pipeline
+        file: agent/tasks/milestone-7-ai-video-stylization/task-20-sd-render.md
+        status: not_started
+        estimated_hours: 6
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-19
+      - id: task-21
+        title: Cloud GPU Provisioning
+        file: agent/tasks/milestone-7-ai-video-stylization/task-21-cloud-gpu.md
+        status: not_started
+        estimated_hours: 4
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-20
+      - id: task-22
+        title: Render CLI & AI Director
+        file: agent/tasks/milestone-7-ai-video-stylization/task-22-render-cli.md
+        status: not_started
+        estimated_hours: 3
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-21
+
 documentation:
   design_documents: 2
-  milestone_documents: 6
+  milestone_documents: 7
   pattern_documents: 0
-  task_documents: 18
+  task_documents: 22
 
 progress:
   planning: 100
-  implementation: 89
-  overall: 89
+  implementation: 73
+  overall: 73
 
 recent_work:
-  - date: 2026-03-23
-    description: "M6 complete — sustained effects, ColorCorrector, AI color grading. 16/18 tasks done."
+  - date: 2026-03-24
+    description: "M7 planned — AI video stylization with SD render pipeline on cloud GPU. 4 tasks, ~15 hours."
 
 next_steps:
-  - "Start M6: Task 16 — Hold Keyframes & ColorCorrector Node"
-  - "Test .setting import in Resolve with comma fix"
+  - "Start M7: Task 19 — Frame Extraction & Reassembly"
+  - "Set up Vast.ai account and API key"
+  - "Push current work (M1-M6 complete, M7 planned)"
 
 notes:
-  - "Total estimated: ~47 hours across 18 tasks"
-  - "MVP (M1+M2) complete"
+  - "Total estimated: ~62 hours across 22 tasks"
+  - "M1-M3, M5-M6 complete (16/22 tasks)"
   - "M4 (Resolve integration) deferred — nice-to-have"
-  - "M5 requires anthropic SDK as optional dependency"
-  - "M6 adds sustained section-level effects + full color grading"
+  - "M7 requires Vast.ai API key, ffmpeg, ~$3 per 30min video render"
 
 current_blockers: []
