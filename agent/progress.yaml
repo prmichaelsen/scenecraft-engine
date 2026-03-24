@@ -300,36 +300,41 @@ milestones:
   - id: M8
     title: EbSynth Hybrid Temporal Coherence
     file: agent/milestones/milestone-8-ebsynth-coherence.md
-    status: not_started
+    status: completed
+    started: 2026-03-24
+    completed: 2026-03-24
     estimated_weeks: 1
     tasks_total: 3
-    tasks_completed: 0
+    tasks_completed: 3
     tasks:
       - id: task-23
         title: Keyframe Selection
         file: agent/tasks/milestone-8-ebsynth-coherence/task-23-keyframe-selection.md
-        status: not_started
+        status: completed
         estimated_hours: 2
-        started: null
-        actual_hours: null
+        started: 2026-03-24T03:00:00Z
+        completed_date: 2026-03-24T03:10:00Z
+        actual_hours: 0.2
         dependencies:
           - task-19
       - id: task-24
         title: EbSynth Integration
         file: agent/tasks/milestone-8-ebsynth-coherence/task-24-ebsynth-integration.md
-        status: not_started
+        status: completed
         estimated_hours: 3
-        started: null
-        actual_hours: null
+        started: 2026-03-24T03:10:00Z
+        completed_date: 2026-03-24T03:20:00Z
+        actual_hours: 0.2
         dependencies:
           - task-23
       - id: task-25
         title: Pipeline Integration
         file: agent/tasks/milestone-8-ebsynth-coherence/task-25-pipeline-integration.md
-        status: not_started
+        status: completed
         estimated_hours: 3
-        started: null
-        actual_hours: null
+        started: 2026-03-24T03:20:00Z
+        completed_date: 2026-03-24T03:30:00Z
+        actual_hours: 0.2
         dependencies:
           - task-24
 
@@ -346,17 +351,16 @@ progress:
 
 recent_work:
   - date: 2026-03-24
-    description: "M8 planned — EbSynth hybrid temporal coherence. 3 tasks for keyframe selection, EbSynth integration, pipeline rewrite."
+    description: "M8 complete — EbSynth hybrid pipeline. Keyframe selection, EbSynth propagation, v2 remote script. 23/25 tasks done."
 
 next_steps:
-  - "Start M8: Task 23 — Keyframe Selection"
-  - "Test current per-frame render on sample clip"
-  - "Evaluate flicker before/after EbSynth"
+  - "Test EbSynth hybrid render on sample clip"
+  - "Compare flicker: per-frame vs EbSynth"
 
 notes:
   - "Total estimated: ~70 hours across 25 tasks"
-  - "M1-M3, M5-M7 complete (20/25 tasks)"
+  - "M1-M3, M5-M8 complete (23/25 tasks)"
   - "M4 (Resolve integration) deferred"
-  - "M8 replaces per-frame render with 10-20x faster keyframe+EbSynth approach"
+  - "EbSynth binary auto-downloads on first use"
 
 current_blockers: []

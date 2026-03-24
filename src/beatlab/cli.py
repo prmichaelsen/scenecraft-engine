@@ -322,26 +322,38 @@ def render(
         frame_count, actual_fps = extract_frames(video_file, frames_dir, fps=fps)
         click.echo(f"  Extracted {frame_count} frames", err=True)
 
-    # ── Step 5: Generate per-frame params ──
-    if work.has_params() and not fresh:
-        click.echo("  Frame params: using cached", err=True)
-        frame_params = work.load_params()
+    # ── Step 5: Select keyframes ──
+    from beatlab.render.keyframe_selector import select_keyframes
+    keyframes_path = work.root / "keyframes.json"
+
+    if keyframes_path.exists() and not fresh:
+        click.echo("  Keyframes: using cached", err=True)
+        with open(keyframes_path) as f:
+            keyframe_list = json.load(f)
     else:
-        frame_params = generate_frame_params(
+        keyframe_list = select_keyframes(
             beat_map, frame_count, actual_fps,
             base_denoise=base_denoise, beat_denoise=beat_denoise,
-            section_styles=section_styles, default_style=style,
+            section_styles=section_styles,
+            default_style=prompt or style,
         )
-        work.save_params(frame_params)
+        with open(keyframes_path, "w") as f:
+            json.dump(keyframe_list, f, indent=2)
 
-    # ── Step 6: Cost estimate ──
-    already_styled = work.styled_count()
-    remaining = frame_count - already_styled
-    cost = estimate_cost(remaining)
     click.echo(
-        f"  Render: {remaining} frames remaining"
-        + (f" ({already_styled} already done)" if already_styled > 0 else "")
-        + f", ~{cost['estimated_hours']:.1f}h, ~${cost['estimated_cost_usd']:.2f}",
+        f"  Keyframes: {len(keyframe_list)} selected "
+        f"({len(keyframe_list) * 100 // max(1, frame_count)}% of {frame_count} frames)",
+        err=True,
+    )
+
+    # ── Step 6: Cost estimate (keyframes only) ──
+    already_styled = work.styled_count()
+    remaining_kf = max(0, len(keyframe_list) - already_styled)
+    cost = estimate_cost(remaining_kf)
+    click.echo(
+        f"  SD render: {remaining_kf} keyframes"
+        + f", ~{cost['estimated_hours']:.2f}h, ~${cost['estimated_cost_usd']:.2f}"
+        + " + EbSynth propagation (fast, CPU)",
         err=True,
     )
 
@@ -378,35 +390,39 @@ def render(
             vast.wait_until_ready(instance_id)
 
         try:
-            # Copy frame_params.json into frames dir for upload
+            # Copy keyframes.json into frames dir for upload
             import shutil
-            shutil.copy2(str(work.params_path), f"{frames_dir}/frame_params.json")
+            shutil.copy2(str(keyframes_path), f"{frames_dir}/keyframes.json")
 
-            # Upload render script
-            import beatlab.render.remote_script as rs
+            # Upload v2 render script
+            import beatlab.render.remote_script_v2 as rs
             script_path = rs.__file__
-            click.echo("  Uploading render script...", err=True)
+            click.echo("  Uploading render script (v2 — keyframe + EbSynth)...", err=True)
             vast.ssh_run(instance_id, "mkdir -p /workspace")
             host, port = vast.get_ssh_info(instance_id)
             ssh_opts = vast._ssh_opts(port)
             key = vast._ssh_key_arg()
             key_opt = f"-i {key} " if key else ""
             subprocess.run(
-                f'scp {key_opt}-o StrictHostKeyChecking=no -P {port} {script_path} root@{host}:/workspace/render.py',
+                f'scp {key_opt}-o StrictHostKeyChecking=no -P {port} {script_path} root@{host}:/workspace/render_v2.py',
                 shell=True, check=True,
             )
 
-            # Clean remote output from previous runs and upload frames
+            # Clean remote output from previous runs and upload frames + keyframes
             vast.ssh_run(instance_id, "rm -rf /workspace/output && mkdir -p /workspace/output")
-            click.echo(f"  Uploading {frame_count} frames...", err=True)
+            click.echo(f"  Uploading {frame_count} frames + keyframes.json...", err=True)
             vast.upload_files(instance_id, frames_dir, "/workspace/input")
 
-            # Run render script on remote
-            click.echo(f"  Rendering {remaining} frames on cloud GPU...", err=True)
+            # Run v2 render script (keyframe SD + EbSynth propagation)
+            click.echo(
+                f"  Phase 1: Rendering {len(keyframe_list)} keyframes on GPU...\n"
+                f"  Phase 2: EbSynth propagation to {frame_count} frames (CPU)...",
+                err=True,
+            )
 
             ssh_cmd = (
                 f'{ssh_opts} root@{host} '
-                f'"python3 /workspace/render.py /workspace/input /workspace/output {model}"'
+                f'"python3 /workspace/render_v2.py /workspace/input /workspace/output {model}"'
             )
             proc = subprocess.Popen(
                 ssh_cmd, shell=True,
