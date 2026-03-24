@@ -30,7 +30,7 @@ class VastAIManager:
 
     def find_instance(
         self,
-        min_vram_gb: int = 8,
+        min_vram_gb: int = 16,
         max_price_hr: float = 10.0,
     ) -> dict:
         """Search for a suitable GPU instance.
@@ -38,11 +38,13 @@ class VastAIManager:
         Returns instance offer dict with id, gpu_name, price, etc.
         """
         # Keep query simple — complex filters cause empty results on Vast.ai CLI
+        # Sort by descending FLOPS to get fastest GPU within budget
         query = f"rentable=true dph_total<={max_price_hr} num_gpus=1"
+        sort_order = "total_flops-"  # fastest first
         output = self._vastai_cmd(
             "search", "offers",
             query,
-            "--order", "dph_total",
+            "--order", sort_order,
             "--limit", "5",
             "--raw",
         )
