@@ -112,9 +112,14 @@ def render_google_pipeline(
             styled_paths.append(styled_path)
             continue
 
-        _log(f"  [{i+1}/{total_sections}] Section {i}: {style[:50]}...")
+        # Enrich style with user's creative direction
+        full_style = style
+        if default_style and default_style != "artistic stylized":
+            full_style = f"{default_style}. {style}"
+
+        _log(f"  [{i+1}/{total_sections}] Section {i}: {full_style[:60]}...")
         try:
-            client.stylize_image(kf_path, style, styled_path)
+            client.stylize_image(kf_path, full_style, styled_path)
         except Exception as e:
             _log(f"  [{i+1}/{total_sections}] FAILED: {e}")
             raise
@@ -138,7 +143,17 @@ def render_google_pipeline(
             clip_paths.append(clip_path)
             continue
 
-        prompt = f"Smooth cinematic video in this visual style: {style}. Maintain the composition and mood."
+        # Build rich Veo prompt from user direction + AI style + section context
+        sec_type = sec.get("type", "")
+        sec_label = sec.get("label", "")
+        prompt_parts = []
+        if default_style and default_style != "artistic stylized":
+            prompt_parts.append(f"Creative vision: {default_style}.")
+        prompt_parts.append(f"Visual style: {style}.")
+        if sec_label:
+            prompt_parts.append(f"This is the {sec_label} section ({sec_type}).")
+        prompt_parts.append("Smooth cinematic motion. Maintain the composition and mood of the reference image.")
+        prompt = " ".join(prompt_parts)
 
         _log(f"  [{i+1}/{total_sections}] Section {i} (8s)...")
         try:
@@ -181,7 +196,8 @@ def render_google_pipeline(
         style_b = plan_map.get(i + 1)
         prompt_a = (style_a.style_prompt if style_a and style_a.style_prompt else default_style)
         prompt_b = (style_b.style_prompt if style_b and style_b.style_prompt else default_style)
-        trans_prompt = f"Smooth cinematic transition morphing from '{prompt_a}' style into '{prompt_b}' style."
+        creative = f" Theme: {default_style}." if default_style and default_style != "artistic stylized" else ""
+        trans_prompt = f"Smooth cinematic transition morphing from '{prompt_a}' style into '{prompt_b}' style.{creative}"
 
         _log(f"  [{i+1}/{num_transitions}] Transition {i}→{i+1} ({trans_seconds}s)...")
         try:
