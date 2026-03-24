@@ -21,7 +21,7 @@ COMFYUI_URL = "http://127.0.0.1:8188"
 CLIENT_ID = str(uuid.uuid4())
 
 
-def wait_for_comfyui(timeout=300):
+def wait_for_comfyui(timeout=900):
     """Wait for ComfyUI to be ready."""
     start = time.time()
     while time.time() - start < timeout:
