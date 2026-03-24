@@ -203,35 +203,15 @@ def apply_effects(
             blurred_arr = np.array(blurred).astype(np.float32)
             frame = frame * (1.0 - glow_strength) + blurred_arr * glow_strength
 
-        # ── Sustained color grading ──
-        master_gain = get_sustained_value(t, "MasterGain", 1.0)
-        master_saturation = get_sustained_value(t, "MasterSaturation", 1.0)
-        master_contrast = get_sustained_value(t, "MasterContrast", 0.0)
-        master_lift = get_sustained_value(t, "MasterLift", 0.0)
-
-        if master_gain != 1.0:
-            frame = frame * master_gain
-
-        if master_lift != 0.0:
-            frame = frame + master_lift * 255.0
-
-        if master_contrast != 0.0:
-            mean = frame.mean()
-            frame = (frame - mean) * (1.0 + master_contrast) + mean
-
-        if master_saturation != 1.0:
-            # Convert to grayscale and blend
-            gray = np.dot(frame[..., :3], [0.299, 0.587, 0.114])
-            gray = np.stack([gray] * 3, axis=-1)
-            frame = gray + master_saturation * (frame - gray)
-
-        # Per-channel gain (color tinting)
-        gain_r = get_sustained_value(t, "GainR", 1.0)
-        gain_g = get_sustained_value(t, "GainG", 1.0)
-        gain_b = get_sustained_value(t, "GainB", 1.0)
-        if gain_r != 1.0 or gain_g != 1.0 or gain_b != 1.0:
-            frame[..., 0] *= gain_r
-            frame[..., 1] *= gain_g
+        # ── Sustained color grading (DISABLED — jarring transitions) ──
+        # TODO: re-enable with smooth interpolation between section boundaries
+        # master_gain = get_sustained_value(t, "MasterGain", 1.0)
+        # master_saturation = get_sustained_value(t, "MasterSaturation", 1.0)
+        # master_contrast = get_sustained_value(t, "MasterContrast", 0.0)
+        # master_lift = get_sustained_value(t, "MasterLift", 0.0)
+        # gain_r = get_sustained_value(t, "GainR", 1.0)
+        # gain_g = get_sustained_value(t, "GainG", 1.0)
+        # gain_b = get_sustained_value(t, "GainB", 1.0)
             frame[..., 2] *= gain_b
 
         # Clamp
