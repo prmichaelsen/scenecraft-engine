@@ -84,17 +84,56 @@ def detect_stale_outputs(
     work = Path(work_dir)
 
     for idx in changed_indices:
-        # Look for clip files, styled frames, or other outputs matching this section
+        # Styled images
         for pattern in [
-            f"clips/clip_{idx:03d}*",
+            f"google_styled/styled_{idx:03d}.png",
             f"styled/section_{idx:03d}*",
-            f"wan_clips/clip_{idx:03d}*",
-            f"wan_clips/segment_{idx}*",
         ]:
             for f in work.glob(pattern):
                 stale.append(str(f))
 
-    return stale
+        # Segments involving this section (as source or destination)
+        for pattern in [
+            f"google_segments/segment_{idx:03d}_*.mp4",
+            f"google_segments/segment_*_{idx:03d}.mp4",
+            f"google_remapped/remapped_{idx:03d}.mp4",
+            f"google_labeled/labeled_{idx:03d}.mp4",
+            f"wan_clips/clip_{idx:03d}*",
+            f"wan_clips/segment_{idx}*",
+            f"clips/clip_{idx:03d}*",
+        ]:
+            for f in work.glob(pattern):
+                stale.append(str(f))
+
+        # Also stale: segments from/to adjacent sections (they reference this section's styled image)
+        for adj in [idx - 1, idx + 1]:
+            if adj < 0:
+                continue
+            for pattern in [
+                f"google_segments/segment_{adj:03d}_{idx:03d}.mp4",
+                f"google_segments/segment_{idx:03d}_{adj:03d}.mp4",
+                f"google_remapped/remapped_{adj:03d}.mp4",
+                f"google_labeled/labeled_{adj:03d}.mp4",
+            ]:
+                for f in work.glob(pattern):
+                    stale.append(str(f))
+
+    # Always invalidate final assembly outputs
+    if changed_indices:
+        for name in [
+            "google_concat.mp4", "google_muxed.mp4", "google_output.mp4",
+            "_xfade_chunks",
+        ]:
+            p = work / name
+            if p.exists():
+                if p.is_dir():
+                    import shutil
+                    shutil.rmtree(str(p))
+                    stale.append(str(p))
+                else:
+                    stale.append(str(p))
+
+    return list(set(stale))
 
 
 def generate_patch_from_updates(updates: list[dict]) -> dict:
