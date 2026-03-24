@@ -161,7 +161,7 @@ def render_google_pipeline(
         sp_next = plan_map.get(i + 1)
         trans_frames = (sp_next.transition_frames if sp_next and sp_next.transition_frames else DEFAULT_TRANSITION_FRAMES)
 
-        trans_seconds = 5  # Veo min 4s — use 5s for all transitions
+        trans_seconds = 8  # Veo only reliably accepts 8s
 
         trans_path = str(transitions_dir / f"trans_{i:03d}_{i+1:03d}.mp4")
 
