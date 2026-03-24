@@ -215,13 +215,14 @@ def run(
 @click.option("--describe", default=None, is_flag=False, flag_value="generate", help="Describe sections with Gemini. Pass a .md file to reuse existing descriptions.")
 @click.option("--vertex/--no-vertex", default=False, help="Use Vertex AI instead of AI Studio (higher rate limits, requires GCP project)")
 @click.option("--audio-prompt/--no-audio-prompt", default=False, help="Include audio descriptions in Veo video generation prompts")
+@click.option("--motion", default=None, type=str, help="Camera/motion direction for Veo (e.g. 'forward dolly through void, warp speed')")
 def render(
     video_file: str, beats: str | None, fps: float | None, style: str,
     ai: bool, prompt: str | None, output: str, base_denoise: float,
     beat_denoise: float, model: str, local_comfyui: str | None,
     sr: int, dry_run: bool, destroy: bool, fresh: bool, work_dir: str,
     engine: str, preview: bool, describe: str | None, vertex: bool,
-    audio_prompt: bool,
+    audio_prompt: bool, motion: str | None,
 ):
     """Render AI-stylized video: extract frames → SD img2img → reassemble.
 
@@ -394,6 +395,7 @@ def render(
             progress_callback=_google_progress,
             vertex=vertex,
             audio_descriptions=audio_descriptions if audio_prompt else None,
+            motion_prompt=motion,
         )
 
         import shutil

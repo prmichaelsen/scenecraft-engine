@@ -26,6 +26,7 @@ def render_google_pipeline(
     progress_callback: Callable[[str, int, int], None] | None = None,
     vertex: bool = False,
     audio_descriptions: list[str] | None = None,
+    motion_prompt: str | None = None,
 ) -> str:
     """Run the full Nano Banana + Veo pipeline.
 
@@ -129,7 +130,10 @@ def render_google_pipeline(
 
         # Build prompt describing the visual journey between sections
         prompt_parts = [f"Cinematic video transitioning from {style_a} ({label_a}) into {style_b} ({label_b})."]
-        prompt_parts.append("Smooth, flowing motion. The visual style gradually transforms.")
+        if motion_prompt:
+            prompt_parts.append(f"Camera and motion: {motion_prompt}.")
+        else:
+            prompt_parts.append("Smooth, flowing motion. The visual style gradually transforms.")
 
         if audio_descriptions:
             desc_a = audio_descriptions[i] if i < len(audio_descriptions) else ""
