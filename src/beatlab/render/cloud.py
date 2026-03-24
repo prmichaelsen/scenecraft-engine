@@ -194,26 +194,39 @@ class VastAIManager:
         self._vastai_cmd("destroy", "instance", instance_id)
         _clear_instance_state()
 
+    @staticmethod
+    def _ssh_key_arg() -> str:
+        """Find the SSH key to use for Vast.ai."""
+        for key in ("~/.ssh/id_vast", "~/.ssh/id_ed25519", "~/.ssh/id_rsa"):
+            expanded = Path(key).expanduser()
+            if expanded.exists():
+                return str(expanded)
+        return ""
+
+    def _ssh_opts(self, port: int) -> str:
+        """Build SSH options string."""
+        key = self._ssh_key_arg()
+        key_opt = f"-i {key} " if key else ""
+        return f"ssh {key_opt}-o StrictHostKeyChecking=no -p {port}"
+
     def ssh_run(self, instance_id: str, command: str) -> str:
         """Run a command on the instance via SSH."""
         host, port = self.get_ssh_info(instance_id)
+        ssh_opts = self._ssh_opts(port)
         result = subprocess.run(
-            [
-                "ssh", "-o", "StrictHostKeyChecking=no",
-                "-p", str(port), f"root@{host}",
-                command,
-            ],
-            capture_output=True, text=True, timeout=300,
+            f'{ssh_opts} root@{host} "{command}"',
+            shell=True, capture_output=True, text=True, timeout=300,
         )
         return result.stdout
 
     def upload_files(self, instance_id: str, local_dir: str, remote_dir: str) -> None:
         """Upload files to instance via rsync."""
         host, port = self.get_ssh_info(instance_id)
+        ssh_opts = self._ssh_opts(port)
         subprocess.run(
             [
                 "rsync", "-avz", "--progress",
-                "-e", f"ssh -o StrictHostKeyChecking=no -p {port}",
+                "-e", ssh_opts,
                 f"{local_dir}/",
                 f"root@{host}:{remote_dir}/",
             ],
@@ -223,11 +236,12 @@ class VastAIManager:
     def download_files(self, instance_id: str, remote_dir: str, local_dir: str) -> None:
         """Download files from instance via rsync."""
         host, port = self.get_ssh_info(instance_id)
+        ssh_opts = self._ssh_opts(port)
         Path(local_dir).mkdir(parents=True, exist_ok=True)
         subprocess.run(
             [
                 "rsync", "-avz", "--progress",
-                "-e", f"ssh -o StrictHostKeyChecking=no -p {port}",
+                "-e", ssh_opts,
                 f"root@{host}:{remote_dir}/",
                 f"{local_dir}/",
             ],
