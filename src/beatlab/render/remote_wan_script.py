@@ -61,6 +61,18 @@ def ensure_comfyui_running(timeout=900):
             capture_output=True, timeout=300,
         )
 
+    # Ensure VHS (Video Helper Suite) custom nodes are installed
+    vhs_dir = os.path.join(comfy_dir, "custom_nodes", "ComfyUI-VideoHelperSuite")
+    if not os.path.exists(vhs_dir):
+        print("  Installing VHS custom nodes...", flush=True)
+        subprocess.run(
+            ["git", "clone", "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git", vhs_dir],
+            capture_output=True, timeout=60,
+        )
+        vhs_reqs = os.path.join(vhs_dir, "requirements.txt")
+        if os.path.exists(vhs_reqs):
+            subprocess.run(["pip", "install", "-q", "-r", vhs_reqs], capture_output=True, timeout=120)
+
     # Ensure models are linked
     models_dir = os.path.join(comfy_dir, "models")
     internal_models = "/opt/workspace-internal/ComfyUI/models"
