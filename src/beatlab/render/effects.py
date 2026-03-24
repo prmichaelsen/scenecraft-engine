@@ -212,7 +212,6 @@ def apply_effects(
         # gain_r = get_sustained_value(t, "GainR", 1.0)
         # gain_g = get_sustained_value(t, "GainG", 1.0)
         # gain_b = get_sustained_value(t, "GainB", 1.0)
-            frame[..., 2] *= gain_b
 
         # Clamp
         frame = np.clip(frame, 0, 255)
