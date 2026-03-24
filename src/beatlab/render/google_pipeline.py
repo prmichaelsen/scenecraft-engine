@@ -252,9 +252,9 @@ def render_google_pipeline(
         check=True, capture_output=True,
     )
 
-    # ── Phase 5: Apply beat-synced effects ──
-    _log("Phase 5: Applying beat-synced effects (zoom, shake, flash, color)...")
-    from beatlab.render.effects import apply_effects
+    # ── Phase 5: Apply beat-synced effects (single-pass ffmpeg) ──
+    _log("Phase 5: Applying beat-synced effects (single-pass ffmpeg)...")
+    from beatlab.render.effects_ffmpeg import apply_effects
 
     apply_effects(
         video_path=muxed_output,
