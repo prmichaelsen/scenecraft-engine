@@ -41,6 +41,7 @@ class GoogleVideoClient:
                     "Set it with: export GOOGLE_CLOUD_PROJECT=your-project-id"
                 )
             self.client = genai.Client(vertexai=True, project=proj, location=location)
+            self._vertex = True
         else:
             # AI Studio auth — API key
             key = api_key or os.environ.get("GOOGLE_API_KEY")
@@ -50,9 +51,40 @@ class GoogleVideoClient:
                     "Get a key at: https://aistudio.google.com/apikey"
                 )
             self.client = genai.Client(api_key=key)
+            self._vertex = False
 
         self._genai = genai
         self._types = types
+
+    def _save_generated_video(self, generated_video, output_path: str) -> None:
+        """Download and save a generated video, handling both Vertex and AI Studio."""
+        video = generated_video.video
+
+        if self._vertex:
+            # Vertex AI: video has a GCS URI — download via gcloud or urllib
+            uri = getattr(video, "uri", None)
+            if uri and uri.startswith("gs://"):
+                import subprocess
+                _log(f"  Downloading from GCS: {uri}")
+                subprocess.run(
+                    ["gcloud", "storage", "cp", uri, output_path],
+                    check=True, capture_output=True,
+                )
+            else:
+                # Try direct video data if available
+                video_bytes = getattr(video, "video_bytes", None) or getattr(video, "data", None)
+                if video_bytes:
+                    with open(output_path, "wb") as f:
+                        f.write(video_bytes)
+                else:
+                    raise RuntimeError(
+                        f"Vertex AI: cannot download video. URI={uri}, "
+                        f"attrs={[a for a in dir(video) if not a.startswith('_')]}"
+                    )
+        else:
+            # AI Studio: use files.download + save
+            self.client.files.download(file=video)
+            video.save(output_path)
 
     def stylize_image(
         self,
@@ -153,8 +185,7 @@ class GoogleVideoClient:
             operation = self.client.operations.get(operation)
 
         generated = operation.result.generated_videos[0]
-        self.client.files.download(file=generated.video)
-        generated.video.save(output_path)
+        self._save_generated_video(generated, output_path)
         return output_path
 
     def generate_video_transition(
@@ -228,6 +259,5 @@ class GoogleVideoClient:
             operation = self.client.operations.get(operation)
 
         generated = operation.result.generated_videos[0]
-        self.client.files.download(file=generated.video)
-        generated.video.save(output_path)
+        self._save_generated_video(generated, output_path)
         return output_path
