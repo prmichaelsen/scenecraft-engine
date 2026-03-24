@@ -130,7 +130,7 @@ class GoogleVideoClient:
                 aspect_ratio=aspect_ratio,
                 number_of_videos=1,
                 duration_seconds=duration_seconds,
-                person_generation="allow_all",
+                person_generation="allow_adult",
             ),
         )
 
@@ -190,7 +190,7 @@ class GoogleVideoClient:
                 aspect_ratio="16:9",
                 number_of_videos=1,
                 duration_seconds=duration_seconds,
-                person_generation="allow_all",
+                person_generation="allow_adult",
                 last_frame=end_img,
             ),
         )
