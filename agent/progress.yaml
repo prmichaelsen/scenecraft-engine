@@ -338,29 +338,75 @@ milestones:
         dependencies:
           - task-24
 
+  - id: M9
+    title: Wan2.1 Video-to-Video + FILM Transitions
+    file: agent/milestones/milestone-9-wan21-film-pipeline.md
+    status: not_started
+    estimated_weeks: 2.5
+    tasks_total: 4
+    tasks_completed: 0
+    tasks:
+      - id: task-26
+        title: Wan2.1 ComfyUI Workflow
+        file: agent/tasks/milestone-9-wan21-film-pipeline/task-26-wan21-workflow.md
+        status: not_started
+        estimated_hours: 4
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-20
+      - id: task-27
+        title: FILM Integration
+        file: agent/tasks/milestone-9-wan21-film-pipeline/task-27-film-integration.md
+        status: not_started
+        estimated_hours: 3
+        started: null
+        actual_hours: null
+      - id: task-28
+        title: Engine Selection & AI Plan
+        file: agent/tasks/milestone-9-wan21-film-pipeline/task-28-engine-plan.md
+        status: not_started
+        estimated_hours: 2
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-22
+      - id: task-29
+        title: Wan Pipeline Assembly
+        file: agent/tasks/milestone-9-wan21-film-pipeline/task-29-pipeline-assembly.md
+        status: not_started
+        estimated_hours: 4
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-26
+          - task-27
+          - task-28
+
 documentation:
-  design_documents: 3
-  milestone_documents: 8
+  design_documents: 4
+  milestone_documents: 9
   pattern_documents: 0
-  task_documents: 25
+  task_documents: 29
 
 progress:
   planning: 100
-  implementation: 80
-  overall: 80
+  implementation: 76
+  overall: 76
 
 recent_work:
   - date: 2026-03-24
-    description: "M8 complete — EbSynth hybrid pipeline. Keyframe selection, EbSynth propagation, v2 remote script. 23/25 tasks done."
+    description: "M9 planned — Wan2.1 + FILM pipeline. 4 tasks, ~13 hours. Design from clarification-2."
 
 next_steps:
-  - "Test EbSynth hybrid render on sample clip"
-  - "Compare flicker: per-frame vs EbSynth"
+  - "Start M9: Task 26 (Wan2.1 ComfyUI Workflow) and Task 27 (FILM Integration) can run in parallel"
+  - "Task 28 (Engine Selection) can also start in parallel"
 
 notes:
-  - "Total estimated: ~70 hours across 25 tasks"
+  - "Total estimated: ~83 hours across 29 tasks"
   - "M1-M3, M5-M8 complete (23/25 tasks)"
   - "M4 (Resolve integration) deferred"
-  - "EbSynth binary auto-downloads on first use"
+  - "M9: Wan2.1 requires 24GB+ VRAM (cloud GPU)"
+  - "FILM runs between ALL clip boundaries (intra-section smoothing + inter-section style morphing)"
 
 current_blockers: []
