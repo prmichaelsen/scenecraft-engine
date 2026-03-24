@@ -97,8 +97,15 @@ def render_google_pipeline(
         try:
             client.stylize_image(kf_path, style, styled_path)
         except Exception as e:
-            _log(f"  [{i+1}/{total_sections}] FAILED: {e}")
-            raise
+            _log(f"  [{i+1}/{total_sections}] Content filter hit, retrying with safe prompt...")
+            # Strip violent/graphic language and retry with abstract version
+            safe_style = f"abstract artistic interpretation, {sec.get('label', 'cinematic')}, dramatic lighting, surreal dreamlike atmosphere"
+            try:
+                client.stylize_image(kf_path, safe_style, styled_path)
+                _log(f"  [{i+1}/{total_sections}] Retry succeeded with safe prompt")
+            except Exception as e2:
+                _log(f"  [{i+1}/{total_sections}] FAILED even with safe prompt: {e2}")
+                raise
 
         styled_paths.append(styled_path)
 

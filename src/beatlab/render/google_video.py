@@ -127,7 +127,17 @@ class GoogleVideoClient:
         )
 
         # Find the image part in the response
-        for part in response.candidates[0].content.parts:
+        candidates = response.candidates or []
+        if not candidates:
+            # Content filter likely blocked it — retry with sanitized prompt
+            finish_reason = getattr(response, "prompt_feedback", None)
+            raise RuntimeError(
+                f"Nano Banana returned no candidates (likely content filter). "
+                f"Feedback: {finish_reason}. Style prompt was: {style_prompt[:100]}"
+            )
+
+        parts = candidates[0].content.parts if candidates[0].content else []
+        for part in parts or []:
             if part.inline_data and part.inline_data.mime_type.startswith("image/"):
                 with open(output_path, "wb") as f:
                     f.write(part.inline_data.data)
