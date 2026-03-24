@@ -1,8 +1,7 @@
-"""Google AI render pipeline — Nano Banana + Veo. No GPU instance needed."""
+"""Google AI render pipeline — Nano Banana (stylize) + Veo (video between stills). No GPU needed."""
 
 from __future__ import annotations
 
-import json
 import subprocess
 import sys
 from datetime import datetime
@@ -15,17 +14,6 @@ from beatlab.render.google_video import GoogleVideoClient
 def _log(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", file=sys.stderr, flush=True)
-
-
-# Default denoise/style mapping by section energy type
-DEFAULT_DENOISE = {
-    "low_energy": 0.35,
-    "mid_energy": 0.45,
-    "high_energy": 0.6,
-}
-
-DEFAULT_TRANSITION_FRAMES = 8
-SECTION_CLIP_DURATION = 8  # Veo max clip length
 
 
 def render_google_pipeline(
@@ -41,18 +29,11 @@ def render_google_pipeline(
 
     Phase 1: Extract keyframes (one per section) from source video
     Phase 2: Nano Banana stylizes each keyframe
-    Phase 3: Veo generates video clips from styled keyframes
-    Phase 4: Veo generates transitions between sections (first/last frame)
-    Phase 5: Concatenate clips + transitions, mux audio
+    Phase 3: Veo generates video transitions between consecutive styled keyframes
+    Phase 4: Concatenate all transition clips, mux audio
 
-    Args:
-        video_file: Source video path.
-        beat_map: Parsed beat map dict with sections.
-        effect_plan: EffectPlan from AI director (optional).
-        work_dir: Work directory root for caching.
-        fps: Frame rate.
-        default_style: Fallback style prompt.
-        progress_callback: Called with (stage, completed, total).
+    Each Veo clip morphs from styled_keyframe[i] → styled_keyframe[i+1],
+    so every clip boundary is seamless — no stitching mismatch.
 
     Returns:
         Path to final assembled video.
@@ -60,13 +41,11 @@ def render_google_pipeline(
     work = Path(work_dir)
     frames_dir = work / "frames"
     styled_dir = work / "google_styled"
-    clips_dir = work / "google_clips"
-    transitions_dir = work / "google_transitions"
+    segments_dir = work / "google_segments"
     output_path = work / "google_output.mp4"
 
     styled_dir.mkdir(parents=True, exist_ok=True)
-    clips_dir.mkdir(parents=True, exist_ok=True)
-    transitions_dir.mkdir(parents=True, exist_ok=True)
+    segments_dir.mkdir(parents=True, exist_ok=True)
 
     sections = beat_map.get("sections", [])
     if not sections:
@@ -90,11 +69,10 @@ def render_google_pipeline(
     for i, sec in enumerate(sections):
         start_frame = sec.get("start_frame", int(sec["start_time"] * video_fps))
         end_frame = sec.get("end_frame", int(sec["end_time"] * video_fps))
-        # Pick frame 1/3 into the section (avoids transition edges)
+        # Pick frame 1/3 into the section
         mid_frame = start_frame + (end_frame - start_frame) // 3
         kf_path = str(frames_dir / f"frame_{mid_frame:06d}.png")
         if not Path(kf_path).exists():
-            # Fall back to first frame
             kf_path = str(frames_dir / f"frame_{start_frame:06d}.png")
         keyframe_paths.append(kf_path)
 
@@ -112,7 +90,6 @@ def render_google_pipeline(
             styled_paths.append(styled_path)
             continue
 
-        # Enrich style with user's creative direction
         full_style = style
         if default_style and default_style != "artistic stylized":
             full_style = f"{default_style}. {style}"
@@ -129,103 +106,60 @@ def render_google_pipeline(
         if progress_callback:
             progress_callback("stylize", i + 1, total_sections)
 
-    # ── Phase 3: Veo video generation per section ──
-    _log(f"Phase 3: Generating {total_sections} video clips with Veo...")
-    clip_paths: list[str] = []
-    for i, (sec, styled_path) in enumerate(zip(sections, styled_paths)):
-        sp = plan_map.get(i)
-        style = (sp.style_prompt if sp and sp.style_prompt else default_style)
+    # ── Phase 3: Veo segments between consecutive styled keyframes ──
+    num_segments = total_sections - 1
+    _log(f"Phase 3: Generating {num_segments} video segments with Veo (still→still)...")
+    segment_paths: list[str] = []
 
-        clip_path = str(clips_dir / f"clip_{i:03d}.mp4")
+    for i in range(num_segments):
+        seg_path = str(segments_dir / f"segment_{i:03d}_{i+1:03d}.mp4")
 
-        if Path(clip_path).exists():
-            _log(f"  [{i+1}/{total_sections}] Section {i} (cached)")
-            clip_paths.append(clip_path)
+        if Path(seg_path).exists():
+            _log(f"  [{i+1}/{num_segments}] Segment {i}→{i+1} (cached)")
+            segment_paths.append(seg_path)
             continue
 
-        # Build rich Veo prompt from user direction + AI style + section context
-        sec_type = sec.get("type", "")
-        sec_label = sec.get("label", "")
+        sp_a = plan_map.get(i)
+        sp_b = plan_map.get(i + 1)
+        style_a = (sp_a.style_prompt if sp_a and sp_a.style_prompt else default_style)
+        style_b = (sp_b.style_prompt if sp_b and sp_b.style_prompt else default_style)
+
+        sec_a = sections[i]
+        sec_b = sections[i + 1]
+        label_a = sec_a.get("label", "")
+        label_b = sec_b.get("label", "")
+
+        # Build prompt describing the visual journey between sections
         prompt_parts = []
         if default_style and default_style != "artistic stylized":
             prompt_parts.append(f"Creative vision: {default_style}.")
-        prompt_parts.append(f"Visual style: {style}.")
-        if sec_label:
-            prompt_parts.append(f"This is the {sec_label} section ({sec_type}).")
-        prompt_parts.append("Smooth cinematic motion. Maintain the composition and mood of the reference image.")
+        prompt_parts.append(f"Cinematic video transitioning from {style_a} ({label_a}) into {style_b} ({label_b}).")
+        prompt_parts.append("Smooth, flowing motion. The visual style gradually transforms.")
         prompt = " ".join(prompt_parts)
 
-        _log(f"  [{i+1}/{total_sections}] Section {i} (8s)...")
-        try:
-            client.generate_video_from_image(styled_path, prompt, clip_path, duration_seconds=8)
-        except Exception as e:
-            _log(f"  [{i+1}/{total_sections}] FAILED: {e}")
-            raise
-
-        clip_paths.append(clip_path)
-
-        if progress_callback:
-            progress_callback("veo", i + 1, total_sections)
-
-    # ── Phase 4: Veo transitions between sections ──
-    num_transitions = total_sections - 1
-    _log(f"Phase 4: Generating {num_transitions} transitions with Veo...")
-    transition_paths: list[str | None] = []
-
-    for i in range(num_transitions):
-        sp_next = plan_map.get(i + 1)
-        trans_frames = (sp_next.transition_frames if sp_next and sp_next.transition_frames else DEFAULT_TRANSITION_FRAMES)
-
-        trans_seconds = 8  # Veo only reliably accepts 8s
-
-        trans_path = str(transitions_dir / f"trans_{i:03d}_{i+1:03d}.mp4")
-
-        if Path(trans_path).exists():
-            _log(f"  [{i+1}/{num_transitions}] Transition {i}→{i+1} (cached)")
-            transition_paths.append(trans_path)
-            continue
-
-        # Extract last frame of clip A and first frame of clip B
-        last_frame_a = str(transitions_dir / f"last_{i:03d}.png")
-        first_frame_b = str(transitions_dir / f"first_{i+1:03d}.png")
-
-        _extract_frame(clip_paths[i], last_frame_a, position="last")
-        _extract_frame(clip_paths[i + 1], first_frame_b, position="first")
-
-        style_a = plan_map.get(i)
-        style_b = plan_map.get(i + 1)
-        prompt_a = (style_a.style_prompt if style_a and style_a.style_prompt else default_style)
-        prompt_b = (style_b.style_prompt if style_b and style_b.style_prompt else default_style)
-        creative = f" Theme: {default_style}." if default_style and default_style != "artistic stylized" else ""
-        trans_prompt = f"Smooth cinematic transition morphing from '{prompt_a}' style into '{prompt_b}' style.{creative}"
-
-        _log(f"  [{i+1}/{num_transitions}] Transition {i}→{i+1} ({trans_seconds}s)...")
+        _log(f"  [{i+1}/{num_segments}] Segment {i}→{i+1}: {label_a}→{label_b} (8s)...")
         try:
             client.generate_video_transition(
-                last_frame_a, first_frame_b, trans_prompt, trans_path,
-                duration_seconds=trans_seconds,
+                styled_paths[i], styled_paths[i + 1], prompt, seg_path,
+                duration_seconds=8,
             )
         except Exception as e:
-            _log(f"  [{i+1}/{num_transitions}] FAILED: {e}")
+            _log(f"  [{i+1}/{num_segments}] FAILED: {e}")
             raise
 
-        transition_paths.append(trans_path)
+        segment_paths.append(seg_path)
 
         if progress_callback:
-            progress_callback("transitions", i + 1, num_transitions)
+            progress_callback("veo", i + 1, num_segments)
 
-    # ── Phase 5: Concatenate and mux audio ──
-    _log("Phase 5: Assembling final video...")
+    # ── Phase 4: Concatenate and mux audio ──
+    _log("Phase 4: Assembling final video...")
 
-    # Build concat list: clip0, trans0, clip1, trans1, clip2, ...
     concat_list = str(work / "google_concat.txt")
     with open(concat_list, "w") as f:
-        for i, clip_path in enumerate(clip_paths):
-            f.write(f"file '{Path(clip_path).resolve()}'\n")
-            if i < len(transition_paths) and transition_paths[i]:
-                f.write(f"file '{Path(transition_paths[i]).resolve()}'\n")
+        for seg_path in segment_paths:
+            f.write(f"file '{Path(seg_path).resolve()}'\n")
 
-    # Concatenate
     concat_output = str(work / "google_concat.mp4")
     subprocess.run(
         ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list,
@@ -246,33 +180,3 @@ def render_google_pipeline(
 
     _log(f"Done! Output: {output_path}")
     return str(output_path)
-
-
-def _extract_frame(video_path: str, output_path: str, position: str = "first") -> None:
-    """Extract first or last frame from a video clip."""
-    if Path(output_path).exists():
-        return
-
-    if position == "last":
-        # Get frame count, then seek to last frame
-        probe = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-count_frames", "-show_entries",
-             "stream=nb_read_frames", "-of", "csv=p=0", video_path],
-            capture_output=True, text=True,
-        )
-        try:
-            total_frames = int(probe.stdout.strip())
-        except ValueError:
-            total_frames = 1
-        # Extract last frame using select filter
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", video_path,
-             "-vf", f"select=eq(n\\,{max(0, total_frames - 1)})",
-             "-vframes", "1", output_path],
-            capture_output=True, check=True,
-        )
-    else:
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", video_path, "-vframes", "1", output_path],
-            capture_output=True, check=True,
-        )
