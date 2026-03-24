@@ -131,9 +131,6 @@ def render_google_pipeline(
         sp = plan_map.get(i)
         style = (sp.style_prompt if sp and sp.style_prompt else default_style)
 
-        sec_duration = sec.get("end_time", 0) - sec.get("start_time", 0)
-        clip_duration = min(SECTION_CLIP_DURATION, max(4, int(sec_duration)))  # Veo min 4s, max 8s
-
         clip_path = str(clips_dir / f"clip_{i:03d}.mp4")
 
         if Path(clip_path).exists():
@@ -143,11 +140,9 @@ def render_google_pipeline(
 
         prompt = f"Smooth cinematic video in this visual style: {style}. Maintain the composition and mood."
 
-        # Ensure strictly within Veo bounds
-        clip_duration = max(4, min(8, clip_duration))
-        _log(f"  [{i+1}/{total_sections}] Section {i} ({clip_duration}s, section={sec_duration:.1f}s)...")
+        _log(f"  [{i+1}/{total_sections}] Section {i} (8s)...")
         try:
-            client.generate_video_from_image(styled_path, prompt, clip_path, duration_seconds=clip_duration)
+            client.generate_video_from_image(styled_path, prompt, clip_path, duration_seconds=8)
         except Exception as e:
             _log(f"  [{i+1}/{total_sections}] FAILED: {e}")
             raise
@@ -166,8 +161,7 @@ def render_google_pipeline(
         sp_next = plan_map.get(i + 1)
         trans_frames = (sp_next.transition_frames if sp_next and sp_next.transition_frames else DEFAULT_TRANSITION_FRAMES)
 
-        # Convert frames to seconds (Veo requires 4-8s)
-        trans_seconds = max(4, min(8, int(trans_frames / video_fps + 0.5)))
+        trans_seconds = 5  # Veo min 4s — use 5s for all transitions
 
         trans_path = str(transitions_dir / f"trans_{i:03d}_{i+1:03d}.mp4")
 
