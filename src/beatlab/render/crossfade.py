@@ -30,33 +30,38 @@ def _xfade_group(
     segment_paths: list[str],
     output_path: str,
     xfade_duration: float,
-) -> bool:
-    """Crossfade a small group of segments. Returns True on success."""
+) -> tuple[bool, str]:
+    """Crossfade a small group of segments. Returns (success, stderr)."""
     if len(segment_paths) == 1:
         shutil.copy2(segment_paths[0], output_path)
-        return True
+        return True, ""
 
     seg_durations = [_get_duration(p) for p in segment_paths]
 
+    # Scale all inputs to same resolution to avoid xfade mismatch
     inputs = []
-    for seg_path in segment_paths:
+    scale_filters = []
+    for i, seg_path in enumerate(segment_paths):
         inputs.extend(["-i", str(Path(seg_path).resolve())])
+        scale_filters.append(f"[{i}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[s{i}]")
 
     n = len(segment_paths)
     if n == 2:
         offset = max(0, seg_durations[0] - xfade_duration)
-        filter_str = f"[0:v][1:v]xfade=transition=fade:duration={xfade_duration:.4f}:offset={offset:.4f}[v]"
+        xfade_str = f"[s0][s1]xfade=transition=fade:duration={xfade_duration:.4f}:offset={offset:.4f}[v]"
     else:
-        filters = []
-        prev = "[0:v]"
+        xfade_parts = []
+        prev = "[s0]"
         cumulative_duration = seg_durations[0]
         for j in range(1, n):
             offset = max(0, cumulative_duration - xfade_duration)
             out = f"[v{j}]" if j < n - 1 else "[v]"
-            filters.append(f"{prev}[{j}:v]xfade=transition=fade:duration={xfade_duration:.4f}:offset={offset:.4f}{out}")
+            xfade_parts.append(f"{prev}[s{j}]xfade=transition=fade:duration={xfade_duration:.4f}:offset={offset:.4f}{out}")
             prev = out
             cumulative_duration += seg_durations[j] - xfade_duration
-        filter_str = ";".join(filters)
+        xfade_str = ";".join(xfade_parts)
+
+    filter_str = ";".join(scale_filters) + ";" + xfade_str
 
     cmd = ["ffmpeg", "-y"] + inputs + [
         "-filter_complex", filter_str,
@@ -66,7 +71,7 @@ def _xfade_group(
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
-    return result.returncode == 0
+    return result.returncode == 0, result.stderr
 
 
 def concat_with_crossfade(
@@ -103,11 +108,13 @@ def concat_with_crossfade(
 
     # Small enough to do in one pass
     if len(segment_paths) <= chunk_size:
-        if _xfade_group(segment_paths, output_path, xfade_duration):
+        ok, stderr = _xfade_group(segment_paths, output_path, xfade_duration)
+        if ok:
             return output_path
         raise RuntimeError(
             f"Crossfade failed for {len(segment_paths)} segments. "
-            f"Check for corrupt segments: {[Path(s).name for s in segment_paths]}"
+            f"Segments: {[Path(s).name for s in segment_paths]}\n"
+            f"ffmpeg stderr: {stderr[-500:]}"
         )
 
     # Chunked processing
@@ -146,10 +153,12 @@ def concat_with_crossfade(
                 if not probe.stdout.strip():
                     raise RuntimeError(f"Crossfade failed: segment corrupt or unreadable: {seg}")
 
-            if not _xfade_group(chunk, chunk_path, xfade_duration):
+            ok, stderr = _xfade_group(chunk, chunk_path, xfade_duration)
+            if not ok:
                 raise RuntimeError(
                     f"Crossfade failed on chunk {chunk_idx} (segments {i}-{end-1}). "
-                    f"Segments: {[Path(s).name for s in chunk]}"
+                    f"Segments: {[Path(s).name for s in chunk]}\n"
+                    f"ffmpeg stderr: {stderr[-500:]}"
                 )
 
         chunk_paths.append(chunk_path)
@@ -163,10 +172,11 @@ def concat_with_crossfade(
     # Now crossfade the chunks together
     if len(chunk_paths) <= chunk_size:
         _log(f"  Final pass: crossfading {len(chunk_paths)} chunks")
-        if not _xfade_group(chunk_paths, output_path, xfade_duration):
+        ok, stderr = _xfade_group(chunk_paths, output_path, xfade_duration)
+        if not ok:
             raise RuntimeError(
-                f"Final crossfade failed on {len(chunk_paths)} chunks. "
-                f"Check for corrupt segments."
+                f"Final crossfade failed on {len(chunk_paths)} chunks.\n"
+                f"ffmpeg stderr: {stderr[-500:]}"
             )
     else:
         # Recursive chunking (unlikely but handles huge videos)
