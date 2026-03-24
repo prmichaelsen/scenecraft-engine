@@ -217,6 +217,7 @@ def run(
 @click.option("--audio-prompt/--no-audio-prompt", default=False, help="Include audio descriptions in Veo video generation prompts")
 @click.option("--motion", default=None, type=str, help="Camera/motion direction for Veo (e.g. 'forward dolly through void, warp speed')")
 @click.option("--plan-patch", default=None, type=click.Path(exists=True), help="Patch JSON to merge into cached plan — only re-renders changed sections")
+@click.option("--labels/--no-labels", default=False, help="Burn section numbers into bottom-right of video for review")
 def render(
     video_file: str, beats: str | None, fps: float | None, style: str,
     ai: bool, prompt: str | None, output: str, base_denoise: float,
@@ -224,6 +225,7 @@ def render(
     sr: int, dry_run: bool, destroy: bool, fresh: bool, work_dir: str,
     engine: str, preview: bool, describe: str | None, vertex: bool,
     audio_prompt: bool, motion: str | None, plan_patch: str | None,
+    labels: bool,
 ):
     """Render AI-stylized video: extract frames → SD img2img → reassemble.
 
@@ -438,6 +440,7 @@ def render(
             vertex=vertex,
             audio_descriptions=audio_descriptions if audio_prompt else None,
             motion_prompt=motion,
+            labels=labels,
         )
 
         import shutil

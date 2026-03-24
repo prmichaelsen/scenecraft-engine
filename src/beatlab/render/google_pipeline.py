@@ -27,6 +27,7 @@ def render_google_pipeline(
     vertex: bool = False,
     audio_descriptions: list[str] | None = None,
     motion_prompt: str | None = None,
+    labels: bool = False,
 ) -> str:
     """Run the full Nano Banana + Veo pipeline.
 
@@ -223,6 +224,14 @@ def render_google_pipeline(
             )
 
         remapped_paths.append(remapped_path)
+
+    # ── Phase 3.75: Burn section labels (optional) ──
+    if labels:
+        _log("Phase 3.75: Burning section labels...")
+        from beatlab.render.crossfade import burn_section_labels
+        labeled_dir = str(work / "google_labeled")
+        section_indices = list(range(num_segments))  # segment i = section i→i+1
+        remapped_paths = burn_section_labels(remapped_paths, section_indices, labeled_dir)
 
     # ── Phase 4: Concatenate with crossfade and mux audio ──
     _log("Phase 4: Assembling with 8-frame crossfades...")

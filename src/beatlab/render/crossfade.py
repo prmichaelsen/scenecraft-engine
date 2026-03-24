@@ -89,6 +89,56 @@ def concat_with_crossfade(
     return output_path
 
 
+def burn_section_labels(
+    segment_paths: list[str],
+    section_indices: list[int],
+    output_dir: str,
+) -> list[str]:
+    """Burn section number overlay onto each segment clip.
+
+    Args:
+        segment_paths: List of video segment paths.
+        section_indices: Corresponding section index for each segment.
+        output_dir: Where to write labeled clips.
+
+    Returns:
+        List of paths to labeled clips.
+    """
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    labeled = []
+
+    for seg_path, idx in zip(segment_paths, section_indices):
+        out_path = str(Path(output_dir) / f"labeled_{idx:03d}.mp4")
+        text = f"Section {idx}"
+        # Bottom-right, white text with black outline, small font
+        drawtext = (
+            f"drawtext=text='{text}'"
+            f":fontsize=18"
+            f":fontcolor=white"
+            f":borderw=2"
+            f":bordercolor=black"
+            f":x=w-tw-10"
+            f":y=h-th-10"
+        )
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", seg_path,
+                "-vf", drawtext,
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-c:a", "copy",
+                out_path,
+            ],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            _log(f"  Label burn failed for section {idx}, using unlabeled")
+            labeled.append(seg_path)
+        else:
+            labeled.append(out_path)
+
+    return labeled
+
+
 def _hard_concat(segment_paths: list[str], output_path: str) -> None:
     """Fallback: simple concat without crossfade."""
     concat_list = output_path + ".concat.txt"
