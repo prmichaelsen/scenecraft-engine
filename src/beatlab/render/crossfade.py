@@ -38,27 +38,35 @@ def _xfade_group(
 
     seg_durations = [_get_duration(p) for p in segment_paths]
 
-    # Scale all inputs to same resolution to avoid xfade mismatch
+    # Scale all inputs to same resolution and framerate to avoid xfade mismatch
     inputs = []
     scale_filters = []
     for i, seg_path in enumerate(segment_paths):
         inputs.extend(["-i", str(Path(seg_path).resolve())])
-        scale_filters.append(f"[{i}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[s{i}]")
+        scale_filters.append(
+            f"[{i}:v]fps=24,scale=1920:1080:force_original_aspect_ratio=decrease,"
+            f"pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[s{i}]"
+        )
 
     n = len(segment_paths)
+
+    # Ensure xfade duration doesn't exceed any segment's duration
+    min_dur = min(seg_durations)
+    safe_xfade = min(xfade_duration, min_dur * 0.5)  # never more than half the shortest segment
+
     if n == 2:
-        offset = max(0, seg_durations[0] - xfade_duration)
-        xfade_str = f"[s0][s1]xfade=transition=fade:duration={xfade_duration:.4f}:offset={offset:.4f}[v]"
+        offset = max(0, seg_durations[0] - safe_xfade)
+        xfade_str = f"[s0][s1]xfade=transition=fade:duration={safe_xfade:.4f}:offset={offset:.4f}[v]"
     else:
         xfade_parts = []
         prev = "[s0]"
         cumulative_duration = seg_durations[0]
         for j in range(1, n):
-            offset = max(0, cumulative_duration - xfade_duration)
+            offset = max(0, cumulative_duration - safe_xfade)
             out = f"[v{j}]" if j < n - 1 else "[v]"
-            xfade_parts.append(f"{prev}[s{j}]xfade=transition=fade:duration={xfade_duration:.4f}:offset={offset:.4f}{out}")
+            xfade_parts.append(f"{prev}[s{j}]xfade=transition=fade:duration={safe_xfade:.4f}:offset={offset:.4f}{out}")
             prev = out
-            cumulative_duration += seg_durations[j] - xfade_duration
+            cumulative_duration += seg_durations[j] - safe_xfade
         xfade_str = ";".join(xfade_parts)
 
     filter_str = ";".join(scale_filters) + ";" + xfade_str
