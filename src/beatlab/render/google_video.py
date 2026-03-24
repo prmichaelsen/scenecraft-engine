@@ -141,7 +141,7 @@ class GoogleVideoClient:
 
         generated = operation.result.generated_videos[0]
         self.client.files.download(file=generated.video)
-        generated.video.save(output_path, overwrite=True)
+        generated.video.save(output_path)
         return output_path
 
     def generate_video_transition(
@@ -201,5 +201,5 @@ class GoogleVideoClient:
 
         generated = operation.result.generated_videos[0]
         self.client.files.download(file=generated.video)
-        generated.video.save(output_path, overwrite=True)
+        generated.video.save(output_path)
         return output_path
