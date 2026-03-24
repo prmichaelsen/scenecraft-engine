@@ -16,6 +16,83 @@ def _log(msg: str) -> None:
     print(f"[{ts}] {msg}", file=sys.stderr, flush=True)
 
 
+def _expand_sections_with_splits(
+    sections: list[dict],
+    plan_map: dict,
+    splits_path,
+    video_fps: float,
+    default_style: str,
+) -> tuple[list[dict], dict]:
+    """Expand long sections into sub-sections using splits.json.
+
+    Each section gets a `_file_key` field used for file naming:
+    - Original sections: "042" (original index)
+    - Sub-sections: "042_001", "042_002" (original index + sub index)
+
+    This preserves cached files from pre-split runs (styled_042.png still valid)
+    while adding new files for sub-sections (styled_042_001.png).
+
+    Returns (expanded_sections, expanded_plan_map).
+    """
+    from beatlab.render.section_splitter import load_splits
+
+    splits = load_splits(str(splits_path))
+    split_map = splits.get("splits", {})
+
+    if not split_map:
+        # Tag all sections with their original file key
+        for i, sec in enumerate(sections):
+            sec["_file_key"] = f"{i:03d}"
+        return sections, plan_map
+
+    expanded = []
+    expanded_plan = {}
+
+    for i, sec in enumerate(sections):
+        idx_str = str(i)
+        if idx_str in split_map:
+            sub_sections = split_map[idx_str]["sub_sections"]
+            for j, sub in enumerate(sub_sections):
+                new_sec = dict(sec)
+                new_sec["start_time"] = sub["start_time"]
+                new_sec["end_time"] = sub["end_time"]
+                new_sec["start_frame"] = round(sub["start_time"] * video_fps)
+                new_sec["end_frame"] = round(sub["end_time"] * video_fps)
+                new_sec["_original_index"] = i
+                new_sec["_sub_index"] = j
+                new_sec["_file_key"] = f"{i:03d}_{j:03d}"
+
+                new_idx = len(expanded)
+                expanded.append(new_sec)
+
+                # Inherit plan from parent with variation
+                parent_plan = plan_map.get(i)
+                if parent_plan:
+                    from dataclasses import replace
+                    sub_plan = replace(parent_plan, section_index=new_idx)
+                    if sub.get("style_prompt"):
+                        sub_plan.style_prompt = sub["style_prompt"]
+                    elif j > 0 and sub_plan.style_prompt:
+                        sub_plan.style_prompt = f"{sub_plan.style_prompt}, continuation with subtle evolution"
+                    if j > 0 and sub_plan.transition_action:
+                        sub_plan.transition_action = f"seamless continuation within {sec.get('label', 'section')}"
+                    expanded_plan[new_idx] = sub_plan
+        else:
+            new_sec = dict(sec)
+            new_sec["_original_index"] = i
+            new_sec["_file_key"] = f"{i:03d}"
+
+            new_idx = len(expanded)
+            expanded.append(new_sec)
+
+            if i in plan_map:
+                from dataclasses import replace
+                expanded_plan[new_idx] = replace(plan_map[i], section_index=new_idx)
+
+    _log(f"  Split {len(split_map)} long sections → {len(expanded)} total (was {len(sections)})")
+    return expanded, expanded_plan
+
+
 def render_google_pipeline(
     video_file: str,
     beat_map: dict,
@@ -65,7 +142,19 @@ def render_google_pipeline(
         for sp in effect_plan.sections:
             plan_map[sp.section_index] = sp
 
+    # ── Check for section splits (long sections broken into sub-sections) ──
+    splits_path = work / "splits.json"
+    if splits_path.exists():
+        _log("Loading section splits...")
+        sections, plan_map = _expand_sections_with_splits(
+            sections, plan_map, splits_path, video_fps, default_style,
+        )
+        _log(f"  Expanded to {len(sections)} sections (from splits)")
+
     total_sections = len(sections)
+
+    # Build file key list — used for all file naming
+    file_keys = [sec.get("_file_key", f"{i:03d}") for i, sec in enumerate(sections)]
 
     # ── Phase 1: Pick a keyframe per section ──
     _log(f"Phase 1: Selecting {total_sections} keyframes...")
@@ -87,7 +176,7 @@ def render_google_pipeline(
         sp = plan_map.get(i)
         style = (sp.style_prompt if sp and sp.style_prompt else default_style)
 
-        styled_path = str(styled_dir / f"styled_{i:03d}.png")
+        styled_path = str(styled_dir / f"styled_{file_keys[i]}.png")
 
         if Path(styled_path).exists():
             _log(f"  [{i+1}/{total_sections}] Section {i} (cached)")
@@ -119,7 +208,7 @@ def render_google_pipeline(
     segment_paths: list[str] = []
 
     for i in range(num_segments):
-        seg_path = str(segments_dir / f"segment_{i:03d}_{i+1:03d}.mp4")
+        seg_path = str(segments_dir / f"segment_{file_keys[i]}_{file_keys[i+1]}.mp4")
 
         if Path(seg_path).exists():
             _log(f"  [{i+1}/{num_segments}] Segment {i}→{i+1} (cached)")
@@ -189,7 +278,7 @@ def render_google_pipeline(
         if target_duration <= 0:
             target_duration = 8.0  # fallback
 
-        remapped_path = str(remapped_dir / f"remapped_{i:03d}.mp4")
+        remapped_path = str(remapped_dir / f"remapped_{file_keys[i]}.mp4")
 
         if Path(remapped_path).exists():
             remapped_paths.append(remapped_path)
