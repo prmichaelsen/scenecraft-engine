@@ -6,10 +6,17 @@ import json
 import random
 import shutil
 import subprocess
+import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
 from beatlab.render.wan import chunk_section_frames, frames_to_clip
+
+
+def _log(msg: str) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", file=sys.stderr, flush=True)
 
 
 # Default denoise mapping by section energy type
@@ -176,7 +183,7 @@ def _run_local(script_path: str, input_dir: str, output_dir: str, model: str,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     for line in proc.stdout:
-        print(f"  [local] {line.rstrip()}", flush=True)
+        _log(f"  [local] {line.rstrip()}")
     proc.wait()
     if proc.returncode != 0:
         raise RuntimeError(f"Local wan render failed with exit code {proc.returncode}")
@@ -192,13 +199,13 @@ def _run_remote(input_dir: str, output_dir: str, model: str,
 
     vast = VastAIManager()
 
-    print("[wan] Looking for GPU instance...", flush=True)
+    _log("[wan] Looking for GPU instance...")
     instance_id, reused = vast.get_or_create_instance()
 
     if reused:
-        print(f"[wan] Reusing running instance {instance_id}", flush=True)
+        _log(f"[wan] Reusing running instance {instance_id}")
     else:
-        print(f"[wan] Created new instance {instance_id}, waiting for it to start...", flush=True)
+        _log(f"[wan] Created new instance {instance_id}, waiting for it to start...")
         vast.wait_until_ready(instance_id)
 
     try:
@@ -211,7 +218,7 @@ def _run_remote(input_dir: str, output_dir: str, model: str,
         # Upload remote script
         import beatlab.render.remote_wan_script as rws
         script_path = rws.__file__
-        print("[wan] Uploading render script...", flush=True)
+        _log("[wan] Uploading render script...")
         vast.ssh_run(instance_id, "mkdir -p /workspace")
         subprocess.run(
             f'scp {key_opt}-o StrictHostKeyChecking=no -P {port} {script_path} root@{host}:/workspace/render_wan.py',
@@ -219,12 +226,12 @@ def _run_remote(input_dir: str, output_dir: str, model: str,
         )
 
         # Upload input clips + plan
-        print(f"[wan] Uploading clips and plan...", flush=True)
+        _log("[wan] Uploading clips and plan...")
         vast.ssh_run(instance_id, "rm -rf /workspace/wan_input /workspace/wan_output && mkdir -p /workspace/wan_output")
         vast.upload_files(instance_id, input_dir, "/workspace/wan_input")
 
         # Run remote script with streaming output
-        print("[wan] Running remote render (Wan2.1 + FILM)...", flush=True)
+        _log("[wan] Running remote render (Wan2.1 + FILM)...")
         if progress_callback:
             progress_callback("render", 0, 1)
 
@@ -234,19 +241,19 @@ def _run_remote(input_dir: str, output_dir: str, model: str,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         )
         for line in proc.stdout:
-            print(f"  [remote] {line.rstrip()}", flush=True)
+            _log(f"  [remote] {line.rstrip()}")
         proc.wait()
         if proc.returncode != 0:
             raise RuntimeError(f"Remote wan render failed with exit code {proc.returncode}")
 
         # Download results
-        print("[wan] Downloading output...", flush=True)
+        _log("[wan] Downloading output...")
         vast.download_files(instance_id, "/workspace/wan_output", output_dir)
 
         if progress_callback:
             progress_callback("render", 1, 1)
 
     except Exception as e:
-        print(f"\n[wan] Error: {e}", flush=True)
-        print(f"[wan] Instance {instance_id} kept alive — fix and retry.", flush=True)
+        _log(f"[wan] Error: {e}")
+        _log(f"[wan] Instance {instance_id} kept alive — fix and retry.")
         raise
