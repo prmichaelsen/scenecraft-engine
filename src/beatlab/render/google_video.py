@@ -118,7 +118,7 @@ class GoogleVideoClient:
             contents=[
                 types.Content(role="user", parts=[
                     types.Part.from_bytes(data=image_bytes, mime_type=mime),
-                    types.Part(text=f"Restyle this image in the following style, keeping the composition and subject intact. The result must be high production value — rich detail, complex textures, sophisticated lighting, cinematic quality. NOT low-polygon, NOT cheap digital art, NOT blurry. Style: {style_prompt}"),
+                    types.Part(text=f"Restyle this image in the following style, keeping the composition and subject intact. The result MUST be hyper-realistic, photorealistic quality — like a still from a big-budget film or high-end music video. Rich detail, complex textures, sophisticated lighting, cinematic depth. Absolutely NOT low-polygon, NOT cartoon, NOT cheap CGI, NOT plastic-looking, NOT blurry. Every surface must have realistic texture and material properties. Style: {style_prompt}"),
                 ]),
             ],
             config=types.GenerateContentConfig(
