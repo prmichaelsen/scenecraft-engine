@@ -434,6 +434,7 @@ def _parse_segment_filter(spec: str) -> set[int]:
 @click.option("--plan-patch", default=None, type=click.Path(exists=True), help="Patch JSON to merge into cached plan — only re-renders changed sections")
 @click.option("--labels/--no-labels", default=False, help="Burn section numbers into bottom-right of video for review")
 @click.option("--segments", default=None, type=str, help="Only process specific segments: e.g. 1,2,20-25,30")
+@click.option("--intra-transition-prompt", default=None, type=str, help="Override the default smooth transition prompt for intra-section sub-section transitions")
 @click.option("--candidates", default=4, type=int, help="Number of styled image candidates per section (default: 4, 0 or 1 to disable)")
 @click.option("--backfill-candidates/--no-backfill-candidates", default=False, help="Generate candidates for sections that already have styled images (promotes existing to v1)")
 def render(
@@ -444,6 +445,7 @@ def render(
     engine: str, preview: bool, describe: str | None, vertex: bool,
     audio_prompt: bool, motion: str | None, plan_patch: str | None,
     labels: bool, candidates: int, backfill_candidates: bool, segments: str | None,
+    intra_transition_prompt: str | None,
 ):
     """Render AI-stylized video: extract frames → SD img2img → reassemble.
 
@@ -720,6 +722,7 @@ def render(
             candidates=candidates,
             backfill_candidates=backfill_candidates,
             segment_filter=_parse_segment_filter(segments) if segments else None,
+            intra_transition_prompt=intra_transition_prompt,
         )
 
         import shutil

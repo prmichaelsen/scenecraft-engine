@@ -108,6 +108,7 @@ def render_google_pipeline(
     candidates: int = 0,
     backfill_candidates: bool = False,
     segment_filter: set[int] | None = None,
+    intra_transition_prompt: str | None = None,
 ) -> str:
     """Run the full Nano Banana + Veo pipeline.
 
@@ -354,13 +355,19 @@ def render_google_pipeline(
         )
 
         if is_intra_section:
-            # Smooth continuation within the same musical passage
-            prompt_parts = [
-                f"Smooth continuous cinematic video. Same visual world and atmosphere throughout.",
-                f"Visual style: {style_a}.",
-                f"Seamless fluid motion — no scene changes, no cuts, no dramatic transformations.",
-                f"The camera drifts slowly through the environment, revealing new angles and details of the same space.",
-            ]
+            if intra_transition_prompt:
+                prompt_parts = [
+                    f"Smooth continuous cinematic video. Same visual world and atmosphere throughout.",
+                    f"Visual style: {style_a}.",
+                    intra_transition_prompt,
+                ]
+            else:
+                prompt_parts = [
+                    f"Smooth continuous cinematic video. Same visual world and atmosphere throughout.",
+                    f"Visual style: {style_a}.",
+                    f"Seamless fluid motion — no scene changes, no cuts, no dramatic transformations.",
+                    f"The camera drifts slowly through the environment, revealing new angles and details of the same space.",
+                ]
         else:
             # Full transition between different sections
             action = (sp_b.transition_action if sp_b and sp_b.transition_action else None)
