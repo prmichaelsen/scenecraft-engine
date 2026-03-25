@@ -229,6 +229,172 @@ def run(
     _log("Done! Import the .setting file into Resolve's Fusion page.")
 
 
+# ── Resolve Commands ────────────────────────────────────────────────────────
+
+
+@main.group()
+def resolve():
+    """DaVinci Resolve headless integration commands."""
+    pass
+
+
+@resolve.command(name="status")
+def resolve_status():
+    """Show Resolve connection status and timeline info."""
+    from beatlab.resolve import connect
+
+    try:
+        session = connect(timeout=10)
+    except (RuntimeError, FileNotFoundError) as e:
+        _log(f"Resolve not available: {e}")
+        return
+
+    _log(f"Resolve {session.get_version()}")
+    _log(f"Project: {session.get_project_name()}")
+    info = session.get_timeline_info()
+    if "error" in info:
+        _log(f"Timeline: {info['error']}")
+    else:
+        _log(f"Timeline: {info['name']}")
+        _log(f"  FPS: {info['fps']} | Frames: {info['duration_frames']} | Duration: {info['duration_sec']}s")
+        _log(f"  Video tracks: {info['track_count_video']} | Audio tracks: {info['track_count_audio']}")
+
+
+@resolve.command(name="inject")
+@click.argument("setting_file", type=click.Path(exists=True))
+@click.option("--track", default=1, type=int, help="Video track number (1-based, default: 1)")
+@click.option("--item", default=0, type=int, help="Item index on track (0-based, default: 0)")
+def resolve_inject(setting_file: str, track: int, item: int):
+    """Import a Fusion .setting file directly into the current timeline item."""
+    from beatlab.resolve import connect
+
+    session = connect()
+    _log(f"Importing {setting_file} into timeline...")
+    success = session.import_fusion_comp(setting_file, track_index=track, item_index=item)
+    if success:
+        _log("Fusion comp injected successfully.")
+    else:
+        _log("Failed to inject Fusion comp.")
+        sys.exit(1)
+
+
+@resolve.command(name="render")
+@click.option("--output-dir", "-o", required=True, type=click.Path(), help="Output directory for rendered file")
+@click.option("--filename", default="render", type=str, help="Output filename (default: render)")
+@click.option("--wait/--no-wait", default=True, help="Wait for render to complete (default: yes)")
+def resolve_render(output_dir: str, filename: str, wait: bool):
+    """Add a render job and optionally wait for completion."""
+    from beatlab.resolve import connect
+
+    session = connect()
+    job_id = session.add_render_job(output_dir, filename=filename)
+    if not job_id:
+        _log("Failed to add render job.")
+        sys.exit(1)
+
+    _log(f"Starting render...")
+    started = session.start_render([job_id])
+    if not started:
+        _log("Failed to start render.")
+        sys.exit(1)
+
+    if wait:
+        status = session.wait_for_render(job_id)
+        if status.get("JobStatus") == "Complete":
+            _log(f"Render complete: {output_dir}/{filename}")
+        else:
+            _log(f"Render failed: {status}")
+            sys.exit(1)
+    else:
+        _log(f"Render queued: job {job_id}")
+
+
+@resolve.command(name="pipeline")
+@click.argument("audio_file", type=click.Path(exists=True))
+@click.option("--output", "-o", default="output.setting", type=click.Path(), help="Output .setting file")
+@click.option("--ai/--no-ai", default=False, help="Use AI to select effects per section")
+@click.option("--prompt", default=None, type=str, help="Creative direction for AI mode")
+@click.option("--hits", default=None, type=click.Path(exists=True), help="Path to hits.json for manual accents")
+@click.option("--track", default=1, type=int, help="Video track to inject into (default: 1)")
+@click.option("--item", default=0, type=int, help="Item index on track (default: 0)")
+@click.option("--render-dir", default=None, type=click.Path(), help="If set, also queue and run a render to this dir")
+def resolve_pipeline(audio_file: str, output: str, ai: bool, prompt: str | None, hits: str | None, track: int, item: int, render_dir: str | None):
+    """Full pipeline: analyze → generate → inject into Resolve → optional render."""
+    from beatlab.analyzer import analyze_audio
+    from beatlab.beat_map import create_beat_map
+    from beatlab.generator import generate_comp, load_hits, _apply_hits
+    from beatlab.resolve import connect
+
+    # Connect to Resolve first to get FPS
+    session = connect()
+    info = session.get_timeline_info()
+    if "error" in info:
+        _log(f"No timeline: {info['error']}")
+        sys.exit(1)
+
+    fps = info["fps"]
+    _log(f"Timeline: {info['name']} @ {fps} fps")
+
+    # Analyze
+    _log(f"Analyzing: {audio_file}")
+    analysis = analyze_audio(audio_file, detect_sections_flag=True)
+    _log(f"  Tempo: {analysis['tempo']:.1f} BPM | Beats: {len(analysis['beats'])}")
+    beat_map = create_beat_map(analysis, fps=fps, source_file=audio_file)
+
+    # Generate comp
+    plan = None
+    if ai:
+        plan = _get_ai_plan(beat_map, prompt)
+
+    if plan:
+        _log("Generating Fusion comp from AI effect plan")
+        comp = generate_comp(beat_map, effect_plan=plan)
+    else:
+        _log("Generating Fusion comp with default presets")
+        comp = generate_comp(beat_map)
+
+    # Layer hits
+    if hits:
+        from beatlab.fusion.nodes import make_media_out
+        hit_data = load_hits(hits)
+        if hit_data:
+            _log(f"  Layering {len(hit_data)} manual hit accents")
+            media_out = comp.nodes.pop()
+            last_node = comp.nodes[-1].name if comp.nodes else None
+            pos_x = comp.nodes[-1].pos_x + 110 if comp.nodes else 0
+            last_name = _apply_hits(comp, hit_data, last_node, pos_x)
+            media_out.inputs["MainInput"] = last_name
+            media_out.pos_x = (comp.nodes[-1].pos_x + 110) if comp.nodes else 110
+            comp.add_node(media_out)
+            comp.active_tool = last_name
+
+    comp.save(output)
+    _log(f"  Fusion comp written to: {output}")
+
+    # Inject into Resolve
+    _log("Injecting into Resolve timeline...")
+    from pathlib import Path
+    success = session.import_fusion_comp(str(Path(output).resolve()), track_index=track, item_index=item)
+    if not success:
+        _log("Failed to inject comp.")
+        sys.exit(1)
+    _log("Fusion comp injected.")
+
+    # Optional render
+    if render_dir:
+        _log("Queueing render...")
+        job_id = session.add_render_job(render_dir)
+        if job_id:
+            session.start_render([job_id])
+            status = session.wait_for_render(job_id)
+            if status.get("JobStatus") == "Complete":
+                _log(f"Render complete: {render_dir}")
+            else:
+                _log(f"Render failed: {status}")
+        else:
+            _log("Failed to queue render.")
+
+
 @main.command()
 @click.argument("video_file", type=click.Path(exists=True))
 @click.option("--beats", default=None, type=click.Path(), help="Beat map JSON (skip audio analysis)")
