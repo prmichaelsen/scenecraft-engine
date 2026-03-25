@@ -405,7 +405,7 @@ def render_google_pipeline(
     import concurrent.futures
     import threading
 
-    max_workers = 4
+    max_workers = 10
     completed = 0
     lock = threading.Lock()
 
