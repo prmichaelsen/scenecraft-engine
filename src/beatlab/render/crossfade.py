@@ -198,7 +198,8 @@ def concat_with_crossfade(
 
     # Now crossfade the chunks together — recursively if too many
     if len(chunk_paths) <= chunk_size:
-        _log(f"  Final merge: crossfading {len(chunk_paths)} chunks")
+        total_dur = sum(_get_duration(p) for p in chunk_paths)
+        _log(f"  Final merge: crossfading {len(chunk_paths)} chunks ({total_dur:.1f}s total)")
         merge_start = _time.time()
         ok, stderr = _xfade_group(chunk_paths, output_path, xfade_duration)
         if not ok:
@@ -206,7 +207,9 @@ def concat_with_crossfade(
                 f"Final crossfade failed on {len(chunk_paths)} chunks.\n"
                 f"ffmpeg stderr: {stderr[-500:]}"
             )
-        _log(f"    Done in {_time.time() - merge_start:.1f}s")
+        elapsed = _time.time() - merge_start
+        speed = total_dur / elapsed if elapsed > 0 else 0
+        _log(f"    Done in {elapsed:.1f}s ({speed:.1f}x realtime)")
     else:
         _log(f"  Final merge: {len(chunk_paths)} chunks too large for single pass, merging recursively...")
         concat_with_crossfade(chunk_paths, output_path, crossfade_frames=crossfade_frames, fps=fps, chunk_size=chunk_size)
