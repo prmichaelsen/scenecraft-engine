@@ -292,25 +292,48 @@ def render_google_pipeline(
             return str(output_path)  # Exit early — user needs to select
 
     # ── Phase 3: Veo segments between consecutive styled keyframes ──
-    num_segments = total_sections - 1
+    # Expand styled_paths for sections with sequence manifests
+    import json as _json2
+    expanded_styled: list[str] = []
+    expanded_keys: list[str] = []
+    expanded_section_idx: list[int] = []  # maps expanded index → original section index
+    for i, sp in enumerate(styled_paths):
+        manifest_path = styled_dir / f"styled_{file_keys[i]}_sequence.json"
+        if manifest_path.exists():
+            manifest = _json2.loads(manifest_path.read_text())
+            for j, img_name in enumerate(manifest["images"]):
+                expanded_styled.append(str(styled_dir / img_name))
+                expanded_keys.append(f"{file_keys[i]}_seq{j}")
+                expanded_section_idx.append(i)
+        else:
+            expanded_styled.append(sp)
+            expanded_keys.append(file_keys[i])
+            expanded_section_idx.append(i)
+
+    # Use expanded lists for Veo generation
+    num_segments = len(expanded_styled) - 1
     _log(f"Phase 3: Generating {num_segments} video segments with Veo (still→still)...")
     segment_paths: list[str] = []
 
     for i in range(num_segments):
-        seg_path = str(segments_dir / f"segment_{file_keys[i]}_{file_keys[i+1]}.mp4")
+        seg_path = str(segments_dir / f"segment_{expanded_keys[i]}_{expanded_keys[i+1]}.mp4")
 
         if Path(seg_path).exists():
-            _log(f"  [{i+1}/{num_segments}] Segment {i}→{i+1} (cached)")
+            _log(f"  [{i+1}/{num_segments}] Segment {expanded_keys[i]}→{expanded_keys[i+1]} (cached)")
             segment_paths.append(seg_path)
             continue
 
-        sp_a = plan_map.get(i)
-        sp_b = plan_map.get(i + 1)
+        # Map expanded indices back to original section indices
+        orig_a = expanded_section_idx[i]
+        orig_b = expanded_section_idx[i + 1]
+
+        sp_a = plan_map.get(orig_a)
+        sp_b = plan_map.get(orig_b)
         style_a = (sp_a.style_prompt if sp_a and sp_a.style_prompt else default_style)
         style_b = (sp_b.style_prompt if sp_b and sp_b.style_prompt else default_style)
 
-        sec_a = sections[i]
-        sec_b = sections[i + 1]
+        sec_a = sections[min(orig_a, len(sections) - 1)]
+        sec_b = sections[min(orig_b, len(sections) - 1)]
         label_a = sec_a.get("label", "")
         label_b = sec_b.get("label", "")
 
@@ -340,7 +363,7 @@ def render_google_pipeline(
         _log(f"  [{i+1}/{num_segments}] Segment {i}→{i+1}: {label_a}→{label_b} (8s)...")
         try:
             client.generate_video_transition(
-                styled_paths[i], styled_paths[i + 1], prompt, seg_path,
+                expanded_styled[i], expanded_styled[i + 1], prompt, seg_path,
                 duration_seconds=8,
             )
         except Exception as e:
@@ -359,15 +382,26 @@ def render_google_pipeline(
     remapped_paths: list[str] = []
 
     for i in range(num_segments):
-        # Target duration = time span from section i start to section i+1 start
-        sec_a_start = sections[i].get("start_time", 0)
-        sec_b_start = sections[i + 1].get("start_time", 0)
+        # Target duration — for sequence sub-clips, split evenly within the section
+        orig_a = expanded_section_idx[i]
+        orig_b = expanded_section_idx[i + 1]
+        sec_a_start = sections[min(orig_a, len(sections) - 1)].get("start_time", 0)
+        sec_b_start = sections[min(orig_b, len(sections) - 1)].get("start_time", 0)
         target_duration = sec_b_start - sec_a_start
+
+        # If both expanded entries map to the same section (sequence within one section),
+        # split the section duration evenly among the sequence clips
+        if orig_a == orig_b:
+            sec = sections[min(orig_a, len(sections) - 1)]
+            sec_dur = sec.get("end_time", 0) - sec.get("start_time", 0)
+            # Count how many expanded entries belong to this section
+            count = sum(1 for idx in expanded_section_idx if idx == orig_a)
+            target_duration = sec_dur / max(1, count)
 
         if target_duration <= 0:
             target_duration = 8.0  # fallback
 
-        remapped_path = str(remapped_dir / f"remapped_{file_keys[i]}.mp4")
+        remapped_path = str(remapped_dir / f"remapped_{expanded_keys[i]}.mp4")
 
         if Path(remapped_path).exists():
             remapped_paths.append(remapped_path)

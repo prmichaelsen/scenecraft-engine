@@ -229,6 +229,78 @@ def apply_selection(
     return stale
 
 
+def apply_sequence_selection(
+    target_idx: int | str,
+    sequence: list[dict],
+    work_dir: str,
+) -> list[str]:
+    """Apply a sequence selection — multiple images fill one time slot.
+
+    Each entry in sequence is {"source": section_idx_or_key, "variant": int}.
+    Images are saved as styled_KEY_seqN.png and a sequence manifest is written
+    so the pipeline knows to generate multiple shorter clips.
+
+    Args:
+        target_idx: Target section index or file key.
+        sequence: List of {"source": idx, "variant": int} dicts.
+        work_dir: Work directory path.
+
+    Returns:
+        List of stale files deleted.
+    """
+    import json as _json
+
+    work = Path(work_dir)
+    target_key = f"{target_idx:03d}" if isinstance(target_idx, int) else str(target_idx)
+
+    # Copy each sequence image
+    seq_images = []
+    for i, entry in enumerate(sequence):
+        source = entry["source"]
+        variant = entry["variant"]
+        source_key = f"{source:03d}" if isinstance(source, int) else str(source)
+
+        cand_path = work / "candidates" / f"section_{source_key}" / f"v{variant}.png"
+        if not cand_path.exists():
+            raise FileNotFoundError(f"Candidate v{variant} not found in section {source_key}: {cand_path}")
+
+        # Save as sequence image
+        seq_path = work / "google_styled" / f"styled_{target_key}_seq{i}.png"
+        shutil.copy2(str(cand_path), str(seq_path))
+        seq_images.append(str(seq_path))
+
+    # Also copy the first image as the primary styled image (for cache checks)
+    styled_path = work / "google_styled" / f"styled_{target_key}.png"
+    shutil.copy2(seq_images[0], str(styled_path))
+
+    # Write sequence manifest so the pipeline knows this section has multiple clips
+    manifest = {
+        "target": target_key,
+        "images": [str(Path(p).name) for p in seq_images],
+        "count": len(sequence),
+    }
+    manifest_path = work / "google_styled" / f"styled_{target_key}_sequence.json"
+    with open(manifest_path, "w") as f:
+        _json.dump(manifest, f, indent=2)
+
+    # Delete stale downstream files
+    stale = []
+    for pattern in [
+        f"google_segments/segment_*_{target_key}*.mp4",
+        f"google_segments/segment_{target_key}*.mp4",
+        f"google_remapped/remapped_{target_key}*.mp4",
+        f"google_labeled/labeled_{target_key}*.mp4",
+        "google_concat.mp4",
+        "google_muxed.mp4",
+        "google_output.mp4",
+    ]:
+        for p in work.glob(pattern):
+            p.unlink()
+            stale.append(str(p))
+
+    return stale
+
+
 def apply_cross_selection(
     target_idx: int | str,
     source_idx: int | str,

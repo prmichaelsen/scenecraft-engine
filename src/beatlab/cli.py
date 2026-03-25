@@ -830,16 +830,18 @@ def select_cmd(video_name: str, selections: tuple[str], work_dir: str):
     Examples:
       beatlab select beyond_the_veil 88:v2 92:v4
       beatlab select beyond_the_veil 016_001:v2
-      beatlab select beyond_the_veil 016_002:016_001/v3  (cross-section: use 016_001's v3 for 016_002)
+      beatlab select beyond_the_veil 016_002:016_001/v3  (cross-section)
+      beatlab select beyond_the_veil 016_001:v2+v4       (sequence: two clips filling the slot)
+      beatlab select beyond_the_veil 016_002:016_001/v3+v1  (cross + sequence)
     """
-    from beatlab.render.candidates import apply_selection, apply_cross_selection
+    from beatlab.render.candidates import apply_selection, apply_cross_selection, apply_sequence_selection
 
     work = str(Path(work_dir) / video_name)
 
     for sel in selections:
         parts = sel.replace("v", "").split(":")
         if len(parts) != 2:
-            _log(f"  Invalid selection format: {sel} (expected idx:vN or idx:source/vN)")
+            _log(f"  Invalid selection format: {sel}")
             continue
 
         target_str = parts[0]
@@ -849,6 +851,27 @@ def select_cmd(video_name: str, selections: tuple[str], work_dir: str):
             target = target_str
 
         source_str = parts[1]
+
+        # Sequence selection: v2+v4 or 016_001/v3+v1
+        if "+" in source_str:
+            sequence_parts = source_str.split("+")
+            sequence = []
+            for sp in sequence_parts:
+                if "/" in sp:
+                    src_sec, var = sp.split("/")
+                    try:
+                        src_sec = int(src_sec)
+                    except ValueError:
+                        pass
+                    sequence.append({"source": src_sec, "variant": int(var)})
+                else:
+                    sequence.append({"source": target, "variant": int(sp)})
+
+            _log(f"  Section {target}: sequence of {len(sequence)} images")
+            stale = apply_sequence_selection(target, sequence, work)
+            if stale:
+                _log(f"    Deleted {len(stale)} stale files")
+            continue
 
         # Cross-section selection: 016_002:016_001/3
         if "/" in source_str:
