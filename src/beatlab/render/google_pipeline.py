@@ -157,6 +157,16 @@ def render_google_pipeline(
     # Build file key list — used for all file naming
     file_keys = [sec.get("_file_key", f"{i:03d}") for i, sec in enumerate(sections)]
 
+    # Copy parent styled images to first sub-section (sub_index 0)
+    import shutil as _shutil
+    for i, sec in enumerate(sections):
+        if sec.get("_sub_index") == 0:
+            parent_idx = sec.get("_original_index")
+            parent_styled = styled_dir / f"styled_{parent_idx:03d}.png"
+            sub_styled = styled_dir / f"styled_{file_keys[i]}.png"
+            if parent_styled.exists() and not sub_styled.exists():
+                _shutil.copy2(str(parent_styled), str(sub_styled))
+
     # ── Phase 1: Pick a keyframe per section ──
     _log(f"Phase 1: Selecting {total_sections} keyframes...")
     keyframe_paths: list[str] = []
