@@ -47,8 +47,11 @@ def _retry_video_generation(generate_fn, client, output_path, max_retries: int =
             try:
                 operation = generate_fn()
 
-                # Poll until done
+                # Poll until done (timeout after 10 minutes)
+                poll_start = time.time()
                 while not operation.done:
+                    if time.time() - poll_start > 600:
+                        raise TimeoutError("Veo generation polling timed out after 10 minutes")
                     time.sleep(10)
                     operation = client.operations.get(operation)
 
@@ -71,6 +74,7 @@ def _retry_video_generation(generate_fn, client, output_path, max_retries: int =
                     or "RESOURCE_EXHAUSTED" in err_str
                     or "None" in err_str
                     or "NoneType" in err_str
+                    or "timed out" in err_str.lower()
                     or "prompt rejection" in err_str.lower()
                     or "empty generated_videos" in err_str
                 )
