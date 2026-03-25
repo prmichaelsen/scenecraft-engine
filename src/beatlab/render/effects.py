@@ -228,18 +228,81 @@ def apply_effects(
         frame = np.clip(frame, 0, 255)
         return frame.astype(np.uint8)
 
-    _log("Applying beat-synced effects...")
-    styled = clip.transform(process_frame)
+    # Pipe processed frames directly to ffmpeg — single encode pass with audio mux
+    import subprocess
+    import time as _time
 
-    _log(f"Writing output: {output_path}")
-    styled.write_videofile(
+    total_frames = int(clip.duration * video_fps)
+    w, h = clip.size
+
+    _log(f"Applying beat-synced effects (OpenCV): {total_frames} frames, {w}x{h} @ {video_fps}fps")
+
+    # Check if glow is used (for logging)
+    has_glow = False
+    for sp in plan_map.values():
+        if "glow_swell" in (sp.presets if hasattr(sp, "presets") else []):
+            has_glow = True
+            break
+    if has_glow:
+        _log("  Glow enabled (slower)")
+
+    # Start ffmpeg encoder — single pass, mux audio from original
+    ffmpeg_cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-s", f"{w}x{h}",
+        "-pix_fmt", "bgr24",
+        "-r", str(video_fps),
+        "-i", "pipe:0",
+        "-i", video_path,
+        "-map", "0:v",
+        "-map", "1:a?",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-crf", "18",
+        "-c:a", "copy",
+        "-shortest",
         output_path,
-        codec="libx264",
-        audio_codec="aac",
-        fps=video_fps,
-        logger=None,
-    )
+    ]
+
+    proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    start_time = _time.time()
+    frame_count = 0
+
+    for frame_idx in range(total_frames):
+        t = frame_idx / video_fps
+        frame = clip.get_frame(t)
+
+        # MoviePy returns RGB, OpenCV expects BGR for our process_frame
+        frame = frame[:, :, ::-1].copy()
+        frame = process_frame(frame, t)
+
+        try:
+            proc.stdin.write(frame.tobytes())
+        except BrokenPipeError:
+            break
+
+        frame_count += 1
+        if frame_count % 1000 == 0:
+            elapsed = _time.time() - start_time
+            fps_actual = frame_count / elapsed if elapsed > 0 else 0
+            remaining = (total_frames - frame_count) / fps_actual if fps_actual > 0 else 0
+            _log(f"  [{frame_count}/{total_frames}] {fps_actual:.0f} fps, ETA {remaining / 60:.1f}m")
+
+    proc.stdin.close()
+    proc.wait()
+
+    elapsed = _time.time() - start_time
+    fps_actual = frame_count / elapsed if elapsed > 0 else 0
+    _log(f"  Effects applied in {elapsed:.0f}s ({fps_actual:.0f} fps)")
 
     clip.close()
-    _log("Effects applied.")
+
+    if proc.returncode != 0:
+        _log(f"ffmpeg encode failed (exit {proc.returncode})")
+        import shutil
+        shutil.copy2(video_path, output_path)
+
     return output_path
