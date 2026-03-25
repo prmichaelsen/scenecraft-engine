@@ -337,13 +337,28 @@ def render_google_pipeline(
         label_a = sec_a.get("label", "")
         label_b = sec_b.get("label", "")
 
-        # Build prompt — use transition_action if Claude provided one
-        action = (sp_b.transition_action if sp_b and sp_b.transition_action else None)
-        if action:
-            prompt_parts = [f"Cinematic video: {action}"]
-            prompt_parts.append(f"Starting visual: {style_a}. Ending visual: {style_b}.")
+        # Detect intra-section transition (both sides are sub-sections of same parent)
+        is_intra_section = (
+            sec_a.get("_original_index") is not None
+            and sec_a.get("_original_index") == sec_b.get("_original_index")
+        )
+
+        if is_intra_section:
+            # Smooth continuation within the same musical passage
+            prompt_parts = [
+                f"Smooth continuous cinematic video. Same visual world and atmosphere throughout.",
+                f"Visual style: {style_a}.",
+                f"Seamless fluid motion — no scene changes, no cuts, no dramatic transformations.",
+                f"The camera drifts slowly through the environment, revealing new angles and details of the same space.",
+            ]
         else:
-            prompt_parts = [f"Cinematic video transitioning from {style_a} ({label_a}) into {style_b} ({label_b})."]
+            # Full transition between different sections
+            action = (sp_b.transition_action if sp_b and sp_b.transition_action else None)
+            if action:
+                prompt_parts = [f"Cinematic video: {action}"]
+                prompt_parts.append(f"Starting visual: {style_a}. Ending visual: {style_b}.")
+            else:
+                prompt_parts = [f"Cinematic video transitioning from {style_a} ({label_a}) into {style_b} ({label_b})."]
 
         if motion_prompt:
             prompt_parts.append(f"Camera and motion: {motion_prompt}.")
