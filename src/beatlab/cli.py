@@ -395,6 +395,19 @@ def resolve_pipeline(audio_file: str, output: str, ai: bool, prompt: str | None,
             _log("Failed to queue render.")
 
 
+def _parse_segment_filter(spec: str) -> set[int]:
+    """Parse segment filter spec like '1,2,20-25,30' into a set of indices."""
+    indices = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" in part:
+            start, end = part.split("-", 1)
+            indices.update(range(int(start), int(end) + 1))
+        else:
+            indices.add(int(part))
+    return indices
+
+
 @main.command()
 @click.argument("video_file", type=click.Path(exists=True))
 @click.option("--beats", default=None, type=click.Path(), help="Beat map JSON (skip audio analysis)")
@@ -420,6 +433,7 @@ def resolve_pipeline(audio_file: str, output: str, ai: bool, prompt: str | None,
 @click.option("--motion", default=None, type=str, help="Camera/motion direction for Veo (e.g. 'forward dolly through void, warp speed')")
 @click.option("--plan-patch", default=None, type=click.Path(exists=True), help="Patch JSON to merge into cached plan — only re-renders changed sections")
 @click.option("--labels/--no-labels", default=False, help="Burn section numbers into bottom-right of video for review")
+@click.option("--segments", default=None, type=str, help="Only process specific segments: e.g. 1,2,20-25,30")
 @click.option("--candidates", default=4, type=int, help="Number of styled image candidates per section (default: 4, 0 or 1 to disable)")
 @click.option("--backfill-candidates/--no-backfill-candidates", default=False, help="Generate candidates for sections that already have styled images (promotes existing to v1)")
 def render(
@@ -429,7 +443,7 @@ def render(
     sr: int, dry_run: bool, destroy: bool, fresh: bool, work_dir: str,
     engine: str, preview: bool, describe: str | None, vertex: bool,
     audio_prompt: bool, motion: str | None, plan_patch: str | None,
-    labels: bool, candidates: int, backfill_candidates: bool,
+    labels: bool, candidates: int, backfill_candidates: bool, segments: str | None,
 ):
     """Render AI-stylized video: extract frames → SD img2img → reassemble.
 
@@ -705,6 +719,7 @@ def render(
             labels=labels,
             candidates=candidates,
             backfill_candidates=backfill_candidates,
+            segment_filter=_parse_segment_filter(segments) if segments else None,
         )
 
         import shutil

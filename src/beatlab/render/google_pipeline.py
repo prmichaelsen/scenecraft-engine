@@ -107,6 +107,7 @@ def render_google_pipeline(
     labels: bool = False,
     candidates: int = 0,
     backfill_candidates: bool = False,
+    segment_filter: set[int] | None = None,
 ) -> str:
     """Run the full Nano Banana + Veo pipeline.
 
@@ -317,6 +318,15 @@ def render_google_pipeline(
 
     for i in range(num_segments):
         seg_path = str(segments_dir / f"segment_{expanded_keys[i]}_{expanded_keys[i+1]}.mp4")
+
+        # Skip if segment_filter is set and this segment isn't in it
+        if segment_filter is not None and i not in segment_filter:
+            if Path(seg_path).exists():
+                segment_paths.append(seg_path)
+            else:
+                _log(f"  [{i+1}/{num_segments}] {expanded_keys[i]}→{expanded_keys[i+1]} (skipped — not in filter)")
+                segment_paths.append(seg_path)  # placeholder
+            continue
 
         if Path(seg_path).exists():
             _log(f"  [{i+1}/{num_segments}] {expanded_keys[i]}→{expanded_keys[i+1]} (cached)")
