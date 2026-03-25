@@ -839,16 +839,19 @@ def select_cmd(video_name: str, selections: tuple[str], work_dir: str):
     work = str(Path(work_dir) / video_name)
 
     for sel in selections:
-        parts = sel.replace("v", "").split(":")
+        parts = sel.split(":")
         if len(parts) != 2:
             _log(f"  Invalid selection format: {sel}")
             continue
 
         target_str = parts[0]
-        try:
-            target = int(target_str)
-        except ValueError:
-            target = target_str
+        if "_" in target_str:
+            target = target_str  # file key like "016_001"
+        else:
+            try:
+                target = int(target_str)
+            except ValueError:
+                target = target_str
 
         source_str = parts[1]
 
@@ -859,13 +862,14 @@ def select_cmd(video_name: str, selections: tuple[str], work_dir: str):
             for sp in sequence_parts:
                 if "/" in sp:
                     src_sec, var = sp.split("/")
-                    try:
-                        src_sec = int(src_sec)
-                    except ValueError:
-                        pass
-                    sequence.append({"source": src_sec, "variant": int(var)})
+                    if "_" not in src_sec:
+                        try:
+                            src_sec = int(src_sec)
+                        except ValueError:
+                            pass
+                    sequence.append({"source": src_sec, "variant": int(var.replace("v", ""))})
                 else:
-                    sequence.append({"source": target, "variant": int(sp)})
+                    sequence.append({"source": target, "variant": int(sp.replace("v", ""))})
 
             _log(f"  Section {target}: sequence of {len(sequence)} images")
             stale = apply_sequence_selection(target, sequence, work)
@@ -877,21 +881,20 @@ def select_cmd(video_name: str, selections: tuple[str], work_dir: str):
         if "/" in source_str:
             source_parts = source_str.split("/")
             source_section = source_parts[0]
-            try:
-                source_section = int(source_section)
-            except ValueError:
-                pass
-            variant = int(source_parts[1])
+            if "_" not in source_section:
+                try:
+                    source_section = int(source_section)
+                except ValueError:
+                    pass
+            variant = int(source_parts[1].replace("v", ""))
             _log(f"  Section {target}: applying v{variant} from section {source_section}")
             stale = apply_cross_selection(target, source_section, variant, work)
         else:
             # Normal selection
-            variant = int(source_str)
+            variant = int(source_str.replace("v", ""))
             _log(f"  Section {target}: applying variant v{variant}")
             stale = apply_selection(target, variant, work)
 
-        _log(f"  Section {idx}: applying variant v{variant}")
-        stale = apply_selection(idx, variant, work)
         if stale:
             _log(f"    Deleted {len(stale)} stale files")
 
