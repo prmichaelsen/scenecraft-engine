@@ -232,7 +232,7 @@ def render_google_pipeline(
                 return output_path
 
             paths = generate_image_candidates(
-                section_idx=i,
+                section_idx=fk,
                 source_image_path=kf_path,
                 style_prompt=style,
                 count=candidates,

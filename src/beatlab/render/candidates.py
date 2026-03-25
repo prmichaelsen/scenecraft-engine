@@ -10,7 +10,7 @@ from typing import Callable
 
 
 def generate_image_candidates(
-    section_idx: int,
+    section_idx: int | str,
     source_image_path: str,
     style_prompt: str,
     count: int,
@@ -21,7 +21,7 @@ def generate_image_candidates(
     """Generate N candidate styled images for a section.
 
     Args:
-        section_idx: Section index.
+        section_idx: Section index or file key (e.g. 42 or "042_001").
         source_image_path: Path to the source keyframe image.
         style_prompt: Style prompt for Nano Banana.
         count: Number of candidates to generate.
@@ -32,7 +32,8 @@ def generate_image_candidates(
     Returns:
         List of paths to candidate images.
     """
-    cand_dir = Path(work_dir) / "candidates" / f"section_{section_idx:03d}"
+    key = f"{section_idx:03d}" if isinstance(section_idx, int) else str(section_idx)
+    cand_dir = Path(work_dir) / "candidates" / f"section_{key}"
     cand_dir.mkdir(parents=True, exist_ok=True)
 
     paths = []
@@ -184,14 +185,14 @@ def _tile_layout(n: int, cols: int) -> list[str]:
 
 
 def apply_selection(
-    section_idx: int,
+    section_idx: int | str,
     variant: int,
     work_dir: str,
 ) -> list[str]:
     """Apply a candidate selection — copy selected variant to styled image, delete stale outputs.
 
     Args:
-        section_idx: Section index.
+        section_idx: Section index (int) or file key (str like "042_001").
         variant: Variant number (1-indexed: v1, v2, v3, v4).
         work_dir: Work directory path.
 
@@ -199,30 +200,29 @@ def apply_selection(
         List of stale files that were deleted.
     """
     work = Path(work_dir)
-    cand_path = work / "candidates" / f"section_{section_idx:03d}" / f"v{variant}.png"
+    key = f"{section_idx:03d}" if isinstance(section_idx, int) else str(section_idx)
+
+    cand_path = work / "candidates" / f"section_{key}" / f"v{variant}.png"
 
     if not cand_path.exists():
-        raise FileNotFoundError(f"Candidate v{variant} not found for section {section_idx}: {cand_path}")
+        raise FileNotFoundError(f"Candidate v{variant} not found for section {key}: {cand_path}")
 
     # Copy to styled image location
-    styled_path = work / "google_styled" / f"styled_{section_idx:03d}.png"
+    styled_path = work / "google_styled" / f"styled_{key}.png"
     shutil.copy2(str(cand_path), str(styled_path))
 
-    # Delete stale downstream files
+    # Delete stale downstream files — use glob to match file key patterns
     stale = []
     for pattern in [
-        f"google_segments/segment_{section_idx-1:03d}_{section_idx:03d}.mp4",
-        f"google_segments/segment_{section_idx:03d}_{section_idx+1:03d}.mp4",
-        f"google_remapped/remapped_{section_idx-1:03d}.mp4",
-        f"google_remapped/remapped_{section_idx:03d}.mp4",
-        f"google_labeled/labeled_{section_idx-1:03d}.mp4",
-        f"google_labeled/labeled_{section_idx:03d}.mp4",
+        f"google_segments/segment_*_{key}.mp4",
+        f"google_segments/segment_{key}_*.mp4",
+        f"google_remapped/remapped_{key}.mp4",
+        f"google_labeled/labeled_{key}.mp4",
         "google_concat.mp4",
         "google_muxed.mp4",
         "google_output.mp4",
     ]:
-        p = work / pattern
-        if p.exists():
+        for p in work.glob(pattern):
             p.unlink()
             stale.append(str(p))
 

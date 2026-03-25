@@ -837,7 +837,12 @@ def select_cmd(video_name: str, selections: tuple[str], work_dir: str):
             _log(f"  Invalid selection format: {sel} (expected idx:vN, e.g. 88:v2)")
             continue
 
-        idx = int(parts[0])
+        # Support both integer (88:v2) and file key (016_001:v3)
+        idx_str = parts[0]
+        try:
+            idx = int(idx_str)
+        except ValueError:
+            idx = idx_str  # file key like "016_001"
         variant = int(parts[1])
 
         _log(f"  Section {idx}: applying variant v{variant}")
