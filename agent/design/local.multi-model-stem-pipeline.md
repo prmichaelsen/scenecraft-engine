@@ -144,12 +144,21 @@ Same rules-based approach, but Claude now sees 11 named instrument stems instead
 
 ---
 
+## Fallback
+
+If the multi-model pipeline does not improve results, the proven fallback is:
+
+**`effects_ai_9_11m_final.mp4` configuration** — Demucs htdemucs 4-stem + frequency-band DSP + Claude rules + vocal bleed confidence ratio (0.15) + flash→contrast_pop + no hard_cut. This produced the best results prior to the multi-model pipeline work.
+
+---
+
 ## Trade-offs
 
 - **Three models = 3x disk space for model weights** — ~2-3GB total. Acceptable for cloud desktops, cacheable.
 - **CPU processing time** — MDX23C models are slow on CPU (~35 min each for 2 min). Mitigated by GPU (DigitalOcean) or parallel execution.
 - **Demucs vocals/drums discarded** — We run Demucs 6s but only use bass/guitar/piano/other. ~40% of its output is thrown away. Acceptable since the alternative (not having guitar/piano separation) is worse.
 - **Model availability** — Depends on audio-separator package and model checkpoint downloads. Models cached after first download.
+- **DrumSep on full mix produces vocal artifacts** — Confirmed: running DrumSep directly on the full mix contaminates drum stems with vocal transients. MUST run on InstVoc instrumental output instead.
 
 ---
 
