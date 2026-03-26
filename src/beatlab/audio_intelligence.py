@@ -925,8 +925,34 @@ def apply_rules(layer1_data: dict, rules: list[dict],
 
     # Sort by time
     events.sort(key=lambda e: e["time"])
-    _log(f"  Total effect events: {len(events)} ({suppressed_total} suppressed as vocal bleed)")
-    return events
+
+    # Reverb deduplication: for each stem_source, if two events are within 200ms,
+    # keep only the stronger one. Real hits don't repeat that fast from the same
+    # source — the second one is a reverb tail ghost.
+    before_dedup = len(events)
+    deduped = []
+    last_by_source = {}  # stem_source → (time, intensity, index_in_deduped)
+
+    for event in events:
+        src = event["stem_source"]
+        t = event["time"]
+        intensity = event["intensity"]
+
+        if src in last_by_source:
+            prev_t, prev_int, prev_idx = last_by_source[src]
+            if t - prev_t < 0.2:  # within 200ms
+                # Keep the stronger one
+                if intensity > prev_int:
+                    deduped[prev_idx] = event
+                    last_by_source[src] = (t, intensity, prev_idx)
+                continue
+
+        last_by_source[src] = (t, intensity, len(deduped))
+        deduped.append(event)
+
+    reverb_removed = before_dedup - len(deduped)
+    _log(f"  Total effect events: {len(deduped)} ({suppressed_total} bleed suppressed, {reverb_removed} reverb ghosts removed)")
+    return deduped
 
 
 def apply_rules_in_range(layer1_data: dict, rules: list[dict],
