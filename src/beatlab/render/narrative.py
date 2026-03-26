@@ -824,7 +824,9 @@ def generate_transition_candidates(
             slot_dir = tr_candidates_dir / tr["id"] / f"slot_{slot_idx}"
             slot_dir.mkdir(parents=True, exist_ok=True)
 
-            prompt = tr.get("action") or "Smooth cinematic transition"
+            action = tr.get("action") or "Smooth cinematic transition"
+            motion_prompt = data.get("meta", {}).get("motion_prompt", "")
+            prompt = f"{action}. Camera and motion: {motion_prompt}" if motion_prompt else action
 
             for v in range(n_candidates):
                 output = str(slot_dir / f"v{v + 1}.mp4")
