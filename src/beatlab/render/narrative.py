@@ -424,11 +424,35 @@ def generate_keyframe_candidates(
         save_narrative(data, yaml_path)
         return
 
-    _log(f"Generating candidates for {len(jobs)} keyframes ({n_candidates} each, max 10 parallel)...")
+    # When 4 or fewer keyframes targeted, parallelize candidates within each keyframe
+    # Otherwise, parallelize across keyframes (each generates candidates sequentially)
+    parallelize_within = len(jobs) <= 4
+
+    if parallelize_within:
+        _log(f"Generating candidates for {len(jobs)} keyframes ({n_candidates} each, parallelizing within each keyframe)...")
+    else:
+        _log(f"Generating candidates for {len(jobs)} keyframes ({n_candidates} each, max 10 parallel)...")
 
     import threading
     lock = threading.Lock()
     completed = [0]
+
+    def _generate_single_candidate(kf, variant_idx):
+        """Generate a single candidate variant for a keyframe."""
+        kf_id = kf["id"]
+        source_path = kf["_source_resolved"]
+        prompt = kf["prompt"]
+        varied_prompt = f"{prompt}, variation {variant_idx}" if variant_idx > 1 else prompt
+
+        cand_dir = kf_candidates_dir / "candidates" / f"section_{kf_id}"
+        cand_dir.mkdir(parents=True, exist_ok=True)
+        out_path = str(cand_dir / f"v{variant_idx}.png")
+
+        if Path(out_path).exists():
+            return out_path
+
+        stylize_fn(source_path, varied_prompt, out_path)
+        return out_path
 
     def _generate_kf(kf):
         kf_id = kf["id"]
@@ -454,13 +478,44 @@ def generate_keyframe_candidates(
             completed[0] += 1
             _log(f"  [{completed[0]}/{len(jobs)}] {kf_id}: done ({grid_path})")
 
-    with ThreadPoolExecutor(max_workers=10) as pool:
-        futures = [pool.submit(_generate_kf, kf) for kf in jobs]
-        for f in as_completed(futures):
-            try:
-                f.result()
-            except Exception as e:
-                _log(f"  FAILED: {e}")
+    if parallelize_within:
+        # Parallelize candidates within each keyframe
+        for kf in jobs:
+            kf_id = kf["id"]
+            _log(f"  {kf_id}: generating {n_candidates} candidates in parallel...")
+
+            with ThreadPoolExecutor(max_workers=n_candidates) as pool:
+                futures = {
+                    pool.submit(_generate_single_candidate, kf, v + 1): v + 1
+                    for v in range(n_candidates)
+                }
+                paths = [None] * n_candidates
+                for f in as_completed(futures):
+                    v = futures[f]
+                    try:
+                        paths[v - 1] = f.result()
+                    except Exception as e:
+                        _log(f"    v{v} FAILED: {e}")
+
+            paths = [p for p in paths if p]
+
+            # Generate contact sheet
+            cand_dir = kf_candidates_dir / "candidates" / f"section_{kf_id}"
+            grid_path = str(cand_dir / "grid.png")
+            make_contact_sheet(paths, grid_path, kf_id)
+
+            kf["candidates"] = paths
+            completed[0] += 1
+            _log(f"  [{completed[0]}/{len(jobs)}] {kf_id}: done ({grid_path})")
+    else:
+        # Parallelize across keyframes
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = [pool.submit(_generate_kf, kf) for kf in jobs]
+            for f in as_completed(futures):
+                try:
+                    f.result()
+                except Exception as e:
+                    _log(f"  FAILED: {e}")
 
     # Save updated YAML
     save_narrative(data, yaml_path)
