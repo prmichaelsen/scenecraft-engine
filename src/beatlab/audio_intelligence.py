@@ -926,19 +926,23 @@ def apply_rules(layer1_data: dict, rules: list[dict],
     # Sort by time
     events.sort(key=lambda e: e["time"])
 
-    # Reverb deduplication: for each stem_source, if two events are within 200ms,
-    # keep only the stronger one. Real hits don't repeat that fast from the same
-    # source — the second one is a reverb tail ghost.
+    # Reverb deduplication: for percussion stems only, if two events from the same
+    # stem_source are within 200ms, keep only the stronger one. Percussion can't
+    # physically repeat that fast — the second onset is a reverb tail ghost.
+    # Non-percussion stems (bass, other, vocals) are NOT deduped — fast synth
+    # arpeggios and lead runs legitimately have onsets every 100-150ms.
+    PERCUSSION_DEDUP_STEMS = {"kick", "snare", "hh", "toms", "ride", "crash", "drums"}
     before_dedup = len(events)
     deduped = []
     last_by_source = {}  # stem_source → (time, intensity, index_in_deduped)
 
     for event in events:
         src = event["stem_source"]
+        stem_name = src.split("/")[0] if "/" in src else src
         t = event["time"]
         intensity = event["intensity"]
 
-        if src in last_by_source:
+        if stem_name in PERCUSSION_DEDUP_STEMS and src in last_by_source:
             prev_t, prev_int, prev_idx = last_by_source[src]
             if t - prev_t < 0.2:  # within 200ms
                 # Keep the stronger one
