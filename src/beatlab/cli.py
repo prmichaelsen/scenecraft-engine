@@ -1386,8 +1386,10 @@ def audio_intelligence(video_file: str, work_dir: str, output: str | None,
 @click.option("--plan", default=None, type=click.Path(exists=True), help="AI effect plan JSON (optional)")
 @click.option("--time-offset", default=0.0, type=float, help="Time offset for AI events (e.g. if video is trimmed from a longer source)")
 @click.option("--remote/--local", default=False, help="Run effects on Vast.ai GPU (NVENC encoding, much faster)")
+@click.option("--hard-cuts/--no-hard-cuts", default=False, help="Enable hard_cut effect (blinding brightness spikes, off by default)")
 def effects(video_file: str, beats: str | None, ai_events: str | None, output: str | None,
-            glow: bool, fps: float | None, plan: str | None, time_offset: float, remote: bool):
+            glow: bool, fps: float | None, plan: str | None, time_offset: float, remote: bool,
+            hard_cuts: bool):
     """Apply beat-synced OpenCV effects to a video.
 
     Two modes:
@@ -1421,7 +1423,7 @@ def effects(video_file: str, beats: str | None, ai_events: str | None, output: s
             ai_data = json.load(f)
         events = ai_data.get("layer3_events", ai_data if isinstance(ai_data, list) else [])
         _log(f"AI-directed effects: {len(events)} events")
-        apply_effects_ai(video_file, output, events, fps=fps, time_offset=time_offset)
+        apply_effects_ai(video_file, output, events, fps=fps, time_offset=time_offset, hard_cuts=hard_cuts)
         return
 
     # Classic beat map mode (local)

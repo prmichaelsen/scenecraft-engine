@@ -303,6 +303,7 @@ def apply_effects_ai(
     effect_events: list[dict],
     fps: float | None = None,
     time_offset: float = 0.0,
+    hard_cuts: bool = False,
 ) -> str:
     """Apply effects from Layer 3 AI-generated effect events.
 
@@ -327,8 +328,14 @@ def apply_effects_ai(
     _log(f"Applying AI-directed effects: {total_frames} frames, {w}x{h} @ {video_fps}fps")
     _log(f"  {len(effect_events)} effect events")
 
-    # Pre-sort events by time
+    # Pre-sort events by time, filter hard_cuts if disabled
     events = sorted(effect_events, key=lambda e: e["time"])
+    if not hard_cuts:
+        before = len(events)
+        events = [e for e in events if e.get("effect") != "hard_cut"]
+        diff = before - len(events)
+        if diff:
+            _log(f"  hard_cut disabled — filtered {diff} events")
 
     # Build event lookup — for each frame, compute active effect intensities
     def get_event_intensity(t: float, event: dict) -> float:
@@ -379,12 +386,25 @@ def apply_effects_ai(
 
         # Find active events — only check events within a reasonable window
         zoom_amount = 0.0
+        zoom_bounce_active = False
         shake_x_val = 0
         shake_y_val = 0
         bright_alpha = 1.0
         bright_beta = 0
         contrast_amount = 0.0
         glow_amount = 0.0
+
+        # First pass: check if any zoom_bounce is active (suppresses zoom_pulse)
+        for event in events:
+            event_time = event["time"] - time_offset
+            max_dur = event.get("duration", 0.2) + (event.get("sustain") or 0.0) + 0.5
+            if event_time > t + 0.1:
+                break
+            if event_time + max_dur < t:
+                continue
+            if event["effect"] == "zoom_bounce" and get_event_intensity(t, event) > 0.05:
+                zoom_bounce_active = True
+                break
 
         for event in events:
             event_time = event["time"] - time_offset
@@ -401,7 +421,9 @@ def apply_effects_ai(
             effect = event["effect"]
 
             if effect == "zoom_pulse":
-                zoom_amount = max(zoom_amount, 0.12 * ei)
+                # Suppress zoom_pulse when zoom_bounce is active
+                if not zoom_bounce_active:
+                    zoom_amount = max(zoom_amount, 0.12 * ei)
             elif effect == "zoom_bounce":
                 zoom_amount = max(zoom_amount, 0.20 * ei)
             elif effect == "shake_x":
