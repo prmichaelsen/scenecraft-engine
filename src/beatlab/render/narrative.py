@@ -557,8 +557,11 @@ def generate_transition_actions(yaml_path: str) -> None:
         from_ctx = from_kf.get("context", {})
         to_ctx = to_kf.get("context", {})
 
+        master_prompt = data.get("meta", {}).get("prompt", "")
+        master_context = f"Overall creative direction: {master_prompt}\n\n" if master_prompt else ""
+
         user_content = [
-            {"type": "text", "text": "You are a visual effects director for a music video. Describe the ideal visual transition between these two keyframes.\n\n"},
+            {"type": "text", "text": f"You are a visual effects director for a music video. {master_context}Describe the ideal visual transition between these two keyframes.\n\n"},
             {"type": "text", "text": f"FROM keyframe ({tr['from']}):\n"
                 f"  Timestamp: {from_kf['timestamp']}\n"
                 f"  Mood: {from_ctx.get('mood', 'unknown')}\n"
