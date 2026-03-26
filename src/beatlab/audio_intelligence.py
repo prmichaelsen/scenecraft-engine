@@ -524,6 +524,8 @@ Each effect event must have:
 6. **BE AGGRESSIVE WITH COVERAGE**: Assign effects to MOST onsets, not just the strongest ones. A music video should have visible effects on nearly every beat. For a 120-second clip at 130 BPM, you should produce 100-300+ effect events. Every kick should get at least a subtle shake. Every snare should get at least a flash. Every bass note should get at least a zoom pulse. Only truly inaudible ghost notes (strength < 0.02) should be skipped.
 7. **Match the music's energy arc**: Buildups = gradually increasing intensity. Drops = hit hard with max layering. Breakdowns = reduce but don't stop — keep subtle glow/zoom pulsing.
 8. **Vary intensity, not presence**: Instead of skipping quiet onsets, assign them lower intensity (0.2-0.4). The video should always be breathing with the music. Silence = no effects. Sound = some effect, even if subtle.
+9. **PATTERN RECOGNITION IS CRITICAL**: Music is repetitive. If a 4-bar phrase has a kick-snare-kick-snare pattern, and that phrase repeats 8 times, you MUST apply effects to ALL 8 repetitions — not just the first 1-2. Scan the DSP onset data for repeating rhythmic patterns (regular intervals, consistent strength profiles) and ensure every instance of the pattern gets effects. A listener will notice if beats 1-8 have effects but beats 9-32 of the same pattern are dead. Consistency across repeated patterns is more important than variety.
+10. **FILL THE GAPS**: After generating your events, mentally scan through the timeline second by second. If there's a gap longer than 1-2 seconds where no effect fires, find an onset in the DSP data to fill it. The video should NEVER feel like effects stopped — there should be continuous visual motion synchronized to the audio.
 
 ## Output Format
 
@@ -559,7 +561,8 @@ Respond with ONLY a JSON array of effect events. No markdown, no explanation out
 
     sensitivity_text = "\n".join(
         f"- **{effect}**: {level:.1f}" + (
-            " (very aggressive — trigger on nearly every relevant onset, high intensity)" if level >= 0.8
+            " (MAXIMUM — trigger on EVERY SINGLE relevant onset without exception. Every kick, every snare, every hi-hat, every bass note, every synth hit. The result should be overwhelming, relentless, nauseating visual intensity. If you can hear it, it gets an effect. Multiple layered effects per onset. No gaps. No mercy.)" if level >= 0.95
+            else " (very aggressive — trigger on nearly every relevant onset, high intensity, multiple layers on strong hits)" if level >= 0.8
             else " (aggressive — trigger frequently, moderate-high intensity)" if level >= 0.6
             else " (moderate — trigger on clear, distinct onsets)" if level >= 0.4
             else " (conservative — only trigger on strong, obvious moments)" if level >= 0.2
@@ -620,6 +623,232 @@ These sensitivity levels are directives from the user controlling how aggressive
     return events
 
 
+# ─── Layer 3 Rules Mode ─────────────────────────────────────────────────────
+
+def extract_layer3_rules(
+    layer1_data: dict,
+    layer2_data: list[dict],
+    time_offset: float = 0.0,
+    time_limit: float | None = None,
+    creative_direction: str | None = None,
+    sensitivity: dict[str, float] | None = None,
+) -> list[dict]:
+    """Ask Claude to generate effect RULES instead of individual events.
+
+    Claude produces a small set of rules (~15-25) that map stem/band/strength
+    ranges to effects. We then apply those rules programmatically to every onset.
+    """
+    import anthropic
+    import os
+
+    _log("  Layer 3 (rules mode): Claude creative direction...")
+
+    dsp_summary = _format_layer1_for_claude(layer1_data, time_offset, time_limit)
+    gemini_summary = _format_layer2_for_claude(layer2_data)
+
+    sens = dict(DEFAULT_SENSITIVITY)
+    if sensitivity:
+        sens.update(sensitivity)
+
+    sensitivity_text = "\n".join(
+        f"- **{effect}**: {level:.1f}" + (
+            " (MAXIMUM — match the widest possible range of onsets, low thresholds, high intensity)" if level >= 0.95
+            else " (very aggressive — wide matching, high intensity)" if level >= 0.8
+            else " (aggressive — generous matching)" if level >= 0.6
+            else " (moderate — match clear onsets)" if level >= 0.4
+            else " (conservative — only strong onsets)" if level >= 0.2
+            else " (minimal — only the most dramatic moments)"
+        )
+        for effect, level in sens.items()
+    )
+
+    system_prompt = """You are a visual effects director for music videos. You receive detailed audio analysis data and must produce EFFECT RULES — not individual events.
+
+Your rules will be applied programmatically to EVERY onset in the DSP data. This guarantees complete coverage across all pattern repetitions with zero gaps.
+
+## Available Effects
+
+- **zoom_pulse**: Gentle zoom in/out. Good for melodic hits, bass notes.
+- **zoom_bounce**: Aggressive zoom. Good for bass drops, heavy kicks.
+- **shake_x**: Horizontal camera shake. Good for snare hits.
+- **shake_y**: Vertical camera shake. Good for kick drums, sub-bass.
+- **flash**: Brightness flash. Good for hi-hats, cymbals.
+- **hard_cut**: Extreme brightness spike. Good for massive drops, climactic moments.
+- **contrast_pop**: Contrast boost. Good for synth stabs, melodic accents.
+- **glow_swell**: Soft glow bloom. Good for sustained pads, ambient textures.
+
+## Rule Schema
+
+Each rule specifies: which onsets to match → what effect to apply.
+
+```json
+{
+  "stem": "drums",
+  "band": "low",
+  "min_strength": 0.1,
+  "max_strength": 1.0,
+  "effect": "shake_y",
+  "intensity_scale": 0.8,
+  "duration": 0.2,
+  "sustain_from_rms": false,
+  "layer_with": [],
+  "layer_threshold": 0.7,
+  "rationale": "every kick drum hit gets vertical shake"
+}
+```
+
+### Rule fields:
+
+- **stem**: "drums", "bass", "vocals", "other"
+- **band**: "low", "mid", "high", "full" (which frequency band's onsets to match)
+- **min_strength**: Minimum onset strength to trigger (0.0-1.0). Lower = more triggers.
+- **max_strength**: Maximum onset strength (for targeting specific ranges, e.g. just ghost notes)
+- **effect**: The primary effect to apply
+- **intensity_scale**: Multiply the onset's strength by this to get effect intensity. 1.0 = onset strength IS effect intensity. 1.5 = amplify weak onsets.
+- **duration**: Base duration in seconds. Transients: 0.1-0.3s. Sustained: 0.5-2.0s.
+- **sustain_from_rms**: If true, when the onset falls within a sustained_region, extend duration to match the region's duration. Great for held chords, pad swells.
+- **layer_with**: Array of additional effects to fire simultaneously when this rule triggers. E.g., ["zoom_bounce"] means the primary effect + zoom_bounce both fire.
+- **layer_threshold**: Only apply layer_with effects when onset strength exceeds this. Prevents layering on weak hits.
+- **rationale**: Why this rule exists.
+
+## Guidelines
+
+1. **Cover every audible element**: Create rules for kicks, snares, hi-hats, bass notes, synth stabs, pads, vocals — everything that makes sound should have at least one rule.
+2. **Use frequency bands for instrument separation**: drums/low = kicks, drums/mid = snares/toms, drums/high = hi-hats/cymbals. bass/low = sub-bass. other/mid = synth stabs. other/high = arpeggios/leads.
+3. **Layer on big hits**: Use layer_with + layer_threshold to stack effects on strong onsets without cluttering weak ones.
+4. **Sustained sounds**: Use sustain_from_rms=true for pads, held synths, vocal notes. This makes glow/zoom hold for the natural duration.
+5. **Sensitivity settings control how aggressive each effect is**: Higher sensitivity = lower min_strength thresholds, higher intensity_scale.
+6. **Aim for 15-30 rules** that collectively cover the full sonic landscape. Quality over quantity — each rule should have a clear musical purpose.
+
+## Output Format
+
+Respond with ONLY a JSON array of rules. No markdown, no explanation outside the JSON."""
+
+    user_prompt = f"""# Audio Analysis Data
+
+{dsp_summary}
+
+{gemini_summary}
+
+## Effect Sensitivity Settings
+
+{sensitivity_text}
+
+"""
+    if creative_direction:
+        user_prompt += f"\n## Creative Direction\n{creative_direction}\n"
+
+    user_prompt += "\nGenerate the effect rules JSON."
+
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+    _log("    Sending to Claude (streaming)...")
+    text = ""
+    with client.messages.stream(
+        model="claude-sonnet-4-20250514",
+        max_tokens=8192,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_prompt}],
+    ) as stream:
+        for chunk in stream.text_stream:
+            text += chunk
+
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+    if text.endswith("```"):
+        text = text[:-3]
+
+    try:
+        rules = json.loads(text.strip())
+    except json.JSONDecodeError as e:
+        _log(f"    Failed to parse Claude response: {e}")
+        _log(f"    Response: {text[:500]}")
+        rules = []
+
+    _log(f"    Claude produced {len(rules)} effect rules")
+    return rules
+
+
+def apply_rules(layer1_data: dict, rules: list[dict]) -> list[dict]:
+    """Apply effect rules to all DSP onsets, producing frame-accurate events.
+
+    This is the deterministic step — every onset that matches a rule gets an effect.
+    Guarantees complete coverage across all pattern repetitions.
+    """
+    _log("  Applying rules to DSP data...")
+    events = []
+
+    for rule in rules:
+        stem = rule.get("stem", "drums")
+        band = rule.get("band", "full")
+        min_str = rule.get("min_strength", 0.0)
+        max_str = rule.get("max_strength", 1.0)
+        effect = rule.get("effect", "shake_y")
+        intensity_scale = rule.get("intensity_scale", 1.0)
+        duration = rule.get("duration", 0.2)
+        sustain_from_rms = rule.get("sustain_from_rms", False)
+        layer_with = rule.get("layer_with", [])
+        layer_threshold = rule.get("layer_threshold", 0.7)
+
+        stem_data = layer1_data.get(stem, {})
+        band_data = stem_data.get(band, {})
+        onsets = band_data.get("onsets", [])
+        sustained_regions = band_data.get("sustained_regions", [])
+
+        matched = 0
+        for onset in onsets:
+            strength = onset.get("strength", 0)
+            if strength < min_str or strength > max_str:
+                continue
+
+            t = onset["time"]
+            intensity = min(1.0, strength * intensity_scale)
+            evt_duration = duration
+            sustain = None
+
+            # Check for sustained region overlap
+            if sustain_from_rms:
+                for region in sustained_regions:
+                    if region["start_time"] <= t <= region["end_time"]:
+                        sustain = region["duration"]
+                        evt_duration = max(duration, region["duration"])
+                        break
+
+            events.append({
+                "time": t,
+                "duration": evt_duration,
+                "effect": effect,
+                "intensity": intensity,
+                "sustain": sustain,
+                "stem_source": f"{stem}/{band}",
+                "rationale": rule.get("rationale", ""),
+            })
+            matched += 1
+
+            # Layered effects on strong hits
+            if layer_with and strength >= layer_threshold:
+                for layer_effect in layer_with:
+                    events.append({
+                        "time": t,
+                        "duration": evt_duration,
+                        "effect": layer_effect,
+                        "intensity": min(1.0, intensity * 0.8),
+                        "sustain": sustain,
+                        "stem_source": f"{stem}/{band}",
+                        "rationale": f"layered with {effect} on strong hit",
+                    })
+
+        _log(f"    Rule '{effect}' on {stem}/{band} [{min_str:.2f}-{max_str:.2f}]: {matched} events")
+
+    # Sort by time
+    events.sort(key=lambda e: e["time"])
+    _log(f"  Total effect events: {len(events)}")
+    return events
+
+
 # ─── Full Pipeline ──────────────────────────────────────────────────────────
 
 def run_audio_intelligence(
@@ -632,6 +861,7 @@ def run_audio_intelligence(
     fps: float = 24.0,
     descriptions_md: str | None = None,
     sensitivity: dict[str, float] | None = None,
+    rules_mode: bool = False,
 ) -> dict:
     """Run the full 3-layer audio intelligence pipeline.
 
@@ -658,14 +888,26 @@ def run_audio_intelligence(
 
     # Layer 3: Claude
     duration = librosa.get_duration(path=audio_path, sr=sr)
-    layer3 = extract_layer3(
-        layer1, layer2,
-        time_offset=0.0,
-        time_limit=duration,
-        creative_direction=creative_direction,
-        fps=fps,
-        sensitivity=sensitivity,
-    )
+
+    if rules_mode:
+        rules = extract_layer3_rules(
+            layer1, layer2,
+            time_offset=0.0,
+            time_limit=duration,
+            creative_direction=creative_direction,
+            sensitivity=sensitivity,
+        )
+        layer3 = apply_rules(layer1, rules)
+    else:
+        rules = None
+        layer3 = extract_layer3(
+            layer1, layer2,
+            time_offset=0.0,
+            time_limit=duration,
+            creative_direction=creative_direction,
+            fps=fps,
+            sensitivity=sensitivity,
+        )
 
     result = {
         "layer1_summary": {
@@ -680,6 +922,7 @@ def run_audio_intelligence(
         },
         "layer2_chunks": len(layer2),
         "layer3_events": layer3,
+        **({"layer3_rules": rules} if rules else {}),
         "layer1": layer1,
         "layer2": layer2,
     }
