@@ -30,17 +30,21 @@ Full Mix Audio
   │
   ├──[MDX23C-InstVoc-HQ]──→ vocals, instrumental
   │                            │
-  │                            └── vocals → vocal onset detection + presence regions
-  │
-  ├──[MDX23C-DrumSep]─────→ kick, snare, toms, hh, ride, crash
+  │                            ├── vocals → vocal onset detection + presence regions + confidence ratio
   │                            │
-  │                            └── per-drum onset detection (no frequency-band hack needed)
+  │                            └── instrumental ──[MDX23C-DrumSep]──→ kick, snare, toms, hh, ride, crash
+  │                                                                    │
+  │                                                                    └── per-drum onset detection
+  │                                                                        (no vocal bleed — DrumSep
+  │                                                                         runs on pre-cleaned instrumental)
   │
   └──[Demucs htdemucs_6s]──→ vocals*, drums*, bass, guitar, piano, other
                                │
                                └── bass, guitar, piano, other → onset detection + sustained regions
                                    (vocals* and drums* discarded — MDX23C versions are cleaner)
 ```
+
+**Key pipeline ordering**: DrumSep runs on the **instrumental output** from MDX23C-InstVoc, NOT on the full mix. This eliminates vocal bleed in the drum stems — vocals are already stripped before drum decomposition begins. This was discovered during benchmarking when DrumSep on the full mix produced drum stems contaminated with vocal transients (each syllable triggered false drum onsets).
 
 ### Why This Combination
 
@@ -74,16 +78,20 @@ Applied to all non-vocal stems: if a stem's RMS energy at onset time is <15% of 
 
 ## Implementation
 
-### Step 1: Run all three models in parallel
+### Step 1: Run MDX23C-InstVoc first, then DrumSep + Demucs 6s in parallel
+
+DrumSep depends on InstVoc's instrumental output (to avoid vocal bleed in drum stems).
+Demucs 6s has no dependencies and can run in parallel with DrumSep.
 
 ```python
-# All three can run simultaneously — no dependencies between them
-with ThreadPoolExecutor(max_workers=3) as executor:
-    fut_instvoc = executor.submit(run_mdx23c_instvoc, audio_path)
-    fut_drumsep = executor.submit(run_mdx23c_drumsep, audio_path)
+# Step 1a: InstVoc must run first
+instvoc_stems = run_mdx23c_instvoc(audio_path)  # vocals, instrumental
+
+# Step 1b: DrumSep on instrumental + Demucs 6s on full mix — in parallel
+with ThreadPoolExecutor(max_workers=2) as executor:
+    fut_drumsep = executor.submit(run_mdx23c_drumsep, instvoc_stems["instrumental"])
     fut_demucs = executor.submit(run_demucs_6s, audio_path)
 
-    instvoc_stems = fut_instvoc.result()   # vocals, instrumental
     drumsep_stems = fut_drumsep.result()   # kick, snare, toms, hh, ride, crash
     demucs_stems = fut_demucs.result()     # vocals*, drums*, bass, guitar, piano, other
 ```
