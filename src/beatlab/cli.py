@@ -1307,6 +1307,7 @@ def server(port: int, host: str, work_dir: str):
 @click.option("--rules/--no-rules", default=True, help="Use rules mode (Claude generates rules, applied programmatically) vs direct event mode (default: rules)")
 @click.option("--chunked/--no-chunked", default=True, help="Generate per-section rules based on energy (uses descriptions.md sections). Requires --rules (default: on)")
 @click.option("--vocal-bleed-threshold", default=0.15, type=float, help="Suppress non-vocal onsets when stem energy < this ratio of vocal energy (0.0 to disable, default: 0.15)")
+@click.option("--stats/--no-stats", default=False, help="Send statistical summaries to Claude instead of individual onsets (compact, fits full tracks)")
 def audio_intelligence(video_file: str, work_dir: str, output: str | None,
                        chunk_duration: float, creative_direction: str | None,
                        fps: float | None, sr: int, descriptions: str | None,
@@ -1315,7 +1316,7 @@ def audio_intelligence(video_file: str, work_dir: str, output: str | None,
                        sens_flash: float, sens_hard_cut: float,
                        sens_contrast_pop: float, sens_glow_swell: float,
                        sens_all: float | None, rules: bool, chunked: bool,
-                       vocal_bleed_threshold: float):
+                       vocal_bleed_threshold: float, stats: bool):
     """Run multi-layer audio intelligence pipeline (DSP + Gemini + Claude).
 
     Requires cached stems in work dir. Run 'beatlab analyze --stems' first.
@@ -1381,6 +1382,7 @@ def audio_intelligence(video_file: str, work_dir: str, output: str | None,
         rules_mode=rules,
         chunked=chunked and rules,
         vocal_bleed_threshold=vocal_bleed_threshold,
+        stats_mode=stats,
     )
 
     _log(f"  {len(result['layer3_events'])} effect events generated")

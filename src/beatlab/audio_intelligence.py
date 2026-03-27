@@ -413,8 +413,14 @@ def _format_layer1_for_claude(layer1_data: dict, time_offset: float = 0.0,
             if time_limit is not None:
                 onsets = [o for o in onsets if time_offset <= o["time"] < time_offset + time_limit]
 
-            # Top onsets by strength (max 80 per band — Claude needs dense data for aggressive coverage)
-            top_onsets = sorted(onsets, key=lambda o: o["strength"], reverse=True)[:80]
+            # Representative sample of onsets — evenly spaced across the strength range
+            # so Claude sees strong, medium, and weak onsets for each stem/band
+            if len(onsets) <= 30:
+                top_onsets = onsets
+            else:
+                sorted_by_strength = sorted(onsets, key=lambda o: o["strength"])
+                step = max(1, len(sorted_by_strength) // 30)
+                top_onsets = sorted_by_strength[::step][:30]
             top_onsets.sort(key=lambda o: o["time"])
 
             # Sustained regions in window
@@ -440,6 +446,140 @@ def _format_layer1_for_claude(layer1_data: dict, time_offset: float = 0.0,
             if spectral:
                 lines.append(f"Spectral: centroid={spectral.get('centroid_mean', 0):.0f}Hz, "
                              f"flux={spectral.get('flux_mean', 0):.2f}")
+
+    return "\n".join(lines)
+
+
+def _compute_stem_stats(layer1_data: dict, time_offset: float = 0.0,
+                         time_limit: float | None = None) -> dict:
+    """Compute statistical summary per stem/band for compact Claude prompts."""
+    import librosa
+
+    stats = {}
+    for stem_name, bands in layer1_data.items():
+        stem_stats = {}
+        for band_name, data in bands.items():
+            onsets = data.get("onsets", [])
+            if time_limit is not None:
+                onsets = [o for o in onsets if time_offset <= o["time"] < time_offset + time_limit]
+
+            sustained = data.get("sustained_regions", [])
+            if time_limit is not None:
+                sustained = [s for s in sustained
+                             if s["start_time"] < time_offset + time_limit and s["end_time"] > time_offset]
+
+            rms_env = data.get("rms_envelope", [])
+            if time_limit is not None:
+                rms_env = [r for r in rms_env if time_offset <= r["time"] < time_offset + time_limit]
+
+            spectral = data.get("spectral", {})
+
+            s = {}
+
+            # Onset stats
+            strengths = np.array([o["strength"] for o in onsets]) if onsets else np.array([])
+            s["onset_count"] = len(onsets)
+
+            if len(strengths) > 0:
+                s["strength_min"] = float(np.min(strengths))
+                s["strength_max"] = float(np.max(strengths))
+                s["strength_mean"] = float(np.mean(strengths))
+                s["strength_median"] = float(np.median(strengths))
+                s["strength_std"] = float(np.std(strengths))
+                for p in [10, 25, 75, 90, 95]:
+                    s[f"strength_p{p}"] = float(np.percentile(strengths, p))
+
+                # Density
+                duration = time_limit or (onsets[-1]["time"] - onsets[0]["time"]) if len(onsets) > 1 else 1.0
+                s["density_per_sec"] = len(onsets) / max(duration, 1.0)
+
+                # Interval stats (temporal regularity)
+                if len(onsets) >= 2:
+                    times = np.array([o["time"] for o in onsets])
+                    intervals = np.diff(times)
+                    s["interval_mean_ms"] = float(np.mean(intervals) * 1000)
+                    s["interval_median_ms"] = float(np.median(intervals) * 1000)
+                    s["interval_min_ms"] = float(np.min(intervals) * 1000)
+                    s["interval_max_ms"] = float(np.max(intervals) * 1000)
+                    s["interval_std_ms"] = float(np.std(intervals) * 1000)
+                    s["regularity"] = 1.0 - min(1.0, float(np.std(intervals) / np.mean(intervals))) if np.mean(intervals) > 0 else 0.0
+            else:
+                s["strength_min"] = s["strength_max"] = s["strength_mean"] = s["strength_median"] = s["strength_std"] = 0.0
+                s["density_per_sec"] = 0.0
+
+            # Sustained stats
+            s["sustained_count"] = len(sustained)
+            if sustained:
+                durations = [r["duration"] for r in sustained]
+                s["sustained_avg_duration"] = float(np.mean(durations))
+                s["sustained_max_duration"] = float(np.max(durations))
+                total_sustained = sum(durations)
+                track_dur = time_limit or 120.0
+                s["sustained_pct"] = min(100.0, total_sustained / track_dur * 100)
+            else:
+                s["sustained_avg_duration"] = 0.0
+                s["sustained_max_duration"] = 0.0
+                s["sustained_pct"] = 0.0
+
+            # RMS / loudness stats
+            if rms_env:
+                energies = np.array([r["energy"] for r in rms_env])
+                s["rms_mean"] = float(np.mean(energies))
+                s["rms_max"] = float(np.max(energies))
+                s["rms_min"] = float(np.min(energies))
+                s["dynamic_range"] = float(np.max(energies) - np.min(energies))
+            else:
+                s["rms_mean"] = s["rms_max"] = s["rms_min"] = s["dynamic_range"] = 0.0
+
+            # Spectral
+            s["spectral_centroid"] = spectral.get("centroid_mean", 0.0)
+            s["spectral_flux"] = spectral.get("flux_mean", 0.0)
+            s["spectral_rolloff"] = spectral.get("rolloff_mean", 0.0)
+
+            stem_stats[band_name] = s
+        stats[stem_name] = stem_stats
+    return stats
+
+
+def _format_stats_for_claude(stats: dict) -> str:
+    """Format statistical summary for Claude prompt — compact and information-dense."""
+    lines = []
+
+    for stem_name, bands in stats.items():
+        lines.append(f"\n## Stem: {stem_name}")
+
+        for band_name, s in bands.items():
+            if s["onset_count"] == 0 and s["sustained_count"] == 0:
+                continue
+
+            lines.append(f"\n### {stem_name}/{band_name}")
+            lines.append(f"Onsets: {s['onset_count']} | Density: {s['density_per_sec']:.2f}/sec")
+
+            if s["onset_count"] > 0:
+                lines.append(
+                    f"Strength: min={s['strength_min']:.2f} p10={s.get('strength_p10', 0):.2f} "
+                    f"p25={s.get('strength_p25', 0):.2f} median={s['strength_median']:.2f} "
+                    f"p75={s.get('strength_p75', 0):.2f} p90={s.get('strength_p90', 0):.2f} "
+                    f"p95={s.get('strength_p95', 0):.2f} max={s['strength_max']:.2f} std={s['strength_std']:.2f}"
+                )
+
+                if "interval_mean_ms" in s:
+                    lines.append(
+                        f"Intervals: mean={s['interval_mean_ms']:.0f}ms median={s['interval_median_ms']:.0f}ms "
+                        f"min={s['interval_min_ms']:.0f}ms max={s['interval_max_ms']:.0f}ms | "
+                        f"Regularity: {s.get('regularity', 0):.2f}"
+                    )
+
+            if s["sustained_count"] > 0:
+                lines.append(
+                    f"Sustained: {s['sustained_count']} regions, avg={s['sustained_avg_duration']:.1f}s "
+                    f"max={s['sustained_max_duration']:.1f}s ({s['sustained_pct']:.0f}% of track)"
+                )
+
+            lines.append(
+                f"Energy: mean={s['rms_mean']:.3f} max={s['rms_max']:.3f} range={s['dynamic_range']:.3f} | "
+                f"Spectral: centroid={s['spectral_centroid']:.0f}Hz flux={s['spectral_flux']:.2f}"
+            )
 
     return "\n".join(lines)
 
@@ -639,18 +779,26 @@ def extract_layer3_rules(
     time_limit: float | None = None,
     creative_direction: str | None = None,
     sensitivity: dict[str, float] | None = None,
+    stats_mode: bool = False,
 ) -> list[dict]:
     """Ask Claude to generate effect RULES instead of individual events.
 
     Claude produces a small set of rules (~15-25) that map stem/band/strength
     ranges to effects. We then apply those rules programmatically to every onset.
+
+    If stats_mode=True, sends statistical summaries instead of individual onset
+    timestamps — much more compact, fits full 35m tracks in one call.
     """
     import anthropic
     import os
 
-    _log("  Layer 3 (rules mode): Claude creative direction...")
+    _log(f"  Layer 3 (rules mode, {'stats' if stats_mode else 'onsets'}): Claude creative direction...")
 
-    dsp_summary = _format_layer1_for_claude(layer1_data, time_offset, time_limit)
+    if stats_mode:
+        stem_stats = _compute_stem_stats(layer1_data, time_offset, time_limit)
+        dsp_summary = _format_stats_for_claude(stem_stats)
+    else:
+        dsp_summary = _format_layer1_for_claude(layer1_data, time_offset, time_limit)
     gemini_summary = _format_layer2_for_claude(layer2_data)
 
     sens = dict(DEFAULT_SENSITIVITY)
@@ -1184,6 +1332,7 @@ def run_audio_intelligence(
     rules_mode: bool = False,
     chunked: bool = False,
     vocal_bleed_threshold: float = 0.15,
+    stats_mode: bool = False,
 ) -> dict:
     """Run the full 3-layer audio intelligence pipeline.
 
@@ -1225,6 +1374,7 @@ def run_audio_intelligence(
             time_limit=duration,
             creative_direction=creative_direction,
             sensitivity=sensitivity,
+            stats_mode=stats_mode,
         )
         layer3 = apply_rules(layer1, rules, vocal_bleed_threshold=vocal_bleed_threshold)
     else:
