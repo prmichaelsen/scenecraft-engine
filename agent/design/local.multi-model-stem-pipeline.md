@@ -144,6 +144,19 @@ Same rules-based approach, but Claude now sees 11 named instrument stems instead
 
 ---
 
+## Render Comparison (9-11m test clip)
+
+| Version | File | Events | Pipeline | Verdict |
+|---|---|---|---|---|
+| final (fallback) | `effects_ai_9_11m_final.mp4` | ~1800 | Demucs 4-stem + freq bands + onset-based rules | Best pre-multi-model result |
+| new_pipeline_v2 | `effects_ai_9_11m_new_pipeline_v2.mp4` | 2059 | Multi-model (InstVoc→DrumSep+Demucs6s) + onset-based rules + vocal bleed + percussion sustain suppression | "Clean as fuck" — best overall so far |
+| drumsep (full mix) | `effects_ai_9_11m_drumsep.mp4` | 1911 | DrumSep on full mix (not instrumental) | Worse — vocal artifacts in drum stems |
+| stats-only | `effects_ai_9_11m_stats.mp4` | 3806 | Multi-model + stats-only Claude prompt | "More precise but less dynamic" |
+| hybrid | `effects_ai_9_11m_hybrid.mp4` | 3067 | Multi-model + hybrid stats+curve-simplified onsets | TBD — comparing now |
+| chunked (full track) | `google_muxed_effects_final.mp4` | 8566 | 27 chunks, per-section rules | Very sparse, underwhelming — chunking kills intensity |
+
+**Current best**: `new_pipeline_v2` — multi-model stems from InstVoc instrumental, onset-based rules, no chunking, vocal bleed suppression, percussion sustained-region suppression, no hard_cut, flash→contrast_pop.
+
 ## Fallback
 
 If the multi-model pipeline does not improve results, the proven fallback is:
