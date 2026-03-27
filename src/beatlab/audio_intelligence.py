@@ -498,7 +498,7 @@ def _estimate_tokens(text: str) -> int:
 
 def _format_hybrid_for_claude(layer1_data: dict, stats: dict, layer2_data: list[dict],
                                 time_offset: float = 0.0, time_limit: float | None = None,
-                                max_tokens: int = 150000) -> str:
+                                max_tokens: int = 100000) -> str:
     """Format stats + simplified onset curves, fitting within token budget.
 
     Strategy:
