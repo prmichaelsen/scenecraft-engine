@@ -261,11 +261,10 @@ def apply_effects(
     elapsed = time.time() - start_time
     _log(f"  Effects applied in {elapsed:.0f}s ({frame_num / elapsed:.0f} fps)")
 
-    # Re-encode with ffmpeg — prefer NVENC (GPU) with libx264 fallback
+    # Re-encode with ffmpeg
     import subprocess
 
     def _try_nvenc():
-        """Check if NVENC is available."""
         try:
             result = subprocess.run(
                 ["ffmpeg", "-hide_banner", "-encoders"],
@@ -275,11 +274,16 @@ def apply_effects(
         except Exception:
             return False
 
-    has_nvenc = _try_nvenc()
-    encoder = "h264_nvenc" if has_nvenc else "libx264"
-    encode_opts = ["-preset", "p4", "-rc", "vbr", "-cq", "18"] if has_nvenc else ["-preset", "fast", "-crf", "18"]
+    is_preview = locals().get("preview", False)
+    if is_preview:
+        encoder = "libx264"
+        encode_opts = ["-preset", "ultrafast", "-crf", "28"]
+    else:
+        has_nvenc = _try_nvenc()
+        encoder = "h264_nvenc" if has_nvenc else "libx264"
+        encode_opts = ["-preset", "p4", "-rc", "vbr", "-cq", "18"] if has_nvenc else ["-preset", "fast", "-crf", "18"]
 
-    _log(f"  Re-encoding with {encoder}...")
+    _log(f"  Re-encoding with {encoder}{' (preview)' if is_preview else ''}...")
     cmd = [
         "ffmpeg", "-y",
         "-i", tmp_path,
@@ -304,6 +308,7 @@ def apply_effects_ai(
     fps: float | None = None,
     time_offset: float = 0.0,
     hard_cuts: bool = False,
+    preview: bool = False,
 ) -> str:
     """Apply effects from Layer 3 AI-generated effect events.
 
@@ -315,6 +320,7 @@ def apply_effects_ai(
         effect_events: List of effect events from audio_intelligence Layer 3.
         fps: Override frame rate.
         time_offset: Offset added to event times (for clips trimmed from a longer video).
+        preview: Half resolution + ultrafast encode for quick previews.
 
     Returns:
         output_path
@@ -325,7 +331,13 @@ def apply_effects_ai(
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    _log(f"Applying AI-directed effects: {total_frames} frames, {w}x{h} @ {video_fps}fps")
+    # Preview mode: half resolution
+    if preview:
+        w = w // 2
+        h = h // 2
+        _log(f"Applying AI-directed effects (PREVIEW): {total_frames} frames, {w}x{h} @ {video_fps}fps")
+    else:
+        _log(f"Applying AI-directed effects: {total_frames} frames, {w}x{h} @ {video_fps}fps")
     _log(f"  {len(effect_events)} effect events")
 
     # Pre-sort events by time, filter hard_cuts if disabled
@@ -381,6 +393,9 @@ def apply_effects_ai(
         ret, frame = cap.read()
         if not ret:
             break
+
+        if preview:
+            frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
 
         t = frame_num / video_fps
 
@@ -481,11 +496,10 @@ def apply_effects_ai(
     elapsed = time.time() - start_time
     _log(f"  Effects applied in {elapsed:.0f}s ({frame_num / elapsed:.0f} fps)")
 
-    # Re-encode with ffmpeg — prefer NVENC (GPU) with libx264 fallback
+    # Re-encode with ffmpeg
     import subprocess
 
     def _try_nvenc():
-        """Check if NVENC is available."""
         try:
             result = subprocess.run(
                 ["ffmpeg", "-hide_banner", "-encoders"],
@@ -495,11 +509,16 @@ def apply_effects_ai(
         except Exception:
             return False
 
-    has_nvenc = _try_nvenc()
-    encoder = "h264_nvenc" if has_nvenc else "libx264"
-    encode_opts = ["-preset", "p4", "-rc", "vbr", "-cq", "18"] if has_nvenc else ["-preset", "fast", "-crf", "18"]
+    is_preview = locals().get("preview", False)
+    if is_preview:
+        encoder = "libx264"
+        encode_opts = ["-preset", "ultrafast", "-crf", "28"]
+    else:
+        has_nvenc = _try_nvenc()
+        encoder = "h264_nvenc" if has_nvenc else "libx264"
+        encode_opts = ["-preset", "p4", "-rc", "vbr", "-cq", "18"] if has_nvenc else ["-preset", "fast", "-crf", "18"]
 
-    _log(f"  Re-encoding with {encoder}...")
+    _log(f"  Re-encoding with {encoder}{' (preview)' if is_preview else ''}...")
     cmd = [
         "ffmpeg", "-y",
         "-i", tmp_path,
