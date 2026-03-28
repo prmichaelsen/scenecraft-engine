@@ -34,6 +34,16 @@ def make_handler(work_dir: Path):
             if path == "/api/projects":
                 return self._handle_list_projects()
 
+            # GET /api/browse?path=subdir (browse .beatlab_work root)
+            if path == "/api/browse":
+                query = parsed.query
+                subpath = ""
+                if query:
+                    for param in query.split("&"):
+                        if param.startswith("path="):
+                            subpath = unquote(param[5:])
+                return self._handle_browse(subpath)
+
             # GET /api/projects/:name/keyframes
             m = re.match(r"^/api/projects/([^/]+)/keyframes$", path)
             if m:
@@ -159,6 +169,33 @@ def make_handler(work_dir: Path):
             self.end_headers()
 
         # ── Handlers ─────────────────────────────────────────────
+
+        def _handle_browse(self, subpath: str):
+            """GET /api/browse?path=subdir — browse .beatlab_work directory tree."""
+            target = (work_dir / subpath).resolve() if subpath else work_dir.resolve()
+
+            if not str(target).startswith(str(work_dir.resolve())):
+                return self._error(403, "FORBIDDEN", "Path traversal denied")
+
+            if not target.is_dir():
+                return self._error(404, "NOT_FOUND", f"Directory not found: {subpath or '/'}")
+
+            entries = []
+            for entry in sorted(target.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
+                rel = str(entry.resolve().relative_to(work_dir.resolve()))
+                info = {"name": entry.name, "path": rel, "isDirectory": entry.is_dir()}
+                if not entry.is_dir():
+                    ext = entry.suffix.lower()
+                    info["size"] = entry.stat().st_size
+                    if ext in ('.png', '.jpg', '.jpeg', '.webp'):
+                        info["type"] = "image"
+                    elif ext in ('.mp4', '.webm', '.mov'):
+                        info["type"] = "video"
+                    else:
+                        info["type"] = "other"
+                entries.append(info)
+
+            self._json_response({"path": subpath or "", "entries": entries})
 
         def _handle_list_projects(self):
             """GET /api/projects — list all projects in work dir."""
@@ -930,7 +967,10 @@ def make_handler(work_dir: Path):
             if not source_path:
                 return self._error(400, "BAD_REQUEST", "Missing 'sourcePath'")
 
+            # Support both absolute paths and paths relative to work_dir
             source = Path(source_path)
+            if not source.is_absolute():
+                source = (work_dir / source_path).resolve()
             if not source.exists():
                 return self._error(404, "NOT_FOUND", f"Source path not found: {source_path}")
 
