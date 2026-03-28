@@ -161,6 +161,16 @@ def make_handler(work_dir: Path):
             if m:
                 return self._handle_import(m.group(1))
 
+            # POST /api/projects/:name/watch-folder
+            m = re.match(r"^/api/projects/([^/]+)/watch-folder$", path)
+            if m:
+                return self._handle_watch_folder(m.group(1))
+
+            # POST /api/projects/:name/unwatch-folder
+            m = re.match(r"^/api/projects/([^/]+)/unwatch-folder$", path)
+            if m:
+                return self._handle_unwatch_folder(m.group(1))
+
             self._error(404, "NOT_FOUND", f"No route: POST {path}")
 
         def do_HEAD(self):
@@ -993,6 +1003,41 @@ def make_handler(work_dir: Path):
             except Exception as e:
                 self._error(500, "INTERNAL_ERROR", str(e))
 
+        def _handle_watch_folder(self, project_name: str):
+            """POST /api/projects/:name/watch-folder — start watching a folder for auto-import."""
+            body = self._read_json_body()
+            if body is None:
+                return
+
+            folder_path = body.get("folderPath")
+            if not folder_path:
+                return self._error(400, "BAD_REQUEST", "Missing 'folderPath'")
+
+            from beatlab.ws_server import folder_watcher
+            if not folder_watcher:
+                return self._error(500, "INTERNAL_ERROR", "Folder watcher not initialized")
+
+            try:
+                result = folder_watcher.add_watch(project_name, folder_path)
+                self._json_response({"success": True, **result})
+            except Exception as e:
+                self._error(400, "BAD_REQUEST", str(e))
+
+        def _handle_unwatch_folder(self, project_name: str):
+            """POST /api/projects/:name/unwatch-folder — stop watching a folder."""
+            body = self._read_json_body()
+            if body is None:
+                return
+
+            folder_path = body.get("folderPath")
+            if not folder_path:
+                return self._error(400, "BAD_REQUEST", "Missing 'folderPath'")
+
+            from beatlab.ws_server import folder_watcher
+            if folder_watcher:
+                folder_watcher.remove_watch(project_name, folder_path)
+            self._json_response({"success": True})
+
         def _handle_import(self, project_name: str):
             """POST /api/projects/:name/import — bulk import images as keyframes and videos as transitions.
 
@@ -1289,7 +1334,9 @@ def run_server(host: str = "0.0.0.0", port: int = 8888, work_dir: str | None = N
 
     # Start WebSocket server for real-time job progress
     ws_port = port + 1
-    from beatlab.ws_server import start_ws_server
+    from beatlab.ws_server import start_ws_server, FolderWatcher
+    import beatlab.ws_server as _ws_mod
+    _ws_mod.folder_watcher = FolderWatcher(wd)
     start_ws_server(host, ws_port)
 
     _log(f"SceneCraft API server running at http://{host}:{port}")
