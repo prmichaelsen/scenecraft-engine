@@ -1299,7 +1299,8 @@ def apply_rules_in_range(layer1_data: dict, rules: list[dict],
             evt_duration = duration
             sustain = None
 
-            if sustain_from_rms:
+            TRANSIENT_EFFECTS = {"shake_x", "shake_y", "flash", "hard_cut"}
+            if sustain_from_rms and effect not in TRANSIENT_EFFECTS:
                 for region in sustained_regions:
                     if region["start_time"] <= t <= region["end_time"]:
                         sustain = region["duration"]
