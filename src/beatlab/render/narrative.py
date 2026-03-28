@@ -1078,6 +1078,7 @@ def apply_transition_selection(yaml_path: str, selections: dict[str, int]) -> No
     selected_dir.mkdir(parents=True, exist_ok=True)
 
     tr_candidates_dir = work_dir / "transition_candidates"
+    tr_by_id = {tr["id"]: tr for tr in data["transitions"]}
 
     for key, variant in selections.items():
         # key is like "tr_001_slot_0" or "tr_001" (shorthand for slot_0)
@@ -1096,6 +1097,13 @@ def apply_transition_selection(yaml_path: str, selections: dict[str, int]) -> No
         dest = selected_dir / f"{tr_id}_slot_{slot_idx}.mp4"
         shutil.copy2(str(source), str(dest))
         _log(f"  {key}: selected v{variant} -> {dest}")
+
+        # Record selection in the transition entry
+        tr = tr_by_id.get(tr_id)
+        if tr:
+            if "selected_variants" not in tr:
+                tr["selected_variants"] = {}
+            tr["selected_variants"][f"slot_{slot_idx}"] = variant
 
     save_narrative(data, yaml_path)
     _log("Transition selections applied.")
