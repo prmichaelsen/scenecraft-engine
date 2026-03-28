@@ -1323,6 +1323,26 @@ def apply_rules_in_range(layer1_data: dict, rules: list[dict],
                     if ratio < vocal_bleed_threshold:
                         continue
 
+            # Percussion cross-stem bleed (same as apply_rules)
+            PERC_STEMS = {"kick", "snare", "hh", "toms", "ride", "crash", "drums"}
+            MELODIC_STEMS = {"vocals", "bass", "piano", "guitar", "other"}
+            if bleed_enabled and stem in PERC_STEMS:
+                s_energy = stem_rms(t)
+                is_bleed = False
+                for mel_stem in MELODIC_STEMS:
+                    mel_rms_env = layer1_data.get(mel_stem, {}).get("full", {}).get("rms_envelope", [])
+                    if not mel_rms_env:
+                        continue
+                    mel_lookup = _build_rms_lookup(mel_rms_env)
+                    mel_energy = mel_lookup(t)
+                    if mel_energy > 0.01 and s_energy > 0:
+                        ratio = s_energy / mel_energy
+                        if ratio < vocal_bleed_threshold:
+                            is_bleed = True
+                            break
+                if is_bleed:
+                    continue
+
             intensity = min(1.0, strength * intensity_scale)
             evt_duration = duration
             sustain = None
