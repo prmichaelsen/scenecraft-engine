@@ -116,6 +116,11 @@ def make_handler(work_dir: Path):
             if m:
                 return self._handle_generate_transition_action(m.group(1))
 
+            # POST /api/projects/:name/generate-transition-candidates
+            m = re.match(r"^/api/projects/([^/]+)/generate-transition-candidates$", path)
+            if m:
+                return self._handle_generate_transition_candidates(m.group(1))
+
             # POST /api/projects/:name/update-meta
             m = re.match(r"^/api/projects/([^/]+)/update-meta$", path)
             if m:
@@ -227,16 +232,39 @@ def make_handler(work_dir: Path):
 
             # Parse transitions
             transitions = []
+            tr_candidates_root = project_dir / "transition_candidates"
             for tr in parsed.get("transitions", []):
+                tr_id = tr.get("id", "")
+                # Scan disk for video candidates per slot
+                slot_candidates = {}
+                tr_dir = tr_candidates_root / tr_id
+                if tr_dir.exists():
+                    for slot_dir in sorted(tr_dir.iterdir()):
+                        if slot_dir.is_dir():
+                            videos = sorted([
+                                f"transition_candidates/{tr_id}/{slot_dir.name}/{f.name}"
+                                for f in slot_dir.glob("v*.mp4")
+                            ])
+                            if videos:
+                                slot_candidates[slot_dir.name] = videos
+
+                # Check for selected transition videos
+                selected_tr_dir = project_dir / "selected_transitions"
+                has_selected_videos = []
+                for slot_idx in range(tr.get("slots", 1)):
+                    sel_path = selected_tr_dir / f"{tr_id}_slot_{slot_idx}.mp4"
+                    has_selected_videos.append(sel_path.exists())
+
                 transitions.append({
-                    "id": tr.get("id", ""),
+                    "id": tr_id,
                     "from": tr.get("from", ""),
                     "to": tr.get("to", ""),
                     "durationSeconds": tr.get("duration_seconds", 0),
                     "slots": tr.get("slots", 1),
                     "action": tr.get("action", ""),
                     "useGlobalPrompt": tr.get("use_global_prompt", True),
-                    "candidates": tr.get("candidates", []),
+                    "candidates": slot_candidates,
+                    "hasSelectedVideos": has_selected_videos,
                     "selected": tr.get("selected", []),
                     "remap": tr.get("remap", {"method": "linear", "target_duration": 0}),
                 })
@@ -674,6 +702,47 @@ def make_handler(work_dir: Path):
                     pyyaml.dump(parsed, f, default_flow_style=False, allow_unicode=True, width=1000)
 
                 self._json_response({"success": True, "action": action})
+            except Exception as e:
+                self._error(500, "INTERNAL_ERROR", str(e))
+
+        def _handle_generate_transition_candidates(self, project_name: str):
+            """POST /api/projects/:name/generate-transition-candidates — generate Veo video candidates for a transition."""
+            body = self._read_json_body()
+            if body is None:
+                return
+
+            tr_id = body.get("transitionId")
+            count = body.get("count")  # optional override for candidates_per_slot
+            if not tr_id:
+                return self._error(400, "BAD_REQUEST", "Missing 'transitionId'")
+
+            yaml_path = work_dir / project_name / "narrative_keyframes.yaml"
+            if not yaml_path.exists():
+                return self._error(404, "NOT_FOUND", "No narrative_keyframes.yaml found")
+
+            try:
+                from beatlab.render.narrative import generate_transition_candidates
+                generate_transition_candidates(
+                    str(yaml_path),
+                    vertex=False,
+                    candidates_per_slot=count,
+                    segment_filter={tr_id},
+                )
+
+                # Return the generated candidate paths
+                project_dir = work_dir / project_name
+                tr_candidates_dir = project_dir / "transition_candidates" / tr_id
+                candidates = {}
+                if tr_candidates_dir.exists():
+                    for slot_dir in sorted(tr_candidates_dir.iterdir()):
+                        if slot_dir.is_dir():
+                            videos = sorted([
+                                f"transition_candidates/{tr_id}/{slot_dir.name}/{f.name}"
+                                for f in slot_dir.glob("v*.mp4")
+                            ])
+                            candidates[slot_dir.name] = videos
+
+                self._json_response({"success": True, "transitionId": tr_id, "candidates": candidates})
             except Exception as e:
                 self._error(500, "INTERNAL_ERROR", str(e))
 
