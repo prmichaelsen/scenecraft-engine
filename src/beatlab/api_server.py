@@ -60,6 +60,11 @@ def make_handler(work_dir: Path):
             if m:
                 return self._handle_get_bin(m.group(1))
 
+            # GET /api/projects/:name/effects
+            m = re.match(r"^/api/projects/([^/]+)/effects$", path)
+            if m:
+                return self._handle_get_effects(m.group(1))
+
             # GET /api/projects/:name/files/(.*)
             m = re.match(r"^/api/projects/([^/]+)/files/(.+)$", path)
             if m:
@@ -130,6 +135,11 @@ def make_handler(work_dir: Path):
             m = re.match(r"^/api/projects/([^/]+)/update-meta$", path)
             if m:
                 return self._handle_update_meta(m.group(1))
+
+            # POST /api/projects/:name/effects (add/update/delete effects)
+            m = re.match(r"^/api/projects/([^/]+)/effects$", path)
+            if m:
+                return self._handle_update_effects(m.group(1))
 
             # POST /api/projects/:name/import
             m = re.match(r"^/api/projects/([^/]+)/import$", path)
@@ -820,6 +830,52 @@ def make_handler(work_dir: Path):
                     pyyaml.dump(parsed, f, default_flow_style=False, allow_unicode=True, width=1000)
 
                 self._json_response({"success": True, "meta": meta})
+            except Exception as e:
+                self._error(500, "INTERNAL_ERROR", str(e))
+
+        def _handle_get_effects(self, project_name: str):
+            """GET /api/projects/:name/effects — load user-authored effects from beats.yaml."""
+            effects_path = work_dir / project_name / "beats.yaml"
+            if not effects_path.exists():
+                return self._json_response({"effects": [], "suppressions": []})
+
+            import yaml as pyyaml
+            with open(effects_path) as f:
+                parsed = pyyaml.safe_load(f) or {}
+
+            self._json_response({
+                "effects": parsed.get("effects", []),
+                "suppressions": parsed.get("suppressions", []),
+            })
+
+        def _handle_update_effects(self, project_name: str):
+            """POST /api/projects/:name/effects — update user-authored effects in beats.yaml.
+
+            Body: { "effects": [...], "suppressions": [...] }
+            Replaces the entire effects file with the provided data.
+            """
+            body = self._read_json_body()
+            if body is None:
+                return
+
+            try:
+                import yaml as pyyaml
+                effects_path = work_dir / project_name / "beats.yaml"
+
+                data = {}
+                if effects_path.exists():
+                    with open(effects_path) as f:
+                        data = pyyaml.safe_load(f) or {}
+
+                if "effects" in body:
+                    data["effects"] = body["effects"]
+                if "suppressions" in body:
+                    data["suppressions"] = body["suppressions"]
+
+                with open(effects_path, "w") as f:
+                    pyyaml.dump(data, f, default_flow_style=False, allow_unicode=True, width=1000)
+
+                self._json_response({"success": True})
             except Exception as e:
                 self._error(500, "INTERNAL_ERROR", str(e))
 
