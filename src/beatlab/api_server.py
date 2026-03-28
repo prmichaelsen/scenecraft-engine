@@ -794,7 +794,7 @@ def make_handler(work_dir: Path):
                 self._error(500, "INTERNAL_ERROR", str(e))
 
         def _handle_generate_keyframe_candidates(self, project_name: str):
-            """POST /api/projects/:name/generate-keyframe-candidates — generate Imagen candidates for a keyframe."""
+            """POST /api/projects/:name/generate-keyframe-candidates — async Imagen generation with WebSocket progress."""
             body = self._read_json_body()
             if body is None:
                 return
@@ -808,37 +808,46 @@ def make_handler(work_dir: Path):
             if not yaml_path.exists():
                 return self._error(404, "NOT_FOUND", "No narrative_keyframes.yaml found")
 
-            try:
-                from beatlab.render.narrative import generate_keyframe_candidates
-                generate_keyframe_candidates(
-                    str(yaml_path),
-                    vertex=False,
-                    candidates_per_slot=count,
-                    segment_filter={kf_id},
-                )
+            from beatlab.ws_server import job_manager
+            n_candidates = count or 4
+            job_id = job_manager.create_job("keyframe_candidates", total=n_candidates, meta={"keyframeId": kf_id, "project": project_name})
 
-                # Return generated candidate paths
-                project_dir = work_dir / project_name
-                candidates_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{kf_id}"
-                candidates = []
-                if candidates_dir.exists():
-                    candidates = sorted([
-                        f"keyframe_candidates/candidates/section_{kf_id}/{f.name}"
-                        for f in candidates_dir.glob("v*.png")
-                    ])
+            def _run():
+                try:
+                    from beatlab.render.narrative import generate_keyframe_candidates
+                    generate_keyframe_candidates(
+                        str(yaml_path),
+                        vertex=False,
+                        candidates_per_slot=count,
+                        segment_filter={kf_id},
+                    )
 
-                self._json_response({"success": True, "keyframeId": kf_id, "candidates": candidates})
-            except Exception as e:
-                self._error(500, "INTERNAL_ERROR", str(e))
+                    # Collect results
+                    project_dir = work_dir / project_name
+                    candidates_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{kf_id}"
+                    candidates = []
+                    if candidates_dir.exists():
+                        candidates = sorted([
+                            f"keyframe_candidates/candidates/section_{kf_id}/{f.name}"
+                            for f in candidates_dir.glob("v*.png")
+                        ])
+
+                    job_manager.complete_job(job_id, {"keyframeId": kf_id, "candidates": candidates})
+                except Exception as e:
+                    job_manager.fail_job(job_id, str(e))
+
+            import threading
+            threading.Thread(target=_run, daemon=True).start()
+            self._json_response({"jobId": job_id, "keyframeId": kf_id})
 
         def _handle_generate_transition_candidates(self, project_name: str):
-            """POST /api/projects/:name/generate-transition-candidates — generate Veo video candidates for a transition."""
+            """POST /api/projects/:name/generate-transition-candidates — async Veo generation with WebSocket progress."""
             body = self._read_json_body()
             if body is None:
                 return
 
             tr_id = body.get("transitionId")
-            count = body.get("count")  # optional override for candidates_per_slot
+            count = body.get("count")
             if not tr_id:
                 return self._error(400, "BAD_REQUEST", "Missing 'transitionId'")
 
@@ -846,31 +855,39 @@ def make_handler(work_dir: Path):
             if not yaml_path.exists():
                 return self._error(404, "NOT_FOUND", "No narrative_keyframes.yaml found")
 
-            try:
-                from beatlab.render.narrative import generate_transition_candidates
-                generate_transition_candidates(
-                    str(yaml_path),
-                    vertex=False,
-                    candidates_per_slot=count,
-                    segment_filter={tr_id},
-                )
+            from beatlab.ws_server import job_manager
+            job_id = job_manager.create_job("transition_candidates", total=0, meta={"transitionId": tr_id, "project": project_name})
 
-                # Return the generated candidate paths
-                project_dir = work_dir / project_name
-                tr_candidates_dir = project_dir / "transition_candidates" / tr_id
-                candidates = {}
-                if tr_candidates_dir.exists():
-                    for slot_dir in sorted(tr_candidates_dir.iterdir()):
-                        if slot_dir.is_dir():
-                            videos = sorted([
-                                f"transition_candidates/{tr_id}/{slot_dir.name}/{f.name}"
-                                for f in slot_dir.glob("v*.mp4")
-                            ])
-                            candidates[slot_dir.name] = videos
+            def _run():
+                try:
+                    from beatlab.render.narrative import generate_transition_candidates
+                    generate_transition_candidates(
+                        str(yaml_path),
+                        vertex=False,
+                        candidates_per_slot=count,
+                        segment_filter={tr_id},
+                    )
 
-                self._json_response({"success": True, "transitionId": tr_id, "candidates": candidates})
-            except Exception as e:
-                self._error(500, "INTERNAL_ERROR", str(e))
+                    # Collect results
+                    project_dir = work_dir / project_name
+                    tr_candidates_dir = project_dir / "transition_candidates" / tr_id
+                    candidates = {}
+                    if tr_candidates_dir.exists():
+                        for slot_dir in sorted(tr_candidates_dir.iterdir()):
+                            if slot_dir.is_dir():
+                                videos = sorted([
+                                    f"transition_candidates/{tr_id}/{slot_dir.name}/{f.name}"
+                                    for f in slot_dir.glob("v*.mp4")
+                                ])
+                                candidates[slot_dir.name] = videos
+
+                    job_manager.complete_job(job_id, {"transitionId": tr_id, "candidates": candidates})
+                except Exception as e:
+                    job_manager.fail_job(job_id, str(e))
+
+            import threading
+            threading.Thread(target=_run, daemon=True).start()
+            self._json_response({"jobId": job_id, "transitionId": tr_id})
 
         def _handle_update_meta(self, project_name: str):
             """POST /api/projects/:name/update-meta — update project meta fields."""
@@ -1241,19 +1258,15 @@ def run_server(host: str = "0.0.0.0", port: int = 8888, work_dir: str | None = N
     handler = make_handler(wd)
     server = HTTPServer((host, port), handler)
 
+    # Start WebSocket server for real-time job progress
+    ws_port = port + 1
+    from beatlab.ws_server import start_ws_server
+    start_ws_server(host, ws_port)
+
     _log(f"SceneCraft API server running at http://{host}:{port}")
+    _log(f"SceneCraft WebSocket server at ws://{host}:{ws_port}")
     _log(f"  Work dir: {wd}")
     _log(f"  Projects: {len([d for d in wd.iterdir() if d.is_dir()])}")
-    _log("")
-    _log("Endpoints:")
-    _log("  GET  /api/projects                          List projects")
-    _log("  GET  /api/projects/:name/keyframes          Keyframe data for editor")
-    _log("  GET  /api/projects/:name/beats              Beat analysis data")
-    _log("  GET  /api/projects/:name/ls?path=             List directory contents")
-    _log("  GET  /api/projects/:name/files/*             Serve project files (audio/video/images)")
-    _log("  POST /api/projects/:name/select-keyframes   Apply keyframe selections")
-    _log("  POST /api/projects/:name/select-slot-keyframes  Apply slot selections")
-    _log("  POST /api/projects/:name/update-timestamp   Update keyframe timestamp")
     _log("")
 
     try:
