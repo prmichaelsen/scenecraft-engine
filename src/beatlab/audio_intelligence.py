@@ -1175,8 +1175,10 @@ def apply_rules(layer1_data: dict, rules: list[dict],
             evt_duration = duration
             sustain = None
 
-            # Check for sustained region overlap
-            if sustain_from_rms:
+            # Check for sustained region overlap — only for non-transient effects
+            # Shake effects should NEVER sustain — sustained shaking is just wrong
+            TRANSIENT_EFFECTS = {"shake_x", "shake_y", "flash", "hard_cut"}
+            if sustain_from_rms and effect not in TRANSIENT_EFFECTS:
                 for region in sustained_regions:
                     if region["start_time"] <= t <= region["end_time"]:
                         sustain = region["duration"]
