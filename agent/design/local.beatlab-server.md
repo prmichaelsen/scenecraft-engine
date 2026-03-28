@@ -99,6 +99,21 @@ Follows `marker_server.py` conventions: `BaseHTTPRequestHandler` subclass, `_jso
 | GET | `/api/projects/:name/ingredients` | `handle_list_ingredients` | List files in `ingredients/` dir |
 | DELETE | `/api/projects/:name/ingredients/:filename` | `handle_delete_ingredient` | Remove ingredient file |
 
+**Phase 3.5 — On-demand candidate generation** (interactive single-candidate flow):
+
+| Method | Path | Handler | Calls |
+|---|---|---|---|
+| POST | `/api/projects/:name/generate-candidate` | `handle_generate_candidate` | Generate 1 candidate for a section (async job) |
+
+**On-demand candidate generation** replaces the batch "generate 4 candidates at once" workflow:
+
+- **Body**: `{"section": "kf_001", "model": "fast"}` — section ID + model choice (fast/standard)
+- **Model options**: `fast` = `veo-3.1-fast-generate-preview` (~$0.10/sec, draft quality), `standard` = `veo-3.1-generate-preview` (~$0.50/sec, full quality)
+- **Flow**: User clicks "Generate" → sees 1 result → clicks "Generate Another" if not satisfied → "Accept" finalizes
+- **Cost savings**: If user likes first candidate, saves 75% vs generating 4 upfront. Fast preview further reduces per-candidate cost by 4-7x.
+- **GUI elements**: "Generate" button per section, Fast/Standard toggle, candidate carousel showing all generated variants, "Accept" button to finalize selection
+- **Storage**: Each candidate saved as `v1.png`, `v2.png`, etc. incrementally — no pre-allocated slots
+
 **Phase 4 — Platform management** (cloud desktop ops):
 
 | Method | Path | Handler | Calls |
