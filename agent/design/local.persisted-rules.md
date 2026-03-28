@@ -133,10 +133,26 @@ beatlab apply-rules rules.yaml --render --preview
 |---|---|---|
 | GET | `/api/projects/:name/rules` | List all rule files in rules/ |
 | GET | `/api/projects/:name/rules/:file` | Get a specific rule file |
-| POST | `/api/projects/:name/rules/generate` | Generate new ruleset (async job) |
+| POST | `/api/projects/:name/rules/generate` | Generate new full ruleset (async job) |
+| POST | `/api/projects/:name/rules/generate-section` | Regenerate rules for a single section only (async job) |
 | POST | `/api/projects/:name/rules/apply` | Set a rule file as master |
 | PUT | `/api/projects/:name/rules/:file` | Update a rule file (GUI edits) |
 | PUT | `/api/projects/:name/rules/master/sections/:idx` | Update a specific section in master |
+
+### Per-Section Regeneration
+
+Users can regenerate rules for a single section without affecting other sections:
+
+- **Body**: `{"section": "D&L Zone 6: peak", "creative_direction": "More aggressive kicks"}`
+- **Flow**:
+  1. Claude call scoped to that section's time range + stats
+  2. New rules replace ONLY that section in `rules.yaml`
+  3. All other sections remain untouched
+  4. Re-apply + preview instantly (no re-render of full track needed)
+- **Use case**: User likes 23 out of 24 sections, wants to re-roll one weak section
+- **Cost**: One Claude call (~$0.01) instead of 24 calls for a full regeneration
+- **GUI**: "Regenerate" button per section in the rules panel
+- **Versioning**: The regenerated section is tagged with its generation number so the user can revert if the new rules are worse
 
 ### Render Flow
 
