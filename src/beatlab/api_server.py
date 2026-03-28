@@ -126,6 +126,11 @@ def make_handler(work_dir: Path):
             if m:
                 return self._handle_update_meta(m.group(1))
 
+            # POST /api/projects/:name/import
+            m = re.match(r"^/api/projects/([^/]+)/import$", path)
+            if m:
+                return self._handle_import(m.group(1))
+
             self._error(404, "NOT_FOUND", f"No route: POST {path}")
 
         def do_OPTIONS(self):
@@ -772,6 +777,163 @@ def make_handler(work_dir: Path):
                     pyyaml.dump(parsed, f, default_flow_style=False, allow_unicode=True, width=1000)
 
                 self._json_response({"success": True, "meta": meta})
+            except Exception as e:
+                self._error(500, "INTERNAL_ERROR", str(e))
+
+        def _handle_import(self, project_name: str):
+            """POST /api/projects/:name/import — bulk import images as keyframes and videos as transitions.
+
+            Body: { "sourcePath": "/absolute/path/to/dir/or/file", "timestamp": "0:00" }
+            - If sourcePath is a directory, all images/videos inside are imported
+            - If sourcePath is a file, just that file
+            - Images (.png, .jpg, .jpeg, .webp) → keyframes, copied to selected_keyframes/
+            - Videos (.mp4, .webm, .mov) → transitions, copied to selected_transitions/
+            - All imported items go to the bin for user review
+            - timestamp is the starting timestamp for imported keyframes (auto-increments by 1s per keyframe)
+            """
+            body = self._read_json_body()
+            if body is None:
+                return
+
+            source_path = body.get("sourcePath")
+            start_timestamp = body.get("timestamp", "0:00")
+            if not source_path:
+                return self._error(400, "BAD_REQUEST", "Missing 'sourcePath'")
+
+            source = Path(source_path)
+            if not source.exists():
+                return self._error(404, "NOT_FOUND", f"Source path not found: {source_path}")
+
+            try:
+                import yaml as pyyaml
+                import shutil
+                from datetime import datetime, timezone
+
+                yaml_path = work_dir / project_name / "narrative_keyframes.yaml"
+                project_dir = work_dir / project_name
+
+                # Load or create YAML
+                if yaml_path.exists():
+                    with open(yaml_path) as f:
+                        parsed = pyyaml.safe_load(f) or {}
+                else:
+                    parsed = {"meta": {"title": project_name, "fps": 24, "resolution": [1920, 1080]}, "keyframes": [], "transitions": []}
+
+                keyframes = parsed.get("keyframes", [])
+                transitions = parsed.get("transitions", [])
+                kf_bin = parsed.get("bin", [])
+                tr_bin = parsed.get("transition_bin", [])
+
+                # Find next IDs
+                all_kf_ids = [kf.get("id", "") for kf in keyframes + kf_bin]
+                max_kf = max((int(m.group(1)) for kid in all_kf_ids if (m := __import__('re').match(r'kf_(\d+)', kid))), default=0)
+
+                all_tr_ids = [tr.get("id", "") for tr in transitions + tr_bin]
+                max_tr = max((int(m.group(1)) for tid in all_tr_ids if (m := __import__('re').match(r'tr_(\d+)', tid))), default=0)
+
+                # Collect files
+                IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp'}
+                VIDEO_EXTS = {'.mp4', '.webm', '.mov'}
+
+                files = []
+                if source.is_dir():
+                    files = sorted(source.iterdir())
+                else:
+                    files = [source]
+
+                now = datetime.now(timezone.utc).isoformat()
+                selected_kf_dir = project_dir / "selected_keyframes"
+                selected_kf_dir.mkdir(parents=True, exist_ok=True)
+                selected_tr_dir = project_dir / "selected_transitions"
+                selected_tr_dir.mkdir(parents=True, exist_ok=True)
+
+                # Parse starting timestamp
+                def parse_ts(ts):
+                    parts = str(ts).split(":")
+                    if len(parts) == 2:
+                        return int(parts[0]) * 60 + float(parts[1])
+                    return 0
+
+                def format_ts(seconds):
+                    m = int(seconds // 60)
+                    s = seconds % 60
+                    whole = int(s)
+                    frac = s - whole
+                    if frac < 0.005:
+                        return f"{m}:{whole:02d}"
+                    return f"{m}:{whole:02d}.{round(frac * 100):02d}"
+
+                current_ts = parse_ts(start_timestamp)
+                imported_kf = []
+                imported_tr = []
+
+                for f in files:
+                    if not f.is_file():
+                        continue
+                    ext = f.suffix.lower()
+
+                    if ext in IMAGE_EXTS:
+                        max_kf += 1
+                        kf_id = f"kf_{max_kf:03d}"
+                        # Copy to selected_keyframes
+                        dest = selected_kf_dir / f"{kf_id}.png"
+                        if ext == '.png':
+                            shutil.copy2(str(f), str(dest))
+                        else:
+                            # Convert to PNG via copy (browser handles format)
+                            shutil.copy2(str(f), str(dest))
+
+                        kf_entry = {
+                            "id": kf_id,
+                            "timestamp": format_ts(current_ts),
+                            "section": "",
+                            "source": str(f),
+                            "prompt": f"Imported from {f.name}",
+                            "context": None,
+                            "candidates": [],
+                            "selected": 1,
+                            "deleted_at": now,
+                        }
+                        kf_bin.append(kf_entry)
+                        imported_kf.append(kf_id)
+                        current_ts += 1.0
+
+                    elif ext in VIDEO_EXTS:
+                        max_tr += 1
+                        tr_id = f"tr_{max_tr:03d}"
+                        # Copy to selected_transitions
+                        dest = selected_tr_dir / f"{tr_id}_slot_0{ext}"
+                        shutil.copy2(str(f), str(dest))
+
+                        tr_entry = {
+                            "id": tr_id,
+                            "from": "",
+                            "to": "",
+                            "duration_seconds": 0,
+                            "slots": 1,
+                            "action": f"Imported from {f.name}",
+                            "candidates": [],
+                            "selected": [],
+                            "remap": {"method": "linear", "target_duration": 0},
+                            "deleted_at": now,
+                        }
+                        tr_bin.append(tr_entry)
+                        imported_tr.append(tr_id)
+
+                parsed["bin"] = kf_bin
+                parsed["transition_bin"] = tr_bin
+
+                with open(yaml_path, "w") as f:
+                    pyyaml.dump(parsed, f, default_flow_style=False, allow_unicode=True, width=1000)
+
+                self._json_response({
+                    "success": True,
+                    "imported": {
+                        "keyframes": imported_kf,
+                        "transitions": imported_tr,
+                    },
+                    "summary": f"{len(imported_kf)} keyframe(s), {len(imported_tr)} transition(s) imported to bin",
+                })
             except Exception as e:
                 self._error(500, "INTERNAL_ERROR", str(e))
 
