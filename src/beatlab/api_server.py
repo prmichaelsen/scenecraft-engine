@@ -309,7 +309,7 @@ def make_handler(work_dir: Path):
                 filenames = [f.name for f in files]
                 has_audio = any(f.endswith((".wav", ".mp3")) for f in filenames)
                 has_video = any(f.endswith(".mp4") for f in filenames)
-                has_yaml = "narrative_keyframes.yaml" in filenames
+                has_yaml = "narrative_keyframes.yaml" in filenames or "timeline.yaml" in filenames
                 has_beats = "beats.json" in filenames
 
                 projects.append({
@@ -326,12 +326,12 @@ def make_handler(work_dir: Path):
 
         def _handle_get_keyframes(self, project_name: str):
             """GET /api/projects/:name/keyframes — load keyframe data for editor."""
+            from beatlab.project import load_project
             project_dir = work_dir / project_name
             if not project_dir.is_dir():
                 return self._error(404, "NOT_FOUND", f"Project not found: {project_name}")
 
-            yaml_path = project_dir / "narrative_keyframes.yaml"
-            if not yaml_path.exists():
+            if not self._has_project_yaml(project_name):
                 return self._json_response({
                     "meta": {"title": project_name, "fps": 24, "resolution": [1920, 1080]},
                     "keyframes": [],
@@ -339,9 +339,7 @@ def make_handler(work_dir: Path):
                     "projectName": project_name,
                 })
 
-            import yaml as pyyaml
-            with open(yaml_path) as f:
-                parsed = pyyaml.safe_load(f)
+            parsed = load_project(project_dir)
 
             meta = parsed.get("meta", {})
             result_meta = {
@@ -1742,6 +1740,32 @@ def make_handler(work_dir: Path):
             self._json_response({"success": True})
 
         # ── Helpers ──────────────────────────────────────────────
+
+        def _get_yaml_path(self, project_name: str) -> Path | None:
+            """Get the YAML path for a project — split or legacy format.
+
+            Returns the legacy narrative_keyframes.yaml path for handlers that
+            still call render/narrative.py functions (which expect that path).
+            For split format, returns narrative_keyframes.yaml if it exists,
+            otherwise None (caller should use load_project instead).
+            """
+            project_dir = work_dir / project_name
+            legacy = project_dir / "narrative_keyframes.yaml"
+            if legacy.exists():
+                return legacy
+            # Check split format — some handlers need the legacy path for
+            # narrative.py compatibility. Return None to signal split format.
+            if (project_dir / "timeline.yaml").exists():
+                return None
+            return None
+
+        def _has_project_yaml(self, project_name: str) -> bool:
+            """Check if a project has any YAML data (split or legacy)."""
+            project_dir = work_dir / project_name
+            return (
+                (project_dir / "narrative_keyframes.yaml").exists()
+                or (project_dir / "timeline.yaml").exists()
+            )
 
         def _read_json_body(self) -> dict | None:
             """Read and parse JSON body from request."""
