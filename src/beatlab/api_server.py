@@ -75,6 +75,16 @@ def make_handler(work_dir: Path):
             if m:
                 return self._handle_get_watched_folders(m.group(1))
 
+            # GET /api/projects/:name/narrative
+            m = re.match(r"^/api/projects/([^/]+)/narrative$", path)
+            if m:
+                return self._handle_get_narrative(m.group(1))
+
+            # GET /api/projects/:name/timelines
+            m = re.match(r"^/api/projects/([^/]+)/timelines$", path)
+            if m:
+                return self._handle_get_timelines(m.group(1))
+
             # GET /api/projects/:name/version/history
             m = re.match(r"^/api/projects/([^/]+)/version/history$", path)
             if m:
@@ -185,6 +195,26 @@ def make_handler(work_dir: Path):
             m = re.match(r"^/api/projects/([^/]+)/unwatch-folder$", path)
             if m:
                 return self._handle_unwatch_folder(m.group(1))
+
+            # POST /api/projects/:name/narrative
+            m = re.match(r"^/api/projects/([^/]+)/narrative$", path)
+            if m:
+                return self._handle_update_narrative(m.group(1))
+
+            # POST /api/projects/:name/timeline/switch
+            m = re.match(r"^/api/projects/([^/]+)/timeline/switch$", path)
+            if m:
+                return self._handle_timeline_switch(m.group(1))
+
+            # POST /api/projects/:name/timeline/import
+            m = re.match(r"^/api/projects/([^/]+)/timeline/import$", path)
+            if m:
+                return self._handle_timeline_import(m.group(1))
+
+            # POST /api/projects/:name/timeline/create
+            m = re.match(r"^/api/projects/([^/]+)/timeline/create$", path)
+            if m:
+                return self._handle_timeline_create(m.group(1))
 
             # POST /api/projects/:name/version/commit
             m = re.match(r"^/api/projects/([^/]+)/version/commit$", path)
@@ -1356,6 +1386,99 @@ def make_handler(work_dir: Path):
                         self.wfile.write(chunk)
             except (BrokenPipeError, ConnectionResetError):
                 pass
+
+        # ── Narrative / Timeline Handlers ─────────────────────────
+
+        def _handle_get_narrative(self, project_name: str):
+            """GET /api/projects/:name/narrative — return sections from narrative.yaml."""
+            from beatlab.project import load_project
+            project_dir = work_dir / project_name
+            if not project_dir.is_dir():
+                return self._error(404, "NOT_FOUND", f"Project not found: {project_name}")
+            data = load_project(project_dir)
+            self._json_response({"sections": data.get("sections", [])})
+
+        def _handle_update_narrative(self, project_name: str):
+            """POST /api/projects/:name/narrative — update sections."""
+            from beatlab.project import load_project, save_project
+            body = self._read_json_body()
+            if body is None:
+                return
+            project_dir = work_dir / project_name
+            if not project_dir.is_dir():
+                return self._error(404, "NOT_FOUND", f"Project not found: {project_name}")
+            data = load_project(project_dir)
+            data["sections"] = body.get("sections", data.get("sections", []))
+            save_project(data, project_dir)
+            self._json_response({"success": True, "sections": len(data["sections"])})
+
+        def _handle_get_timelines(self, project_name: str):
+            """GET /api/projects/:name/timelines — list available timelines."""
+            from beatlab.project import get_timelines
+            project_dir = work_dir / project_name
+            if not project_dir.is_dir():
+                return self._error(404, "NOT_FOUND", f"Project not found: {project_name}")
+            try:
+                result = get_timelines(project_dir)
+                self._json_response(result)
+            except Exception as e:
+                self._error(500, "INTERNAL_ERROR", str(e))
+
+        def _handle_timeline_switch(self, project_name: str):
+            """POST /api/projects/:name/timeline/switch — switch active timeline."""
+            from beatlab.project import switch_timeline
+            body = self._read_json_body()
+            if body is None:
+                return
+            name = body.get("name")
+            if not name:
+                return self._error(400, "BAD_REQUEST", "Missing 'name'")
+            project_dir = work_dir / project_name
+            if not project_dir.is_dir():
+                return self._error(404, "NOT_FOUND", f"Project not found: {project_name}")
+            try:
+                switch_timeline(project_dir, name)
+                self._json_response({"success": True, "active": name})
+            except ValueError as e:
+                self._error(404, "NOT_FOUND", str(e))
+
+        def _handle_timeline_import(self, project_name: str):
+            """POST /api/projects/:name/timeline/import — import timeline from source."""
+            from beatlab.project import import_timeline
+            body = self._read_json_body()
+            if body is None:
+                return
+            source_path = body.get("sourcePath")
+            timeline_name = body.get("timelineName")
+            if not source_path:
+                return self._error(400, "BAD_REQUEST", "Missing 'sourcePath'")
+            project_dir = work_dir / project_name
+            if not project_dir.is_dir():
+                return self._error(404, "NOT_FOUND", f"Project not found: {project_name}")
+            try:
+                result = import_timeline(project_dir, source_path, timeline_name)
+                self._json_response({"success": True, **result})
+            except Exception as e:
+                self._error(500, "INTERNAL_ERROR", str(e))
+
+        def _handle_timeline_create(self, project_name: str):
+            """POST /api/projects/:name/timeline/create — create new timeline."""
+            from beatlab.project import create_timeline
+            body = self._read_json_body()
+            if body is None:
+                return
+            name = body.get("name")
+            copy_from = body.get("copyFrom")
+            if not name:
+                return self._error(400, "BAD_REQUEST", "Missing 'name'")
+            project_dir = work_dir / project_name
+            if not project_dir.is_dir():
+                return self._error(404, "NOT_FOUND", f"Project not found: {project_name}")
+            try:
+                create_timeline(project_dir, name, copy_from)
+                self._json_response({"success": True, "name": name})
+            except ValueError as e:
+                self._error(400, "BAD_REQUEST", str(e))
 
         # ── Git Version Handlers ─────────────────────────────────
 
