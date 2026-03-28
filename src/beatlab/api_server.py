@@ -70,6 +70,11 @@ def make_handler(work_dir: Path):
             if m:
                 return self._handle_get_bin(m.group(1))
 
+            # GET /api/projects/:name/watched-folders
+            m = re.match(r"^/api/projects/([^/]+)/watched-folders$", path)
+            if m:
+                return self._handle_get_watched_folders(m.group(1))
+
             # GET /api/projects/:name/effects
             m = re.match(r"^/api/projects/([^/]+)/effects$", path)
             if m:
@@ -960,6 +965,16 @@ def make_handler(work_dir: Path):
             except Exception as e:
                 self._error(500, "INTERNAL_ERROR", str(e))
 
+        def _handle_get_watched_folders(self, project_name: str):
+            """GET /api/projects/:name/watched-folders — list persisted watched folders."""
+            import yaml as pyyaml
+            yaml_path = work_dir / project_name / "narrative_keyframes.yaml"
+            if not yaml_path.exists():
+                return self._json_response({"watchedFolders": []})
+            with open(yaml_path) as f:
+                parsed = pyyaml.safe_load(f) or {}
+            self._json_response({"watchedFolders": parsed.get("watched_folders", [])})
+
         def _handle_get_effects(self, project_name: str):
             """GET /api/projects/:name/effects — load user-authored effects from beats.yaml."""
             effects_path = work_dir / project_name / "beats.yaml"
@@ -1022,6 +1037,20 @@ def make_handler(work_dir: Path):
 
             try:
                 result = folder_watcher.add_watch(project_name, folder_path)
+
+                # Persist to YAML
+                import yaml as pyyaml
+                yaml_path = work_dir / project_name / "narrative_keyframes.yaml"
+                if yaml_path.exists():
+                    with open(yaml_path) as f:
+                        parsed = pyyaml.safe_load(f) or {}
+                    watched = parsed.get("watched_folders", [])
+                    if folder_path not in watched:
+                        watched.append(folder_path)
+                    parsed["watched_folders"] = watched
+                    with open(yaml_path, "w") as f:
+                        pyyaml.dump(parsed, f, default_flow_style=False, allow_unicode=True, width=1000)
+
                 self._json_response({"success": True, **result})
             except Exception as e:
                 self._error(400, "BAD_REQUEST", str(e))
@@ -1039,6 +1068,20 @@ def make_handler(work_dir: Path):
             from beatlab.ws_server import folder_watcher
             if folder_watcher:
                 folder_watcher.remove_watch(project_name, folder_path)
+
+            # Remove from YAML
+            import yaml as pyyaml
+            yaml_path = work_dir / project_name / "narrative_keyframes.yaml"
+            if yaml_path.exists():
+                with open(yaml_path) as f:
+                    parsed = pyyaml.safe_load(f) or {}
+                watched = parsed.get("watched_folders", [])
+                if folder_path in watched:
+                    watched.remove(folder_path)
+                parsed["watched_folders"] = watched
+                with open(yaml_path, "w") as f:
+                    pyyaml.dump(parsed, f, default_flow_style=False, allow_unicode=True, width=1000)
+
             self._json_response({"success": True})
 
         def _handle_import(self, project_name: str):
@@ -1344,10 +1387,33 @@ def run_server(host: str = "0.0.0.0", port: int = 8888, work_dir: str | None = N
     _ws_mod.folder_watcher = FolderWatcher(wd)
     start_ws_server(host, ws_port)
 
+    # Restore persisted folder watches from project YAMLs
+    import yaml as pyyaml
+    restored_watches = 0
+    for project_dir in wd.iterdir():
+        if not project_dir.is_dir():
+            continue
+        yaml_path = project_dir / "narrative_keyframes.yaml"
+        if not yaml_path.exists():
+            continue
+        try:
+            with open(yaml_path) as f:
+                parsed = pyyaml.safe_load(f) or {}
+            for folder_path in parsed.get("watched_folders", []):
+                try:
+                    _ws_mod.folder_watcher.add_watch(project_dir.name, folder_path)
+                    restored_watches += 1
+                except Exception as e:
+                    _log(f"  Warning: could not restore watch {folder_path} for {project_dir.name}: {e}")
+        except Exception:
+            pass
+
     _log(f"SceneCraft API server running at http://{host}:{port}")
     _log(f"SceneCraft WebSocket server at ws://{host}:{ws_port}")
     _log(f"  Work dir: {wd}")
     _log(f"  Projects: {len([d for d in wd.iterdir() if d.is_dir()])}")
+    if restored_watches:
+        _log(f"  Restored watches: {restored_watches}")
     _log("")
 
     try:
