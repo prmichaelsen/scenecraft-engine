@@ -116,6 +116,11 @@ def make_handler(work_dir: Path):
             if m:
                 return self._handle_generate_transition_action(m.group(1))
 
+            # POST /api/projects/:name/generate-keyframe-candidates
+            m = re.match(r"^/api/projects/([^/]+)/generate-keyframe-candidates$", path)
+            if m:
+                return self._handle_generate_keyframe_candidates(m.group(1))
+
             # POST /api/projects/:name/generate-transition-candidates
             m = re.match(r"^/api/projects/([^/]+)/generate-transition-candidates$", path)
             if m:
@@ -707,6 +712,44 @@ def make_handler(work_dir: Path):
                     pyyaml.dump(parsed, f, default_flow_style=False, allow_unicode=True, width=1000)
 
                 self._json_response({"success": True, "action": action})
+            except Exception as e:
+                self._error(500, "INTERNAL_ERROR", str(e))
+
+        def _handle_generate_keyframe_candidates(self, project_name: str):
+            """POST /api/projects/:name/generate-keyframe-candidates — generate Imagen candidates for a keyframe."""
+            body = self._read_json_body()
+            if body is None:
+                return
+
+            kf_id = body.get("keyframeId")
+            count = body.get("count")
+            if not kf_id:
+                return self._error(400, "BAD_REQUEST", "Missing 'keyframeId'")
+
+            yaml_path = work_dir / project_name / "narrative_keyframes.yaml"
+            if not yaml_path.exists():
+                return self._error(404, "NOT_FOUND", "No narrative_keyframes.yaml found")
+
+            try:
+                from beatlab.render.narrative import generate_keyframe_candidates
+                generate_keyframe_candidates(
+                    str(yaml_path),
+                    vertex=False,
+                    candidates_per_slot=count,
+                    segment_filter={kf_id},
+                )
+
+                # Return generated candidate paths
+                project_dir = work_dir / project_name
+                candidates_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{kf_id}"
+                candidates = []
+                if candidates_dir.exists():
+                    candidates = sorted([
+                        f"keyframe_candidates/candidates/section_{kf_id}/{f.name}"
+                        for f in candidates_dir.glob("v*.png")
+                    ])
+
+                self._json_response({"success": True, "keyframeId": kf_id, "candidates": candidates})
             except Exception as e:
                 self._error(500, "INTERNAL_ERROR", str(e))
 
