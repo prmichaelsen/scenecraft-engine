@@ -364,37 +364,21 @@ class GoogleVideoClient:
             _log(f"    Duration clamped: {duration_seconds}s → {clamped_duration}s (Veo requires 6-8s)")
 
         def _generate():
-            try:
-                config = types.GenerateVideosConfig(
-                    aspect_ratio="16:9",
-                    number_of_videos=1,
-                    duration_seconds=clamped_duration,
-                    person_generation="allow_adult",
-                    last_frame=end_img,
-                    **({"reference_images": ref_images} if ref_images else {}),
-                )
-                return _retry_on_429(
-                    self.client.models.generate_videos,
-                    model="veo-3.1-generate-preview",
-                    prompt=prompt,
-                    image=start_img,
-                    config=config,
-                )
-            except Exception as e:
-                _log(f"    Veo 3.1 failed ({e}), falling back to Veo 3.0 without last_frame...")
-                config = types.GenerateVideosConfig(
-                    aspect_ratio="16:9",
-                    number_of_videos=1,
-                    duration_seconds=clamped_duration,
-                    person_generation="allow_adult",
-                )
-                return _retry_on_429(
-                    self.client.models.generate_videos,
-                    model=model,
-                    prompt=prompt,
-                    image=start_img,
-                    config=config,
-                )
+            config = types.GenerateVideosConfig(
+                aspect_ratio="16:9",
+                number_of_videos=1,
+                duration_seconds=clamped_duration,
+                person_generation="allow_adult",
+                last_frame=end_img,
+                **({"reference_images": ref_images} if ref_images else {}),
+            )
+            return _retry_on_429(
+                self.client.models.generate_videos,
+                model="veo-3.1-generate-preview",
+                prompt=prompt,
+                image=start_img,
+                config=config,
+            )
 
         generated = _retry_video_generation(_generate, self.client, output_path)
         self._save_generated_video(generated, output_path)
