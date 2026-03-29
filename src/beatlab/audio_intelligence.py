@@ -215,6 +215,86 @@ def extract_layer1(stem_paths: dict[str, str], sr: int = 22050) -> dict:
     return results
 
 
+def extract_layer1_multimodel(
+    vocals_path: str,
+    drumsep_paths: dict[str, str],
+    melodic_paths: dict[str, str],
+    sr: int = 22050,
+) -> dict:
+    """Run Layer 1 DSP extraction using multi-model stems.
+
+    DrumSep stems (kick/snare/hh/etc) get full-band analysis only — no frequency
+    band splitting since they're already instrument-isolated.
+    Melodic stems (bass/guitar/piano/other) get full-band + sustained region detection.
+    Vocals get full-band + presence detection.
+
+    Args:
+        vocals_path: Path to MDX23C-InstVoc vocals stem.
+        drumsep_paths: {"kick": path, "snare": path, "hh": path, "ride": path, "crash": path, "toms": path}
+        melodic_paths: {"bass": path, "guitar": path, "piano": path, "other": path}
+        sr: Sample rate.
+
+    Returns:
+        Dict keyed by stem name: {stem: {"full": {onsets, rms_envelope, sustained_regions, spectral}}}
+    """
+    results = {}
+
+    # Vocals — full band only, focus on presence
+    if vocals_path and Path(vocals_path).exists():
+        _log(f"  Layer 1: analyzing vocals...")
+        y, sr_out = librosa.load(vocals_path, sr=sr, mono=True)
+        results["vocals"] = {
+            "full": {
+                "onsets": _detect_onsets(y, sr_out),
+                "rms_envelope": _compute_rms_envelope(y, sr_out),
+                "sustained_regions": _detect_sustained_regions(y, sr_out, min_duration=0.5),
+                "spectral": _compute_spectral_features(y, sr_out),
+            }
+        }
+        n = len(results["vocals"]["full"]["onsets"])
+        _log(f"    vocals/full: {n} onsets, {len(results['vocals']['full']['sustained_regions'])} sustained")
+
+    # DrumSep stems — full band only, no frequency splitting needed
+    for stem_name, path in drumsep_paths.items():
+        if not Path(path).exists():
+            _log(f"  Warning: drum stem {stem_name} not found at {path}, skipping")
+            continue
+        _log(f"  Layer 1: analyzing {stem_name} (drum)...")
+        y, sr_out = librosa.load(path, sr=sr, mono=True)
+        results[stem_name] = {
+            "full": {
+                "onsets": _detect_onsets(y, sr_out),
+                "rms_envelope": _compute_rms_envelope(y, sr_out),
+                "sustained_regions": _detect_sustained_regions(y, sr_out, min_duration=0.1),
+                "spectral": _compute_spectral_features(y, sr_out),
+            }
+        }
+        n = len(results[stem_name]["full"]["onsets"])
+        ns = len(results[stem_name]["full"]["sustained_regions"])
+        _log(f"    {stem_name}/full: {n} onsets, {ns} sustained")
+
+    # Melodic stems — full band + sustained regions
+    for stem_name, path in melodic_paths.items():
+        if not Path(path).exists():
+            _log(f"  Warning: melodic stem {stem_name} not found at {path}, skipping")
+            continue
+        _log(f"  Layer 1: analyzing {stem_name} (melodic)...")
+        y, sr_out = librosa.load(path, sr=sr, mono=True)
+        results[stem_name] = {
+            "full": {
+                "onsets": _detect_onsets(y, sr_out),
+                "rms_envelope": _compute_rms_envelope(y, sr_out),
+                "sustained_regions": _detect_sustained_regions(y, sr_out, min_duration=0.3),
+                "spectral": _compute_spectral_features(y, sr_out),
+            }
+        }
+        n = len(results[stem_name]["full"]["onsets"])
+        ns = len(results[stem_name]["full"]["sustained_regions"])
+        _log(f"    {stem_name}/full: {n} onsets, {ns} sustained")
+
+    return results
+
+
 # ─── Layer 2: Gemini Audio Listening ────────────────────────────────────────
 
 def _chunk_audio_for_gemini(audio_path: str, chunk_duration: float = 30.0) -> list[dict]:
@@ -1596,6 +1676,85 @@ def run_audio_intelligence(
         "layer2_chunks": len(layer2),
         "layer3_events": layer3,
         **({"layer3_rules": rules} if rules else {}),
+        "layer1": layer1,
+        "layer2": layer2,
+    }
+
+    if output_path:
+        with open(output_path, "w") as f:
+            json.dump(result, f, indent=2)
+        _log(f"  Results saved to {output_path}")
+
+    _log(f"=== Pipeline complete: {len(layer3)} effect events ===")
+    return result
+
+
+def run_audio_intelligence_multimodel(
+    vocals_path: str,
+    drumsep_paths: dict[str, str],
+    melodic_paths: dict[str, str],
+    audio_path: str,
+    output_path: str | None = None,
+    sr: int = 22050,
+    descriptions_md: str | None = None,
+    creative_direction: str | None = None,
+    sensitivity: dict[str, float] | None = None,
+    vocal_bleed_threshold: float = 0.25,
+    fps: float = 24.0,
+    stats_mode: bool = False,
+) -> dict:
+    """Run the 3-layer pipeline using multi-model stems.
+
+    Uses MDX23C-InstVoc vocals + DrumSep kick/snare/hh/etc + Demucs 6s bass/guitar/piano/other.
+
+    Args:
+        vocals_path: Path to MDX23C-InstVoc vocals stem.
+        drumsep_paths: {"kick": path, "snare": path, "hh": path, ...}
+        melodic_paths: {"bass": path, "guitar": path, "piano": path, "other": path}
+        audio_path: Path to full mix audio for Gemini/descriptions.
+        output_path: Optional path to save results JSON.
+        sr: Sample rate.
+        descriptions_md: Path to descriptions.md fallback.
+        creative_direction: Creative direction for Claude.
+        sensitivity: Per-effect sensitivity overrides.
+        vocal_bleed_threshold: Confidence ratio threshold.
+        fps: Video frame rate.
+        stats_mode: Use stats-only Claude prompt.
+    """
+    _log("=== Multi-Model Audio Intelligence Pipeline ===")
+
+    # Layer 1: DSP extraction on multi-model stems
+    layer1 = extract_layer1_multimodel(vocals_path, drumsep_paths, melodic_paths, sr=sr)
+
+    # Layer 2: Gemini (or cached descriptions)
+    layer2 = extract_layer2(audio_path, descriptions_md=descriptions_md)
+
+    # Layer 3: Claude rules + apply
+    duration = librosa.get_duration(path=audio_path, sr=sr)
+    rules = extract_layer3_rules(
+        layer1, layer2,
+        time_offset=0.0,
+        time_limit=duration,
+        creative_direction=creative_direction,
+        sensitivity=sensitivity,
+        stats_mode=stats_mode,
+    )
+    layer3 = apply_rules(layer1, rules, vocal_bleed_threshold=vocal_bleed_threshold)
+
+    result = {
+        "layer1_summary": {
+            stem: {
+                band: {
+                    "onset_count": len(data.get("onsets", [])),
+                    "sustained_count": len(data.get("sustained_regions", [])),
+                }
+                for band, data in bands.items()
+            }
+            for stem, bands in layer1.items()
+        },
+        "layer2_chunks": len(layer2),
+        "layer3_events": layer3,
+        "layer3_rules": rules,
         "layer1": layer1,
         "layer2": layer2,
     }

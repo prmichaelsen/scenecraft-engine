@@ -1388,6 +1388,85 @@ def audio_intelligence(video_file: str, work_dir: str, output: str | None,
     _log(f"  {len(result['layer3_events'])} effect events generated")
 
 
+@main.command(name="audio-intelligence-multimodel")
+@click.argument("video_file", type=click.Path(exists=True))
+@click.option("--vocals", required=True, type=click.Path(exists=True), help="MDX23C-InstVoc vocals stem")
+@click.option("--kick", required=True, type=click.Path(exists=True), help="DrumSep kick stem")
+@click.option("--snare", required=True, type=click.Path(exists=True), help="DrumSep snare stem")
+@click.option("--hh", required=True, type=click.Path(exists=True), help="DrumSep hi-hat stem")
+@click.option("--ride", default=None, type=click.Path(exists=True), help="DrumSep ride stem")
+@click.option("--crash", default=None, type=click.Path(exists=True), help="DrumSep crash stem")
+@click.option("--toms", default=None, type=click.Path(exists=True), help="DrumSep toms stem")
+@click.option("--bass", required=True, type=click.Path(exists=True), help="Demucs 6s bass stem")
+@click.option("--guitar", default=None, type=click.Path(exists=True), help="Demucs 6s guitar stem")
+@click.option("--piano", default=None, type=click.Path(exists=True), help="Demucs 6s piano stem")
+@click.option("--other", default=None, type=click.Path(exists=True), help="Demucs 6s other stem")
+@click.option("--output", "-o", default=None, type=click.Path(), help="Output JSON")
+@click.option("--descriptions", default=None, type=click.Path(exists=True), help="descriptions.md fallback")
+@click.option("--creative-direction", default=None, type=str, help="Creative direction")
+@click.option("--vocal-bleed-threshold", default=0.25, type=float, help="Bleed threshold (default: 0.25)")
+@click.option("--work-dir", default=".beatlab_work", type=str, help="Work directory")
+@click.option("--fps", default=None, type=float, help="Video frame rate")
+@click.option("--sr", default=22050, type=int, help="Sample rate")
+def audio_intelligence_multimodel(
+    video_file: str, vocals: str, kick: str, snare: str, hh: str,
+    ride: str | None, crash: str | None, toms: str | None,
+    bass: str, guitar: str | None, piano: str | None, other: str | None,
+    output: str | None, descriptions: str | None, creative_direction: str | None,
+    vocal_bleed_threshold: float, work_dir: str, fps: float | None, sr: int,
+):
+    """Run multi-model audio intelligence pipeline (InstVoc + DrumSep + Demucs 6s)."""
+    from beatlab.render.frames import detect_fps
+    from beatlab.render.workdir import WorkDir
+    from beatlab.audio_intelligence import run_audio_intelligence_multimodel
+
+    work = WorkDir(video_file, base_dir=work_dir)
+    video_fps = fps or detect_fps(video_file)
+
+    # Auto-detect descriptions
+    descriptions_path = descriptions
+    if not descriptions_path:
+        auto_desc = work.root / "descriptions.md"
+        if auto_desc.exists():
+            descriptions_path = str(auto_desc)
+
+    audio_path = str(work.audio_path) if work.has_audio() else video_file
+
+    drumsep_paths = {"kick": kick, "snare": snare, "hh": hh}
+    if ride:
+        drumsep_paths["ride"] = ride
+    if crash:
+        drumsep_paths["crash"] = crash
+    if toms:
+        drumsep_paths["toms"] = toms
+
+    melodic_paths = {"bass": bass}
+    if guitar:
+        melodic_paths["guitar"] = guitar
+    if piano:
+        melodic_paths["piano"] = piano
+    if other:
+        melodic_paths["other"] = other
+
+    out_path = output or str(work.root / "audio_intelligence_multimodel.json")
+
+    result = run_audio_intelligence_multimodel(
+        vocals_path=vocals,
+        drumsep_paths=drumsep_paths,
+        melodic_paths=melodic_paths,
+        audio_path=audio_path,
+        output_path=out_path,
+        sr=sr,
+        descriptions_md=descriptions_path,
+        creative_direction=creative_direction,
+        sensitivity={k: 1.0 for k in ['zoom_pulse','zoom_bounce','shake_x','shake_y','flash','hard_cut','contrast_pop','glow_swell']},
+        vocal_bleed_threshold=vocal_bleed_threshold,
+        fps=video_fps,
+    )
+
+    _log(f"  {len(result['layer3_events'])} effect events generated")
+
+
 @main.command(name="effects")
 @click.argument("video_file", type=click.Path(exists=True))
 @click.option("--beats", default=None, type=click.Path(exists=True), help="Beat map JSON (with optional stem data)")
