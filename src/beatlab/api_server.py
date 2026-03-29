@@ -491,6 +491,7 @@ def make_handler(work_dir: Path):
                     "remap": tr.get("remap", {"method": "linear", "target_duration": 0}),
                     "slotKeyframeCandidates": slot_kf_candidates,
                     "selectedSlotKeyframes": selected_slot_kfs,
+                    "slotActions": tr.get("slot_actions", []),
                 })
 
             self._json_response({
@@ -893,6 +894,7 @@ def make_handler(work_dir: Path):
 
             tr_id = body.get("transitionId")
             action = body.get("action")
+            slot_actions = body.get("slotActions")  # optional: per-slot prompts
             use_global = body.get("useGlobalPrompt")
             if not tr_id:
                 return self._error(400, "BAD_REQUEST", "Missing 'transitionId'")
@@ -913,6 +915,8 @@ def make_handler(work_dir: Path):
 
                 if action is not None:
                     tr["action"] = action
+                if slot_actions is not None:
+                    tr["slot_actions"] = slot_actions
                 if use_global is not None:
                     tr["use_global_prompt"] = use_global
 
@@ -1020,43 +1024,98 @@ def make_handler(work_dir: Path):
                 master_prompt = parsed.get("meta", {}).get("prompt", "")
                 master_context = f"Overall creative direction: {master_prompt}\n\n" if master_prompt else ""
 
-                user_content = [
-                    {"type": "text", "text": f"You are a visual effects director for a music video. {master_context}Describe the ideal visual transition between these two keyframes.\n\n"},
-                    {"type": "text", "text": f"FROM keyframe ({tr['from']}):\n"
-                        f"  Timestamp: {from_kf['timestamp']}\n"
-                        f"  Mood: {from_ctx.get('mood', 'unknown')}\n"
-                        f"  Energy: {from_ctx.get('energy', 'unknown')}\n"
-                        f"  Instruments: {', '.join(from_ctx.get('instruments', []))}\n"
-                        f"  Visual direction: {from_ctx.get('visual_direction', '')}\n\n"},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": from_b64}},
-                    {"type": "text", "text": f"\nTO keyframe ({tr['to']}):\n"
-                        f"  Timestamp: {to_kf['timestamp']}\n"
-                        f"  Mood: {to_ctx.get('mood', 'unknown')}\n"
-                        f"  Energy: {to_ctx.get('energy', 'unknown')}\n"
-                        f"  Instruments: {', '.join(to_ctx.get('instruments', []))}\n"
-                        f"  Visual direction: {to_ctx.get('visual_direction', '')}\n\n"},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": to_b64}},
-                    {"type": "text", "text": f"\nTransition duration: {tr['duration_seconds']}s, {tr['slots']} slot(s).\n\n"
-                        "Write a concise cinematic transition description (1-3 sentences) that describes the visual journey "
-                        "from the first image to the second, considering the musical context. "
-                        "Focus on motion, transformation, and mood shift. "
-                        "This will be used as a prompt for Veo video generation.\n\n"
-                        "Reply with ONLY the transition description, no preamble."},
-                ]
+                n_slots = tr.get("slots", 1)
+                selected_slot_kf_dir = project_dir / "selected_slot_keyframes"
 
-                response = client.messages.create(
-                    model="claude-sonnet-4-20250514",
-                    max_tokens=300,
-                    messages=[{"role": "user", "content": user_content}],
-                )
+                if n_slots <= 1:
+                    # Single-slot: generate one action from the two keyframes
+                    user_content = [
+                        {"type": "text", "text": f"You are a visual effects director for a music video. {master_context}Describe the ideal visual transition between these two keyframes.\n\n"},
+                        {"type": "text", "text": f"FROM keyframe ({tr['from']}):\n"
+                            f"  Timestamp: {from_kf['timestamp']}\n"
+                            f"  Mood: {from_ctx.get('mood', 'unknown')}\n"
+                            f"  Energy: {from_ctx.get('energy', 'unknown')}\n"
+                            f"  Instruments: {', '.join(from_ctx.get('instruments', []))}\n"
+                            f"  Visual direction: {from_ctx.get('visual_direction', '')}\n\n"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": from_b64}},
+                        {"type": "text", "text": f"\nTO keyframe ({tr['to']}):\n"
+                            f"  Timestamp: {to_kf['timestamp']}\n"
+                            f"  Mood: {to_ctx.get('mood', 'unknown')}\n"
+                            f"  Energy: {to_ctx.get('energy', 'unknown')}\n"
+                            f"  Instruments: {', '.join(to_ctx.get('instruments', []))}\n"
+                            f"  Visual direction: {to_ctx.get('visual_direction', '')}\n\n"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": to_b64}},
+                        {"type": "text", "text": f"\nTransition duration: {tr['duration_seconds']}s.\n\n"
+                            "Write a concise cinematic transition description (1-3 sentences) that describes the visual journey "
+                            "from the first image to the second, considering the musical context. "
+                            "Focus on motion, transformation, and mood shift. "
+                            "This will be used as a prompt for Veo video generation.\n\n"
+                            "Reply with ONLY the transition description, no preamble."},
+                    ]
 
-                action = response.content[0].text.strip()
-                tr["action"] = action
+                    response = client.messages.create(
+                        model="claude-sonnet-4-20250514",
+                        max_tokens=300,
+                        messages=[{"role": "user", "content": user_content}],
+                    )
+
+                    action = response.content[0].text.strip()
+                    tr["action"] = action
+                else:
+                    # Multi-slot: build the chain of images (from_kf -> intermediate_0 -> ... -> to_kf)
+                    chain_images = [from_img]
+                    for s in range(n_slots - 1):
+                        slot_kf_path = selected_slot_kf_dir / f"{tr_id}_slot_{s}.png"
+                        if slot_kf_path.exists():
+                            chain_images.append(slot_kf_path)
+                        else:
+                            chain_images.append(None)
+                    chain_images.append(to_img)
+
+                    # Generate one prompt per slot
+                    slot_actions = []
+                    slot_duration = tr["duration_seconds"] / n_slots
+                    for s in range(n_slots):
+                        start_img_path = chain_images[s]
+                        end_img_path = chain_images[s + 1]
+                        if not start_img_path or not end_img_path or not start_img_path.exists() or not end_img_path.exists():
+                            slot_actions.append(f"Smooth cinematic transition (slot {s})")
+                            continue
+
+                        s_b64 = base64.b64encode(start_img_path.read_bytes()).decode()
+                        e_b64 = base64.b64encode(end_img_path.read_bytes()).decode()
+
+                        user_content = [
+                            {"type": "text", "text": f"You are a visual effects director for a music video. {master_context}"
+                                f"This is slot {s + 1} of {n_slots} in a multi-slot transition from {tr['from']} to {tr['to']}.\n\n"},
+                            {"type": "text", "text": "START frame for this slot:\n"},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": s_b64}},
+                            {"type": "text", "text": "\nEND frame for this slot:\n"},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": e_b64}},
+                            {"type": "text", "text": f"\nSlot duration: {slot_duration:.1f}s.\n\n"
+                                "Write a concise cinematic description (1-3 sentences) of what happens visually during this slot. "
+                                "The start and end frames may look similar — describe the motion, energy, and subtle transformations "
+                                "that should occur between them. Focus on camera movement, lighting shifts, and particle/element behavior. "
+                                "This will be used as a prompt for Veo video generation.\n\n"
+                                "Reply with ONLY the description, no preamble."},
+                        ]
+
+                        response = client.messages.create(
+                            model="claude-sonnet-4-20250514",
+                            max_tokens=300,
+                            messages=[{"role": "user", "content": user_content}],
+                        )
+                        slot_actions.append(response.content[0].text.strip())
+
+                    tr["slot_actions"] = slot_actions
+                    # Also set action to slot 0's action as a summary/fallback
+                    if slot_actions:
+                        tr["action"] = slot_actions[0]
 
                 with open(yaml_path, "w") as f:
                     pyyaml.dump(parsed, f, default_flow_style=False, allow_unicode=True, width=1000)
 
-                self._json_response({"success": True, "action": action})
+                self._json_response({"success": True, "action": tr.get("action", ""), "slotActions": tr.get("slot_actions", [])})
             except Exception as e:
                 self._error(500, "INTERNAL_ERROR", str(e))
 
@@ -1163,6 +1222,7 @@ def make_handler(work_dir: Path):
 
             tr_id = body.get("transitionId")
             count = body.get("count", 4)  # how many NEW candidates to generate
+            slot_index = body.get("slotIndex")  # optional: generate for a single slot only
             if not tr_id:
                 return self._error(400, "BAD_REQUEST", "Missing 'transitionId'")
 
@@ -1175,9 +1235,14 @@ def make_handler(work_dir: Path):
             tr_candidates_dir = project_dir / "transition_candidates" / tr_id
             existing_count = 0
             if tr_candidates_dir.exists():
-                for slot_dir in tr_candidates_dir.iterdir():
-                    if slot_dir.is_dir():
-                        existing_count = max(existing_count, len(list(slot_dir.glob("v*.mp4"))))
+                if slot_index is not None:
+                    slot_dir = tr_candidates_dir / f"slot_{slot_index}"
+                    if slot_dir.exists():
+                        existing_count = len(list(slot_dir.glob("v*.mp4")))
+                else:
+                    for slot_dir in tr_candidates_dir.iterdir():
+                        if slot_dir.is_dir():
+                            existing_count = max(existing_count, len(list(slot_dir.glob("v*.mp4"))))
             total_count = existing_count + count
 
             from beatlab.ws_server import job_manager
@@ -1187,15 +1252,20 @@ def make_handler(work_dir: Path):
                 try:
                     from beatlab.render.narrative import generate_transition_candidates
                     from beatlab.render.google_video import PromptRejectedError
+
+                    job_manager.update_progress(job_id, 0, "Starting Veo generation...")
+
                     try:
                         generate_transition_candidates(
                             str(yaml_path),
                             vertex=True,
                             candidates_per_slot=total_count,
                             segment_filter={tr_id},
+                            slot_filter={slot_index} if slot_index is not None else None,
                         )
-                    except PromptRejectedError:
-                        pass  # Handled inside — some candidates may still have been generated
+                    except PromptRejectedError as pre:
+                        job_manager.update_progress(job_id, 0, f"Prompt issue: {str(pre)[:100]}")
+                        # Some candidates may still have been generated — continue to collect
 
                     # Collect results
                     project_dir = work_dir / project_name
@@ -1212,7 +1282,11 @@ def make_handler(work_dir: Path):
 
                     job_manager.complete_job(job_id, {"transitionId": tr_id, "candidates": candidates})
                 except Exception as e:
-                    job_manager.fail_job(job_id, str(e))
+                    err = str(e)
+                    if "transient" in err.lower() or "None" in err:
+                        job_manager.fail_job(job_id, f"Veo returned empty results after retries. This is usually transient — try again. ({err[:80]})")
+                    else:
+                        job_manager.fail_job(job_id, err)
 
             import threading
             threading.Thread(target=_run, daemon=True).start()

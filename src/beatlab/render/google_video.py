@@ -41,19 +41,27 @@ class PromptRejectedError(Exception):
     pass
 
 
-def _retry_video_generation(generate_fn, client, output_path, max_retries: int = 8):
+def _retry_video_generation(generate_fn, client, output_path, max_retries: int = 8, on_status=None):
     """Retry video generation with backoff on NoneType/transient failures.
 
     Handles: rate limits (429), transient None results (common with Veo preview models),
     and timeouts. Only raises PromptRejectedError after 6+ consecutive None results.
+
+    Args:
+        on_status: optional callback(message: str) for progress reporting
     """
+    def _status(msg):
+        _log(f"    {msg}")
+        if on_status:
+            on_status(msg)
+
     none_count = 0
 
     for attempt in range(max_retries):
         try:
-            _log(f"    Submitting Veo request... (attempt {attempt + 1}/{max_retries})")
+            _status(f"Submitting to Veo (attempt {attempt + 1}/{max_retries})...")
             operation = generate_fn()
-            _log(f"    Veo request accepted, polling for result...")
+            _status("Veo accepted, waiting for result...")
 
             # Poll until done (timeout after 10 minutes)
             poll_start = time.time()
@@ -64,27 +72,27 @@ def _retry_video_generation(generate_fn, client, output_path, max_retries: int =
                     raise TimeoutError("Veo generation polling timed out after 10 minutes")
                 poll_count += 1
                 if poll_count % 3 == 0:  # Log every 30s
-                    _log(f"    Polling Veo... ({int(elapsed)}s elapsed)")
+                    _status(f"Waiting for Veo... ({int(elapsed)}s)")
                 time.sleep(10)
                 operation = client.operations.get(operation)
-            _log(f"    Veo generation complete ({int(time.time() - poll_start)}s)")
+            _status(f"Veo complete ({int(time.time() - poll_start)}s)")
 
             # Check for valid result
             if operation.result is None:
                 none_count += 1
-                _log(f"    Result is None (transient, attempt {none_count}). Retrying...")
+                _status(f"Veo returned empty result (transient). Retrying {none_count}/{max_retries}...")
                 time.sleep(min(5 * none_count, 30))
                 continue
             if not operation.result.generated_videos:
                 none_count += 1
-                _log(f"    Empty generated_videos (transient, attempt {none_count}). Retrying...")
+                _status(f"Veo returned no videos (transient). Retrying {none_count}/{max_retries}...")
                 time.sleep(min(5 * none_count, 30))
                 continue
 
             generated = operation.result.generated_videos[0]
             if generated is None:
                 none_count += 1
-                _log(f"    First video is None (transient, attempt {none_count}). Retrying...")
+                _status(f"Veo video is None (transient). Retrying {none_count}/{max_retries}...")
                 time.sleep(min(5 * none_count, 30))
                 continue
 
@@ -103,7 +111,7 @@ def _retry_video_generation(generate_fn, client, output_path, max_retries: int =
 
             if is_retryable:
                 wait = min(2 ** (attempt + 1), 60)
-                _log(f"    Rate limited or timeout: {err_str[:80]}. Retrying in {wait}s...")
+                _status(f"Rate limited. Retrying in {wait}s...")
                 time.sleep(wait)
             else:
                 raise
