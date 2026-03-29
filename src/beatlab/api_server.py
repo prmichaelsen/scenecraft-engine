@@ -598,10 +598,11 @@ def make_handler(work_dir: Path):
             try:
                 # Read, find keyframe, update timestamp, write back
                 content = yaml_path.read_text()
-                id_pattern = f"- id: {kf_id}"
-                idx = content.find(id_pattern)
-                if idx == -1:
+                # Match both "- id: kf_001" and "  id: kf_001" (pyyaml sorts keys, so id may not be first)
+                id_match = re.search(rf"^[ -]+id: {re.escape(kf_id)}\s*$", content, re.MULTILINE)
+                if not id_match:
                     return self._error(404, "NOT_FOUND", f"Keyframe {kf_id} not found")
+                idx = id_match.start()
 
                 ts_pattern = re.compile(r"\n(\s+)timestamp:\s*'?([^'\n]+)'?")
                 after = content[idx:]
@@ -2197,12 +2198,15 @@ def make_handler(work_dir: Path):
         def _json_response(self, obj, status: int = 200):
             """Send a JSON response."""
             data = json.dumps(obj).encode()
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self._cors_headers()
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self._cors_headers()
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # Client disconnected before response was sent
 
         def _error(self, status: int, code: str, message: str):
             """Send a JSON error response."""
