@@ -1233,8 +1233,10 @@ def apply_rules(layer1_data: dict, rules: list[dict],
             # a sustained region at this time, the "onset" is actually bleed
             # from a sustained instrument (pad, bass), not a real drum hit.
             # Real percussion is transient by nature — never sustained.
+            # NOTE: Skip for bleed-exempt stems (from instrumental) — their
+            # sustained regions are reverb tails, not instrument bleed.
             PERCUSSION_STEMS = {"kick", "snare", "hh", "toms", "ride", "crash", "drums"}
-            if stem in PERCUSSION_STEMS:
+            if stem in PERCUSSION_STEMS and stem not in exempt:
                 full_sustained = layer1_data.get(stem, {}).get("full", {}).get("sustained_regions", [])
                 in_sustained = any(
                     r["start_time"] <= t <= r["end_time"]
