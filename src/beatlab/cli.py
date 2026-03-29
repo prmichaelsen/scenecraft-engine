@@ -1390,14 +1390,15 @@ def audio_intelligence(video_file: str, work_dir: str, output: str | None,
 
 @main.command(name="audio-intelligence-multimodel")
 @click.argument("video_file", type=click.Path(exists=True))
-@click.option("--vocals", required=True, type=click.Path(exists=True), help="MDX23C-InstVoc vocals stem")
-@click.option("--kick", required=True, type=click.Path(exists=True), help="DrumSep kick stem")
-@click.option("--snare", required=True, type=click.Path(exists=True), help="DrumSep snare stem")
-@click.option("--hh", required=True, type=click.Path(exists=True), help="DrumSep hi-hat stem")
+@click.option("--auto-separate/--no-auto-separate", default=False, help="Auto-run 3-model separation (InstVoc → DrumSep + Demucs 6s) before analysis")
+@click.option("--vocals", default=None, type=click.Path(exists=True), help="MDX23C-InstVoc vocals stem (auto-detected if --auto-separate)")
+@click.option("--kick", default=None, type=click.Path(exists=True), help="DrumSep kick stem")
+@click.option("--snare", default=None, type=click.Path(exists=True), help="DrumSep snare stem")
+@click.option("--hh", default=None, type=click.Path(exists=True), help="DrumSep hi-hat stem")
 @click.option("--ride", default=None, type=click.Path(exists=True), help="DrumSep ride stem")
 @click.option("--crash", default=None, type=click.Path(exists=True), help="DrumSep crash stem")
 @click.option("--toms", default=None, type=click.Path(exists=True), help="DrumSep toms stem")
-@click.option("--bass", required=True, type=click.Path(exists=True), help="Demucs 6s bass stem")
+@click.option("--bass", default=None, type=click.Path(exists=True), help="Demucs 6s bass stem")
 @click.option("--guitar", default=None, type=click.Path(exists=True), help="Demucs 6s guitar stem")
 @click.option("--piano", default=None, type=click.Path(exists=True), help="Demucs 6s piano stem")
 @click.option("--other", default=None, type=click.Path(exists=True), help="Demucs 6s other stem")
@@ -1409,19 +1410,34 @@ def audio_intelligence(video_file: str, work_dir: str, output: str | None,
 @click.option("--fps", default=None, type=float, help="Video frame rate")
 @click.option("--sr", default=22050, type=int, help="Sample rate")
 def audio_intelligence_multimodel(
-    video_file: str, vocals: str, kick: str, snare: str, hh: str,
+    video_file: str, auto_separate: bool,
+    vocals: str | None, kick: str | None, snare: str | None, hh: str | None,
     ride: str | None, crash: str | None, toms: str | None,
-    bass: str, guitar: str | None, piano: str | None, other: str | None,
+    bass: str | None, guitar: str | None, piano: str | None, other: str | None,
     output: str | None, descriptions: str | None, creative_direction: str | None,
     vocal_bleed_threshold: float, work_dir: str, fps: float | None, sr: int,
 ):
-    """Run multi-model audio intelligence pipeline (InstVoc + DrumSep + Demucs 6s)."""
-    from beatlab.render.frames import detect_fps
+    """Run multi-model audio intelligence pipeline (InstVoc + DrumSep + Demucs 6s).
+
+    Two modes:
+      --auto-separate: Auto-runs 3-model separation then analysis (one command does everything)
+      Manual: Provide pre-separated stem paths via --vocals, --kick, etc.
+
+    Examples:
+        beatlab audio-intelligence-multimodel video.mov --auto-separate
+        beatlab audio-intelligence-multimodel video.mov --vocals v.wav --kick k.wav --snare s.wav --hh h.wav --bass b.wav
+    """
+    from beatlab.render.frames import detect_fps, extract_audio
     from beatlab.render.workdir import WorkDir
     from beatlab.audio_intelligence import run_audio_intelligence_multimodel
 
     work = WorkDir(video_file, base_dir=work_dir)
     video_fps = fps or detect_fps(video_file)
+
+    # Ensure audio is extracted
+    if not work.has_audio():
+        _log("  Extracting audio...")
+        extract_audio(video_file, str(work.audio_path), sr=sr)
 
     # Auto-detect descriptions
     descriptions_path = descriptions
@@ -1430,7 +1446,32 @@ def audio_intelligence_multimodel(
         if auto_desc.exists():
             descriptions_path = str(auto_desc)
 
-    audio_path = str(work.audio_path) if work.has_audio() else video_file
+    audio_path = str(work.audio_path)
+
+    # Auto-separate: run the 3-model pipeline
+    if auto_separate:
+        from beatlab.stems import separate_stems_multimodel
+        stems_dir = str(work.root / "stems_v2")
+        all_stems = separate_stems_multimodel(audio_path, stems_dir)
+
+        # Override any manually provided stems with auto-separated ones
+        vocals = vocals or all_stems.get("vocals")
+        kick = kick or all_stems.get("kick")
+        snare = snare or all_stems.get("snare")
+        hh = hh or all_stems.get("hh")
+        ride = ride or all_stems.get("ride")
+        crash = crash or all_stems.get("crash")
+        toms = toms or all_stems.get("toms")
+        bass = bass or all_stems.get("bass")
+        guitar = guitar or all_stems.get("guitar")
+        piano = piano or all_stems.get("piano")
+        other = other or all_stems.get("other")
+
+    # Validate required stems
+    if not vocals or not kick or not snare or not hh or not bass:
+        raise click.ClickException(
+            "Missing required stems. Either use --auto-separate or provide --vocals, --kick, --snare, --hh, --bass"
+        )
 
     drumsep_paths = {"kick": kick, "snare": snare, "hh": hh}
     if ride:

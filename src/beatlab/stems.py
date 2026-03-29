@@ -188,6 +188,244 @@ def separate_stems_local(
     return expected
 
 
+MULTIMODEL_STEMS = {
+    "vocals": "mdx23c_instvoc",
+    "kick": "mdx23c_drumsep",
+    "snare": "mdx23c_drumsep",
+    "hh": "mdx23c_drumsep",
+    "ride": "mdx23c_drumsep",
+    "crash": "mdx23c_drumsep",
+    "toms": "mdx23c_drumsep",
+    "bass": "demucs_6s",
+    "guitar": "demucs_6s",
+    "piano": "demucs_6s",
+    "other": "demucs_6s",
+}
+
+
+def separate_stems_multimodel(audio_path: str, output_dir: str) -> dict[str, str]:
+    """Run the 3-model stem separation pipeline locally.
+
+    Pipeline: MDX23C-InstVoc → {vocals, instrumental}
+              DrumSep(instrumental) → {kick, snare, hh, ride, crash, toms}
+              Demucs 6s(instrumental) → {bass, guitar, piano, other}
+
+    Args:
+        audio_path: Path to input audio file.
+        output_dir: Root output directory for all stems.
+
+    Returns:
+        Dict mapping stem name to WAV path for all 11 stems.
+    """
+    import subprocess
+    import sys
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    instvoc_dir = out / "mdx23c_instvoc"
+    drumsep_dir = out / "mdx23c_drumsep"
+    demucs_dir = out / "demucs_6s"
+
+    # Check if all stems already exist (cache)
+    result_paths = _multimodel_result_paths(out, Path(audio_path).stem)
+    if all(Path(p).exists() for p in result_paths.values()):
+        _log("Multi-model stems: using cached")
+        return result_paths
+
+    # ── Step 1: MDX23C-InstVoc ──
+    vocals_path, instrumental_path = _run_instvoc(audio_path, instvoc_dir)
+
+    # ── Step 2: DrumSep + Demucs 6s on instrumental (sequential to avoid OOM) ──
+    drumsep_paths = _run_drumsep(instrumental_path, drumsep_dir)
+    demucs_paths = _run_demucs_6s(instrumental_path, demucs_dir)
+
+    # ── Step 3: Collect all paths ──
+    result = {"vocals": vocals_path}
+    result.update(drumsep_paths)
+    result.update(demucs_paths)
+
+    _log(f"Multi-model separation complete: {len(result)} stems")
+    return result
+
+
+def _multimodel_result_paths(out: Path, audio_stem: str) -> dict[str, str]:
+    """Build expected result paths for cache checking."""
+    instvoc_dir = out / "mdx23c_instvoc"
+    drumsep_dir = out / "mdx23c_drumsep"
+    demucs_dir = out / "demucs_6s"
+
+    # audio-separator names files with the input filename prefix
+    # Demucs 6s names files by stem name in a subdirectory
+    paths = {}
+
+    # InstVoc vocals
+    for f in instvoc_dir.glob("*Vocals*") if instvoc_dir.exists() else []:
+        if f.suffix == ".wav":
+            paths["vocals"] = str(f)
+            break
+
+    # DrumSep
+    for drum in ("kick", "snare", "hh", "ride", "crash", "toms"):
+        for f in drumsep_dir.glob(f"*({drum})*") if drumsep_dir.exists() else []:
+            if f.suffix == ".wav":
+                paths[drum] = str(f)
+                break
+
+    # Demucs 6s — look in the htdemucs_6s subdirectory
+    demucs_stem_dir = None
+    if demucs_dir.exists():
+        for d in demucs_dir.rglob("htdemucs_6s"):
+            for sub in d.iterdir():
+                if sub.is_dir():
+                    demucs_stem_dir = sub
+                    break
+            break
+
+    if demucs_stem_dir:
+        for stem in ("bass", "guitar", "piano", "other"):
+            wav = demucs_stem_dir / f"{stem}.wav"
+            mp3 = demucs_stem_dir / f"{stem}.mp3"
+            if wav.exists():
+                paths[stem] = str(wav)
+            elif mp3.exists():
+                paths[stem] = str(mp3)  # will need conversion
+
+    return paths
+
+
+def _run_instvoc(audio_path: str, output_dir: Path) -> tuple[str, str]:
+    """Run MDX23C-InstVoc-HQ. Returns (vocals_path, instrumental_path)."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check cache
+    vocals_files = list(output_dir.glob("*Vocals*.wav"))
+    inst_files = list(output_dir.glob("*Instrumental*.wav"))
+    if vocals_files and inst_files:
+        _log("  InstVoc: using cached")
+        return str(vocals_files[0]), str(inst_files[0])
+
+    _log("  Step 1: MDX23C-InstVoc (vocals + instrumental)...")
+    from audio_separator.separator import Separator
+    sep = Separator(output_dir=str(output_dir), model_file_dir="/tmp/audio-separator-models/")
+    sep.load_model("MDX23C-8KFFT-InstVoc_HQ.ckpt")
+    stems = sep.separate(audio_path)
+    _log(f"    Produced: {stems}")
+
+    # Find outputs
+    vocals_files = list(output_dir.glob("*Vocals*.wav"))
+    inst_files = list(output_dir.glob("*Instrumental*.wav"))
+    if not vocals_files or not inst_files:
+        raise RuntimeError(f"InstVoc did not produce expected stems in {output_dir}")
+
+    return str(vocals_files[0]), str(inst_files[0])
+
+
+def _run_drumsep(instrumental_path: str, output_dir: Path) -> dict[str, str]:
+    """Run MDX23C-DrumSep on instrumental. Returns {kick, snare, hh, ride, crash, toms} paths."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check cache
+    cached = {}
+    for drum in ("kick", "snare", "hh", "ride", "crash", "toms"):
+        matches = list(output_dir.glob(f"*({drum})*.wav"))
+        if matches:
+            cached[drum] = str(matches[0])
+    if len(cached) == 6:
+        _log("  DrumSep: using cached")
+        return cached
+
+    _log("  Step 2a: MDX23C-DrumSep (kick/snare/hh/ride/crash/toms)...")
+    from audio_separator.separator import Separator
+    sep = Separator(output_dir=str(output_dir), model_file_dir="/tmp/audio-separator-models/")
+    sep.load_model("MDX23C-DrumSep-aufr33-jarredou.ckpt")
+    stems = sep.separate(instrumental_path)
+    _log(f"    Produced: {stems}")
+
+    result = {}
+    for drum in ("kick", "snare", "hh", "ride", "crash", "toms"):
+        matches = list(output_dir.glob(f"*({drum})*.wav"))
+        if matches:
+            result[drum] = str(matches[0])
+        else:
+            _log(f"    Warning: {drum} stem not found")
+
+    return result
+
+
+def _run_demucs_6s(instrumental_path: str, output_dir: Path) -> dict[str, str]:
+    """Run Demucs htdemucs_6s on instrumental. Returns {bass, guitar, piano, other} paths."""
+    import subprocess
+    import sys
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Find the demucs output subdirectory
+    inst_stem = Path(instrumental_path).stem
+
+    def _find_demucs_stems():
+        for d in output_dir.rglob("htdemucs_6s"):
+            for sub in d.iterdir():
+                if sub.is_dir():
+                    result = {}
+                    for stem in ("bass", "guitar", "piano", "other"):
+                        wav = sub / f"{stem}.wav"
+                        mp3 = sub / f"{stem}.mp3"
+                        if wav.exists():
+                            result[stem] = str(wav)
+                        elif mp3.exists():
+                            result[stem] = str(mp3)
+                    if len(result) >= 4:
+                        return result
+        return None
+
+    # Check cache
+    cached = _find_demucs_stems()
+    if cached:
+        _log("  Demucs 6s: using cached")
+        # Convert mp3 to wav if needed
+        for stem, path in cached.items():
+            if path.endswith(".mp3"):
+                wav_path = path.replace(".mp3", ".wav")
+                if not Path(wav_path).exists():
+                    _log(f"    Converting {stem}.mp3 → wav...")
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-i", path, "-acodec", "pcm_s16le",
+                         "-ar", "44100", "-ac", "2", wav_path],
+                        check=True, capture_output=True,
+                    )
+                cached[stem] = wav_path
+        return cached
+
+    _log("  Step 2b: Demucs htdemucs_6s (bass/guitar/piano/other)...")
+    result = subprocess.run(
+        [sys.executable, "-m", "demucs", "-n", "htdemucs_6s", "-d", "cpu",
+         "--mp3", "--mp3-bitrate", "320", "-o", str(output_dir), instrumental_path],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Demucs 6s failed: {result.stderr[-500:]}")
+
+    stems = _find_demucs_stems()
+    if not stems:
+        raise RuntimeError(f"Demucs 6s did not produce expected stems in {output_dir}")
+
+    # Convert mp3 to wav
+    for stem, path in stems.items():
+        if path.endswith(".mp3"):
+            wav_path = path.replace(".mp3", ".wav")
+            _log(f"    Converting {stem}.mp3 → wav...")
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", path, "-acodec", "pcm_s16le",
+                 "-ar", "44100", "-ac", "2", wav_path],
+                check=True, capture_output=True,
+            )
+            stems[stem] = wav_path
+
+    _log(f"    Demucs 6s complete: {list(stems.keys())}")
+    return stems
+
+
 def _detect_onsets(y, sr_out, hop_length=512) -> list[dict]:
     """Detect onsets using librosa directly (no beat_this)."""
     import librosa
