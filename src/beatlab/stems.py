@@ -227,10 +227,10 @@ def separate_stems_multimodel(audio_path: str, output_dir: str) -> dict[str, str
     drumsep_dir = out / "mdx23c_drumsep"
     demucs_dir = out / "demucs_6s"
 
-    # Check if all stems already exist (cache)
+    # Check if all stems already exist (cache) — need at least 10 stems
     result_paths = _multimodel_result_paths(out, Path(audio_path).stem)
-    if all(Path(p).exists() for p in result_paths.values()):
-        _log("Multi-model stems: using cached")
+    if len(result_paths) >= 10 and all(Path(p).exists() for p in result_paths.values()):
+        _log(f"Multi-model stems: using cached ({len(result_paths)} stems)")
         return result_paths
 
     # ── Step 1: MDX23C-InstVoc ──
