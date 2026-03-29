@@ -90,6 +90,11 @@ def make_handler(work_dir: Path):
             if m:
                 return self._handle_get_settings(m.group(1))
 
+            # GET /api/projects/:name/audio-intelligence
+            m = re.match(r"^/api/projects/([^/]+)/audio-intelligence$", path)
+            if m:
+                return self._handle_get_audio_intelligence(m.group(1))
+
             # GET /api/projects/:name/version/history
             m = re.match(r"^/api/projects/([^/]+)/version/history$", path)
             if m:
@@ -1208,6 +1213,51 @@ def make_handler(work_dir: Path):
                     pyyaml.dump(parsed, f, default_flow_style=False, allow_unicode=True, width=1000)
 
                 self._json_response({"success": True, "meta": meta})
+            except Exception as e:
+                self._error(500, "INTERNAL_ERROR", str(e))
+
+        def _handle_get_audio_intelligence(self, project_name: str):
+            """GET /api/projects/:name/audio-intelligence — return processed beat events from audio intelligence file."""
+            project_dir = work_dir / project_name
+
+            # Determine which file to use
+            import yaml as pyyaml
+            settings_path = project_dir / "settings.yaml"
+            ai_file = None
+            if settings_path.exists():
+                with open(settings_path) as f:
+                    s = pyyaml.safe_load(f) or {}
+                ai_file = s.get("audio_intelligence_file")
+
+            # Auto-detect latest if not configured
+            if not ai_file:
+                candidates = sorted(project_dir.glob("audio_intelligence*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+                if candidates:
+                    ai_file = candidates[0].name
+
+            if not ai_file or not (project_dir / ai_file).exists():
+                # Fallback: return empty (frontend falls back to beats.json)
+                return self._json_response({"activeFile": None, "events": [], "sections": [], "rules": []})
+
+            try:
+                import json as _json
+                with open(project_dir / ai_file) as f:
+                    data = _json.load(f)
+
+                events = data.get("layer3_events", [])
+                sections = data.get("layer2", [])
+                rules = data.get("layer3_rules", [])
+
+                # List available files
+                available = sorted([f.name for f in project_dir.glob("audio_intelligence*.json")], reverse=True)
+
+                self._json_response({
+                    "activeFile": ai_file,
+                    "availableFiles": available,
+                    "events": events,
+                    "sections": sections,
+                    "ruleCount": len(rules),
+                })
             except Exception as e:
                 self._error(500, "INTERNAL_ERROR", str(e))
 
