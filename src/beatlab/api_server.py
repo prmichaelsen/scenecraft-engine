@@ -95,6 +95,11 @@ def make_handler(work_dir: Path):
             if m:
                 return self._handle_get_audio_intelligence(m.group(1))
 
+            # GET /api/projects/:name/pool
+            m = re.match(r"^/api/projects/([^/]+)/pool$", path)
+            if m:
+                return self._handle_get_pool(m.group(1))
+
             # GET /api/projects/:name/version/history
             m = re.match(r"^/api/projects/([^/]+)/version/history$", path)
             if m:
@@ -180,6 +185,11 @@ def make_handler(work_dir: Path):
             m = re.match(r"^/api/projects/([^/]+)/generate-transition-action$", path)
             if m:
                 return self._handle_generate_transition_action(m.group(1))
+
+            # POST /api/projects/:name/enhance-transition-action
+            m = re.match(r"^/api/projects/([^/]+)/enhance-transition-action$", path)
+            if m:
+                return self._handle_enhance_transition_action(m.group(1))
 
             # POST /api/projects/:name/generate-slot-keyframe-candidates
             m = re.match(r"^/api/projects/([^/]+)/generate-slot-keyframe-candidates$", path)
@@ -655,6 +665,38 @@ def make_handler(work_dir: Path):
 
             self._json_response({"bin": bin_entries, "transitionBin": transition_bin})
 
+        def _handle_get_pool(self, project_name: str):
+            """GET /api/projects/:name/pool — list pool assets (unassigned keyframe images and video segments)."""
+            project_dir = work_dir / project_name
+            pool_dir = project_dir / "pool"
+            if not pool_dir.is_dir():
+                return self._json_response({"keyframes": [], "segments": []})
+
+            kf_dir = pool_dir / "keyframes"
+            seg_dir = pool_dir / "segments"
+
+            keyframes = []
+            if kf_dir.is_dir():
+                for f in sorted(kf_dir.iterdir()):
+                    if f.suffix.lower() in ('.png', '.jpg', '.jpeg', '.webp'):
+                        keyframes.append({
+                            "name": f.name,
+                            "path": f"pool/keyframes/{f.name}",
+                            "size": f.stat().st_size,
+                        })
+
+            segments = []
+            if seg_dir.is_dir():
+                for f in sorted(seg_dir.iterdir()):
+                    if f.suffix.lower() in ('.mp4', '.webm', '.mov'):
+                        segments.append({
+                            "name": f.name,
+                            "path": f"pool/segments/{f.name}",
+                            "size": f.stat().st_size,
+                        })
+
+            self._json_response({"keyframes": keyframes, "segments": segments})
+
         def _handle_add_keyframe(self, project_name: str):
             """POST /api/projects/:name/add-keyframe — create a new keyframe at a given timestamp."""
             body = self._read_json_body()
@@ -754,6 +796,15 @@ def make_handler(work_dir: Path):
 
                 tl["bin"].append(removed)
                 tl["keyframes"] = keyframes
+
+                # Also soft-delete any transitions referencing this keyframe
+                now = removed["deleted_at"]
+                orphaned = [tr for tr in tl["transitions"] if tr.get("from") == kf_id or tr.get("to") == kf_id]
+                for tr in orphaned:
+                    tr["deleted_at"] = now
+                    tl["transition_bin"].append(tr)
+                tl["transitions"] = [tr for tr in tl["transitions"] if tr.get("from") != kf_id and tr.get("to") != kf_id]
+
                 self._save_timeline_data(parsed, tl)
 
                 with open(yaml_path, "w") as f:
@@ -832,7 +883,8 @@ def make_handler(work_dir: Path):
                 with open(yaml_path) as f:
                     parsed = pyyaml.safe_load(f)
 
-                transitions = parsed.get("transitions", [])
+                tl = self._load_timeline_data(parsed)
+                transitions = tl["transitions"]
                 idx = next((i for i, tr in enumerate(transitions) if tr.get("id") == tr_id), -1)
                 if idx == -1:
                     return self._error(404, "NOT_FOUND", f"Transition {tr_id} not found")
@@ -840,10 +892,8 @@ def make_handler(work_dir: Path):
                 removed = transitions.pop(idx)
                 removed["deleted_at"] = datetime.now(timezone.utc).isoformat()
 
-                tr_bin = parsed.get("transition_bin", [])
-                tr_bin.append(removed)
-                parsed["transition_bin"] = tr_bin
-                parsed["transitions"] = transitions
+                tl["transition_bin"].append(removed)
+                self._save_timeline_data(parsed, tl)
 
                 with open(yaml_path, "w") as f:
                     pyyaml.dump(parsed, f, default_flow_style=False, allow_unicode=True, width=1000)
@@ -871,7 +921,8 @@ def make_handler(work_dir: Path):
                 with open(yaml_path) as f:
                     parsed = pyyaml.safe_load(f)
 
-                tr_bin = parsed.get("transition_bin", [])
+                tl = self._load_timeline_data(parsed)
+                tr_bin = tl["transition_bin"]
                 idx = next((i for i, tr in enumerate(tr_bin) if tr.get("id") == tr_id), -1)
                 if idx == -1:
                     return self._error(404, "NOT_FOUND", f"Transition {tr_id} not in bin")
@@ -879,10 +930,8 @@ def make_handler(work_dir: Path):
                 restored = tr_bin.pop(idx)
                 del restored["deleted_at"]
 
-                transitions = parsed.get("transitions", [])
-                transitions.append(restored)
-                parsed["transitions"] = transitions
-                parsed["transition_bin"] = tr_bin
+                tl["transitions"].append(restored)
+                self._save_timeline_data(parsed, tl)
 
                 with open(yaml_path, "w") as f:
                     pyyaml.dump(parsed, f, default_flow_style=False, allow_unicode=True, width=1000)
@@ -913,7 +962,8 @@ def make_handler(work_dir: Path):
                 with open(yaml_path) as f:
                     parsed = pyyaml.safe_load(f)
 
-                transitions = parsed.get("transitions", [])
+                tl = self._load_timeline_data(parsed)
+                transitions = tl["transitions"]
                 tr = next((t for t in transitions if t.get("id") == tr_id), None)
                 if not tr:
                     return self._error(404, "NOT_FOUND", f"Transition {tr_id} not found")
@@ -925,7 +975,7 @@ def make_handler(work_dir: Path):
                 if use_global is not None:
                     tr["use_global_prompt"] = use_global
 
-                parsed["transitions"] = transitions
+                self._save_timeline_data(parsed, tl)
                 with open(yaml_path, "w") as f:
                     pyyaml.dump(parsed, f, default_flow_style=False, allow_unicode=True, width=1000)
 
@@ -954,7 +1004,8 @@ def make_handler(work_dir: Path):
                 with open(yaml_path) as f:
                     parsed = pyyaml.safe_load(f)
 
-                transitions = parsed.get("transitions", [])
+                tl = self._load_timeline_data(parsed)
+                transitions = tl["transitions"]
                 tr = next((t for t in transitions if t.get("id") == tr_id), None)
                 if not tr:
                     return self._error(404, "NOT_FOUND", f"Transition {tr_id} not found")
@@ -966,7 +1017,7 @@ def make_handler(work_dir: Path):
                     remap["method"] = method
                 tr["remap"] = remap
 
-                parsed["transitions"] = transitions
+                self._save_timeline_data(parsed, tl)
                 with open(yaml_path, "w") as f:
                     pyyaml.dump(parsed, f, default_flow_style=False, allow_unicode=True, width=1000)
 
@@ -996,12 +1047,13 @@ def make_handler(work_dir: Path):
                 with open(yaml_path) as f:
                     parsed = pyyaml.safe_load(f)
 
-                transitions = parsed.get("transitions", [])
+                tl = self._load_timeline_data(parsed)
+                transitions = tl.get("transitions", [])
                 tr = next((t for t in transitions if t.get("id") == tr_id), None)
                 if not tr:
                     return self._error(404, "NOT_FOUND", f"Transition {tr_id} not found")
 
-                kf_by_id = {kf["id"]: kf for kf in parsed.get("keyframes", [])}
+                kf_by_id = {kf["id"]: kf for kf in tl.get("keyframes", [])}
                 from_kf = kf_by_id.get(tr["from"])
                 to_kf = kf_by_id.get(tr["to"])
                 if not from_kf or not to_kf:
@@ -1026,7 +1078,14 @@ def make_handler(work_dir: Path):
                 to_b64 = base64.b64encode(to_img.read_bytes()).decode()
                 from_ctx = from_kf.get("context", {})
                 to_ctx = to_kf.get("context", {})
-                master_prompt = parsed.get("meta", {}).get("prompt", "")
+                # In split format, meta is in project.yaml; in legacy, it's in the same file
+                project_yaml = work_dir / project_name / "project.yaml"
+                if project_yaml.exists():
+                    with open(project_yaml) as pf:
+                        project_data = pyyaml.safe_load(pf) or {}
+                    master_prompt = project_data.get("meta", {}).get("prompt", "")
+                else:
+                    master_prompt = parsed.get("meta", {}).get("prompt", "")
                 master_context = f"Overall creative direction: {master_prompt}\n\n" if master_prompt else ""
 
                 n_slots = tr.get("slots", 1)
@@ -1121,6 +1180,81 @@ def make_handler(work_dir: Path):
                     pyyaml.dump(parsed, f, default_flow_style=False, allow_unicode=True, width=1000)
 
                 self._json_response({"success": True, "action": tr.get("action", ""), "slotActions": tr.get("slot_actions", [])})
+            except Exception as e:
+                self._error(500, "INTERNAL_ERROR", str(e))
+
+        def _handle_enhance_transition_action(self, project_name: str):
+            """POST /api/projects/:name/enhance-transition-action — enhance an existing action prompt to be more descriptive."""
+            body = self._read_json_body()
+            if body is None:
+                return
+
+            tr_id = body.get("transitionId")
+            current_action = body.get("action", "")
+            if not tr_id or not current_action:
+                return self._error(400, "BAD_REQUEST", "Missing 'transitionId' or 'action'")
+
+            yaml_path = self._require_yaml_path(project_name)
+            if yaml_path is None:
+                return
+
+            try:
+                import yaml as pyyaml
+                import base64
+                import os
+
+                with open(yaml_path) as f:
+                    parsed = pyyaml.safe_load(f)
+
+                tl = self._load_timeline_data(parsed)
+                transitions = tl["transitions"]
+                tr = next((t for t in transitions if t.get("id") == tr_id), None)
+                if not tr:
+                    return self._error(404, "NOT_FOUND", f"Transition {tr_id} not found")
+
+                api_key = os.environ.get("ANTHROPIC_API_KEY")
+                if not api_key:
+                    return self._error(500, "INTERNAL_ERROR", "ANTHROPIC_API_KEY not set")
+
+                project_dir = work_dir / project_name
+                from_img = project_dir / "selected_keyframes" / f"{tr['from']}.png"
+                to_img = project_dir / "selected_keyframes" / f"{tr['to']}.png"
+
+                user_content = [
+                    {"type": "text", "text":
+                        "You are a visual effects director enhancing a transition prompt for Veo video generation. "
+                        "Take the user's existing prompt and make it more vivid, specific, and cinematic. "
+                        "Add details about camera movement, lighting, particle effects, color shifts, and timing. "
+                        "Keep the core intent but make it significantly more descriptive for AI video generation.\n\n"
+                        f"Current prompt: \"{current_action}\"\n\n"},
+                ]
+
+                # Include keyframe images if available for visual context
+                if from_img.exists() and to_img.exists():
+                    from_b64 = base64.b64encode(from_img.read_bytes()).decode()
+                    to_b64 = base64.b64encode(to_img.read_bytes()).decode()
+                    user_content.extend([
+                        {"type": "text", "text": "FROM keyframe:\n"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": from_b64}},
+                        {"type": "text", "text": "\nTO keyframe:\n"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": to_b64}},
+                        {"type": "text", "text": "\nUse these images to inform your enhancement — reference specific visual elements you see.\n\n"},
+                    ])
+
+                user_content.append({"type": "text", "text":
+                    "Reply with ONLY the enhanced prompt, no preamble or explanation. "
+                    "Keep it to 2-4 sentences."})
+
+                from anthropic import Anthropic
+                client = Anthropic(api_key=api_key)
+                response = client.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=400,
+                    messages=[{"role": "user", "content": user_content}],
+                )
+
+                enhanced = response.content[0].text.strip()
+                self._json_response({"success": True, "action": enhanced})
             except Exception as e:
                 self._error(500, "INTERNAL_ERROR", str(e))
 
@@ -1316,15 +1450,26 @@ def make_handler(work_dir: Path):
                 with open(yaml_path) as f:
                     parsed = pyyaml.safe_load(f)
 
-                meta = parsed.get("meta", {})
-                # Only allow updating specific safe fields
-                for key in ("motion_prompt", "default_transition_prompt"):
-                    if key in body:
-                        meta[key] = body[key]
-
-                parsed["meta"] = meta
-                with open(yaml_path, "w") as f:
-                    pyyaml.dump(parsed, f, default_flow_style=False, allow_unicode=True, width=1000)
+                # For split format, meta lives in project.yaml
+                project_yaml = work_dir / project_name / "project.yaml"
+                if project_yaml.exists():
+                    with open(project_yaml) as pf:
+                        project_data = pyyaml.safe_load(pf) or {}
+                    meta = project_data.get("meta", {})
+                    for key in ("motion_prompt", "default_transition_prompt"):
+                        if key in body:
+                            meta[key] = body[key]
+                    project_data["meta"] = meta
+                    with open(project_yaml, "w") as pf:
+                        pyyaml.dump(project_data, pf, default_flow_style=False, allow_unicode=True, width=1000)
+                else:
+                    meta = parsed.get("meta", {})
+                    for key in ("motion_prompt", "default_transition_prompt"):
+                        if key in body:
+                            meta[key] = body[key]
+                    parsed["meta"] = meta
+                    with open(yaml_path, "w") as f:
+                        pyyaml.dump(parsed, f, default_flow_style=False, allow_unicode=True, width=1000)
 
                 self._json_response({"success": True, "meta": meta})
             except Exception as e:
@@ -2292,31 +2437,13 @@ def run_server(host: str = "0.0.0.0", port: int = 8888, work_dir: str | None = N
     _ws_mod.folder_watcher = FolderWatcher(wd)
     start_ws_server(host, ws_port)
 
-    # Restore persisted folder watches from project YAMLs
-    from beatlab.project import load_project
-    restored_watches = 0
-    for project_dir in wd.iterdir():
-        if not project_dir.is_dir():
-            continue
-        try:
-            parsed = load_project(project_dir)
-            if parsed.get("_format") == "empty":
-                continue
-            for folder_path in parsed.get("watched_folders", []):
-                try:
-                    _ws_mod.folder_watcher.add_watch(project_dir.name, folder_path)
-                    restored_watches += 1
-                except Exception as e:
-                    _log(f"  Warning: could not restore watch {folder_path} for {project_dir.name}: {e}")
-        except Exception:
-            pass
+    # Folder watches are lazy — activated when frontend opens a project and calls watch-folder,
+    # NOT restored on server boot. This avoids inotify overhead for projects not being viewed.
 
     _log(f"SceneCraft API server running at http://{host}:{port}")
     _log(f"SceneCraft WebSocket server at ws://{host}:{ws_port}")
     _log(f"  Work dir: {wd}")
     _log(f"  Projects: {len([d for d in wd.iterdir() if d.is_dir()])}")
-    if restored_watches:
-        _log(f"  Restored watches: {restored_watches}")
     _log("")
 
     try:
