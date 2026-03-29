@@ -41,18 +41,17 @@ class PromptRejectedError(Exception):
     pass
 
 
-def _retry_video_generation(generate_fn, client, output_path, max_retries: int = 5):
-    """Retry video generation with backoff on NoneType/rejected responses.
+def _retry_video_generation(generate_fn, client, output_path, max_retries: int = 8):
+    """Retry video generation with backoff on NoneType/transient failures.
 
-    Handles: rate limits (429), prompt rejections (NoneType result),
-    and transient failures. Raises PromptRejectedError after max_retries
-    consecutive None results (likely content filter).
+    Handles: rate limits (429), transient None results (common with Veo preview models),
+    and timeouts. Only raises PromptRejectedError after 6+ consecutive None results.
     """
     none_count = 0
 
     for attempt in range(max_retries):
         try:
-            _log(f"    Submitting Veo request...")
+            _log(f"    Submitting Veo request... (attempt {attempt + 1}/{max_retries})")
             operation = generate_fn()
             _log(f"    Veo request accepted, polling for result...")
 
@@ -71,18 +70,23 @@ def _retry_video_generation(generate_fn, client, output_path, max_retries: int =
             _log(f"    Veo generation complete ({int(time.time() - poll_start)}s)")
 
             # Check for valid result
-            _log(f"    Checking result...")
             if operation.result is None:
                 none_count += 1
-                raise ValueError("Video generation returned None result (likely prompt rejection)")
+                _log(f"    Result is None (transient, attempt {none_count}). Retrying...")
+                time.sleep(min(5 * none_count, 30))
+                continue
             if not operation.result.generated_videos:
                 none_count += 1
-                raise ValueError("Video generation returned empty generated_videos list")
+                _log(f"    Empty generated_videos (transient, attempt {none_count}). Retrying...")
+                time.sleep(min(5 * none_count, 30))
+                continue
 
             generated = operation.result.generated_videos[0]
             if generated is None:
                 none_count += 1
-                raise ValueError("First generated video is None")
+                _log(f"    First video is None (transient, attempt {none_count}). Retrying...")
+                time.sleep(min(5 * none_count, 30))
+                continue
 
             return generated
 
@@ -91,33 +95,28 @@ def _retry_video_generation(generate_fn, client, output_path, max_retries: int =
         except Exception as e:
             err_str = str(e)
 
-            # If we've gotten None results multiple times in a row, it's a prompt rejection — stop retrying
-            if none_count >= 3:
-                raise PromptRejectedError(
-                    f"Prompt likely rejected by Veo content filter ({none_count} consecutive None results). "
-                    f"Edit the transition action to remove potentially flagged content."
-                )
-
             is_retryable = (
                 "429" in err_str
                 or "RESOURCE_EXHAUSTED" in err_str
-                or "None" in err_str
-                or "NoneType" in err_str
                 or "timed out" in err_str.lower()
-                or "prompt rejection" in err_str.lower()
-                or "empty generated_videos" in err_str
             )
 
             if is_retryable:
-                wait = 2 ** (attempt + 1)
-                _log(f"  Generation failed: {err_str[:100]}. Retrying in {wait}s ({attempt + 1}/{max_retries})...")
+                wait = min(2 ** (attempt + 1), 60)
+                _log(f"    Rate limited or timeout: {err_str[:80]}. Retrying in {wait}s...")
                 time.sleep(wait)
             else:
                 raise
 
-    raise PromptRejectedError(
-        f"Video generation failed after {max_retries} retries. Last error involved None results — "
-        f"prompt is likely being rejected by Veo content filter."
+    # Only call it a rejection after many consecutive None results
+    if none_count >= 6:
+        raise PromptRejectedError(
+            f"Prompt likely rejected by Veo content filter ({none_count} consecutive None results). "
+            f"Try editing the transition action to simplify or remove potentially flagged content."
+        )
+    raise RuntimeError(
+        f"Video generation failed after {max_retries} attempts ({none_count} None results). "
+        f"This is likely a transient Veo issue — try again."
     )
 
 
