@@ -45,17 +45,26 @@ def _retry_video_generation(generate_fn, client, output_path, max_retries: int =
     while True:
         for attempt in range(max_retries):
             try:
+                _log(f"    Submitting Veo request...")
                 operation = generate_fn()
+                _log(f"    Veo request accepted, polling for result...")
 
                 # Poll until done (timeout after 10 minutes)
                 poll_start = time.time()
+                poll_count = 0
                 while not operation.done:
-                    if time.time() - poll_start > 600:
+                    elapsed = time.time() - poll_start
+                    if elapsed > 600:
                         raise TimeoutError("Veo generation polling timed out after 10 minutes")
+                    poll_count += 1
+                    if poll_count % 3 == 0:  # Log every 30s
+                        _log(f"    Polling Veo... ({int(elapsed)}s elapsed)")
                     time.sleep(10)
                     operation = client.operations.get(operation)
+                _log(f"    Veo generation complete ({int(time.time() - poll_start)}s)")
 
                 # Check for valid result
+                _log(f"    Checking result...")
                 if operation.result is None:
                     raise ValueError("Video generation returned None result (likely prompt rejection)")
                 if not operation.result.generated_videos:
@@ -350,36 +359,21 @@ class GoogleVideoClient:
         ref_images = self._load_ingredient_images(ingredients) if ingredients else None
 
         def _generate():
-            try:
-                config = types.GenerateVideosConfig(
-                    aspect_ratio="16:9",
-                    number_of_videos=1,
-                    duration_seconds=duration_seconds,
-                    person_generation="allow_adult",
-                    last_frame=end_img,
-                    **({"reference_images": ref_images} if ref_images else {}),
-                )
-                return _retry_on_429(
-                    self.client.models.generate_videos,
-                    model="veo-3.1-generate-preview",
-                    prompt=prompt,
-                    image=start_img,
-                    config=config,
-                )
-            except Exception:
-                # Fall back to start-frame-only on veo-3.0 (no ingredients in fallback)
-                return _retry_on_429(
-                    self.client.models.generate_videos,
-                    model=model,
-                    prompt=prompt,
-                    image=start_img,
-                    config=types.GenerateVideosConfig(
-                        aspect_ratio="16:9",
-                        number_of_videos=1,
-                        duration_seconds=duration_seconds,
-                        person_generation="allow_adult",
-                    ),
-                )
+            config = types.GenerateVideosConfig(
+                aspect_ratio="16:9",
+                number_of_videos=1,
+                duration_seconds=duration_seconds,
+                person_generation="allow_adult",
+                last_frame=end_img,
+                **({"reference_images": ref_images} if ref_images else {}),
+            )
+            return _retry_on_429(
+                self.client.models.generate_videos,
+                model="veo-3.1-generate-preview",
+                prompt=prompt,
+                image=start_img,
+                config=config,
+            )
 
         generated = _retry_video_generation(_generate, self.client, output_path)
         self._save_generated_video(generated, output_path)
