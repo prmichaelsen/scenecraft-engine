@@ -1145,7 +1145,7 @@ def make_handler(work_dir: Path):
             import yaml as pyyaml
             settings_path = work_dir / project_name / "settings.yaml"
             defaults = {
-                "preview_quality": "medium",
+                "preview_quality": 50,
                 "audio_intelligence_file": None,
                 "render_preview_fps": 24,
             }
