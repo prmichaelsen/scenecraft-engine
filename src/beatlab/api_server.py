@@ -971,7 +971,7 @@ def make_handler(work_dir: Path):
                     from beatlab.render.narrative import generate_keyframe_candidates
                     generate_keyframe_candidates(
                         str(yaml_path),
-                        vertex=False,
+                        vertex=True,
                         candidates_per_slot=total_count,
                         segment_filter={kf_id},
                     )
@@ -1027,7 +1027,7 @@ def make_handler(work_dir: Path):
                     from beatlab.render.narrative import generate_transition_candidates
                     generate_transition_candidates(
                         str(yaml_path),
-                        vertex=False,
+                        vertex=True,
                         candidates_per_slot=total_count,
                         segment_filter={tr_id},
                     )
