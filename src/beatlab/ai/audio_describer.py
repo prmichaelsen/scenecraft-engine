@@ -87,43 +87,61 @@ class GeminiAudioDescriber(AudioDescriber):
         sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
         wav_bytes = buf.getvalue()
 
-        response = self.client.models.generate_content(
-            model=self.model,
-            contents=[
-                types.Content(parts=[
-                    types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav"),
-                    types.Part(text=(
-                        f"You are a professional music producer with perfect pitch and rhythm. "
-                        f"This audio spans {chunk_start:.0f}s to {chunk_end:.0f}s in the full track. "
-                        f"Use ABSOLUTE timestamps (starting at {chunk_start:.0f}s), not relative to this chunk.\n\n"
-                        "Produce a DETAILED account of every audible musical event. "
-                        "Every second of audio must be accounted for — no gaps.\n\n"
-                        "## 1. EVENT LOG (most important — be exhaustive)\n"
-                        "List EVERY distinct audible event with its timestamp [M:SS]. Event types: "
-                        "kick, snare, hi-hat, cymbal_crash, tom, percussion_other, bass_note, bass_drop, "
-                        "bass_sustain_start, bass_sustain_end, synth_stab, synth_pad_start, synth_pad_end, "
-                        "synth_lead, arpeggio, riser_start, riser_peak, drop, breakdown_start, buildup_start, "
-                        "vocal_start, vocal_end, vocal_chop, fx_sweep, fx_impact, silence_start, silence_end.\n"
-                        "For repeating patterns, describe the pattern AND list first few timestamps with interval.\n"
-                        "For sustained sounds, give BOTH start and end timestamps.\n\n"
-                        "## 2. RHYTHM ANALYSIS\n"
-                        "- BPM estimate\n- Time signature\n- Kick/snare/hi-hat patterns\n\n"
-                        "## 3. ENERGY PROFILE\n"
-                        "Rate intensity 1-10 at: start, 25%, 50%, 75%, end. Note sudden energy changes with timestamps.\n\n"
-                        "## 4. SUSTAINED SOUNDS\n"
-                        "Every sustained sound with start time, end time, and character (pads, drones, reverb tails, risers, bass).\n\n"
-                        "## 5. KEY MOMENTS\n"
-                        "The 3-5 most visually impactful moments — timestamps and why they're impactful.\n\n"
-                        "## 6. INSTRUMENTS HEARD\n"
-                        "Complete list of instruments/sounds present.\n\n"
-                        "## 7. MOOD & TEXTURE\n"
-                        "Mood, emotional sensation, and production texture.\n\n"
-                        "Be EXHAUSTIVE. Every second must be covered. More detail = better visual sync."
-                    )),
-                ]),
-            ],
+        import time as _time
+        import sys
+
+        prompt_text = (
+            f"You are a professional music producer with perfect pitch and rhythm. "
+            f"This audio spans {chunk_start:.0f}s to {chunk_end:.0f}s in the full track. "
+            f"Use ABSOLUTE timestamps (starting at {chunk_start:.0f}s), not relative to this chunk.\n\n"
+            "Produce a DETAILED account of every audible musical event. "
+            "Every second of audio must be accounted for — no gaps.\n\n"
+            "## 1. EVENT LOG (most important — be exhaustive)\n"
+            "List EVERY distinct audible event with its timestamp [M:SS]. Event types: "
+            "kick, snare, hi-hat, cymbal_crash, tom, percussion_other, bass_note, bass_drop, "
+            "bass_sustain_start, bass_sustain_end, synth_stab, synth_pad_start, synth_pad_end, "
+            "synth_lead, arpeggio, riser_start, riser_peak, drop, breakdown_start, buildup_start, "
+            "vocal_start, vocal_end, vocal_chop, fx_sweep, fx_impact, silence_start, silence_end.\n"
+            "For repeating patterns, describe the pattern AND list first few timestamps with interval.\n"
+            "For sustained sounds, give BOTH start and end timestamps.\n\n"
+            "## 2. RHYTHM ANALYSIS\n"
+            "- BPM estimate\n- Time signature\n- Kick/snare/hi-hat patterns\n\n"
+            "## 3. ENERGY PROFILE\n"
+            "Rate intensity 1-10 at: start, 25%, 50%, 75%, end. Note sudden energy changes with timestamps.\n\n"
+            "## 4. SUSTAINED SOUNDS\n"
+            "Every sustained sound with start time, end time, and character (pads, drones, reverb tails, risers, bass).\n\n"
+            "## 5. KEY MOMENTS\n"
+            "The 3-5 most visually impactful moments — timestamps and why they're impactful.\n\n"
+            "## 6. INSTRUMENTS HEARD\n"
+            "Complete list of instruments/sounds present.\n\n"
+            "## 7. MOOD & TEXTURE\n"
+            "Mood, emotional sensation, and production texture.\n\n"
+            "Be EXHAUSTIVE. Every second must be covered. More detail = better visual sync."
         )
-        return response.text.strip()
+
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=[
+                        types.Content(parts=[
+                            types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav"),
+                            types.Part(text=prompt_text),
+                        ]),
+                    ],
+                )
+                return response.text.strip()
+            except Exception as e:
+                err = str(e)
+                if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                    wait = 2 ** (attempt + 1)
+                    print(f"  Gemini rate limited, waiting {wait}s (attempt {attempt + 1}/{max_retries})...", file=sys.stderr, flush=True)
+                    _time.sleep(wait)
+                else:
+                    raise
+
+        raise RuntimeError(f"Gemini failed after {max_retries} retries")
 
 
 class Qwen2AudioDescriber(AudioDescriber):
