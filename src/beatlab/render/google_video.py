@@ -55,8 +55,6 @@ def _retry_video_generation(generate_fn, client, output_path, max_retries: int =
         if on_status:
             on_status(msg)
 
-    none_count = 0
-
     for attempt in range(max_retries):
         try:
             _status(f"Submitting to Veo (attempt {attempt + 1}/{max_retries})...")
@@ -77,24 +75,24 @@ def _retry_video_generation(generate_fn, client, output_path, max_retries: int =
                 operation = client.operations.get(operation)
             _status(f"Veo complete ({int(time.time() - poll_start)}s)")
 
-            # Check for valid result
+            # Check for valid result — fail immediately on None (Vertex charges per request)
             if operation.result is None:
-                none_count += 1
-                _status(f"Veo returned empty result (transient). Retrying {none_count}/{max_retries}...")
-                time.sleep(min(5 * none_count, 30))
-                continue
+                raise PromptRejectedError(
+                    "Veo returned None result. Likely prompt rejection or content filter. "
+                    "Edit the transition action and retry. (Not retrying — Vertex charges per attempt.)"
+                )
             if not operation.result.generated_videos:
-                none_count += 1
-                _status(f"Veo returned no videos (transient). Retrying {none_count}/{max_retries}...")
-                time.sleep(min(5 * none_count, 30))
-                continue
+                raise PromptRejectedError(
+                    "Veo returned empty video list. Likely prompt rejection or content filter. "
+                    "Edit the transition action and retry. (Not retrying — Vertex charges per attempt.)"
+                )
 
             generated = operation.result.generated_videos[0]
             if generated is None:
-                none_count += 1
-                _status(f"Veo video is None (transient). Retrying {none_count}/{max_retries}...")
-                time.sleep(min(5 * none_count, 30))
-                continue
+                raise PromptRejectedError(
+                    "Veo generated video is None. Likely prompt rejection or content filter. "
+                    "Edit the transition action and retry. (Not retrying — Vertex charges per attempt.)"
+                )
 
             return generated
 
@@ -116,15 +114,9 @@ def _retry_video_generation(generate_fn, client, output_path, max_retries: int =
             else:
                 raise
 
-    # Only call it a rejection after many consecutive None results
-    if none_count >= 6:
-        raise PromptRejectedError(
-            f"Prompt likely rejected by Veo content filter ({none_count} consecutive None results). "
-            f"Try editing the transition action to simplify or remove potentially flagged content."
-        )
     raise RuntimeError(
-        f"Video generation failed after {max_retries} attempts ({none_count} None results). "
-        f"This is likely a transient Veo issue — try again."
+        f"Video generation failed after {max_retries} attempts (rate limits or timeouts). "
+        f"Try again later."
     )
 
 
