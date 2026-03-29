@@ -452,6 +452,31 @@ def make_handler(work_dir: Path):
                 if not isinstance(selected_list, list):
                     selected_list = []
 
+                # Scan for slot keyframe candidates (intermediate keyframe images for multi-slot transitions)
+                slot_kf_candidates = {}
+                selected_slot_kfs = {}
+                slot_kf_root = project_dir / "slot_keyframe_candidates" / "candidates"
+                selected_slot_kf_dir = project_dir / "selected_slot_keyframes"
+                num_slots = tr.get("slots", 1)
+                if num_slots > 1:
+                    for slot_idx in range(num_slots - 1):
+                        slot_key = f"{tr_id}_slot_{slot_idx}"
+                        section_dir = slot_kf_root / f"section_{slot_key}"
+                        if section_dir.exists():
+                            images = sorted([
+                                f"slot_keyframe_candidates/candidates/section_{slot_key}/{f.name}"
+                                for f in section_dir.glob("v*.png")
+                            ])
+                            if images:
+                                slot_kf_candidates[slot_key] = images
+                        # Check for selected slot keyframe
+                        sel_path = selected_slot_kf_dir / f"{slot_key}.png"
+                        if sel_path.exists():
+                            # Find which variant is selected from YAML
+                            slot_kf_selected = tr.get("selected_slot_keyframes", {})
+                            if isinstance(slot_kf_selected, dict):
+                                selected_slot_kfs[slot_key] = slot_kf_selected.get(slot_key)
+
                 transitions.append({
                     "id": tr_id,
                     "from": tr.get("from", ""),
@@ -464,6 +489,8 @@ def make_handler(work_dir: Path):
                     "hasSelectedVideos": has_selected_videos,
                     "selected": selected_list,
                     "remap": tr.get("remap", {"method": "linear", "target_duration": 0}),
+                    "slotKeyframeCandidates": slot_kf_candidates,
+                    "selectedSlotKeyframes": selected_slot_kfs,
                 })
 
             self._json_response({

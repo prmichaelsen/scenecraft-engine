@@ -926,8 +926,13 @@ def apply_slot_keyframe_selection(yaml_path: str, selections: dict[str, int]) ->
 
     slot_kf_dir = work_dir / "slot_keyframe_candidates"
 
+    # Build lookup: tr_id -> transition dict
+    tr_by_id: dict[str, dict] = {}
+    for tr in data.get("transitions", []):
+        tr_by_id[tr.get("id", "")] = tr
+
     for slot_key, variant in selections.items():
-        source = slot_kf_dir / slot_key / f"v{variant}.png"
+        source = slot_kf_dir / "candidates" / f"section_{slot_key}" / f"v{variant}.png"
         if not source.exists():
             _log(f"  WARNING: Candidate not found: {source}")
             continue
@@ -935,6 +940,17 @@ def apply_slot_keyframe_selection(yaml_path: str, selections: dict[str, int]) ->
         dest = selected_dir / f"{slot_key}.png"
         shutil.copy2(str(source), str(dest))
         _log(f"  {slot_key}: selected v{variant} -> {dest}")
+
+        # Persist selection index in the transition YAML data
+        # slot_key format: "tr_006_slot_0" -> tr_id = "tr_006"
+        parts = slot_key.rsplit("_slot_", 1)
+        if len(parts) == 2:
+            tr_id = parts[0]
+            tr = tr_by_id.get(tr_id)
+            if tr is not None:
+                if "selected_slot_keyframes" not in tr or not isinstance(tr.get("selected_slot_keyframes"), dict):
+                    tr["selected_slot_keyframes"] = {}
+                tr["selected_slot_keyframes"][slot_key] = variant
 
     save_narrative(data, yaml_path)
     _log("Slot keyframe selections applied.")
