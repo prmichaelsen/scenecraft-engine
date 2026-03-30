@@ -10,10 +10,17 @@ import yaml
 def load_project(work_dir: Path) -> dict:
     """Load project data from split or legacy YAML files.
 
+    If project.db exists, dumps it to YAML first (db is source of truth).
+
     Returns a unified dict with: meta, sections, keyframes, transitions, bin,
     transition_bin, watched_folders, _format, _active_timeline, _work_dir.
     """
     work_dir = Path(work_dir)
+
+    # Dump db to YAML if db exists (db is source of truth)
+    if (work_dir / "project.db").exists():
+        from beatlab.db_dump import dump_db_to_yaml
+        dump_db_to_yaml(work_dir)
 
     if (work_dir / "timeline.yaml").exists():
         # Split format
