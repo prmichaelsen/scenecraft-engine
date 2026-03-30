@@ -1409,6 +1409,7 @@ def audio_intelligence(video_file: str, work_dir: str, output: str | None,
 @click.option("--work-dir", default=".beatlab_work", type=str, help="Work directory")
 @click.option("--fps", default=None, type=float, help="Video frame rate")
 @click.option("--sr", default=22050, type=int, help="Sample rate")
+@click.option("--sections-yaml", default=None, type=click.Path(exists=True), help="Manual sections.yaml for per-section rule generation")
 def audio_intelligence_multimodel(
     video_file: str, auto_separate: bool,
     vocals: str | None, kick: str | None, snare: str | None, hh: str | None,
@@ -1416,6 +1417,7 @@ def audio_intelligence_multimodel(
     bass: str | None, guitar: str | None, piano: str | None, other: str | None,
     output: str | None, descriptions: str | None, creative_direction: str | None,
     vocal_bleed_threshold: float, work_dir: str, fps: float | None, sr: int,
+    sections_yaml: str | None,
 ):
     """Run multi-model audio intelligence pipeline (InstVoc + DrumSep + Demucs 6s).
 
@@ -1491,6 +1493,13 @@ def audio_intelligence_multimodel(
 
     out_path = output or str(work.root / "audio_intelligence_multimodel.json")
 
+    # Auto-detect sections.yaml in work dir if not specified
+    if not sections_yaml:
+        auto_sections = work.root / "sections.yaml"
+        if auto_sections.exists():
+            sections_yaml = str(auto_sections)
+            _log(f"  Auto-detected sections.yaml: {auto_sections}")
+
     result = run_audio_intelligence_multimodel(
         vocals_path=vocals,
         drumsep_paths=drumsep_paths,
@@ -1503,6 +1512,7 @@ def audio_intelligence_multimodel(
         sensitivity={k: 1.0 for k in ['zoom_pulse','zoom_bounce','shake_x','shake_y','flash','hard_cut','contrast_pop','glow_swell']},
         vocal_bleed_threshold=vocal_bleed_threshold,
         fps=video_fps,
+        sections_yaml=sections_yaml,
     )
 
     _log(f"  {len(result['layer3_events'])} effect events generated")
