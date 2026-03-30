@@ -73,7 +73,7 @@ def _parse_timestamp(ts: str) -> float:
 
 
 def load_narrative(yaml_path: str) -> dict:
-    """Load and validate a narrative_keyframes.yaml file.
+    """Load and validate a narrative YAML file (legacy or split format).
 
     Returns the parsed dict with timestamps converted to seconds and
     all paths resolved relative to the YAML file's parent directory.
@@ -82,8 +82,13 @@ def load_narrative(yaml_path: str) -> dict:
     if not yaml_path.exists():
         raise FileNotFoundError(f"Narrative YAML not found: {yaml_path}")
 
-    with open(yaml_path) as f:
-        data = yaml.safe_load(f)
+    # Split format: timeline.yaml exists alongside project.yaml + narrative.yaml
+    if yaml_path.name == "timeline.yaml" or (yaml_path.parent / "timeline.yaml").exists():
+        from beatlab.project import load_project
+        data = load_project(yaml_path.parent)
+    else:
+        with open(yaml_path) as f:
+            data = yaml.safe_load(f)
 
     # Validate top-level structure
     for key in ("meta", "keyframes", "transitions"):
@@ -107,15 +112,17 @@ def load_narrative(yaml_path: str) -> dict:
         # Parse timestamp to seconds
         kf["_timestamp_seconds"] = _parse_timestamp(kf["timestamp"])
 
-    # Validate transitions
+    # Validate transitions (warn on orphaned references instead of failing)
+    valid_transitions = []
     for tr in data["transitions"]:
         for key in ("id", "from", "to", "duration_seconds", "slots"):
             if key not in tr:
                 raise ValueError(f"Transition {tr.get('id', '?')} missing required key: {key}")
-        if tr["from"] not in kf_ids:
-            raise ValueError(f"Transition {tr['id']}: 'from' references unknown keyframe {tr['from']}")
-        if tr["to"] not in kf_ids:
-            raise ValueError(f"Transition {tr['id']}: 'to' references unknown keyframe {tr['to']}")
+        if tr["from"] not in kf_ids or tr["to"] not in kf_ids:
+            _log(f"  WARNING: Transition {tr['id']} references missing keyframe ({tr['from']} -> {tr['to']}), skipping")
+            continue
+        valid_transitions.append(tr)
+    data["transitions"] = valid_transitions
 
     # Resolve paths relative to YAML parent
     base_dir = yaml_path.parent
@@ -162,6 +169,14 @@ def load_narrative(yaml_path: str) -> dict:
 
 def save_narrative(data: dict, yaml_path: str | None = None) -> None:
     """Write the narrative data back to YAML, stripping internal fields."""
+    # Split format: delegate to save_project
+    fmt = data.get("_format")
+    work_dir = data.get("_work_dir")
+    if fmt == "split" or (work_dir and (Path(work_dir) / "timeline.yaml").exists()):
+        from beatlab.project import save_project
+        save_project(data, Path(work_dir))
+        return
+
     yaml_path = yaml_path or data.get("_yaml_path")
     if not yaml_path:
         raise ValueError("No yaml_path provided and none stored in data")
@@ -966,6 +981,7 @@ def generate_transition_candidates(
     segment_filter: set[str] | None = None,
     slot_filter: set[int] | None = None,
     on_status=None,
+    duration_seconds: int | None = None,
 ) -> None:
     """Generate Veo transition video candidates for each slot."""
     # First resolve boundary frames from any existing segments
@@ -974,7 +990,7 @@ def generate_transition_candidates(
     data = load_narrative(yaml_path)
     work_dir = Path(data["_work_dir"])
     n_candidates = candidates_per_slot or 1
-    max_seconds = data["meta"]["transition_max_seconds"]
+    max_seconds = duration_seconds or data["meta"]["transition_max_seconds"]
 
     kf_by_id = {kf["id"]: kf for kf in data["keyframes"]}
     selected_kf_dir = work_dir / "selected_keyframes"
@@ -1062,15 +1078,12 @@ def generate_transition_candidates(
         _log("All transition candidates already generated.")
         return
 
-    _log(f"Generating {len(jobs)} Veo transition clips (sequential)...")
-
     from beatlab.render.google_video import PromptRejectedError
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     rejected = []
+    completed_count = [0]
 
-    for i, job in enumerate(jobs):
-        if job['tr_id'] in rejected:
-            _log(f"    [{i + 1}/{len(jobs)}] {job['tr_id']} — skipping (prompt rejected)")
-            continue
+    def _run_job(i, job):
         _log(f"    [{i + 1}/{len(jobs)}] {job['tr_id']} slot_{job['slot_idx']} v{job['variant']}...")
         _log(f"    Prompt: {job['prompt'][:150]}...")
         try:
@@ -1082,10 +1095,21 @@ def generate_transition_candidates(
                 duration_seconds=int(job["duration"]),
                 on_status=on_status,
             )
-            _log(f"    [{i + 1}/{len(jobs)}] {job['tr_id']} slot_{job['slot_idx']} v{job['variant']} done")
+            completed_count[0] += 1
+            _log(f"    [{completed_count[0]}/{len(jobs)}] {job['tr_id']} slot_{job['slot_idx']} v{job['variant']} done")
         except PromptRejectedError as e:
             _log(f"    ⚠ PROMPT REJECTED: {job['tr_id']} — {e}")
             rejected.append(job['tr_id'])
+
+    _log(f"Generating {len(jobs)} Veo transition clips (parallel, max {min(len(jobs), 4)} workers)...")
+
+    with ThreadPoolExecutor(max_workers=min(len(jobs), 4)) as pool:
+        futures = [pool.submit(_run_job, i, job) for i, job in enumerate(jobs)]
+        for f in as_completed(futures):
+            try:
+                f.result()
+            except Exception as e:
+                _log(f"    ⚠ Unexpected error: {e}")
 
     if rejected:
         _log(f"⚠ {len(set(rejected))} transitions had prompts rejected. Edit their actions and retry: {', '.join(set(rejected))}")
@@ -1139,9 +1163,100 @@ def apply_transition_selection(yaml_path: str, selections: dict[str, int]) -> No
 # ── Assembly ───────────────────────────────────────────────────────
 
 
+def _evaluate_curve(curve_points: list[list[float]], linear_progress: float) -> float:
+    """Piecewise-linear curve evaluation (mirrors TypeScript evaluateCurve)."""
+    if not curve_points or len(curve_points) < 2:
+        return linear_progress
+    p = max(0.0, min(1.0, linear_progress))
+    if p <= curve_points[0][0]:
+        return curve_points[0][1]
+    if p >= curve_points[-1][0]:
+        return curve_points[-1][1]
+    lo, hi = 0, len(curve_points) - 1
+    while lo < hi - 1:
+        mid = (lo + hi) // 2
+        if curve_points[mid][0] <= p:
+            lo = mid
+        else:
+            hi = mid
+    x0, y0 = curve_points[lo]
+    x1, y1 = curve_points[hi]
+    dx = x1 - x0
+    if dx == 0:
+        return y0
+    t = (p - x0) / dx
+    return y0 + t * (y1 - y0)
+
+
+def _remap_with_curve(
+    input_path: str, output_path: str, target_duration: float,
+    curve_points: list[list[float]],
+) -> None:
+    """Time-remap a video using a piecewise-linear curve via frame extraction."""
+    import json
+    import subprocess
+
+    # Probe source video
+    probe = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json",
+         "-show_format", "-show_streams", input_path],
+        capture_output=True, text=True,
+    )
+    probe_data = json.loads(probe.stdout)
+    actual_duration = float(probe_data["format"]["duration"])
+    video_stream = next(s for s in probe_data["streams"] if s["codec_type"] == "video")
+    fps_parts = video_stream["r_frame_rate"].split("/")
+    fps = float(fps_parts[0]) / float(fps_parts[1]) if len(fps_parts) == 2 else float(fps_parts[0])
+
+    n_out = max(1, round(target_duration * fps))
+    _log(f"    curve remap: {actual_duration:.1f}s @ {fps:.0f}fps -> {n_out} output frames ({target_duration:.1f}s)")
+
+    # Extract source frames
+    stem = Path(input_path).stem
+    frames_dir = Path(output_path).parent / f"_frames_{stem}"
+    out_dir = Path(output_path).parent / f"_outframes_{stem}"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    subprocess.run([
+        "ffmpeg", "-y", "-i", input_path, str(frames_dir / "%06d.png"),
+    ], capture_output=True, check=True)
+
+    src_frames = sorted(frames_dir.glob("*.png"))
+    n_src = len(src_frames)
+    if n_src == 0:
+        raise RuntimeError(f"No frames extracted from {input_path}")
+
+    # Build output sequence using curve mapping
+    for i in range(n_out):
+        timeline_progress = i / max(n_out - 1, 1)
+        video_progress = _evaluate_curve(curve_points, timeline_progress)
+        src_idx = max(0, min(round(video_progress * (n_src - 1)), n_src - 1))
+        shutil.copy2(str(src_frames[src_idx]), str(out_dir / f"{i + 1:06d}.png"))
+
+    # Encode output
+    subprocess.run([
+        "ffmpeg", "-y", "-framerate", str(fps),
+        "-i", str(out_dir / "%06d.png"),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-an", output_path,
+    ], capture_output=True, check=True)
+
+    # Cleanup temp frames
+    shutil.rmtree(str(frames_dir))
+    shutil.rmtree(str(out_dir))
+
+
 def assemble_final(yaml_path: str, output_path: str) -> str:
     """Time-remap selected transitions, concatenate, and mux audio."""
     import subprocess
+
+    # Export DB to YAML first so curve_points and other DB-only edits are included
+    yaml_dir = Path(yaml_path).parent
+    if (yaml_dir / "project.db").exists():
+        from beatlab.db import export_to_yaml
+        export_to_yaml(yaml_dir)
+        _log("  Exported DB to YAML before assembly")
 
     data = load_narrative(yaml_path)
     work_dir = Path(data["_work_dir"])
@@ -1157,7 +1272,12 @@ def assemble_final(yaml_path: str, output_path: str) -> str:
     remapped_clips = []
     for tr in transitions:
         n_slots = tr["slots"]
+        if n_slots == 0 or tr["duration_seconds"] <= 0:
+            _log(f"  WARNING: Skipping {tr['id']} — zero duration or slots")
+            continue
         target_per_slot = tr["duration_seconds"] / n_slots
+        remap = tr.get("remap", {})
+        use_curve = remap.get("method") == "curve" and remap.get("curve_points")
 
         slot_clips = []
         for slot_idx in range(n_slots):
@@ -1166,27 +1286,32 @@ def assemble_final(yaml_path: str, output_path: str) -> str:
                 _log(f"  WARNING: Missing selected transition: {selected}")
                 continue
 
-            # Probe actual duration
-            probe = subprocess.run(
-                ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(selected)],
-                capture_output=True, text=True,
-            )
-            import json
-            probe_data = json.loads(probe.stdout)
-            actual_duration = float(probe_data["format"]["duration"])
-
             remapped = remapped_dir / f"{tr['id']}_slot_{slot_idx}.mp4"
-            speed_factor = actual_duration / target_per_slot
 
-            if abs(speed_factor - 1.0) > 0.05:
-                _log(f"  {tr['id']} slot_{slot_idx}: remap {actual_duration:.1f}s -> {target_per_slot:.1f}s ({speed_factor:.2f}x)")
-                subprocess.run([
-                    "ffmpeg", "-y", "-i", str(selected),
-                    "-filter:v", f"setpts={1/speed_factor}*PTS",
-                    "-an", str(remapped),
-                ], capture_output=True, check=True)
+            if use_curve:
+                _log(f"  {tr['id']} slot_{slot_idx}: curve remap -> {target_per_slot:.1f}s ({len(remap['curve_points'])} points)")
+                _remap_with_curve(str(selected), str(remapped), target_per_slot, remap["curve_points"])
             else:
-                shutil.copy2(str(selected), str(remapped))
+                # Probe actual duration
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(selected)],
+                    capture_output=True, text=True,
+                )
+                import json
+                probe_data = json.loads(probe.stdout)
+                actual_duration = float(probe_data["format"]["duration"])
+
+                speed_factor = actual_duration / target_per_slot
+
+                if abs(speed_factor - 1.0) > 0.05:
+                    _log(f"  {tr['id']} slot_{slot_idx}: remap {actual_duration:.1f}s -> {target_per_slot:.1f}s ({speed_factor:.2f}x)")
+                    subprocess.run([
+                        "ffmpeg", "-y", "-i", str(selected),
+                        "-filter:v", f"setpts={1/speed_factor}*PTS",
+                        "-an", str(remapped),
+                    ], capture_output=True, check=True)
+                else:
+                    shutil.copy2(str(selected), str(remapped))
 
             slot_clips.append(str(remapped))
 
