@@ -2350,13 +2350,21 @@ def crossfade_cmd(video_file: str, output: str | None, crossfade_frames: int,
     if not output:
         output = str(work.root / "crossfade_output.mp4")
 
-    # Collect remapped clips in timeline order
+    # Collect remapped clips in timeline order (sorted by from-keyframe timestamp)
     remapped_dir = work.root / "remapped"
     selected_tr_dir = work.root / "selected_transitions"
 
     transitions = data.get("transitions", [])
     if not transitions:
         raise click.ClickException("No transitions found in project")
+
+    # Sort transitions by from-keyframe timestamp
+    keyframes = data.get("keyframes", [])
+    def _parse_ts(ts):
+        parts = str(ts).split(":")
+        return int(parts[0]) * 60 + float(parts[1]) if len(parts) == 2 else 0
+    kf_ts = {kf["id"]: _parse_ts(kf["timestamp"]) for kf in keyframes}
+    transitions = sorted(transitions, key=lambda tr: kf_ts.get(tr.get("from", ""), 999999))
 
     clips = []
     for tr in transitions:
