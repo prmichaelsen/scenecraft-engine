@@ -1193,6 +1193,49 @@ def _evaluate_curve(curve_points: list[list[float]], linear_progress: float) -> 
     return y0 + t * (y1 - y0)
 
 
+def _remap_linear_exact(input_path: str, output_path: str, target_duration: float) -> None:
+    """Linear time-remap preserving all source frames, trimmed to exact frame count.
+
+    Uses setpts for speed change (keeps all frames, no drops), then trims to
+    the exact number of output frames to prevent accumulated duration drift.
+    """
+    import json
+    import subprocess
+
+    # Probe source
+    probe = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json",
+         "-show_format", "-show_streams", input_path],
+        capture_output=True, text=True,
+    )
+    probe_data = json.loads(probe.stdout)
+    actual_duration = float(probe_data["format"]["duration"])
+    video_stream = next(s for s in probe_data["streams"] if s["codec_type"] == "video")
+    fps_parts = video_stream["r_frame_rate"].split("/")
+    fps = float(fps_parts[0]) / float(fps_parts[1]) if len(fps_parts) == 2 else float(fps_parts[0])
+
+    speed_factor = actual_duration / target_duration
+    n_out = int(target_duration * fps)  # exact frame count (floor)
+
+    if abs(speed_factor - 1.0) < 0.01 and abs(actual_duration - target_duration) < 0.05:
+        # Close enough — just trim to exact frames
+        _log(f"  {Path(input_path).stem}: trim to {n_out} frames ({target_duration:.2f}s)")
+        subprocess.run([
+            "ffmpeg", "-y", "-i", input_path,
+            "-frames:v", str(n_out), "-an",
+            output_path,
+        ], capture_output=True, check=True)
+    else:
+        # Speed change + trim to exact frames
+        _log(f"  {Path(input_path).stem}: setpts {speed_factor:.2f}x -> trim {n_out} frames ({target_duration:.2f}s)")
+        subprocess.run([
+            "ffmpeg", "-y", "-i", input_path,
+            "-filter:v", f"setpts={1/speed_factor}*PTS",
+            "-frames:v", str(n_out),
+            "-an", output_path,
+        ], capture_output=True, check=True)
+
+
 def _remap_with_curve(
     input_path: str, output_path: str, target_duration: float,
     curve_points: list[list[float]],
@@ -1318,13 +1361,13 @@ def assemble_final(yaml_path: str, output_path: str) -> str:
             remapped = remapped_dir / f"{tr['id']}_slot_{slot_idx}.mp4"
 
             if use_curve:
+                # Curve remap must use frame extraction (variable speed)
                 _log(f"  {tr['id']} slot_{slot_idx}: curve remap -> {target_per_slot:.1f}s ({len(remap['curve_points'])} points)")
                 _remap_with_curve(str(selected), str(remapped), target_per_slot, remap["curve_points"])
             else:
-                # Linear remap — use exact frame count to prevent duration drift
-                # (setpts-based remap accumulates rounding errors over many clips)
-                _log(f"  {tr['id']} slot_{slot_idx}: linear remap -> {target_per_slot:.1f}s")
-                _remap_with_curve(str(selected), str(remapped), target_per_slot, [[0, 0], [1, 1]])
+                # Linear remap — use setpts to preserve all source frames (no drops),
+                # then trim to exact frame count to prevent accumulated drift
+                _remap_linear_exact(str(selected), str(remapped), target_per_slot)
 
             slot_clips.append(str(remapped))
 
