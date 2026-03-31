@@ -1213,7 +1213,7 @@ def _remap_with_curve(
     fps_parts = video_stream["r_frame_rate"].split("/")
     fps = float(fps_parts[0]) / float(fps_parts[1]) if len(fps_parts) == 2 else float(fps_parts[0])
 
-    n_out = max(1, round(target_duration * fps))
+    n_out = max(1, int(target_duration * fps))  # floor, not round — prevents clips being longer than timeline gap
     _log(f"    curve remap: {actual_duration:.1f}s @ {fps:.0f}fps -> {n_out} output frames ({target_duration:.1f}s)")
 
     # Extract source frames
@@ -1321,26 +1321,10 @@ def assemble_final(yaml_path: str, output_path: str) -> str:
                 _log(f"  {tr['id']} slot_{slot_idx}: curve remap -> {target_per_slot:.1f}s ({len(remap['curve_points'])} points)")
                 _remap_with_curve(str(selected), str(remapped), target_per_slot, remap["curve_points"])
             else:
-                # Probe actual duration
-                probe = subprocess.run(
-                    ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(selected)],
-                    capture_output=True, text=True,
-                )
-                import json
-                probe_data = json.loads(probe.stdout)
-                actual_duration = float(probe_data["format"]["duration"])
-
-                speed_factor = actual_duration / target_per_slot
-
-                if abs(speed_factor - 1.0) > 0.05:
-                    _log(f"  {tr['id']} slot_{slot_idx}: remap {actual_duration:.1f}s -> {target_per_slot:.1f}s ({speed_factor:.2f}x)")
-                    subprocess.run([
-                        "ffmpeg", "-y", "-i", str(selected),
-                        "-filter:v", f"setpts={1/speed_factor}*PTS",
-                        "-an", str(remapped),
-                    ], capture_output=True, check=True)
-                else:
-                    shutil.copy2(str(selected), str(remapped))
+                # Linear remap — use exact frame count to prevent duration drift
+                # (setpts-based remap accumulates rounding errors over many clips)
+                _log(f"  {tr['id']} slot_{slot_idx}: linear remap -> {target_per_slot:.1f}s")
+                _remap_with_curve(str(selected), str(remapped), target_per_slot, [[0, 0], [1, 1]])
 
             slot_clips.append(str(remapped))
 
