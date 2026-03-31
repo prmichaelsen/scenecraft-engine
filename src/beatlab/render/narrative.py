@@ -1273,14 +1273,37 @@ def assemble_final(yaml_path: str, output_path: str) -> str:
     transitions = data["transitions"]
     max_seconds = meta["transition_max_seconds"]
 
+    # Build keyframe timestamp lookup for computing timeline durations
+    kf_by_id = {kf["id"]: kf for kf in data["keyframes"]}
+
+    def _parse_ts(ts):
+        parts = str(ts).split(":")
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+        return 0.0
+
     # Phase 1: Time-remap each transition
     remapped_clips = []
     for tr in transitions:
         n_slots = tr["slots"]
-        if n_slots == 0 or tr["duration_seconds"] <= 0:
-            _log(f"  WARNING: Skipping {tr['id']} — zero duration or slots")
+        if n_slots == 0:
+            _log(f"  WARNING: Skipping {tr['id']} — zero slots")
             continue
-        target_per_slot = tr["duration_seconds"] / n_slots
+
+        # Compute target duration from keyframe timestamps (timeline gap),
+        # NOT from duration_seconds (which is the Veo generation request duration)
+        from_kf = kf_by_id.get(tr.get("from", ""))
+        to_kf = kf_by_id.get(tr.get("to", ""))
+        if from_kf and to_kf:
+            timeline_duration = _parse_ts(to_kf["timestamp"]) - _parse_ts(from_kf["timestamp"])
+        else:
+            timeline_duration = tr["duration_seconds"]  # fallback
+
+        if timeline_duration <= 0:
+            _log(f"  WARNING: Skipping {tr['id']} — zero or negative timeline duration ({timeline_duration:.2f}s)")
+            continue
+
+        target_per_slot = timeline_duration / n_slots
         remap = tr.get("remap", {})
         use_curve = remap.get("method") == "curve" and remap.get("curve_points")
 
