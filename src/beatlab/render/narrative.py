@@ -1233,10 +1233,11 @@ def _remap_with_curve(
         raise RuntimeError(f"No frames extracted from {input_path}")
 
     # Build output sequence using curve mapping
+    # Matches frontend: Math.min(Math.floor(progress * totalFrames), totalFrames - 1)
     for i in range(n_out):
         timeline_progress = i / max(n_out - 1, 1)
         video_progress = _evaluate_curve(curve_points, timeline_progress)
-        src_idx = max(0, min(round(video_progress * (n_src - 1)), n_src - 1))
+        src_idx = max(0, min(int(video_progress * n_src), n_src - 1))
         shutil.copy2(str(src_frames[src_idx]), str(out_dir / f"{i + 1:06d}.png"))
 
     # Encode output
