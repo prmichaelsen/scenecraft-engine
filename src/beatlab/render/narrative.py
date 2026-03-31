@@ -1326,89 +1326,111 @@ def assemble_final(yaml_path: str, output_path: str) -> str:
             return int(parts[0]) * 60 + float(parts[1])
         return 0.0
 
-    # Phase 1: Time-remap each transition
-    remapped_clips = []
+    # Sort transitions by timeline order
+    transitions = sorted(transitions, key=lambda tr: _parse_ts(
+        kf_by_id.get(tr.get("from", ""), {}).get("timestamp", "99:99")
+    ))
+
+    # Collect clip info with timeline durations
+    clips_info = []
     for tr in transitions:
         n_slots = tr["slots"]
         if n_slots == 0:
-            _log(f"  WARNING: Skipping {tr['id']} — zero slots")
             continue
 
-        # Compute target duration from keyframe timestamps (timeline gap),
-        # NOT from duration_seconds (which is the Veo generation request duration)
         from_kf = kf_by_id.get(tr.get("from", ""))
         to_kf = kf_by_id.get(tr.get("to", ""))
         if from_kf and to_kf:
             timeline_duration = _parse_ts(to_kf["timestamp"]) - _parse_ts(from_kf["timestamp"])
         else:
-            timeline_duration = tr["duration_seconds"]  # fallback
+            timeline_duration = tr["duration_seconds"]
 
         if timeline_duration <= 0:
-            _log(f"  WARNING: Skipping {tr['id']} — zero or negative timeline duration ({timeline_duration:.2f}s)")
             continue
 
-        target_per_slot = timeline_duration / n_slots
-        remap = tr.get("remap", {})
+        selected = selected_tr_dir / f"{tr['id']}_slot_0.mp4"
+        if not selected.exists():
+            _log(f"  WARNING: Missing {selected}")
+            continue
+
+        clips_info.append({
+            "tr": tr,
+            "selected": str(selected),
+            "from_ts": _parse_ts(from_kf["timestamp"]) if from_kf else 0,
+            "to_ts": _parse_ts(to_kf["timestamp"]) if to_kf else 0,
+            "timeline_dur": timeline_duration,
+        })
+
+    if not clips_info:
+        raise RuntimeError("No clips to assemble")
+
+    n_clips = len(clips_info)
+    fps = 24.0
+    XFADE_FRAMES = 8
+    HALF = XFADE_FRAMES // 2
+
+    # Phase 1: Remap with accumulated correction + crossfade extensions
+    _log(f"Phase 1: Remapping {n_clips} clips (accumulated correction + {XFADE_FRAMES}-frame crossfade)...")
+    accumulated_frames = 0
+    output_clips = []
+
+    for i, ci in enumerate(clips_info):
+        # Accumulated correction: exact frame count for this clip's core
+        target_end = round(ci["to_ts"] * fps)
+        core_frames = target_end - accumulated_frames
+        if core_frames <= 0:
+            core_frames = 1
+
+        # Half-overlap extensions for crossfade
+        extend_start = HALF if i > 0 else 0
+        extend_end = HALF if i < n_clips - 1 else 0
+        total_frames = core_frames + extend_start + extend_end
+
+        # Speed factor from EXTENDED duration (not core) so setpts produces enough frames
+        extended_dur = total_frames / fps
+        actual_dur = _get_duration(ci["selected"])
+        speed_factor = actual_dur / extended_dur
+
+        output = remapped_dir / f"{ci['tr']['id']}_slot_0.mp4"
+
+        remap = ci["tr"].get("remap", {})
         use_curve = remap.get("method") == "curve" and remap.get("curve_points")
 
-        slot_clips = []
-        for slot_idx in range(n_slots):
-            selected = selected_tr_dir / f"{tr['id']}_slot_{slot_idx}.mp4"
-            if not selected.exists():
-                _log(f"  WARNING: Missing selected transition: {selected}")
-                continue
-
-            remapped = remapped_dir / f"{tr['id']}_slot_{slot_idx}.mp4"
-
-            if use_curve:
-                # Curve remap must use frame extraction (variable speed)
-                _log(f"  {tr['id']} slot_{slot_idx}: curve remap -> {target_per_slot:.1f}s ({len(remap['curve_points'])} points)")
-                _remap_with_curve(str(selected), str(remapped), target_per_slot, remap["curve_points"])
-            else:
-                # Linear remap — use setpts to preserve all source frames (no drops),
-                # then trim to exact frame count to prevent accumulated drift
-                _remap_linear_exact(str(selected), str(remapped), target_per_slot)
-
-            slot_clips.append(str(remapped))
-
-        if not slot_clips:
-            continue
-
-        # Concatenate slots within transition if multi-slot
-        if len(slot_clips) == 1:
-            tr_clip = slot_clips[0]
-        else:
-            concat_list = remapped_dir / f"{tr['id']}_concat.txt"
-            with open(concat_list, "w") as f:
-                for clip in slot_clips:
-                    f.write(f"file '{clip}'\n")
-            tr_clip = str(remapped_dir / f"{tr['id']}.mp4")
+        if use_curve:
+            _remap_with_curve(ci["selected"], str(output), extended_dur, remap["curve_points"])
+        elif abs(speed_factor - 1.0) < 0.01:
             subprocess.run([
-                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                "-i", str(concat_list), "-c", "copy", tr_clip,
+                "ffmpeg", "-y", "-i", ci["selected"],
+                "-frames:v", str(total_frames), "-an", str(output),
+            ], capture_output=True, check=True)
+        else:
+            subprocess.run([
+                "ffmpeg", "-y", "-i", ci["selected"],
+                "-filter:v", f"setpts={1/speed_factor}*PTS",
+                "-frames:v", str(total_frames), "-an", str(output),
             ], capture_output=True, check=True)
 
-        remapped_clips.append(tr_clip)
+        accumulated_frames += core_frames
+        output_clips.append(str(Path(output).resolve()))
 
-    if not remapped_clips:
-        raise RuntimeError("No remapped clips to assemble")
+        if i % 50 == 0 or i == n_clips - 1:
+            drift = accumulated_frames / fps - ci["to_ts"]
+            _log(f"  [{i+1}/{n_clips}] {ci['tr']['id']}: core={core_frames} +{extend_start}+{extend_end}={total_frames} drift={drift:+.4f}s")
 
-    # Phase 2: Concatenate all transitions
-    _log(f"Concatenating {len(remapped_clips)} transition clips...")
-    final_concat_list = remapped_dir / "final_concat.txt"
-    with open(final_concat_list, "w") as f:
-        for clip in remapped_clips:
-            f.write(f"file '{Path(clip).resolve()}'\n")
-
+    # Phase 2: Crossfade
+    _log(f"Phase 2: Crossfading {len(output_clips)} clips...")
+    from beatlab.render.crossfade import concat_with_crossfade
     no_audio = str(work_dir / "narrative_noaudio.mp4")
-    subprocess.run([
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", str(final_concat_list), "-c", "copy", no_audio,
-    ], capture_output=True, check=True)
+
+    # Clear xfade cache
+    for d in work_dir.glob("_xfade_chunks_*"):
+        shutil.rmtree(d)
+
+    concat_with_crossfade(output_clips, no_audio, crossfade_frames=XFADE_FRAMES, fps=fps, chunk_size=10)
 
     # Phase 3: Mux audio
     audio_path = meta["_audio_resolved"]
-    _log(f"Muxing audio from {audio_path}...")
+    _log(f"Phase 3: Muxing audio from {audio_path}...")
     subprocess.run([
         "ffmpeg", "-y",
         "-i", no_audio,
@@ -1421,3 +1443,13 @@ def assemble_final(yaml_path: str, output_path: str) -> str:
 
     _log(f"Final output: {output_path}")
     return output_path
+
+
+def _get_duration(path: str) -> float:
+    """Get video duration via ffprobe."""
+    import json
+    result = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", path],
+        capture_output=True, text=True,
+    )
+    return float(json.loads(result.stdout)["format"]["duration"])
