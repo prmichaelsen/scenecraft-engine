@@ -1447,7 +1447,7 @@ def assemble_final(yaml_path: str, output_path: str) -> str:
 
 def _get_duration(path: str) -> float:
     """Get video duration via ffprobe."""
-    import json
+    import json, subprocess
     result = subprocess.run(
         ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", path],
         capture_output=True, text=True,

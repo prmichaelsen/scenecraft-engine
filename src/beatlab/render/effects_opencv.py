@@ -301,15 +301,107 @@ def apply_effects(
     return output_path
 
 
+def _apply_rules_client(onsets: dict, rules: list[dict], sections_only: bool = True,
+                        layer1: dict | None = None, vocal_bleed_threshold: float = 0.25) -> list[dict]:
+    """Apply rules to onsets client-style with optional vocal bleed suppression.
+
+    Args:
+        onsets: Per-stem per-band onset arrays.
+        rules: Effect rules from Claude.
+        sections_only: Skip rules without _group_start/_group_end.
+        layer1: Full layer1 data (needed for bleed suppression RMS envelopes).
+        vocal_bleed_threshold: Suppress non-vocal onsets when stem RMS < this fraction of vocal RMS.
+    """
+    # Build vocal RMS lookup for bleed suppression
+    vocal_rms_env = (layer1 or {}).get("vocals", {}).get("full", {}).get("rms_envelope", [])
+    bleed_enabled = vocal_bleed_threshold > 0 and len(vocal_rms_env) > 0 and layer1 is not None
+
+    def _rms_at(rms_env, t):
+        """Get RMS value at time t via linear search."""
+        if not rms_env:
+            return 0.0
+        for i, entry in enumerate(rms_env):
+            if entry["time"] >= t:
+                return entry.get("rms", 0.0)
+        return rms_env[-1].get("rms", 0.0) if rms_env else 0.0
+
+    events = []
+    for rule in rules:
+        group_start = rule.get("_group_start")
+        group_end = rule.get("_group_end")
+
+        if sections_only and (group_start is None or group_end is None):
+            continue
+
+        stem = rule.get("stem", "drums")
+        band = rule.get("band", "full")
+        min_str = rule.get("min_strength", 0.0)
+        max_str = rule.get("max_strength", 1.0)
+        effect = rule.get("effect", "zoom_pulse")
+        intensity_scale = rule.get("intensity_scale", 1.0)
+        duration = rule.get("duration", 0.2)
+
+        stem_onsets = onsets.get(stem, {}).get(band, [])
+        if not stem_onsets:
+            continue
+
+        # Get stem RMS envelope for bleed check
+        stem_rms_env = (layer1 or {}).get(stem, {}).get(band, {}).get("rms_envelope", [])
+        check_bleed = bleed_enabled and stem != "vocals"
+
+        for onset in stem_onsets:
+            t = onset["time"]
+            if t < group_start or t > group_end:
+                continue
+            strength = onset.get("strength", 0.5)
+            if strength < min_str or strength > max_str:
+                continue
+
+            # Vocal bleed suppression
+            if check_bleed and stem_rms_env:
+                stem_rms = _rms_at(stem_rms_env, t)
+                vocal_rms = _rms_at(vocal_rms_env, t)
+                if vocal_rms > 0 and stem_rms / vocal_rms < vocal_bleed_threshold:
+                    continue
+
+            intensity = min(1.0, strength * intensity_scale)
+            events.append({
+                "time": t,
+                "duration": duration,
+                "effect": effect,
+                "intensity": intensity,
+                "sustain": 0,
+                "stem_source": f"{stem}/{band}",
+            })
+
+            layer_with = rule.get("layer_with", [])
+            layer_threshold = rule.get("layer_threshold", 0.7)
+            if layer_with and strength >= layer_threshold:
+                for layer_effect in layer_with:
+                    events.append({
+                        "time": t,
+                        "duration": duration,
+                        "effect": layer_effect,
+                        "intensity": min(1.0, intensity * 0.8),
+                        "sustain": 0,
+                        "stem_source": f"{stem}/{band}",
+                    })
+
+    events.sort(key=lambda e: e["time"])
+    return events
+
+
 def apply_effects_ai(
     video_path: str,
     output_path: str,
-    effect_events: list[dict],
+    effect_events: list[dict] | None = None,
     fps: float | None = None,
     time_offset: float = 0.0,
     hard_cuts: bool = False,
     preview: bool = False,
     effect_offsets: dict[str, float] | None = None,
+    intel_path: str | None = None,
+    project_dir: str | None = None,
 ) -> str:
     """Apply effects from Layer 3 AI-generated effect events.
 
@@ -322,10 +414,69 @@ def apply_effects_ai(
         fps: Override frame rate.
         time_offset: Offset added to event times (for clips trimmed from a longer video).
         preview: Half resolution + ultrafast encode for quick previews.
+        intel_path: Path to audio_intelligence JSON. When provided, applies rules to
+            onsets client-side (matching frontend behavior) instead of using pre-computed events.
 
     Returns:
         output_path
     """
+    if intel_path:
+        import json as _json
+        with open(intel_path) as f:
+            intel_data = _json.load(f)
+        onsets = {}
+        for stem, bands in intel_data.get("layer1", {}).items():
+            onsets[stem] = {}
+            for band, bdata in bands.items():
+                onsets[stem][band] = bdata.get("onsets", [])
+        rules = intel_data.get("layer3_rules", [])
+        layer1 = intel_data.get("layer1", {})
+        effect_events = _apply_rules_client(onsets, rules, layer1=layer1)
+        _log(f"  Applied {len(rules)} rules to onsets → {len(effect_events)} events (client-style, bleed suppression on)")
+
+    # Load user effects and suppressions from project DB
+    user_effects = []
+    suppressions = []
+    if project_dir:
+        from pathlib import Path as _Path
+        from beatlab.db import get_effects, get_suppressions
+        _pdir = _Path(project_dir)
+        if (_pdir / "project.db").exists():
+            user_effects = get_effects(_pdir)
+            suppressions = get_suppressions(_pdir)
+            if user_effects:
+                _log(f"  Loaded {len(user_effects)} user effects from DB")
+                for ufx in user_effects:
+                    effect_events.append({
+                        "time": ufx["time"],
+                        "duration": ufx["duration"],
+                        "effect": ufx["type"],
+                        "intensity": ufx["intensity"],
+                        "sustain": 0,
+                        "stem_source": "user",
+                    })
+                effect_events.sort(key=lambda e: e["time"])
+            if suppressions:
+                _log(f"  Loaded {len(suppressions)} suppressions from DB")
+
+    def _is_suppressed(t: float, effect: str) -> bool:
+        """Check if an effect at time t is suppressed."""
+        for sup in suppressions:
+            if sup["from"] <= t <= sup["to"]:
+                effect_types = sup.get("effectTypes")
+                if effect_types is None:
+                    return True  # suppress all
+                # Map effect names to suppression categories
+                if effect in ("zoom_pulse", "zoom_bounce") and "zoom" in effect_types:
+                    return True
+                if effect in ("shake_x", "shake_y") and "shake" in effect_types:
+                    return True
+                if effect == "flash" and "pulse" in effect_types:
+                    return True
+                if effect in effect_types:
+                    return True
+        return False
+
     cap = cv2.VideoCapture(video_path)
     video_fps = fps or cap.get(cv2.CAP_PROP_FPS)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -445,6 +596,10 @@ def apply_effects_ai(
 
             ei = get_event_intensity(t, event)
             if ei < 0.01:
+                continue
+
+            # Check suppression
+            if suppressions and _is_suppressed(event_time + time_offset, event["effect"]):
                 continue
 
             effect = event["effect"]

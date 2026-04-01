@@ -982,6 +982,8 @@ These sensitivity levels are directives from the user controlling how aggressive
 
 # ─── Layer 3 Rules Mode ─────────────────────────────────────────────────────
 
+DEFAULT_DISABLED_EFFECTS = {"flash", "hard_cut"}
+
 def extract_layer3_rules(
     layer1_data: dict,
     layer2_data: list[dict],
@@ -990,6 +992,7 @@ def extract_layer3_rules(
     creative_direction: str | None = None,
     sensitivity: dict[str, float] | None = None,
     stats_mode: bool = False,
+    disabled_effects: set[str] | None = None,
 ) -> list[dict]:
     """Ask Claude to generate effect RULES instead of individual events.
 
@@ -1034,20 +1037,32 @@ def extract_layer3_rules(
         for effect, level in sens.items()
     )
 
-    system_prompt = """You are a visual effects director for music videos. You receive detailed audio analysis data and must produce EFFECT RULES — not individual events.
+    _disabled = disabled_effects if disabled_effects is not None else DEFAULT_DISABLED_EFFECTS
+
+    ALL_EFFECTS = {
+        "zoom_pulse": "Gentle zoom in/out. The workhorse effect — good for melodic hits, bass notes, rhythmic elements.",
+        "zoom_bounce": "Aggressive zoom punch. THE go-to effect for bass drops, heavy kicks, big impacts. Drops should BOUNCE the visuals, not blind the viewer.",
+        "shake_x": "Horizontal camera shake. Good for snare hits.",
+        "shake_y": "Vertical camera shake. Good for kick drums, sub-bass.",
+        "flash": "Brightness flash. Use SPARINGLY — only for the crispest hi-hat accents or cymbal crashes.",
+        "hard_cut": "Extreme brightness spike. AVOID for drops — use zoom_bounce + shake instead. Only for rare singular climactic moments.",
+        "contrast_pop": "Contrast boost. Good for synth stabs, melodic accents. A subtler alternative to flash.",
+        "glow_swell": "Soft glow bloom. Good for sustained pads, ambient textures, vocal sections.",
+        "echo": "Concentric zoom echo layers. Good for atmospheric moments, reverb tails.",
+    }
+    effects_text = "\n".join(
+        f"- **{name}**: {desc}" for name, desc in ALL_EFFECTS.items() if name not in _disabled
+    )
+
+    system_prompt = f"""You are a visual effects director for music videos. You receive detailed audio analysis data and must produce EFFECT RULES — not individual events.
 
 Your rules will be applied programmatically to EVERY onset in the DSP data. This guarantees complete coverage across all pattern repetitions with zero gaps.
 
 ## Available Effects
 
-- **zoom_pulse**: Gentle zoom in/out. The workhorse effect — good for melodic hits, bass notes, rhythmic elements.
-- **zoom_bounce**: Aggressive zoom punch. THE go-to effect for bass drops, heavy kicks, big impacts. Drops should BOUNCE the visuals, not blind the viewer.
-- **shake_x**: Horizontal camera shake. Good for snare hits.
-- **shake_y**: Vertical camera shake. Good for kick drums, sub-bass.
-- **flash**: Brightness flash. Use SPARINGLY — only for the crispest hi-hat accents or cymbal crashes. Too much flash is blinding and cheap-looking. Prefer zoom_pulse or contrast_pop for most rhythmic elements.
-- **hard_cut**: Extreme brightness spike. AVOID for drops — use zoom_bounce + shake instead. Only use hard_cut for rare, singular climactic moments (1-2 per minute MAX). Drops should bounce, not blind.
-- **contrast_pop**: Contrast boost. Good for synth stabs, melodic accents. A subtler alternative to flash.
-- **glow_swell**: Soft glow bloom. Good for sustained pads, ambient textures, vocal sections.
+{effects_text}
+
+IMPORTANT: Do NOT use these disabled effects: {', '.join(_disabled) if _disabled else 'none'}. Do NOT include them in effect fields or layer_with arrays.
 
 ## Rule Schema
 
@@ -1142,6 +1157,17 @@ Respond with ONLY a JSON array of rules. No markdown, no explanation outside the
         _log(f"    Response: {text[:500]}")
         rules = []
 
+    # Filter out disabled effects that Claude may have included anyway
+    if _disabled:
+        before = len(rules)
+        rules = [r for r in rules if r.get("effect") not in _disabled]
+        for r in rules:
+            lw = r.get("layer_with", [])
+            if lw:
+                r["layer_with"] = [e for e in lw if e not in _disabled]
+        if len(rules) < before:
+            _log(f"    Filtered {before - len(rules)} disabled effect rules")
+
     _log(f"    Claude produced {len(rules)} effect rules")
     return rules
 
@@ -1201,6 +1227,8 @@ def apply_rules(layer1_data: dict, rules: list[dict],
     suppressed_total = 0
 
     for rule in rules:
+        if rule.get("_disabled"):
+            continue
         stem = rule.get("stem", "drums")
         band = rule.get("band", "full")
         min_str = rule.get("min_strength", 0.0)
@@ -1208,6 +1236,9 @@ def apply_rules(layer1_data: dict, rules: list[dict],
         effect = rule.get("effect", "shake_y")
         intensity_scale = rule.get("intensity_scale", 1.0)
         duration = rule.get("duration", 0.2)
+        # Scope rule to its group time range if available
+        group_start = rule.get("_group_start")
+        group_end = rule.get("_group_end")
         sustain_from_rms = rule.get("sustain_from_rms", False)
         layer_with = rule.get("layer_with", [])
         layer_threshold = rule.get("layer_threshold", 0.7)
@@ -1218,8 +1249,18 @@ def apply_rules(layer1_data: dict, rules: list[dict],
 
         stem_data = layer1_data.get(stem, {})
         band_data = stem_data.get(band, {})
-        onsets = band_data.get("onsets", [])
+        all_onsets = band_data.get("onsets", [])
         sustained_regions = band_data.get("sustained_regions", [])
+
+        # Pre-filter onsets to group time range using binary search
+        if group_start is not None or group_end is not None:
+            import bisect
+            onset_times = [o["time"] for o in all_onsets]
+            lo_idx = bisect.bisect_left(onset_times, group_start) if group_start is not None else 0
+            hi_idx = bisect.bisect_right(onset_times, group_end) if group_end is not None else len(all_onsets)
+            onsets = all_onsets[lo_idx:hi_idx]
+        else:
+            onsets = all_onsets
 
         matched = 0
         suppressed = 0
@@ -1554,19 +1595,11 @@ def extract_layer3_rules_chunked(
         end = chunk["end_time"]
         dur = end - start
 
-        # Build chunk-specific creative direction
-        energy_guidance = {
-            "low": "This is a LOW energy section — ambient, dreamy, meditative. Use gentle effects: glow_swell, subtle zoom_pulse. Minimize shake and flash. Let the music breathe.",
-            "mid": "This is a MID energy section — building tension, melodic, driving but not peak. Use moderate zoom_pulse, contrast_pop, some shake on strong beats. Hold back on aggressive effects.",
-            "high": "This is a HIGH energy section — peak intensity, drops, aggressive beats. Use zoom_bounce, shake_x, shake_y aggressively. Layer effects on strong hits. This should feel powerful and punchy.",
-        }
-
-        chunk_direction = energy_guidance.get(energy, energy_guidance["mid"])
+        # Build chunk-specific creative direction (no energy guidance — let Claude decide from audio context)
+        chunk_direction = f"This chunk covers {start:.0f}s to {end:.0f}s ({dur:.0f}s)."
+        chunk_direction += f"\n\nAudio context: {chunk['description_summary']}"
         if creative_direction:
             chunk_direction = f"{creative_direction}\n\n{chunk_direction}"
-
-        chunk_direction += f"\n\nThis chunk covers {start:.0f}s to {end:.0f}s ({dur:.0f}s)."
-        chunk_direction += f"\n\nAudio context: {chunk['description_summary']}"
 
         _log(f"  Chunk {i+1}/{len(chunks)}: {start:.0f}s-{end:.0f}s ({energy}, {dur:.0f}s)")
 
@@ -1583,7 +1616,7 @@ def extract_layer3_rules_chunked(
         for rule in rules:
             rule["_chunk_start"] = start
             rule["_chunk_end"] = end
-            rule["_chunk_energy"] = energy
+            rule["_chunk_energy"] = chunk.get("energy", "unknown")
 
         # Apply rules only to onsets in this time range
         chunk_events = apply_rules_in_range(layer1_data, rules, start, end,
@@ -1641,6 +1674,7 @@ def extract_layer3_rules_from_sections_yaml(
     sensitivity: dict[str, float] | None = None,
     vocal_bleed_threshold: float = 0.25,
     bleed_exempt_stems: set[str] | None = None,
+    disabled_effects: set[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Generate per-section rules using manual sections.yaml groupings.
 
@@ -1673,8 +1707,6 @@ def extract_layer3_rules_from_sections_yaml(
         ) if group_descs else group.get("notes", "")
 
         chunk_direction = f"Section: \"{name}\" ({start:.0f}s to {end:.0f}s, {dur:.0f}s)"
-        if group.get("notes"):
-            chunk_direction += f"\nNotes: {group['notes']}"
         chunk_direction += f"\n\nAudio descriptions:\n{desc_summary}"
         if creative_direction:
             chunk_direction = f"{creative_direction}\n\n{chunk_direction}"
@@ -1687,6 +1719,7 @@ def extract_layer3_rules_from_sections_yaml(
             time_limit=dur,
             creative_direction=chunk_direction,
             sensitivity=sensitivity,
+            disabled_effects=disabled_effects,
         )
 
         for rule in rules:
