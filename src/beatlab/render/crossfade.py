@@ -127,45 +127,44 @@ def concat_with_crossfade(
         )
 
     # Chunked processing
+    # Each chunk borrows the first segment of the next chunk as its tail overlap,
+    # and the last segment of the previous chunk as its head overlap.
+    # This means each chunk's crossfade handles the boundary transitions,
+    # and chunks can be hard-concatenated without losing frames.
     import time as _time
 
-    # Calculate total chunks upfront
-    step = chunk_size
     total_chunks = math.ceil(len(segment_paths) / chunk_size)
-    total_chunks += 1  # final pass to merge chunks
+    _log(f"  Chunked crossfade: {len(segment_paths)} segments → {total_chunks} chunks + hard concat")
 
-    _log(f"  Chunked crossfade: {len(segment_paths)} segments → {total_chunks - 1} chunks + final merge")
-
-    # Create temp dir for chunks — named after output to avoid collision on recursive calls
     out_dir = Path(output_path).parent
-    out_stem = Path(output_path).stem  # e.g. "google_concat"
+    out_stem = Path(output_path).stem
     chunk_dir = out_dir / f"_xfade_chunks_{out_stem}"
     chunk_dir.mkdir(parents=True, exist_ok=True)
 
     chunk_paths = []
     chunk_times: list[float] = []
 
-    i = 0
-    chunk_idx = 0
-    chunks_done = 0
-    while i < len(segment_paths):
-        end = min(i + chunk_size, len(segment_paths))
-        chunk = segment_paths[i:end]
+    for chunk_idx in range(total_chunks):
+        core_start = chunk_idx * chunk_size
+        core_end = min(core_start + chunk_size, len(segment_paths))
+
+        # Borrow 1 segment from previous chunk (head overlap) and 1 from next (tail overlap)
+        actual_start = core_start - 1 if chunk_idx > 0 else core_start
+        actual_end = core_end + 1 if core_end < len(segment_paths) else core_end
+        chunk = segment_paths[actual_start:actual_end]
+
         chunk_path = str(chunk_dir / f"chunk_{chunk_idx:03d}.mp4")
 
         if not Path(chunk_path).exists():
-            # Time estimate
             if chunk_times:
                 avg_time = sum(chunk_times) / len(chunk_times)
-                remaining = (total_chunks - 1 - chunks_done) * avg_time
-                eta_min = remaining / 60
-                _log(f"  Chunk {chunk_idx + 1}/{total_chunks - 1}: segments {i}-{end-1} ({len(chunk)} segs) — ETA {eta_min:.1f}m")
+                remaining = (total_chunks - len(chunk_paths)) * avg_time
+                _log(f"  Chunk {chunk_idx + 1}/{total_chunks}: segments {actual_start}-{actual_end-1} ({len(chunk)} segs) — ETA {remaining/60:.1f}m")
             else:
-                _log(f"  Chunk {chunk_idx + 1}/{total_chunks - 1}: segments {i}-{end-1} ({len(chunk)} segs)")
+                _log(f"  Chunk {chunk_idx + 1}/{total_chunks}: segments {actual_start}-{actual_end-1} ({len(chunk)} segs)")
 
             chunk_start = _time.time()
 
-            # Validate all segments in chunk before attempting xfade
             for seg in chunk:
                 if not Path(seg).exists():
                     raise RuntimeError(f"Crossfade failed: segment missing: {seg}")
@@ -176,74 +175,67 @@ def concat_with_crossfade(
                 if not probe.stdout.strip():
                     raise RuntimeError(f"Crossfade failed: segment corrupt or unreadable: {seg}")
 
-            ok, stderr = _xfade_group(chunk, chunk_path, xfade_duration)
+            # Crossfade all segments in this chunk (including borrowed overlaps)
+            xfade_path = str(chunk_dir / f"chunk_{chunk_idx:03d}_xfade.mp4")
+            ok, stderr = _xfade_group(chunk, xfade_path, xfade_duration)
             chunk_elapsed = _time.time() - chunk_start
             chunk_times.append(chunk_elapsed)
 
             if not ok:
                 raise RuntimeError(
-                    f"Crossfade failed on chunk {chunk_idx} (segments {i}-{end-1}). "
+                    f"Crossfade failed on chunk {chunk_idx} (segments {actual_start}-{actual_end-1}). "
                     f"Segments: {[Path(s).name for s in chunk]}\n"
                     f"ffmpeg stderr: {stderr[-500:]}"
                 )
 
-            _log(f"    Done in {chunk_elapsed:.1f}s")
-        else:
-            _log(f"  Chunk {chunk_idx + 1}/{total_chunks - 1}: cached")
+            # Trim the borrowed overlap frames from head and tail
+            # Head: if we borrowed from prev chunk, trim xfade_duration/2 from start
+            # Tail: if we borrowed from next chunk, trim xfade_duration/2 from end
+            xfade_dur = _get_duration(xfade_path)
+            trim_start = xfade_duration / 2 if chunk_idx > 0 else 0
+            trim_end = xfade_dur - (xfade_duration / 2 if core_end < len(segment_paths) else 0)
 
-        chunks_done += 1
-        chunk_paths.append(chunk_path)
-        chunk_idx += 1
-        i += step
-
-    # Iteratively merge chunks until small enough for one pass
-    merge_level = 0
-    merge_paths = chunk_paths
-    while len(merge_paths) > chunk_size:
-        merge_level += 1
-        _log(f"  Merge level {merge_level}: {len(merge_paths)} chunks → groups of {chunk_size}")
-        level_dir = chunk_dir / f"merge_L{merge_level}"
-        level_dir.mkdir(parents=True, exist_ok=True)
-
-        next_paths = []
-        gi = 0
-        for start in range(0, len(merge_paths), chunk_size):
-            group = merge_paths[start:start + chunk_size]
-            group_path = str(level_dir / f"group_{gi:03d}.mp4")
-
-            if not Path(group_path).exists():
-                _log(f"    Group {gi + 1}: merging {len(group)} chunks")
-                grp_start = _time.time()
-                ok, stderr = _xfade_group(group, group_path, xfade_duration)
-                if not ok:
-                    raise RuntimeError(
-                        f"Merge level {merge_level} group {gi} failed.\n"
-                        f"ffmpeg stderr: {stderr[-500:]}"
-                    )
-                _log(f"      Done in {_time.time() - grp_start:.1f}s")
+            if trim_start > 0 or trim_end < xfade_dur:
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", xfade_path,
+                    "-ss", f"{trim_start:.6f}", "-to", f"{trim_end:.6f}",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    chunk_path,
+                ], capture_output=True, check=True)
+                Path(xfade_path).unlink(missing_ok=True)
             else:
-                _log(f"    Group {gi + 1}: cached")
+                shutil.move(xfade_path, chunk_path)
 
-            next_paths.append(group_path)
-            gi += 1
+            _log(f"    Done in {chunk_elapsed:.1f}s (trimmed {trim_start:.3f}s head, {xfade_dur - trim_end:.3f}s tail)")
+        else:
+            _log(f"  Chunk {chunk_idx + 1}/{total_chunks}: cached")
 
-        merge_paths = next_paths
+        chunk_paths.append(chunk_path)
 
-    # Final pass — small enough for one ffmpeg call
-    total_dur = sum(_get_duration(p) for p in merge_paths)
-    _log(f"  Final merge: crossfading {len(merge_paths)} chunks ({total_dur:.1f}s total)")
+    # Hard concat chunks (no crossfade — boundaries already handled)
+    total_dur = sum(_get_duration(p) for p in chunk_paths)
+    _log(f"  Final merge: hard concat {len(chunk_paths)} chunks ({total_dur:.1f}s total)")
     merge_start = _time.time()
-    ok, stderr = _xfade_group(merge_paths, output_path, xfade_duration)
-    if not ok:
-        raise RuntimeError(
-            f"Final crossfade failed on {len(merge_paths)} chunks.\n"
-            f"ffmpeg stderr: {stderr[-500:]}"
-        )
+
+    # Use ffmpeg concat demuxer for lossless join
+    concat_list = chunk_dir / "concat_list.txt"
+    with open(concat_list, "w") as f:
+        for cp in chunk_paths:
+            f.write(f"file '{Path(cp).resolve()}'\n")
+
+    cmd = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", str(concat_list),
+        "-c", "copy",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Hard concat failed.\nffmpeg stderr: {result.stderr[-500:]}")
+
     elapsed = _time.time() - merge_start
     speed = total_dur / elapsed if elapsed > 0 else 0
     _log(f"    Done in {elapsed:.1f}s ({speed:.1f}x realtime)")
-
-    # Keep chunks cached for reuse — only stale if source segments change
 
     return output_path
 
