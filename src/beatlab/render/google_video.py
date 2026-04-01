@@ -274,6 +274,116 @@ class GoogleVideoClient:
 
         raise RuntimeError("Nano Banana did not return an image after 3 attempts")
 
+    def generate_image(
+        self,
+        prompt: str,
+        output_path: str,
+        aspect_ratio: str = "16:9",
+        model: str = "imagen-3.0-generate-002",
+    ) -> str:
+        """Generate an image from text prompt only using the Imagen API.
+
+        Args:
+            prompt: Text description of the image to generate.
+            output_path: Where to save the generated image.
+            aspect_ratio: Aspect ratio string (e.g. "16:9", "1:1", "9:16").
+            model: Imagen model name.
+
+        Returns:
+            output_path
+        """
+        from google.genai import types
+
+        full_prompt = (
+            f"Hyper-realistic, photorealistic image. Like a still from a big-budget "
+            f"film shot on 35mm. Rich intricate detail, complex natural textures, "
+            f"sophisticated cinematic lighting, depth of field. Every surface has "
+            f"realistic material properties. Scene: {prompt}"
+        )
+
+        response = _retry_on_429(
+            self.client.models.generate_images,
+            model=model,
+            prompt=full_prompt,
+            config=types.GenerateImagesConfig(
+                aspect_ratio=aspect_ratio,
+                number_of_images=1,
+            ),
+        )
+
+        if not response.generated_images:
+            raise RuntimeError(f"Image generation returned no images. Prompt: {prompt[:100]}")
+
+        img = response.generated_images[0].image
+        img.save(output_path)
+        return output_path
+
+    def transform_image(
+        self,
+        image_path: str,
+        prompt: str,
+        output_path: str,
+        model: str = "gemini-2.5-flash-image",
+    ) -> str:
+        """Transform an image based on a prompt, allowing significant changes to content and composition.
+
+        Unlike stylize_image which preserves composition, this method encourages
+        the model to modify the scene according to the prompt.
+        """
+        from google.genai import types
+
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+
+        ext = Path(image_path).suffix.lower()
+        mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(ext, "image/png")
+
+        # Get source dimensions to enforce matching aspect ratio
+        from PIL import Image as _PILImage
+        with _PILImage.open(image_path) as src_img:
+            src_w, src_h = src_img.size
+
+        import time as _time
+        for attempt in range(3):
+            if attempt > 0:
+                _time.sleep(2)
+
+            response = _retry_on_429(
+                self.client.models.generate_content,
+                model=model,
+                contents=[
+                    types.Content(role="user", parts=[
+                        types.Part.from_bytes(data=image_bytes, mime_type=mime),
+                        types.Part(text=f"Edit this image according to these instructions. You may significantly change the scene, add or remove elements, alter lighting, composition, and atmosphere. Maintain photorealistic, cinematic quality. Output the image at the same aspect ratio as the input. Instructions: {prompt}"),
+                    ]),
+                ],
+                config=types.GenerateContentConfig(
+                    response_modalities=["image", "text"],
+                ),
+            )
+
+            candidates = response.candidates or []
+            if not candidates:
+                if attempt < 2:
+                    continue
+                raise RuntimeError(f"Transform returned no candidates. Prompt: {prompt[:100]}")
+
+            parts = candidates[0].content.parts if candidates[0].content else []
+            for part in parts or []:
+                if part.inline_data and part.inline_data.mime_type.startswith("image/"):
+                    # Resize to match source dimensions
+                    import io
+                    out_img = _PILImage.open(io.BytesIO(part.inline_data.data))
+                    if (out_img.width, out_img.height) != (src_w, src_h):
+                        out_img = out_img.resize((src_w, src_h), _PILImage.LANCZOS)
+                    out_img.save(output_path)
+                    return output_path
+
+            if attempt < 2:
+                continue
+
+        raise RuntimeError("Transform did not return an image after 3 attempts")
+
     @staticmethod
     def _load_ingredient_images(ingredient_paths: list[str]) -> list:
         """Load ingredient images as VideoGenerationReferenceImage objects.

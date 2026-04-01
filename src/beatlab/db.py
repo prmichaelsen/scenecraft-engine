@@ -155,6 +155,11 @@ def _ensure_schema(conn: sqlite3.Connection):
     if "track_id" not in cols:
         conn.execute("ALTER TABLE transitions ADD COLUMN track_id TEXT NOT NULL DEFAULT 'track_1'")
 
+    # Add chroma_key column to tracks if missing
+    track_cols = {row[1] for row in conn.execute("PRAGMA table_info(tracks)").fetchall()}
+    if "chroma_key" not in track_cols:
+        conn.execute("ALTER TABLE tracks ADD COLUMN chroma_key TEXT")
+
     # Ensure default track exists
     try:
         if not conn.execute("SELECT 1 FROM tracks WHERE id = 'track_1'").fetchone():
@@ -548,6 +553,7 @@ def get_tracks(project_dir: Path) -> list[dict]:
         "id": r["id"], "name": r["name"], "z_order": r["z_order"],
         "blend_mode": r["blend_mode"], "base_opacity": r["base_opacity"],
         "enabled": bool(r["enabled"]),
+        "chroma_key": json.loads(r["chroma_key"]) if r["chroma_key"] else None,
     } for r in rows]
 
 
@@ -569,6 +575,8 @@ def update_track(project_dir: Path, track_id: str, **fields):
     for key, val in fields.items():
         if key == "enabled":
             val = 1 if val else 0
+        elif key == "chroma_key":
+            val = json.dumps(val) if val is not None else None
         sets.append(f"{key} = ?")
         values.append(val)
     values.append(track_id)

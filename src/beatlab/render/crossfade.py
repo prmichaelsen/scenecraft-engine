@@ -144,13 +144,18 @@ def concat_with_crossfade(
     chunk_paths = []
     chunk_times: list[float] = []
 
+    # Pre-compute all segment durations
+    seg_durations = [_get_duration(p) for p in segment_paths]
+
     for chunk_idx in range(total_chunks):
         core_start = chunk_idx * chunk_size
         core_end = min(core_start + chunk_size, len(segment_paths))
 
         # Borrow 1 segment from previous chunk (head overlap) and 1 from next (tail overlap)
-        actual_start = core_start - 1 if chunk_idx > 0 else core_start
-        actual_end = core_end + 1 if core_end < len(segment_paths) else core_end
+        has_head_borrow = chunk_idx > 0
+        has_tail_borrow = core_end < len(segment_paths)
+        actual_start = core_start - 1 if has_head_borrow else core_start
+        actual_end = core_end + 1 if has_tail_borrow else core_end
         chunk = segment_paths[actual_start:actual_end]
 
         chunk_path = str(chunk_dir / f"chunk_{chunk_idx:03d}.mp4")
@@ -188,14 +193,40 @@ def concat_with_crossfade(
                     f"ffmpeg stderr: {stderr[-500:]}"
                 )
 
-            # Trim the borrowed overlap frames from head and tail
-            # Head: if we borrowed from prev chunk, trim xfade_duration/2 from start
-            # Tail: if we borrowed from next chunk, trim xfade_duration/2 from end
-            xfade_dur = _get_duration(xfade_path)
-            trim_start = xfade_duration / 2 if chunk_idx > 0 else 0
-            trim_end = xfade_dur - (xfade_duration / 2 if core_end < len(segment_paths) else 0)
+            # Compute expected core duration from segment durations:
+            # Core segments crossfaded = sum(core_durations) - (n_core-1) * xfade_duration
+            # Then add half-xfade at each borrowed boundary (we keep our half of the blend)
+            core_durs = seg_durations[core_start:core_end]
+            n_core = len(core_durs)
+            core_xfaded_dur = sum(core_durs) - (n_core - 1) * xfade_duration
+            # Add half-xfade for head borrow (we keep the second half of the blend)
+            # Add half-xfade for tail borrow (we keep the first half of the blend)
+            expected_dur = core_xfaded_dur
+            if has_head_borrow:
+                expected_dur += xfade_duration / 2
+            if has_tail_borrow:
+                expected_dur += xfade_duration / 2
 
-            if trim_start > 0 or trim_end < xfade_dur:
+            # Compute trim points from the full crossfaded chunk
+            xfade_full_dur = _get_duration(xfade_path)
+            # The borrowed head segment contributes: its_dur - xfade_dur (it gets xfaded with core[0])
+            # We want to keep only xfade_dur/2 of that transition (the blended half)
+            if has_head_borrow:
+                head_borrow_dur = seg_durations[core_start - 1]
+                # In the xfade output, the borrowed head occupies: head_borrow_dur - xfade_duration
+                # plus xfade_duration of blended region. We want to cut all of the unblended head
+                # and half the blend = head_borrow_dur - xfade_duration + xfade_duration/2
+                trim_start = head_borrow_dur - xfade_duration / 2
+            else:
+                trim_start = 0
+
+            if has_tail_borrow:
+                tail_borrow_dur = seg_durations[core_end]
+                trim_end = xfade_full_dur - (tail_borrow_dur - xfade_duration / 2)
+            else:
+                trim_end = xfade_full_dur
+
+            if trim_start > 0 or trim_end < xfade_full_dur:
                 subprocess.run([
                     "ffmpeg", "-y", "-i", xfade_path,
                     "-ss", f"{trim_start:.6f}", "-to", f"{trim_end:.6f}",
@@ -206,7 +237,8 @@ def concat_with_crossfade(
             else:
                 shutil.move(xfade_path, chunk_path)
 
-            _log(f"    Done in {chunk_elapsed:.1f}s (trimmed {trim_start:.3f}s head, {xfade_dur - trim_end:.3f}s tail)")
+            actual_dur = _get_duration(chunk_path)
+            _log(f"    Done in {chunk_elapsed:.1f}s (expected {expected_dur:.2f}s, got {actual_dur:.2f}s, trim {trim_start:.3f}s-{trim_end:.3f}s)")
         else:
             _log(f"  Chunk {chunk_idx + 1}/{total_chunks}: cached")
 
