@@ -155,10 +155,27 @@ def _ensure_schema(conn: sqlite3.Connection):
     if "track_id" not in cols:
         conn.execute("ALTER TABLE transitions ADD COLUMN track_id TEXT NOT NULL DEFAULT 'track_1'")
 
+    # Add label/label_color columns to keyframes if missing
+    if "label" not in cols:
+        conn.execute("ALTER TABLE keyframes ADD COLUMN label TEXT NOT NULL DEFAULT ''")
+    if "label_color" not in cols:
+        conn.execute("ALTER TABLE keyframes ADD COLUMN label_color TEXT NOT NULL DEFAULT ''")
+
+    # Add label/label_color/tags columns to transitions if missing
+    tr_cols = {row[1] for row in conn.execute("PRAGMA table_info(transitions)").fetchall()}
+    if "label" not in tr_cols:
+        conn.execute("ALTER TABLE transitions ADD COLUMN label TEXT NOT NULL DEFAULT ''")
+    if "label_color" not in tr_cols:
+        conn.execute("ALTER TABLE transitions ADD COLUMN label_color TEXT NOT NULL DEFAULT ''")
+    if "tags" not in tr_cols:
+        conn.execute("ALTER TABLE transitions ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'")
+
     # Add chroma_key column to tracks if missing
     track_cols = {row[1] for row in conn.execute("PRAGMA table_info(tracks)").fetchall()}
     if "chroma_key" not in track_cols:
         conn.execute("ALTER TABLE tracks ADD COLUMN chroma_key TEXT")
+    if "hidden" not in track_cols:
+        conn.execute("ALTER TABLE tracks ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
 
     # Ensure default track exists
     try:
@@ -214,6 +231,8 @@ def _row_to_keyframe(row: sqlite3.Row) -> dict:
         "candidates": json.loads(row["candidates"]),
         "context": json.loads(row["context"]) if row["context"] else None,
         "track_id": row["track_id"] if "track_id" in row.keys() else "track_1",
+        "label": row["label"] if "label" in row.keys() else "",
+        "label_color": row["label_color"] if "label_color" in row.keys() else "",
         "deleted_at": row["deleted_at"],
     }
 
@@ -309,6 +328,9 @@ def _row_to_transition(row: sqlite3.Row) -> dict:
         "selected": selected,
         "remap": remap,
         "track_id": row["track_id"] if "track_id" in row.keys() else "track_1",
+        "label": row["label"] if "label" in row.keys() else "",
+        "label_color": row["label_color"] if "label_color" in row.keys() else "",
+        "tags": json.loads(row["tags"]) if "tags" in row.keys() and row["tags"] else [],
         "deleted_at": row["deleted_at"],
     }
 
@@ -373,6 +395,8 @@ def update_transition(project_dir: Path, tr_id: str, **fields):
             val = json.dumps(val)
         elif key == "use_global_prompt":
             val = int(val)
+        elif key == "tags":
+            val = json.dumps(val) if isinstance(val, list) else val
         sets.append(f"{col} = ?")
         values.append(val)
     values.append(tr_id)
@@ -554,6 +578,7 @@ def get_tracks(project_dir: Path) -> list[dict]:
         "blend_mode": r["blend_mode"], "base_opacity": r["base_opacity"],
         "enabled": bool(r["enabled"]),
         "chroma_key": json.loads(r["chroma_key"]) if r["chroma_key"] else None,
+        "hidden": bool(r["hidden"]) if "hidden" in r.keys() else False,
     } for r in rows]
 
 
@@ -573,7 +598,7 @@ def update_track(project_dir: Path, track_id: str, **fields):
     sets = []
     values = []
     for key, val in fields.items():
-        if key == "enabled":
+        if key == "enabled" or key == "hidden":
             val = 1 if val else 0
         elif key == "chroma_key":
             val = json.dumps(val) if val is not None else None

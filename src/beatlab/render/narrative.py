@@ -1296,8 +1296,12 @@ def _remap_with_curve(
     shutil.rmtree(str(out_dir))
 
 
-def assemble_final(yaml_path: str, output_path: str) -> str:
-    """Time-remap selected transitions, concatenate, and mux audio."""
+def assemble_final(yaml_path: str, output_path: str, max_time: float | None = None) -> str:
+    """Time-remap selected transitions, concatenate, and mux audio.
+
+    Args:
+        max_time: Stop assembling after this timeline time (seconds). None = full track.
+    """
     import subprocess
 
     # Export DB to YAML first so curve_points and other DB-only edits are included
@@ -1350,12 +1354,26 @@ def assemble_final(yaml_path: str, output_path: str) -> str:
 
         selected = selected_tr_dir / f"{tr['id']}_slot_0.mp4"
         if not selected.exists():
-            _log(f"  WARNING: Missing {selected}")
+            # Fallback: use from-keyframe image as a still frame
+            kf_image = work_dir / "selected_keyframes" / f"{tr.get('from', '')}.png"
+            if kf_image.exists():
+                _log(f"  {tr['id']}: no video, using keyframe image {kf_image.name}")
+                clips_info.append({
+                    "tr": tr,
+                    "selected": str(kf_image),
+                    "is_still": True,
+                    "from_ts": _parse_ts(from_kf["timestamp"]) if from_kf else 0,
+                    "to_ts": _parse_ts(to_kf["timestamp"]) if to_kf else 0,
+                    "timeline_dur": timeline_duration,
+                })
+            else:
+                _log(f"  WARNING: Missing {selected} (no keyframe fallback)")
             continue
 
         clips_info.append({
             "tr": tr,
             "selected": str(selected),
+            "is_still": False,
             "from_ts": _parse_ts(from_kf["timestamp"]) if from_kf else 0,
             "to_ts": _parse_ts(to_kf["timestamp"]) if to_kf else 0,
             "timeline_dur": timeline_duration,
@@ -1363,6 +1381,15 @@ def assemble_final(yaml_path: str, output_path: str) -> str:
 
     if not clips_info:
         raise RuntimeError("No clips to assemble")
+
+    # Apply max_time filter
+    if max_time is not None:
+        clips_info = [ci for ci in clips_info if ci["from_ts"] < max_time]
+        # Clamp last clip's to_ts
+        if clips_info and clips_info[-1]["to_ts"] > max_time:
+            clips_info[-1]["to_ts"] = max_time
+            clips_info[-1]["timeline_dur"] = max_time - clips_info[-1]["from_ts"]
+        _log(f"  max_time={max_time:.1f}s → {len(clips_info)} clips")
 
     n_clips = len(clips_info)
     fps = 24.0
@@ -1572,6 +1599,7 @@ def assemble_final(yaml_path: str, output_path: str) -> str:
         remap = ci["tr"].get("remap", {})
         clip_schedule.append({
             "source": ci["selected"],
+            "is_still": ci.get("is_still", False),
             "core": core,
             "from_ts": ci["from_ts"],
             "to_ts": ci["to_ts"],
@@ -1580,11 +1608,15 @@ def assemble_final(yaml_path: str, output_path: str) -> str:
         })
         acc += core
 
-    # Determine output resolution from first clip
-    cap0 = cv2.VideoCapture(clip_schedule[0]["source"])
-    w = int(cap0.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap0.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    cap0.release()
+    # Determine output resolution from first video clip (skip stills)
+    w, h = 1920, 1080
+    for s in clip_schedule:
+        if not s.get("is_still"):
+            cap0 = cv2.VideoCapture(s["source"])
+            w = int(cap0.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap0.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap0.release()
+            break
 
     preview = output_path.endswith("_preview.mp4")
     if preview:
@@ -1602,17 +1634,28 @@ def assemble_final(yaml_path: str, output_path: str) -> str:
     prev_tail_frames = []  # last HALF remapped frames from previous clip
 
     for clip_idx, sched in enumerate(clip_schedule):
-        # Read ALL source frames into memory
-        cap = cv2.VideoCapture(sched["source"])
-        source_frames = []
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+        # Read source frames — video or still image
+        if sched.get("is_still"):
+            img = cv2.imread(sched["source"])
+            if img is None:
+                _log(f"  WARNING: Could not read {sched['source']}, skipping")
+                continue
             if preview:
-                frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
-            source_frames.append(frame)
-        cap.release()
+                img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+            else:
+                img = cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)
+            source_frames = [img]
+        else:
+            cap = cv2.VideoCapture(sched["source"])
+            source_frames = []
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if preview:
+                    frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+                source_frames.append(frame)
+            cap.release()
 
         n_source = len(source_frames)
         if n_source == 0:

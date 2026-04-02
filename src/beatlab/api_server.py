@@ -389,8 +389,9 @@ def make_handler(work_dir: Path):
                 from beatlab.db import add_track as db_add_track, get_tracks as db_get_tracks
                 existing = db_get_tracks(project_dir)
                 track_id = f"track_{len(existing) + 1}"
+                # Add at top (highest z_order = rendered on top in compositor)
                 z_order = max((t["z_order"] for t in existing), default=-1) + 1
-                db_add_track(project_dir, {"id": track_id, "name": body.get("name", f"Track {z_order + 1}"), "z_order": z_order, **{k: v for k, v in body.items() if k in ("blend_mode", "base_opacity", "enabled")}})
+                db_add_track(project_dir, {"id": track_id, "name": body.get("name", f"Track {len(existing) + 1}"), "z_order": z_order, **{k: v for k, v in body.items() if k in ("blend_mode", "base_opacity", "enabled")}})
                 return self._json_response({"success": True, "id": track_id})
 
             # POST /api/projects/:name/tracks/update
@@ -404,7 +405,7 @@ def make_handler(work_dir: Path):
                 track_id = body.pop("id", None)
                 if not track_id: return self._error(400, "BAD_REQUEST", "Missing 'id'")
                 field_map = {"blendMode": "blend_mode", "baseOpacity": "base_opacity", "chromaKey": "chroma_key"}
-                mapped = {field_map.get(k, k): v for k, v in body.items() if field_map.get(k, k) in ("name", "blend_mode", "base_opacity", "enabled", "z_order", "chroma_key")}
+                mapped = {field_map.get(k, k): v for k, v in body.items() if field_map.get(k, k) in ("name", "blend_mode", "base_opacity", "enabled", "z_order", "chroma_key", "hidden")}
                 db_update_track(project_dir, track_id, **mapped)
                 return self._json_response({"success": True})
 
@@ -645,6 +646,65 @@ def make_handler(work_dir: Path):
                 threading.Thread(target=_run_variations, daemon=True).start()
                 return self._json_response({"jobId": job_id, "keyframeId": kf_id})
 
+            # POST /api/projects/:name/duplicate-transition-video
+            m = re.match(r"^/api/projects/([^/]+)/duplicate-transition-video$", path)
+            if m:
+                body = self._read_json_body()
+                if body is None: return
+                source_id = body.get("sourceId")
+                target_id = body.get("targetId")
+                if not source_id or not target_id: return self._error(400, "BAD_REQUEST", "Missing sourceId or targetId")
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                import shutil
+                src_sel = project_dir / "selected_transitions" / f"{source_id}_slot_0.mp4"
+                if src_sel.exists():
+                    dst_sel = project_dir / "selected_transitions" / f"{target_id}_slot_0.mp4"
+                    dst_sel.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(src_sel), str(dst_sel))
+                src_cands = project_dir / "transition_candidates" / source_id
+                if src_cands.is_dir():
+                    dst_cands = project_dir / "transition_candidates" / target_id
+                    dst_cands.mkdir(parents=True, exist_ok=True)
+                    for slot_dir in src_cands.iterdir():
+                        if slot_dir.is_dir():
+                            dst_slot = dst_cands / slot_dir.name
+                            dst_slot.mkdir(parents=True, exist_ok=True)
+                            for f in slot_dir.iterdir():
+                                if not (dst_slot / f.name).exists():
+                                    shutil.copy2(str(f), str(dst_slot / f.name))
+                from beatlab.db import get_transition, update_transition
+                src_tr = get_transition(project_dir, source_id)
+                if src_tr and src_tr.get("selected"):
+                    update_transition(project_dir, target_id, selected=src_tr["selected"])
+                _log(f"duplicate-transition-video: {source_id} -> {target_id}")
+                return self._json_response({"success": True})
+
+            # POST /api/projects/:name/update-keyframe-label
+            m = re.match(r"^/api/projects/([^/]+)/update-keyframe-label$", path)
+            if m:
+                body = self._read_json_body()
+                if body is None: return
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                from beatlab.db import update_keyframe
+                update_keyframe(project_dir, body["keyframeId"], label=body.get("label", ""), label_color=body.get("labelColor", ""))
+                return self._json_response({"success": True})
+
+            # POST /api/projects/:name/update-transition-label
+            m = re.match(r"^/api/projects/([^/]+)/update-transition-label$", path)
+            if m:
+                body = self._read_json_body()
+                if body is None: return
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                from beatlab.db import update_transition
+                fields = {"label": body.get("label", ""), "label_color": body.get("labelColor", "")}
+                if "tags" in body:
+                    fields["tags"] = body["tags"]
+                update_transition(project_dir, body["transitionId"], **fields)
+                return self._json_response({"success": True})
+
             # POST /api/projects/:name/assign-keyframe-image
             m = re.match(r"^/api/projects/([^/]+)/assign-keyframe-image$", path)
             if m:
@@ -661,10 +721,22 @@ def make_handler(work_dir: Path):
                 dst = project_dir / "selected_keyframes" / f"{kf_id}.png"
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(str(src), str(dst))
+                # Also create as v1 candidate so it appears in the candidates panel
+                cand_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{kf_id}"
+                cand_dir.mkdir(parents=True, exist_ok=True)
+                existing = len(list(cand_dir.glob("v*.png")))
+                v = existing + 1
+                shutil.copy2(str(src), str(cand_dir / f"v{v}.png"))
                 from beatlab.db import update_keyframe
-                update_keyframe(project_dir, kf_id, selected=1)
-                _log(f"assign-keyframe-image: {source_path} -> {kf_id}")
-                return self._json_response({"success": True})
+                import time as _t
+                cache_bust = int(_t.time())
+                all_cands = sorted([
+                    f"keyframe_candidates/candidates/section_{kf_id}/{f.name}"
+                    for f in cand_dir.glob("v*.png")
+                ], key=lambda p: int(p.rsplit("v", 1)[-1].split(".")[0]))
+                update_keyframe(project_dir, kf_id, selected=v, candidates=all_cands)
+                _log(f"assign-keyframe-image: {source_path} -> {kf_id} as v{v} (selected={v})")
+                return self._json_response({"success": True, "selected": v})
 
             # POST /api/projects/:name/markers/add
             m = re.match(r"^/api/projects/([^/]+)/markers/add$", path)
@@ -958,6 +1030,8 @@ def make_handler(work_dir: Path):
                     "selected": kf.get("selected"),
                     "hasSelectedImage": has_selected,
                     "trackId": kf.get("track_id", "track_1"),
+                    "label": kf.get("label", ""),
+                    "labelColor": kf.get("label_color", ""),
                     "candidates": candidate_files,
                     "context": {
                         "mood": ctx.get("mood", ""),
@@ -1040,6 +1114,9 @@ def make_handler(work_dir: Path):
                     "action": tr.get("action", ""),
                     "useGlobalPrompt": tr.get("use_global_prompt", True),
                     "trackId": tr.get("track_id", "track_1"),
+                    "label": tr.get("label", ""),
+                    "labelColor": tr.get("label_color", ""),
+                    "tags": tr.get("tags", []),
                     "candidates": slot_candidates,
                     "hasSelectedVideos": has_selected_videos,
                     "selected": selected_list,
@@ -1058,7 +1135,7 @@ def make_handler(work_dir: Path):
                 "tracks": [{
                     "id": t["id"], "name": t["name"], "zOrder": t["z_order"],
                     "blendMode": t["blend_mode"], "baseOpacity": t["base_opacity"],
-                    "enabled": t["enabled"], "chromaKey": t.get("chroma_key"),
+                    "enabled": t["enabled"], "chromaKey": t.get("chroma_key"), "hidden": t.get("hidden", False),
                 } for t in (get_tracks(project_dir) if (project_dir / "project.db").exists() else [{"id": "track_1", "name": "Track 1", "z_order": 0, "blend_mode": "normal", "base_opacity": 1.0, "enabled": True}])],
             })
 
@@ -1391,6 +1468,7 @@ def make_handler(work_dir: Path):
 
             section = body.get("section", "")
             prompt = body.get("prompt", "")
+            track_id = body.get("trackId", "track_1")
 
             project_dir = self._require_project_dir(project_name)
             if project_dir is None:
@@ -1416,12 +1494,12 @@ def make_handler(work_dir: Path):
                 new_kf = {
                     "id": new_id, "timestamp": timestamp, "section": section,
                     "source": f"selected_keyframes/{new_id}.png", "prompt": prompt,
-                    "candidates": [], "selected": None,
+                    "candidates": [], "selected": None, "track_id": track_id,
                 }
                 db_add_kf(project_dir, new_kf)
 
-                # Find timeline neighbors
-                all_kfs = db_get_kfs(project_dir)
+                # Find timeline neighbors on the same track
+                all_kfs = [k for k in db_get_kfs(project_dir) if k.get("track_id", "track_1") == track_id]
                 sorted_kfs = sorted(all_kfs, key=lambda k: parse_ts(k["timestamp"]))
                 new_idx = next((i for i, k in enumerate(sorted_kfs) if k["id"] == new_id), -1)
                 prev_kf = sorted_kfs[new_idx - 1] if new_idx > 0 else None
@@ -1429,6 +1507,7 @@ def make_handler(work_dir: Path):
 
                 # Wire transitions: split spanning transition or create new ones
                 from datetime import datetime, timezone
+                old_tr = None
                 if prev_kf and next_kf:
                     all_trs = db_get_trs(project_dir)
                     old_tr = next((t for t in all_trs if t["from"] == prev_kf["id"] and t["to"] == next_kf["id"]), None)
@@ -1450,10 +1529,32 @@ def make_handler(work_dir: Path):
                 if next_kf:
                     dur_after = round(next_time - new_time, 2)
                     tr2_id = next_transition_id(project_dir)
+                    # Inherit video + candidates from the split transition
+                    inherited_selected = None
+                    if old_tr and old_tr.get("selected") and old_tr["selected"] not in (None, [None]):
+                        import shutil as _sh
+                        old_sel = project_dir / "selected_transitions" / f"{old_tr['id']}_slot_0.mp4"
+                        if old_sel.exists():
+                            new_sel = project_dir / "selected_transitions" / f"{tr2_id}_slot_0.mp4"
+                            new_sel.parent.mkdir(parents=True, exist_ok=True)
+                            _sh.copy2(str(old_sel), str(new_sel))
+                            inherited_selected = 1
+                        old_cands = project_dir / "transition_candidates" / old_tr["id"]
+                        if old_cands.is_dir():
+                            new_cands = project_dir / "transition_candidates" / tr2_id
+                            new_cands.mkdir(parents=True, exist_ok=True)
+                            for slot_dir in old_cands.iterdir():
+                                if slot_dir.is_dir():
+                                    dst_slot = new_cands / slot_dir.name
+                                    dst_slot.mkdir(parents=True, exist_ok=True)
+                                    for f in slot_dir.iterdir():
+                                        _sh.copy2(str(f), str(dst_slot / f.name))
+                        _log(f"  Inherited video from {old_tr['id']} to {tr2_id}")
                     db_add_tr(project_dir, {
                         "id": tr2_id, "from": new_id, "to": next_kf["id"],
                         "duration_seconds": dur_after, "slots": 1,
-                        "action": "", "use_global_prompt": False, "selected": None,
+                        "action": old_tr.get("action", "") if old_tr else "",
+                        "use_global_prompt": False, "selected": inherited_selected,
                         "remap": {"method": "linear", "target_duration": dur_after},
                     })
                 _log(f"  Wired: {prev_kf['id'] if prev_kf else '(start)'} -> {new_id} -> {next_kf['id'] if next_kf else '(end)'}")
@@ -1929,7 +2030,10 @@ def make_handler(work_dir: Path):
 
             try:
                 import subprocess as sp
+                import traceback as _tb
                 from beatlab.db import get_keyframes, get_transitions, add_to_bench
+
+                _log(f"bench-capture: {project_name} time={time_sec}")
 
                 def parse_ts(ts):
                     parts = str(ts).split(":")
@@ -1961,8 +2065,12 @@ def make_handler(work_dir: Path):
                     ft = parse_ts(from_kf["timestamp"])
                     tt = parse_ts(to_kf["timestamp"])
                     sel = tr.get("selected")
-                    has_video = sel is not None and sel != [None] and sel != "null"
+                    has_video = sel is not None and sel not in (0, "null", "none", "None")
+                    # Also verify the video file actually exists on disk
                     if has_video and ft <= time_sec < tt:
+                        video_file = project_dir / "selected_transitions" / f"{tr['id']}_slot_0.mp4"
+                        if not video_file.exists():
+                            continue
                         active_tr = tr
                         tr_from_time = ft
                         tr_to_time = tt
@@ -1974,45 +2082,52 @@ def make_handler(work_dir: Path):
                 snap_name = f"bench_{int(_t.time() * 1000)}.png"
                 snap_path = snap_dir / snap_name
 
+                _log(f"  current_kf={current_kf['id'] if current_kf else None}, active_tr={active_tr['id'] if active_tr else None}")
+
                 if active_tr:
-                    # Extract frame from transition video at relative offset
                     video_path = project_dir / "selected_transitions" / f"{active_tr['id']}_slot_0.mp4"
+                    _log(f"  transition path: {video_path} exists={video_path.exists()}")
                     if not video_path.exists():
                         return self._error(404, "NOT_FOUND", f"Transition video not found: {active_tr['id']}")
 
                     timeline_dur = tr_to_time - tr_from_time
                     progress = (time_sec - tr_from_time) / timeline_dur if timeline_dur > 0 else 0
-                    # Map timeline progress to video time using duration_seconds
                     video_dur = active_tr.get("duration_seconds", timeline_dur)
                     video_time = progress * video_dur
+                    _log(f"  ffmpeg: -ss {video_time:.3f} from {video_path.name} -> {snap_path}")
 
-                    sp.run(
+                    result = sp.run(
                         ["ffmpeg", "-y", "-ss", str(video_time), "-i", str(video_path),
                          "-vframes", "1", "-q:v", "2", str(snap_path)],
-                        capture_output=True, timeout=10,
+                        capture_output=True, text=True, timeout=10,
                     )
+                    if result.returncode != 0:
+                        _log(f"  ffmpeg failed: {result.stderr[:300]}")
                     label = f"frame @ {int(time_sec // 60)}:{time_sec % 60:05.2f} ({active_tr['id']})"
                 elif current_kf:
-                    # Copy the keyframe image
                     import shutil
                     kf_img = project_dir / "selected_keyframes" / f"{current_kf['id']}.png"
+                    _log(f"  keyframe path: {kf_img} exists={kf_img.exists()}")
                     if kf_img.exists():
                         shutil.copy2(str(kf_img), str(snap_path))
                     else:
                         return self._error(404, "NOT_FOUND", f"No image for {current_kf['id']}")
                     label = f"frame @ {int(time_sec // 60)}:{time_sec % 60:05.2f} ({current_kf['id']})"
                 else:
+                    _log(f"  no keyframe or transition found at t={time_sec}")
                     return self._error(404, "NOT_FOUND", "No keyframe or transition at this time")
 
+                _log(f"  snap_path exists={snap_path.exists()}")
                 if not snap_path.exists():
                     return self._error(500, "INTERNAL_ERROR", "Failed to capture frame")
 
                 source_path = f"bench_snapshots/{snap_name}"
                 bench_id = add_to_bench(project_dir, "keyframe", source_path, label)
-                _log(f"bench-capture: {project_name} t={time_sec:.2f} -> {source_path} ({bench_id})")
+                _log(f"  success: {source_path} ({bench_id})")
                 self._json_response({"success": True, "benchId": bench_id, "sourcePath": source_path})
             except Exception as e:
                 _log(f"bench-capture error: {e}")
+                _tb.print_exc()
                 self._error(500, "INTERNAL_ERROR", str(e))
 
         def _handle_bench_upload(self, project_name: str):
@@ -2255,21 +2370,25 @@ def make_handler(work_dir: Path):
 
                     def _split_video():
                         try:
-                            # Split part 1
+                            # Split part 1 — re-encode for precise cut
                             cand1_dir = project_dir / "transition_candidates" / tr1_id / "slot_0"
                             cand1_dir.mkdir(parents=True, exist_ok=True)
                             part1 = cand1_dir / "v1.mp4"
                             sp.run(["ffmpeg", "-y", "-i", str(sel_video), "-t", str(split_at),
-                                    "-c", "copy", str(part1)], capture_output=True, timeout=30)
+                                    "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+                                    "-c:a", "aac", "-b:a", "192k",
+                                    str(part1)], capture_output=True, timeout=60)
                             sel1 = project_dir / "selected_transitions" / f"{tr1_id}_slot_0.mp4"
                             shutil.copy2(str(part1), str(sel1))
 
-                            # Split part 2
+                            # Split part 2 — re-encode to get a clean cut (stream copy can't seek precisely)
                             cand2_dir = project_dir / "transition_candidates" / tr2_id / "slot_0"
                             cand2_dir.mkdir(parents=True, exist_ok=True)
                             part2 = cand2_dir / "v1.mp4"
-                            sp.run(["ffmpeg", "-y", "-i", str(sel_video), "-ss", str(split_at),
-                                    "-c", "copy", str(part2)], capture_output=True, timeout=30)
+                            sp.run(["ffmpeg", "-y", "-ss", str(split_at), "-i", str(sel_video),
+                                    "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+                                    "-c:a", "aac", "-b:a", "192k",
+                                    str(part2)], capture_output=True, timeout=60)
                             sel2 = project_dir / "selected_transitions" / f"{tr2_id}_slot_0.mp4"
                             shutil.copy2(str(part2), str(sel2))
 
@@ -2890,55 +3009,67 @@ def make_handler(work_dir: Path):
                 threading.Thread(target=_run_refine, daemon=True).start()
                 return self._json_response({"jobId": job_id, "keyframeId": kf_id})
 
-            # Export DB to YAML before generation (narrative.py still reads YAML)
-            if (project_dir / "project.db").exists():
-                try:
-                    from beatlab.db import export_to_yaml
-                    export_to_yaml(project_dir)
-                except Exception as ex:
-                    _log(f"  Warning: DB->YAML export failed: {ex}")
+            # Read keyframe directly from DB — no YAML export needed
+            from beatlab.db import get_keyframe, update_keyframe
+            kf = get_keyframe(project_dir, kf_id)
+            if not kf:
+                return self._error(404, "NOT_FOUND", f"Keyframe {kf_id} not found")
 
-            yaml_path = self._require_yaml_path(project_name)
-            if yaml_path is None:
-                return
+            source = kf.get("source", f"selected_keyframes/{kf_id}.png")
+            source_path = project_dir / source
+            if not source_path.exists():
+                # Fallback: try selected_keyframes
+                source_path = project_dir / "selected_keyframes" / f"{kf_id}.png"
+            if not source_path.exists():
+                return self._error(400, "BAD_REQUEST", f"No source image for {kf_id}")
 
-            # Count existing candidates so we generate beyond them (v5, v6, etc.)
+            prompt = kf.get("prompt", "")
+            if not prompt:
+                return self._error(400, "BAD_REQUEST", f"Keyframe {kf_id} has no prompt")
+
             candidates_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{kf_id}"
-            existing_count = len(list(candidates_dir.glob("v*.png"))) if candidates_dir.exists() else 0
-            total_count = existing_count + count
+            candidates_dir.mkdir(parents=True, exist_ok=True)
+            existing_count = len(list(candidates_dir.glob("v*.png")))
 
             from beatlab.ws_server import job_manager
             job_id = job_manager.create_job("keyframe_candidates", total=count, meta={"keyframeId": kf_id, "project": project_name})
 
+            _log(f"  stylize: {kf_id} source={source_path.name} prompt={prompt[:60]!r} count={count} existing={existing_count}")
+
             def _run():
                 try:
-                    from beatlab.render.narrative import generate_keyframe_candidates
-                    generate_keyframe_candidates(
-                        str(yaml_path),
-                        vertex=True,
-                        candidates_per_slot=total_count,
-                        segment_filter={kf_id},
-                    )
+                    from beatlab.render.google_video import GoogleVideoClient
+                    from concurrent.futures import ThreadPoolExecutor
+                    client = GoogleVideoClient(vertex=True)
 
-                    # Collect results
-                    project_dir = work_dir / project_name
-                    candidates_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{kf_id}"
-                    candidates = []
-                    if candidates_dir.exists():
-                        candidates = sorted([
-                            f"keyframe_candidates/candidates/section_{kf_id}/{f.name}"
-                            for f in candidates_dir.glob("v*.png")
-                        ])
+                    def _gen_one(v):
+                        out_path = str(candidates_dir / f"v{v}.png")
+                        if Path(out_path).exists():
+                            return
+                        varied = f"{prompt}, variation {v}" if v > 1 else prompt
+                        try:
+                            client.stylize_image(str(source_path), varied, out_path)
+                            _log(f"    {kf_id} v{v} done")
+                        except Exception as e:
+                            _log(f"    {kf_id} v{v} FAILED: {e}")
+                        job_manager.update_progress(job_id, v - existing_count, f"v{v}")
 
-                    # Persist candidates to DB
-                    from beatlab.db import update_keyframe
-                    update_keyframe(project_dir, kf_id, candidates=candidates)
+                    variants = list(range(existing_count + 1, existing_count + count + 1))
+                    with ThreadPoolExecutor(max_workers=count) as pool:
+                        pool.map(_gen_one, variants)
 
-                    job_manager.complete_job(job_id, {"keyframeId": kf_id, "candidates": candidates})
+                    all_cands = sorted([
+                        f"keyframe_candidates/candidates/section_{kf_id}/{f.name}"
+                        for f in candidates_dir.glob("v*.png")
+                    ], key=lambda p: int(p.rsplit("v", 1)[-1].split(".")[0]))
+                    update_keyframe(project_dir, kf_id, candidates=all_cands)
+
+                    job_manager.complete_job(job_id, {"keyframeId": kf_id, "candidates": all_cands})
                 except Exception as e:
                     job_manager.fail_job(job_id, str(e))
 
             import threading
+            from pathlib import Path
             threading.Thread(target=_run, daemon=True).start()
             self._json_response({"jobId": job_id, "keyframeId": kf_id})
 
@@ -2958,20 +3089,33 @@ def make_handler(work_dir: Path):
 
             project_dir = work_dir / project_name
 
-            # Export DB to YAML before generation (narrative.py still reads YAML)
-            if (project_dir / "project.db").exists():
-                try:
-                    from beatlab.db import export_to_yaml
-                    export_to_yaml(project_dir)
-                    _log(f"  Exported DB->YAML for {project_name}")
-                except Exception as ex:
-                    _log(f"  Warning: DB->YAML export failed: {ex}")
+            # Read transition directly from DB — no YAML export needed
+            from beatlab.db import get_transition, get_meta
+            tr = get_transition(project_dir, tr_id)
+            if not tr:
+                return self._error(404, "NOT_FOUND", f"Transition {tr_id} not found")
 
-            yaml_path = self._require_yaml_path(project_name)
-            if yaml_path is None:
-                return
+            meta = get_meta(project_dir)
+            motion_prompt = meta.get("motionPrompt") or meta.get("motion_prompt") or ""
+            max_seconds = duration or meta.get("transition_max_seconds") or 8
 
-            # Count existing candidates so we generate beyond them (v5, v6, etc.)
+            from_kf_id = tr["from"]
+            to_kf_id = tr["to"]
+            n_slots = tr.get("slots", 1)
+            tr_duration = tr.get("duration_seconds", 0)
+            action = tr.get("action") or "Smooth cinematic transition"
+
+            selected_kf_dir = project_dir / "selected_keyframes"
+            start_img = str(selected_kf_dir / f"{from_kf_id}.png")
+            end_img = str(selected_kf_dir / f"{to_kf_id}.png")
+
+            from pathlib import Path as _Path
+            if not _Path(start_img).exists():
+                return self._error(400, "BAD_REQUEST", f"Start keyframe image not found: {from_kf_id}")
+            if not _Path(end_img).exists():
+                return self._error(400, "BAD_REQUEST", f"End keyframe image not found: {to_kf_id}")
+
+            # Count existing candidates
             tr_candidates_dir = project_dir / "transition_candidates" / tr_id
             existing_count = 0
             if tr_candidates_dir.exists():
@@ -2980,51 +3124,98 @@ def make_handler(work_dir: Path):
                     if slot_dir.exists():
                         existing_count = len(list(slot_dir.glob("v*.mp4")))
                 else:
-                    for slot_dir in tr_candidates_dir.iterdir():
-                        if slot_dir.is_dir():
-                            existing_count = max(existing_count, len(list(slot_dir.glob("v*.mp4"))))
-            total_count = existing_count + count
+                    for sd in tr_candidates_dir.iterdir():
+                        if sd.is_dir():
+                            existing_count = max(existing_count, len(list(sd.glob("v*.mp4"))))
+
+            prompt = f"{action}. Camera and motion: {motion_prompt}" if motion_prompt else action
+            if duration:
+                slot_duration = duration
+            else:
+                slot_duration = min(max_seconds, tr_duration / n_slots) if tr_duration > 0 else max_seconds
+
+            _log(f"  veo: {tr_id} {from_kf_id}→{to_kf_id} prompt={prompt[:60]!r} dur={slot_duration}s count={count} existing={existing_count}")
 
             from beatlab.ws_server import job_manager
             job_id = job_manager.create_job("transition_candidates", total=count, meta={"transitionId": tr_id, "project": project_name})
 
             def _run():
                 try:
-                    _log(f"[job {job_id}] Starting transition candidate generation for {tr_id}...")
-                    from beatlab.render.narrative import generate_transition_candidates
-                    from beatlab.render.google_video import PromptRejectedError
+                    from beatlab.render.google_video import GoogleVideoClient, PromptRejectedError
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+                    from pathlib import Path as _Path
 
+                    client = GoogleVideoClient(vertex=True)
                     job_manager.update_progress(job_id, 0, "Starting Veo generation...")
 
-                    def _on_status(msg):
-                        job_manager.update_progress(job_id, 0, msg)
+                    # Build jobs for each slot + variant
+                    gen_jobs = []
+                    for si in range(n_slots):
+                        if slot_index is not None and si != slot_index:
+                            continue
+                        slot_dir = project_dir / "transition_candidates" / tr_id / f"slot_{si}"
+                        slot_dir.mkdir(parents=True, exist_ok=True)
 
-                    try:
-                        generate_transition_candidates(
-                            str(yaml_path),
-                            vertex=True,
-                            candidates_per_slot=total_count,
-                            segment_filter={tr_id},
-                            slot_filter={slot_index} if slot_index is not None else None,
-                            on_status=_on_status,
-                            duration_seconds=duration,
-                        )
-                    except PromptRejectedError as pre:
-                        job_manager.update_progress(job_id, 0, f"Prompt issue: {str(pre)[:100]}")
-                        # Some candidates may still have been generated — continue to collect
+                        # For multi-slot, use slot keyframes if available
+                        s_img = start_img if si == 0 else str(project_dir / "selected_slot_keyframes" / f"{tr_id}_slot_{si - 1}.png")
+                        e_img = end_img if si == n_slots - 1 else str(project_dir / "selected_slot_keyframes" / f"{tr_id}_slot_{si}.png")
+                        if not _Path(s_img).exists():
+                            s_img = start_img
+                        if not _Path(e_img).exists():
+                            e_img = end_img
+
+                        slot_existing = len(list(slot_dir.glob("v*.mp4")))
+                        for v in range(slot_existing + 1, slot_existing + count + 1):
+                            output = str(slot_dir / f"v{v}.mp4")
+                            if _Path(output).exists():
+                                continue
+                            gen_jobs.append({"slot": si, "variant": v, "start": s_img, "end": e_img, "output": output})
+
+                    if not gen_jobs:
+                        job_manager.complete_job(job_id, {"transitionId": tr_id, "candidates": {}})
+                        return
+
+                    _log(f"[job {job_id}] Generating {len(gen_jobs)} Veo clips for {tr_id}...")
+                    completed_count = [0]
+                    rejected = []
+
+                    def _gen(j):
+                        try:
+                            client.generate_video_transition(
+                                start_frame_path=j["start"],
+                                end_frame_path=j["end"],
+                                prompt=prompt,
+                                output_path=j["output"],
+                                duration_seconds=int(slot_duration),
+                                on_status=lambda msg: job_manager.update_progress(job_id, completed_count[0], msg),
+                            )
+                            completed_count[0] += 1
+                            _log(f"    {tr_id} slot_{j['slot']} v{j['variant']} done")
+                        except PromptRejectedError as e:
+                            _log(f"    ⚠ PROMPT REJECTED: {tr_id} — {e}")
+                            rejected.append(tr_id)
+                        except Exception as e:
+                            _log(f"    ⚠ {tr_id} slot_{j['slot']} v{j['variant']} FAILED: {e}")
+
+                    with ThreadPoolExecutor(max_workers=min(len(gen_jobs), 4)) as pool:
+                        futures = [pool.submit(_gen, j) for j in gen_jobs]
+                        for f in as_completed(futures):
+                            try:
+                                f.result()
+                            except Exception:
+                                pass
 
                     # Collect results
-                    project_dir = work_dir / project_name
-                    tr_candidates_dir = project_dir / "transition_candidates" / tr_id
                     candidates = {}
-                    if tr_candidates_dir.exists():
-                        for slot_dir in sorted(tr_candidates_dir.iterdir()):
-                            if slot_dir.is_dir():
+                    tr_cand_dir = project_dir / "transition_candidates" / tr_id
+                    if tr_cand_dir.exists():
+                        for sd in sorted(tr_cand_dir.iterdir()):
+                            if sd.is_dir():
                                 videos = sorted([
-                                    f"transition_candidates/{tr_id}/{slot_dir.name}/{f.name}"
-                                    for f in slot_dir.glob("v*.mp4")
+                                    f"transition_candidates/{tr_id}/{sd.name}/{f.name}"
+                                    for f in sd.glob("v*.mp4")
                                 ])
-                                candidates[slot_dir.name] = videos
+                                candidates[sd.name] = videos
 
                     job_manager.complete_job(job_id, {"transitionId": tr_id, "candidates": candidates})
                 except Exception as e:
@@ -3033,11 +3224,12 @@ def make_handler(work_dir: Path):
                     traceback.print_exc()
                     err = str(e)
                     if "transient" in err.lower() or "None" in err:
-                        job_manager.fail_job(job_id, f"Veo returned empty results after retries. This is usually transient — try again. ({err[:80]})")
+                        job_manager.fail_job(job_id, f"Veo returned empty results after retries — try again. ({err[:80]})")
                     else:
                         job_manager.fail_job(job_id, err)
 
             import threading
+            from pathlib import Path
             threading.Thread(target=_run, daemon=True).start()
             self._json_response({"jobId": job_id, "transitionId": tr_id})
 
