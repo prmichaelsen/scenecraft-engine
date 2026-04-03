@@ -449,7 +449,7 @@ class GoogleVideoClient:
         ref_images = self._load_ingredient_images(ingredients) if ingredients else None
         # Ingredients require veo-3.1
         if ref_images:
-            model = "veo-3.1-generate-preview"
+            model = "veo-3.1-generate"
 
         def _generate():
             config = types.GenerateVideosConfig(
@@ -531,7 +531,7 @@ class GoogleVideoClient:
             )
             return _retry_on_429(
                 self.client.models.generate_videos,
-                model="veo-3.1-generate-preview",
+                model="veo-3.1-generate",
                 prompt=prompt,
                 image=start_img,
                 config=config,

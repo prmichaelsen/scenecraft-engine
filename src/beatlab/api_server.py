@@ -334,6 +334,11 @@ def make_handler(work_dir: Path):
             if m:
                 return self._handle_restore_transition(m.group(1))
 
+            # POST /api/projects/:name/unlink-keyframe
+            m = re.match(r"^/api/projects/([^/]+)/unlink-keyframe$", path)
+            if m:
+                return self._handle_unlink_keyframe(m.group(1))
+
             # POST /api/projects/:name/update-transition-action
             m = re.match(r"^/api/projects/([^/]+)/update-transition-action$", path)
             if m:
@@ -2590,6 +2595,46 @@ def make_handler(work_dir: Path):
             except Exception as e:
                 import traceback
                 traceback.print_exc()
+                self._error(500, "INTERNAL_ERROR", str(e))
+
+        def _handle_unlink_keyframe(self, project_name: str):
+            """POST /api/projects/:name/unlink-keyframe — remove all transitions touching a keyframe.
+
+            Body: { "keyframeId": "kf_XXX", "side": "both" | "left" | "right" }
+            side defaults to "both".
+            """
+            body = self._read_json_body()
+            if body is None:
+                return
+
+            kf_id = body.get("keyframeId")
+            if not kf_id:
+                return self._error(400, "BAD_REQUEST", "Missing 'keyframeId'")
+
+            side = body.get("side", "both")
+
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+
+            try:
+                from beatlab.db import get_transitions_involving, delete_transition as db_del_tr
+                from datetime import datetime, timezone
+                now = datetime.now(timezone.utc).isoformat()
+
+                orphaned = get_transitions_involving(project_dir, kf_id)
+                deleted = []
+                for tr in orphaned:
+                    if side == "left" and tr["to"] != kf_id:
+                        continue
+                    if side == "right" and tr["from"] != kf_id:
+                        continue
+                    db_del_tr(project_dir, tr["id"], now)
+                    deleted.append(tr["id"])
+
+                _log(f"unlink-keyframe: {kf_id} side={side} deleted={deleted}")
+                self._json_response({"success": True, "deleted": deleted})
+            except Exception as e:
                 self._error(500, "INTERNAL_ERROR", str(e))
 
         def _handle_delete_transition(self, project_name: str):
