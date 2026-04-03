@@ -802,6 +802,45 @@ def make_handler(work_dir: Path):
                 _log(f"assign-keyframe-image: {source_path} -> {kf_id} as v{v} (selected={v})")
                 return self._json_response({"success": True, "selected": v})
 
+            # POST /api/projects/:name/transition-effects/add
+            m = re.match(r"^/api/projects/([^/]+)/transition-effects/add$", path)
+            if m:
+                body = self._read_json_body()
+                if body is None: return
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                from beatlab.db import add_transition_effect
+                tr_id = body.get("transitionId")
+                etype = body.get("type")
+                params = body.get("params", {})
+                if not tr_id or not etype: return self._error(400, "BAD_REQUEST", "Missing transitionId or type")
+                effect_id = add_transition_effect(project_dir, tr_id, etype, params)
+                return self._json_response({"success": True, "id": effect_id})
+
+            # POST /api/projects/:name/transition-effects/update
+            m = re.match(r"^/api/projects/([^/]+)/transition-effects/update$", path)
+            if m:
+                body = self._read_json_body()
+                if body is None: return
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                from beatlab.db import update_transition_effect
+                effect_id = body.pop("id", None)
+                if not effect_id: return self._error(400, "BAD_REQUEST", "Missing id")
+                update_transition_effect(project_dir, effect_id, **body)
+                return self._json_response({"success": True})
+
+            # POST /api/projects/:name/transition-effects/delete
+            m = re.match(r"^/api/projects/([^/]+)/transition-effects/delete$", path)
+            if m:
+                body = self._read_json_body()
+                if body is None: return
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                from beatlab.db import delete_transition_effect
+                delete_transition_effect(project_dir, body.get("id", ""))
+                return self._json_response({"success": True})
+
             # POST /api/projects/:name/save-as-still
             m = re.match(r"^/api/projects/([^/]+)/save-as-still$", path)
             if m:
@@ -1146,6 +1185,8 @@ def make_handler(work_dir: Path):
                     break
 
             # Parse transitions from DB
+            from beatlab.db import get_all_transition_effects
+            all_tr_effects = get_all_transition_effects(project_dir)
             transitions = []
             tr_candidates_root = project_dir / "transition_candidates"
             for tr in db_get_transitions(project_dir):
@@ -1222,6 +1263,7 @@ def make_handler(work_dir: Path):
                     "slotKeyframeCandidates": slot_kf_candidates,
                     "selectedSlotKeyframes": selected_slot_kfs,
                     "slotActions": tr.get("slot_actions", []),
+                    "effects": all_tr_effects.get(tr_id, []),
                 })
 
             self._json_response({

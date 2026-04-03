@@ -1638,6 +1638,7 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
             "to_ts": ci["to_ts"],
             "remap_method": remap.get("method", "linear"),
             "curve_points": remap.get("curve_points"),
+            "effects": get_transition_effects(work_dir, ci["tr"]["id"]) if (work_dir / "project.db").exists() else [],
         })
         acc += core
 
@@ -1687,7 +1688,9 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                 tr_opacity = tr.get("opacity")
                 tr_opacity_curve = tr.get("opacity_curve")
                 tr_blend = tr.get("blend_mode") or blend_mode
-                clip_data = {"from_ts": ft, "to_ts": tt, "opacity": tr_opacity, "opacity_curve": tr_opacity_curve, "blend_mode": tr_blend}
+                from beatlab.db import get_transition_effects
+                tr_effects = get_transition_effects(work_dir, tr["id"])
+                clip_data = {"from_ts": ft, "to_ts": tt, "opacity": tr_opacity, "opacity_curve": tr_opacity_curve, "blend_mode": tr_blend, "effects": tr_effects}
                 if sel and sel not in (0, "null") and video_path.exists():
                     clip_data.update({"video": str(video_path), "still": None})
                     overlay_clips.append(clip_data)
@@ -1731,6 +1734,15 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                     # Per-clip blend mode
                     if oclip.get("blend_mode"):
                         clip_blend = oclip["blend_mode"]
+                    # Per-clip effects (e.g. strobe)
+                    for efx in oclip.get("effects", []):
+                        if not efx.get("enabled", True):
+                            continue
+                        if efx["type"] == "strobe":
+                            freq = efx["params"].get("frequency", 8)
+                            duty = efx["params"].get("duty", 0.5)
+                            if (progress * freq) % 1 > duty:
+                                clip_opacity = 0
                     if oclip.get("video"):
                         if "_cap" not in oclip:
                             oclip["_cap"] = cv2.VideoCapture(oclip["video"])
@@ -1847,6 +1859,16 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                 src_idx = min(int(out_i / frames_needed * n_core_source), n_core_source - 1)
                 t = global_frame / fps
                 frame = _apply_frame_effects(core_source[src_idx], t, w, h)
+                # Apply per-transition effects (strobe etc.)
+                clip_progress = out_i / frames_needed if frames_needed > 0 else 0
+                for efx in sched.get("effects", []):
+                    if not efx.get("enabled", True):
+                        continue
+                    if efx["type"] == "strobe":
+                        freq = efx["params"].get("frequency", 8)
+                        duty = efx["params"].get("duty", 0.5)
+                        if (clip_progress * freq) % 1 > duty:
+                            frame = np.zeros_like(frame)
                 frame = _composite_overlays(frame, t, w, h)
                 out.write(frame)
                 global_frame += 1

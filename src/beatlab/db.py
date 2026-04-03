@@ -146,6 +146,16 @@ def _ensure_schema(conn: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_transitions_to ON transitions(to_kf);
         CREATE INDEX IF NOT EXISTS idx_transitions_deleted ON transitions(deleted_at);
         CREATE INDEX IF NOT EXISTS idx_opacity_kf_track ON opacity_keyframes(track_id, time);
+
+        CREATE TABLE IF NOT EXISTS transition_effects (
+            id TEXT PRIMARY KEY,
+            transition_id TEXT NOT NULL,
+            type TEXT NOT NULL,
+            params TEXT NOT NULL DEFAULT '{}',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            z_order INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_tr_effects ON transition_effects(transition_id);
     """)
 
     # ── Migration: add track_id to keyframes/transitions if missing ──
@@ -450,6 +460,67 @@ def delete_transition(project_dir: Path, tr_id: str, deleted_at: str):
 def restore_transition(project_dir: Path, tr_id: str):
     conn = get_db(project_dir)
     conn.execute("UPDATE transitions SET deleted_at = NULL WHERE id = ?", (tr_id,))
+    conn.commit()
+
+
+# ── Transition effects ─────────────────────────────────────────────
+
+def get_transition_effects(project_dir: Path, transition_id: str) -> list[dict]:
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        "SELECT * FROM transition_effects WHERE transition_id = ? ORDER BY z_order",
+        (transition_id,),
+    ).fetchall()
+    return [{"id": r["id"], "transitionId": r["transition_id"], "type": r["type"],
+             "params": json.loads(r["params"]), "enabled": bool(r["enabled"]), "zOrder": r["z_order"]} for r in rows]
+
+
+def get_all_transition_effects(project_dir: Path) -> dict[str, list[dict]]:
+    """Returns a dict mapping transition_id -> list of effects."""
+    conn = get_db(project_dir)
+    rows = conn.execute("SELECT * FROM transition_effects ORDER BY z_order").fetchall()
+    result: dict[str, list[dict]] = {}
+    for r in rows:
+        tr_id = r["transition_id"]
+        if tr_id not in result:
+            result[tr_id] = []
+        result[tr_id].append({"id": r["id"], "transitionId": tr_id, "type": r["type"],
+                              "params": json.loads(r["params"]), "enabled": bool(r["enabled"]), "zOrder": r["z_order"]})
+    return result
+
+
+def add_transition_effect(project_dir: Path, transition_id: str, effect_type: str, params: dict | None = None) -> str:
+    conn = get_db(project_dir)
+    import time as _t
+    effect_id = f"tfx_{int(_t.time() * 1000)}"
+    max_z = conn.execute("SELECT COALESCE(MAX(z_order), -1) FROM transition_effects WHERE transition_id = ?", (transition_id,)).fetchone()[0]
+    conn.execute(
+        "INSERT INTO transition_effects (id, transition_id, type, params, enabled, z_order) VALUES (?, ?, ?, ?, 1, ?)",
+        (effect_id, transition_id, effect_type, json.dumps(params or {}), max_z + 1),
+    )
+    conn.commit()
+    return effect_id
+
+
+def update_transition_effect(project_dir: Path, effect_id: str, **fields):
+    conn = get_db(project_dir)
+    sets = []
+    values = []
+    for key, val in fields.items():
+        if key == "params":
+            val = json.dumps(val) if isinstance(val, dict) else val
+        elif key == "enabled":
+            val = int(val)
+        sets.append(f"{key} = ?")
+        values.append(val)
+    values.append(effect_id)
+    conn.execute(f"UPDATE transition_effects SET {', '.join(sets)} WHERE id = ?", values)
+    conn.commit()
+
+
+def delete_transition_effect(project_dir: Path, effect_id: str):
+    conn = get_db(project_dir)
+    conn.execute("DELETE FROM transition_effects WHERE id = ?", (effect_id,))
     conn.commit()
 
 
