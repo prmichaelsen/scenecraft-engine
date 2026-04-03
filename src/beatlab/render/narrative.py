@@ -1684,13 +1684,18 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                 tt = _parse_ts(to_kf["timestamp"])
                 sel = tr.get("selected")
                 video_path = work_dir / "selected_transitions" / f"{tr['id']}_slot_0.mp4"
+                tr_opacity = tr.get("opacity")
+                tr_opacity_curve = tr.get("opacity_curve")
+                tr_blend = tr.get("blend_mode") or blend_mode
+                clip_data = {"from_ts": ft, "to_ts": tt, "opacity": tr_opacity, "opacity_curve": tr_opacity_curve, "blend_mode": tr_blend}
                 if sel and sel not in (0, "null") and video_path.exists():
-                    overlay_clips.append({"from_ts": ft, "to_ts": tt, "video": str(video_path), "still": None})
+                    clip_data.update({"video": str(video_path), "still": None})
+                    overlay_clips.append(clip_data)
                 else:
-                    # Use from-keyframe image as still
                     kf_img = work_dir / "selected_keyframes" / f"{tr['from']}.png"
                     if kf_img.exists():
-                        overlay_clips.append({"from_ts": ft, "to_ts": tt, "video": None, "still": str(kf_img)})
+                        clip_data.update({"video": None, "still": str(kf_img)})
+                        overlay_clips.append(clip_data)
 
             # Also add keyframes that have no outgoing transition (hold stills)
             tr_from_ids = {tr["from"] for tr in ttrs}
@@ -1713,10 +1718,20 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
         result = base_frame
         for otrack in overlay_tracks:
             frame = None
+            clip_opacity = otrack["opacity"]
+            clip_blend = otrack["blend_mode"]
             for oclip in otrack["clips"]:
                 if oclip["from_ts"] <= t < oclip["to_ts"]:
-                    if oclip["video"]:
-                        progress = (t - oclip["from_ts"]) / (oclip["to_ts"] - oclip["from_ts"]) if oclip["to_ts"] > oclip["from_ts"] else 0
+                    progress = (t - oclip["from_ts"]) / (oclip["to_ts"] - oclip["from_ts"]) if oclip["to_ts"] > oclip["from_ts"] else 0
+                    # Per-clip opacity: evaluate curve if present, else static, else track default
+                    if oclip.get("opacity_curve"):
+                        clip_opacity = _evaluate_curve(oclip["opacity_curve"], progress)
+                    elif oclip.get("opacity") is not None:
+                        clip_opacity = oclip["opacity"]
+                    # Per-clip blend mode
+                    if oclip.get("blend_mode"):
+                        clip_blend = oclip["blend_mode"]
+                    if oclip.get("video"):
                         if "_cap" not in oclip:
                             oclip["_cap"] = cv2.VideoCapture(oclip["video"])
                             oclip["_nframes"] = int(oclip["_cap"].get(cv2.CAP_PROP_FRAME_COUNT))
@@ -1726,7 +1741,7 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                         ret, f = cap.read()
                         if ret:
                             frame = cv2.resize(f, (ow, oh), interpolation=cv2.INTER_LINEAR)
-                    elif oclip["still"]:
+                    elif oclip.get("still"):
                         if "_img" not in oclip:
                             oclip["_img"] = cv2.imread(oclip["still"])
                             if oclip["_img"] is not None:
@@ -1734,7 +1749,7 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                         frame = oclip["_img"]
                     break
             if frame is not None:
-                result = _blend_frames(result, frame, otrack["blend_mode"], otrack["opacity"])
+                result = _blend_frames(result, frame, clip_blend, clip_opacity)
         return result
 
     preview = output_path.endswith("_preview.mp4")
@@ -1815,32 +1830,26 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                 global_frame += 1
                 xfade_written += 1
 
-        # Core frames (after crossfade region)
-        core_start = extend_before
-        core_end = extend_before + core - xfade_written
-        for fi in range(core_start, min(core_end, len(remapped))):
-            t = global_frame / fps
-            frame = _apply_frame_effects(remapped[fi], t, w, h)
-            frame = _composite_overlays(frame, t, w, h)
-            out.write(frame)
-            global_frame += 1
-
-        # Drift correction: force global_frame to match expected timeline position
+        # Core frames: write exactly enough to land on expected_frame
+        # This adjusts playback speed slightly to absorb any drift from crossfade
         expected_frame = round(sched["to_ts"] * fps)
-        if global_frame < expected_frame:
-            # Behind — duplicate last frame to catch up
-            last_frame = remapped[min(core_end - 1, len(remapped) - 1)] if remapped else None
-            while global_frame < expected_frame and last_frame is not None:
+        frames_needed = expected_frame - global_frame
+        if frames_needed < 0:
+            frames_needed = 0
+
+        # Source frames available for core (after crossfade region)
+        core_source = remapped[extend_before:extend_before + core]
+        n_core_source = len(core_source)
+
+        if n_core_source > 0 and frames_needed > 0:
+            for out_i in range(frames_needed):
+                # Map output frame to source frame — distributes evenly
+                src_idx = min(int(out_i / frames_needed * n_core_source), n_core_source - 1)
                 t = global_frame / fps
-                corrected = _apply_frame_effects(last_frame.copy(), t, w, h)
-                corrected = _composite_overlays(corrected, t, w, h)
-                out.write(corrected)
+                frame = _apply_frame_effects(core_source[src_idx], t, w, h)
+                frame = _composite_overlays(frame, t, w, h)
+                out.write(frame)
                 global_frame += 1
-        elif global_frame > expected_frame:
-            # Ahead — adjust global_frame counter so next clip starts correctly.
-            # We can't un-write frames, but we can prevent writing extra on the next clip
-            # by resetting the counter. The extra frames become slightly faster playback.
-            global_frame = expected_frame
 
         # Buffer tail frames for next clip's crossfade
         tail_start = extend_before + core - xfade_written
