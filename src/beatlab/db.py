@@ -489,10 +489,14 @@ def get_all_transition_effects(project_dir: Path) -> dict[str, list[dict]]:
     return result
 
 
+_tfx_counter = 0
+
 def add_transition_effect(project_dir: Path, transition_id: str, effect_type: str, params: dict | None = None) -> str:
+    global _tfx_counter
     conn = get_db(project_dir)
     import time as _t
-    effect_id = f"tfx_{int(_t.time() * 1000)}"
+    _tfx_counter += 1
+    effect_id = f"tfx_{int(_t.time() * 1000)}_{_tfx_counter}"
     max_z = conn.execute("SELECT COALESCE(MAX(z_order), -1) FROM transition_effects WHERE transition_id = ?", (transition_id,)).fetchone()[0]
     conn.execute(
         "INSERT INTO transition_effects (id, transition_id, type, params, enabled, z_order) VALUES (?, ?, ?, ?, 1, ?)",

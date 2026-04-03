@@ -1787,8 +1787,9 @@ def make_handler(work_dir: Path):
                 }
                 db_add_kf(project_dir, new_kf)
 
-                # Wire up transitions (same logic as add-keyframe)
-                all_kfs = db_get_kfs(project_dir)
+                # Wire up transitions (same logic as add-keyframe — filter by track)
+                track_id = source_kf.get("track_id", "track_1")
+                all_kfs = [k for k in db_get_kfs(project_dir) if k.get("track_id", "track_1") == track_id]
                 sorted_kfs = sorted(all_kfs, key=lambda k: parse_ts(k["timestamp"]))
                 new_idx = next((i for i, k in enumerate(sorted_kfs) if k["id"] == new_id), -1)
                 prev_kf = sorted_kfs[new_idx - 1] if new_idx > 0 else None
@@ -2049,7 +2050,8 @@ def make_handler(work_dir: Path):
                             return float(ts) if isinstance(ts, (int, float)) else 0
 
                         removed_time = parse_ts(kf["timestamp"])
-                        all_kfs = db_get_kfs(project_dir)
+                        kf_track = kf.get("track_id", "track_1")
+                        all_kfs = [k for k in db_get_kfs(project_dir) if k.get("track_id", "track_1") == kf_track]
                         sorted_kfs = sorted(all_kfs, key=lambda k: parse_ts(k["timestamp"]))
                         prev_kf = None
                         next_kf = None
@@ -2102,6 +2104,7 @@ def make_handler(work_dir: Path):
                             "duration_seconds": dur, "slots": 1,
                             "action": "", "use_global_prompt": False, "selected": selected,
                             "remap": {"method": "linear", "target_duration": dur},
+                            "track_id": kf_track,
                         })
                         _log(f"[delete-kf] {kf_id}: bridged {prev_kf['id']} -> {next_kf['id']} as {new_tr_id}")
                     except Exception as e:
@@ -2611,12 +2614,15 @@ def make_handler(work_dir: Path):
                 dur1 = round(split_time - from_time, 2)
                 dur2 = round(to_time - split_time, 2)
 
+                # Inherit track_id from the original transition
+                tr_track = tr.get("track_id", "track_1")
+
                 # Create new keyframe at split point
                 new_kf_id = next_keyframe_id(project_dir)
                 db_add_kf(project_dir, {
                     "id": new_kf_id, "timestamp": to_ts(split_time), "section": "",
                     "source": f"selected_keyframes/{new_kf_id}.png", "prompt": "",
-                    "candidates": [], "selected": None,
+                    "candidates": [], "selected": None, "track_id": tr_track,
                 })
 
                 # Soft-delete original transition
@@ -2632,6 +2638,7 @@ def make_handler(work_dir: Path):
                     "duration_seconds": dur1, "slots": 1, "action": tr.get("action", ""),
                     "use_global_prompt": tr.get("use_global_prompt", False), "selected": None,
                     "remap": {"method": "linear", "target_duration": dur1},
+                    "track_id": tr_track,
                 })
                 # Re-get next ID after tr1 is committed
                 tr2_id = next_transition_id(project_dir)
@@ -2640,6 +2647,7 @@ def make_handler(work_dir: Path):
                     "duration_seconds": dur2, "slots": 1, "action": tr.get("action", ""),
                     "use_global_prompt": tr.get("use_global_prompt", False), "selected": None,
                     "remap": {"method": "linear", "target_duration": dur2},
+                    "track_id": tr_track,
                 })
 
                 _log(f"  Created {new_kf_id}, {tr1_id} ({dur1}s), {tr2_id} ({dur2}s)")
@@ -2697,7 +2705,7 @@ def make_handler(work_dir: Path):
                         except Exception as e:
                             _log(f"  Warning: video split failed: {e}")
 
-                    threading.Thread(target=_split_video, daemon=True).start()
+                    _split_video()  # synchronous — ensures files exist before response
 
                 self._json_response({
                     "success": True, "keyframeId": new_kf_id,
