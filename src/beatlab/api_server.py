@@ -784,7 +784,7 @@ def make_handler(work_dir: Path):
 
                 # Copy style fields
                 style_fields = {}
-                for key in ("blend_mode", "opacity", "opacity_curve", "red_curve", "green_curve", "blue_curve", "black_curve", "hue_shift_curve", "saturation_curve", "is_adjustment"):
+                for key in ("blend_mode", "opacity", "opacity_curve", "red_curve", "green_curve", "blue_curve", "black_curve", "hue_shift_curve", "saturation_curve", "invert_curve", "is_adjustment"):
                     if src.get(key) is not None:
                         style_fields[key] = src[key]
                     elif key in ("blend_mode",):
@@ -935,6 +935,8 @@ def make_handler(work_dir: Path):
                     fields["hue_shift_curve"] = body["hueShiftCurve"]
                 if "saturationCurve" in body:
                     fields["saturation_curve"] = body["saturationCurve"]
+                if "invertCurve" in body:
+                    fields["invert_curve"] = body["invertCurve"]
                 if "chromaKey" in body:
                     fields["chroma_key"] = body["chromaKey"]
                 if "isAdjustment" in body:
@@ -1449,6 +1451,7 @@ def make_handler(work_dir: Path):
                     "blackCurve": tr.get("black_curve"),
                     "hueShiftCurve": tr.get("hue_shift_curve"),
                     "saturationCurve": tr.get("saturation_curve"),
+                    "invertCurve": tr.get("invert_curve"),
                     "chromaKey": tr.get("chroma_key"),
                     "isAdjustment": tr.get("is_adjustment", False),
                     "candidates": slot_candidates,
@@ -2176,6 +2179,7 @@ def make_handler(work_dir: Path):
                         "black_curve": src_tr.get("black_curve"),
                         "hue_shift_curve": src_tr.get("hue_shift_curve"),
                         "saturation_curve": src_tr.get("saturation_curve"),
+                        "invert_curve": src_tr.get("invert_curve"),
                         "is_adjustment": src_tr.get("is_adjustment", False),
                         "label": src_tr.get("label", ""),
                         "label_color": src_tr.get("label_color", ""),

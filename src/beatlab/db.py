@@ -210,7 +210,7 @@ def _ensure_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE transitions ADD COLUMN opacity REAL")
     if "opacity_curve" not in tr_cols2:
         conn.execute("ALTER TABLE transitions ADD COLUMN opacity_curve TEXT")
-    for curve_col in ("red_curve", "green_curve", "blue_curve", "black_curve", "hue_shift_curve", "saturation_curve"):
+    for curve_col in ("red_curve", "green_curve", "blue_curve", "black_curve", "hue_shift_curve", "saturation_curve", "invert_curve"):
         if curve_col not in tr_cols2:
             conn.execute(f"ALTER TABLE transitions ADD COLUMN {curve_col} TEXT")
     if "is_adjustment" not in tr_cols2:
@@ -398,6 +398,7 @@ def _row_to_transition(row: sqlite3.Row) -> dict:
         "blue_curve": json.loads(row["blue_curve"]) if "blue_curve" in row.keys() and row["blue_curve"] else None,
         "black_curve": json.loads(row["black_curve"]) if "black_curve" in row.keys() and row["black_curve"] else None,
         "hue_shift_curve": json.loads(row["hue_shift_curve"]) if "hue_shift_curve" in row.keys() and row["hue_shift_curve"] else None,
+        "invert_curve": json.loads(row["invert_curve"]) if "invert_curve" in row.keys() and row["invert_curve"] else None,
         "chroma_key": json.loads(row["chroma_key"]) if "chroma_key" in row.keys() and row["chroma_key"] else None,
         "is_adjustment": bool(row["is_adjustment"]) if "is_adjustment" in row.keys() else False,
         "deleted_at": row["deleted_at"],
@@ -447,8 +448,8 @@ def add_transition(project_dir: Path, tr: dict):
 
     def _do_insert():
         conn.execute(
-            """INSERT OR REPLACE INTO transitions (id, from_kf, to_kf, duration_seconds, slots, action, use_global_prompt, selected, remap, deleted_at, track_id, label, label_color, tags, blend_mode, opacity, opacity_curve, red_curve, green_curve, blue_curve, black_curve, hue_shift_curve, saturation_curve, is_adjustment)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT OR REPLACE INTO transitions (id, from_kf, to_kf, duration_seconds, slots, action, use_global_prompt, selected, remap, deleted_at, track_id, label, label_color, tags, blend_mode, opacity, opacity_curve, red_curve, green_curve, blue_curve, black_curve, hue_shift_curve, saturation_curve, invert_curve, is_adjustment)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (tr["id"], tr.get("from", ""), tr.get("to", ""), tr.get("duration_seconds", 0),
              tr.get("slots", 1), tr.get("action", ""), int(tr.get("use_global_prompt", False)),
              json.dumps(selected), json.dumps(tr.get("remap", {"method": "linear", "target_duration": 0})),
@@ -463,6 +464,7 @@ def add_transition(project_dir: Path, tr: dict):
              _json_or_none(tr.get("black_curve")),
              _json_or_none(tr.get("hue_shift_curve")),
              _json_or_none(tr.get("saturation_curve")),
+             _json_or_none(tr.get("invert_curve")),
              int(tr.get("is_adjustment", False))),
         )
         conn.commit()
@@ -496,7 +498,7 @@ def update_transition(project_dir: Path, tr_id: str, **fields):
             val = int(val)
         elif key == "tags":
             val = json.dumps(val) if isinstance(val, list) else val
-        elif key in ("opacity_curve", "red_curve", "green_curve", "blue_curve", "black_curve", "hue_shift_curve", "saturation_curve"):
+        elif key in ("opacity_curve", "red_curve", "green_curve", "blue_curve", "black_curve", "hue_shift_curve", "saturation_curve", "invert_curve"):
             val = json.dumps(val) if isinstance(val, list) else val
         elif key == "chroma_key":
             val = json.dumps(val) if isinstance(val, (dict, list)) else val

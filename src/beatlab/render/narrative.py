@@ -1639,40 +1639,89 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
         t_lerp = (p - x0) / (x1 - x0)
         return y0 + t_lerp * (y1 - y0)
 
-    def _get_tr_effects(wd, tr_id):
-        try:
-            from beatlab.db import get_transition_effects
-            if (wd / "project.db").exists():
-                return get_transition_effects(wd, tr_id)
-        except Exception:
-            pass
-        return []
+    # Build timeline segments from track_1 transitions (DB if available, else YAML)
+    # Each segment: {from_ts, to_ts, source, is_still, remap_method, curve_points, effects}
+    # Sorted by from_ts, non-overlapping on the base track
+    segments = []
+    if (work_dir / "project.db").exists():
+        from beatlab.db import get_transitions as db_get_trs_base, get_keyframes as db_get_kfs_base
+        db_trs = [tr for tr in db_get_trs_base(work_dir)
+                  if tr.get("track_id") == "track_1" and not tr.get("deleted_at")]
+        db_kfs = {kf["id"]: kf for kf in db_get_kfs_base(work_dir)
+                  if kf.get("track_id", "track_1") == "track_1" and not kf.get("deleted_at")}
+        for tr in db_trs:
+            from_kf = db_kfs.get(tr.get("from_id") or tr.get("from", ""))
+            to_kf = db_kfs.get(tr.get("to_id") or tr.get("to", ""))
+            if not from_kf or not to_kf:
+                continue
+            from_ts = _parse_ts(from_kf["timestamp"])
+            to_ts = _parse_ts(to_kf["timestamp"])
+            if to_ts <= from_ts:
+                continue
+            if max_time is not None and from_ts >= max_time:
+                continue
+            if max_time is not None and to_ts > max_time:
+                to_ts = max_time
 
-    clip_schedule = []
-    acc = 0
-    for i, ci in enumerate(clips_info):
-        target_end = round(ci["to_ts"] * fps)
-        core = target_end - acc
-        if core <= 0:
-            core = 1
-        remap = ci["tr"].get("remap", {})
-        clip_schedule.append({
-            "source": ci["selected"],
-            "is_still": ci.get("is_still", False),
-            "core": core,
-            "from_ts": ci["from_ts"],
-            "to_ts": ci["to_ts"],
-            "remap_method": remap.get("method", "linear"),
-            "curve_points": remap.get("curve_points"),
-            "effects": _get_tr_effects(work_dir, ci["tr"]["id"]),
-        })
-        acc += core
+            tr_id = tr["id"]
+            selected = selected_tr_dir / f"{tr_id}_slot_0.mp4"
+            remap = {}
+            if tr.get("remap"):
+                remap = tr["remap"] if isinstance(tr["remap"], dict) else {}
 
-    # Determine output resolution from first video clip (skip stills)
+            # Get per-transition effects
+            try:
+                from beatlab.db import get_transition_effects
+                tr_effects = get_transition_effects(work_dir, tr_id)
+            except Exception:
+                tr_effects = []
+
+            if selected.exists():
+                segments.append({
+                    "from_ts": from_ts, "to_ts": to_ts,
+                    "source": str(selected), "is_still": False,
+                    "remap_method": remap.get("method", "linear"),
+                    "curve_points": remap.get("curve_points"),
+                    "effects": tr_effects,
+                })
+            else:
+                kf_image = work_dir / "selected_keyframes" / f"{tr.get('from_id') or tr.get('from', '')}.png"
+                if kf_image.exists():
+                    segments.append({
+                        "from_ts": from_ts, "to_ts": to_ts,
+                        "source": str(kf_image), "is_still": True,
+                        "remap_method": "linear", "curve_points": None,
+                        "effects": tr_effects,
+                    })
+    else:
+        # Fallback to YAML-based clips_info
+        for ci in clips_info:
+            remap = ci["tr"].get("remap", {})
+            segments.append({
+                "from_ts": ci["from_ts"], "to_ts": ci["to_ts"],
+                "source": ci["selected"], "is_still": ci.get("is_still", False),
+                "remap_method": remap.get("method", "linear"),
+                "curve_points": remap.get("curve_points"),
+                "effects": [],
+            })
+
+    # Sort by from_ts and deduplicate overlaps (keep longest)
+    segments.sort(key=lambda s: (s["from_ts"], -(s["to_ts"] - s["from_ts"])))
+    deduped = []
+    for seg in segments:
+        if deduped and seg["from_ts"] < deduped[-1]["to_ts"]:
+            # Overlap — keep the one that's already there (it's longer due to sort)
+            continue
+        deduped.append(seg)
+    segments = deduped
+    _log(f"  {len(segments)} base track segments (deduped from DB)")
+
+    # Pre-load source frames for each segment
+    # Determine output resolution from first video segment
     w, h = 1920, 1080
-    for s in clip_schedule:
-        if not s.get("is_still"):
-            cap0 = cv2.VideoCapture(s["source"])
+    for seg in segments:
+        if not seg["is_still"]:
+            cap0 = cv2.VideoCapture(seg["source"])
             w = int(cap0.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap0.get(cv2.CAP_PROP_FRAME_HEIGHT))
             cap0.release()
@@ -1716,7 +1765,13 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                 tr_blend = tr.get("blend_mode") or blend_mode
                 from beatlab.db import get_transition_effects
                 tr_effects = get_transition_effects(work_dir, tr["id"])
-                clip_data = {"from_ts": ft, "to_ts": tt, "opacity": tr_opacity, "opacity_curve": tr_opacity_curve, "blend_mode": tr_blend, "effects": tr_effects}
+                clip_data = {
+                    "from_ts": ft, "to_ts": tt, "opacity": tr_opacity, "opacity_curve": tr_opacity_curve, "blend_mode": tr_blend, "effects": tr_effects,
+                    "red_curve": tr.get("red_curve"), "green_curve": tr.get("green_curve"), "blue_curve": tr.get("blue_curve"),
+                    "black_curve": tr.get("black_curve"), "saturation_curve": tr.get("saturation_curve"),
+                    "hue_shift_curve": tr.get("hue_shift_curve"), "invert_curve": tr.get("invert_curve"),
+                    "is_adjustment": tr.get("is_adjustment", False),
+                }
                 if sel and sel not in (0, "null") and video_path.exists():
                     clip_data.update({"video": str(video_path), "still": None})
                     overlay_clips.append(clip_data)
@@ -1742,6 +1797,51 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                 overlay_tracks.append({"blend_mode": blend_mode, "opacity": opacity, "clips": overlay_clips})
                 _log(f"  Overlay track {tid}: {len(overlay_clips)} clips, blend={blend_mode}, opacity={opacity}")
 
+    def _apply_color_grading(frame, clip, progress):
+        """Apply per-clip color curves (red, green, blue, black, saturation, hue_shift, invert) to a frame."""
+        import numpy as np
+        f = frame.astype(np.float32) / 255.0
+
+        # RGB channel multipliers
+        for ch, curve_key in enumerate(("blue_curve", "green_curve", "red_curve")):  # OpenCV is BGR
+            curve = clip.get(curve_key)
+            if curve:
+                f[:, :, ch] *= _evaluate_curve(curve, progress)
+
+        # Black fade
+        black_curve = clip.get("black_curve")
+        if black_curve:
+            f *= (1.0 - _evaluate_curve(black_curve, progress))
+
+        # Saturation
+        sat_curve = clip.get("saturation_curve")
+        if sat_curve:
+            sat = _evaluate_curve(sat_curve, progress)
+            if abs(sat - 1.0) > 0.001:
+                gray = np.mean(f, axis=2, keepdims=True)
+                f = gray + sat * (f - gray)
+
+        # Hue shift
+        hue_curve = clip.get("hue_shift_curve")
+        if hue_curve:
+            shift = _evaluate_curve(hue_curve, progress)
+            if shift > 0.001:
+                hsv = cv2.cvtColor(np.clip(f, 0, 1).astype(np.float32), cv2.COLOR_BGR2HSV)
+                hsv[:, :, 0] = (hsv[:, :, 0] / 360.0 + shift) % 1.0 * 360.0
+                f = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+        # Invert (from curve or effect)
+        inv = 0.0
+        inv_curve = clip.get("invert_curve")
+        if inv_curve:
+            inv = _evaluate_curve(inv_curve, progress)
+        if clip.get("_effect_invert"):
+            inv = max(inv, clip["_effect_invert"])
+        if inv > 0.001:
+            f = f * (1.0 - inv) + (1.0 - f) * inv
+
+        return np.clip(f * 255, 0, 255).astype(np.uint8)
+
     def _composite_overlays(base_frame, t, ow, oh):
         """Composite overlay tracks onto base frame at timeline time t."""
         result = base_frame
@@ -1749,10 +1849,13 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
             frame = None
             clip_opacity = otrack["opacity"]
             clip_blend = otrack["blend_mode"]
+            matched_clip = None
+            progress = 0.0
             for oclip in otrack["clips"]:
                 if oclip["from_ts"] <= t < oclip["to_ts"]:
+                    matched_clip = oclip
                     progress = (t - oclip["from_ts"]) / (oclip["to_ts"] - oclip["from_ts"]) if oclip["to_ts"] > oclip["from_ts"] else 0
-                    # Per-clip opacity: evaluate curve if present, else static, else track default
+                    # Per-clip opacity
                     if oclip.get("opacity_curve"):
                         clip_opacity = _evaluate_curve(oclip["opacity_curve"], progress)
                     elif oclip.get("opacity") is not None:
@@ -1760,15 +1863,22 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                     # Per-clip blend mode
                     if oclip.get("blend_mode"):
                         clip_blend = oclip["blend_mode"]
-                    # Per-clip effects (e.g. strobe)
+                    # Per-clip effects (e.g. strobe, invert)
+                    clip_invert = 0.0
                     for efx in oclip.get("effects", []):
                         if not efx.get("enabled", True):
                             continue
                         if efx["type"] == "strobe":
-                            freq = efx["params"].get("frequency", 8)
+                            period = efx["params"].get("period", 1.0 / efx["params"].get("frequency", 8))
                             duty = efx["params"].get("duty", 0.5)
-                            if (progress * freq) % 1 > duty:
+                            elapsed = t - oclip["from_ts"]
+                            if (elapsed / period) % 1 > duty:
                                 clip_opacity = 0
+                        elif efx["type"] == "invert":
+                            clip_invert = efx["params"].get("amount", 1.0)
+                    # Store effect-driven invert for _apply_color_grading
+                    if clip_invert > 0 and not oclip.get("invert_curve"):
+                        oclip["_effect_invert"] = clip_invert
                     if oclip.get("video"):
                         if "_cap" not in oclip:
                             oclip["_cap"] = cv2.VideoCapture(oclip["video"])
@@ -1786,137 +1896,176 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                                 oclip["_img"] = cv2.resize(oclip["_img"], (ow, oh), interpolation=cv2.INTER_LINEAR)
                         frame = oclip["_img"]
                     break
-            if frame is not None:
-                result = _blend_frames(result, frame, clip_blend, clip_opacity)
+            if matched_clip is not None:
+                if matched_clip.get("is_adjustment"):
+                    # Adjustment layer: apply color grading directly to the composite
+                    result = _apply_color_grading(result, matched_clip, progress)
+                elif frame is not None:
+                    # Apply color grading to the layer frame before blending
+                    has_curves = any(matched_clip.get(k) for k in ("red_curve", "green_curve", "blue_curve", "black_curve", "saturation_curve", "hue_shift_curve", "invert_curve"))
+                    if has_curves:
+                        frame = _apply_color_grading(frame, matched_clip, progress)
+                    result = _blend_frames(result, frame, clip_blend, clip_opacity)
         return result
 
     preview = output_path.endswith("_preview.mp4")
     if preview:
         w, h = w // 2, h // 2
 
-    total_output_frames = acc
-    _log(f"Phase 2: Unified stitch+remap+crossfade+effects — {total_output_frames} frames, {w}x{h} @ {fps}fps")
-    _log(f"  {len(clip_schedule)} clips, {XFADE_FRAMES}-frame crossfade, {len(effect_events)} effect events")
+    # Lazy-load segment source frames — only load when needed, cache current segment
+    for seg in segments:
+        if seg["is_still"]:
+            img = cv2.imread(seg["source"])
+            if img is not None:
+                img = cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)
+            seg["_frames"] = [img] if img is not None else []
+            seg["_n"] = len(seg["_frames"])
+        else:
+            # Get frame count without loading frames
+            cap = cv2.VideoCapture(seg["source"])
+            seg["_n"] = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+            seg["_frames"] = None  # loaded on demand
+            seg["_loaded"] = False
+
+    _loaded_segs = set()  # track which segments are loaded
+
+    def _ensure_loaded(seg_idx):
+        """Load segment frames into memory, evicting old segments (keep max 3 for crossfade)."""
+        seg = segments[seg_idx]
+        if seg.get("_loaded") or seg["is_still"]:
+            return
+        # Evict segments far from current (keep neighbors for crossfade)
+        keep = {seg_idx, seg_idx - 1, seg_idx + 1}
+        for old_idx in list(_loaded_segs):
+            if old_idx not in keep and 0 <= old_idx < len(segments):
+                old = segments[old_idx]
+                if not old["is_still"]:
+                    old["_frames"] = None
+                    old["_loaded"] = False
+                    _loaded_segs.discard(old_idx)
+        # Load this segment
+        cap = cv2.VideoCapture(seg["source"])
+        frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            fh, fw = frame.shape[:2]
+            if fw != w or fh != h:
+                frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA if preview else cv2.INTER_LINEAR)
+            elif preview:
+                frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+            frames.append(frame)
+        cap.release()
+        seg["_frames"] = frames
+        seg["_n"] = len(frames)
+        seg["_loaded"] = True
+        _loaded_segs.add(seg_idx)
+
+    # Compute total output duration and frames
+    end_time = segments[-1]["to_ts"] if segments else 0
+    total_output_frames = round(end_time * fps)
+    _log(f"Phase 2: Per-frame render — {total_output_frames} frames ({end_time:.2f}s), {w}x{h} @ {fps}fps")
+    _log(f"  {len(segments)} segments, {XFADE_FRAMES}-frame crossfade, {len(effect_events)} effect events")
 
     tmp_path = output_path + ".tmp.mp4"
     out = cv2.VideoWriter(tmp_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
 
     start_time = _time.time()
-    global_frame = 0
-    prev_tail_frames = []  # last HALF remapped frames from previous clip
+    xfade_dur = XFADE_FRAMES / fps
+    half_xfade = xfade_dur / 2
 
-    for clip_idx, sched in enumerate(clip_schedule):
-        # Read source frames — video or still image
-        if sched.get("is_still"):
-            img = cv2.imread(sched["source"])
-            if img is None:
-                _log(f"  WARNING: Could not read {sched['source']}, skipping")
-                continue
-            if preview:
-                img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+    # Binary search helper
+    def _find_segment(t):
+        """Find segment index active at time t."""
+        lo, hi = 0, len(segments) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if segments[mid]["to_ts"] <= t:
+                lo = mid + 1
+            elif segments[mid]["from_ts"] > t:
+                hi = mid - 1
             else:
-                img = cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)
-            source_frames = [img]
+                return mid
+        return -1
+
+    def _get_frame_at(seg_idx, progress):
+        """Get source frame from segment at given progress (0-1), with remap."""
+        seg = segments[seg_idx]
+        _ensure_loaded(seg_idx)
+        use_curve = seg["remap_method"] == "curve" and seg.get("curve_points")
+        p = progress
+        if use_curve:
+            p = _evaluate_curve(seg["curve_points"], p)
+        n = seg["_n"]
+        if n == 0:
+            return np.zeros((h, w, 3), dtype=np.uint8)
+        idx = min(int(p * n), n - 1)
+        return seg["_frames"][idx]
+
+    black_frame = np.zeros((h, w, 3), dtype=np.uint8)
+
+    for frame_num in range(total_output_frames):
+        t = frame_num / fps
+        seg_idx = _find_segment(t)
+
+        if seg_idx < 0:
+            # No segment covers this time — black frame
+            frame = black_frame.copy()
         else:
-            cap = cv2.VideoCapture(sched["source"])
-            source_frames = []
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                fh, fw = frame.shape[:2]
-                if fw != w or fh != h:
-                    frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA if preview else cv2.INTER_LINEAR)
-                elif preview:
-                    frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
-                source_frames.append(frame)
-            cap.release()
+            seg = segments[seg_idx]
+            seg_dur = seg["to_ts"] - seg["from_ts"]
+            progress = (t - seg["from_ts"]) / seg_dur if seg_dur > 0 else 0
+            progress = max(0.0, min(0.999, progress))
+            frame = _get_frame_at(seg_idx, progress)
 
-        n_source = len(source_frames)
-        if n_source == 0:
-            continue
+            # Crossfade at segment boundaries
+            # Start of segment: blend with end of previous segment
+            if seg_idx > 0 and (t - seg["from_ts"]) < half_xfade:
+                prev_seg = segments[seg_idx - 1]
+                if prev_seg["to_ts"] == seg["from_ts"] and prev_seg["_n"] > 0:
+                    blend_t = (t - seg["from_ts"]) / half_xfade  # 0→1 over half_xfade
+                    alpha = blend_t * 0.5 + 0.5  # 0.5→1.0
+                    prev_progress = max(0.0, min(0.999, (t - prev_seg["from_ts"]) / (prev_seg["to_ts"] - prev_seg["from_ts"])))
+                    prev_frame = _get_frame_at(seg_idx - 1, prev_progress)
+                    frame = cv2.addWeighted(prev_frame, 1.0 - alpha, frame, alpha, 0)
 
-        core = sched["core"]
-        use_curve = sched["remap_method"] == "curve" and sched["curve_points"]
+            # End of segment: blend with start of next segment
+            elif seg_idx < len(segments) - 1 and (seg["to_ts"] - t) < half_xfade:
+                next_seg = segments[seg_idx + 1]
+                if next_seg["from_ts"] == seg["to_ts"] and next_seg["_n"] > 0:
+                    blend_t = (seg["to_ts"] - t) / half_xfade  # 1→0 over half_xfade
+                    alpha = blend_t * 0.5 + 0.5  # 1.0→0.5
+                    next_progress = max(0.0, min(0.999, (t - next_seg["from_ts"]) / (next_seg["to_ts"] - next_seg["from_ts"])))
+                    next_frame = _get_frame_at(seg_idx + 1, next_progress)
+                    frame = cv2.addWeighted(frame, alpha, next_frame, 1.0 - alpha, 0)
 
-        # Inline remap: for each output frame, pick the source frame
-        # matching frontend: floor(progress * totalSourceFrames) clamped
-        # Total output frames for this clip = core + HALF on each touching side
-        is_first = clip_idx == 0
-        is_last = clip_idx == len(clip_schedule) - 1
-        extend_before = HALF if not is_first else 0
-        extend_after = HALF if not is_last else 0
-        total_clip_frames = extend_before + core + extend_after
+            # Per-transition effects (strobe etc.)
+            for efx in seg.get("effects", []):
+                if not efx.get("enabled", True):
+                    continue
+                if efx["type"] == "strobe":
+                    freq = efx["params"].get("frequency", 8)
+                    duty = efx["params"].get("duty", 0.5)
+                    if (progress * freq) % 1 > duty:
+                        frame = np.zeros_like(frame)
 
-        remapped = []
-        for fi in range(total_clip_frames):
-            # Progress through the clip: 0 to 1
-            progress = fi / total_clip_frames if total_clip_frames > 1 else 0
-            if use_curve:
-                progress = _evaluate_curve(sched["curve_points"], progress)
-            src_idx = min(int(progress * n_source), n_source - 1)
-            remapped.append(source_frames[src_idx])
+        # Apply beat-synced effects + overlay compositing
+        frame = _apply_frame_effects(frame, t, w, h)
+        frame = _composite_overlays(frame, t, w, h)
+        out.write(frame)
 
-        # Crossfade zone at start: blend prev_tail_frames with our first HALF frames
-        xfade_written = 0
-        if extend_before > 0 and prev_tail_frames:
-            xfade_len = min(len(prev_tail_frames), extend_before)
-            for j in range(xfade_len):
-                alpha = (j + 1) / (xfade_len + 1)
-                blended = cv2.addWeighted(prev_tail_frames[j], 1.0 - alpha, remapped[j], alpha, 0)
-                t = global_frame / fps
-                blended = _apply_frame_effects(blended, t, w, h)
-                blended = _composite_overlays(blended, t, w, h)
-                out.write(blended)
-                global_frame += 1
-                xfade_written += 1
-
-        # Core frames: write exactly enough to land on expected_frame
-        # This adjusts playback speed slightly to absorb any drift from crossfade
-        expected_frame = round(sched["to_ts"] * fps)
-        frames_needed = expected_frame - global_frame
-        if frames_needed < 0:
-            frames_needed = 0
-
-        # Source frames available for core (after crossfade region)
-        core_source = remapped[extend_before:extend_before + core]
-        n_core_source = len(core_source)
-
-        if n_core_source > 0 and frames_needed > 0:
-            for out_i in range(frames_needed):
-                # Map output frame to source frame — distributes evenly
-                src_idx = min(int(out_i / frames_needed * n_core_source), n_core_source - 1)
-                t = global_frame / fps
-                frame = _apply_frame_effects(core_source[src_idx], t, w, h)
-                # Apply per-transition effects (strobe etc.)
-                clip_progress = out_i / frames_needed if frames_needed > 0 else 0
-                for efx in sched.get("effects", []):
-                    if not efx.get("enabled", True):
-                        continue
-                    if efx["type"] == "strobe":
-                        freq = efx["params"].get("frequency", 8)
-                        duty = efx["params"].get("duty", 0.5)
-                        if (clip_progress * freq) % 1 > duty:
-                            frame = np.zeros_like(frame)
-                frame = _composite_overlays(frame, t, w, h)
-                out.write(frame)
-                global_frame += 1
-
-        # Buffer tail frames for next clip's crossfade
-        tail_start = extend_before + core - xfade_written
-        tail_end = tail_start + extend_after
-        prev_tail_frames = remapped[tail_start:tail_end] if extend_after > 0 else []
-
-        if (clip_idx + 1) % 20 == 0 or clip_idx == len(clip_schedule) - 1:
+        if (frame_num + 1) % 1000 == 0 or frame_num == total_output_frames - 1:
             elapsed = _time.time() - start_time
-            fps_actual = global_frame / elapsed if elapsed > 0 else 0
-            eta = (total_output_frames - global_frame) / fps_actual / 60 if fps_actual > 0 else 0
-            _log(f"  [{clip_idx+1}/{len(clip_schedule)}] frame {global_frame}/{total_output_frames} ({fps_actual:.0f} fps, ETA {eta:.1f}m)")
+            fps_actual = (frame_num + 1) / elapsed if elapsed > 0 else 0
+            eta = (total_output_frames - frame_num - 1) / fps_actual / 60 if fps_actual > 0 else 0
+            _log(f"  [{frame_num+1}/{total_output_frames}] {fps_actual:.0f} fps, ETA {eta:.1f}m")
 
     out.release()
     elapsed = _time.time() - start_time
-    _log(f"  Stitch+effects done in {elapsed:.0f}s ({global_frame / elapsed:.0f} fps)")
-    _log(f"  Output: {global_frame} frames ({global_frame / fps:.2f}s, expected {total_output_frames / fps:.2f}s)")
+    _log(f"  Render done in {elapsed:.0f}s ({total_output_frames / elapsed:.0f} fps)")
+    _log(f"  Output: {total_output_frames} frames ({total_output_frames / fps:.2f}s)")
 
     # Re-encode + mux audio
     audio_path = meta["_audio_resolved"]
