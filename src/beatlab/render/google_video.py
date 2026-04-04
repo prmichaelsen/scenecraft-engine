@@ -195,25 +195,99 @@ class GoogleVideoClient:
         image_path: str,
         style_prompt: str,
         output_path: str,
-        model: str = "gemini-2.5-flash-image",
+        image_model: str = "replicate/nano-banana-2",
+        # Legacy compat
+        model: str | None = None,
+        backend: str | None = None,
     ) -> str:
-        """Stylize an image using Nano Banana (Gemini image generation).
+        """Stylize an image.
 
         Args:
             image_path: Path to source image.
             style_prompt: Style description.
             output_path: Where to save the styled image.
-            model: Nano Banana model name.
+            image_model: "provider/model" string, e.g. "replicate/nano-banana-2" or "vertex/gemini-2.5-flash-image".
 
         Returns:
             output_path
         """
+        # Legacy: if old-style backend/model args are passed, convert
+        if backend or model:
+            b = backend or "replicate"
+            m = model or "nano-banana-2"
+            image_model = f"{b}/{m}"
+
+        provider, _, model_name = image_model.partition("/")
+        if not model_name:
+            model_name = provider
+            provider = "replicate"
+
+        if provider == "replicate":
+            return self._stylize_replicate(image_path, style_prompt, output_path, model_name)
+        return self._stylize_vertex(image_path, style_prompt, output_path, model_name)
+
+    def _stylize_replicate(self, image_path: str, style_prompt: str, output_path: str, model_name: str = "nano-banana-2") -> str:
+        """Stylize via Replicate."""
+        import replicate
+        import urllib.request
+
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+
+        full_prompt = (
+            f"Restyle this image in the following style, keeping the composition and subject intact. "
+            f"Hyper-realistic, photorealistic quality. Like a still from a big-budget film shot on 35mm. "
+            f"Rich intricate detail, complex natural textures, sophisticated cinematic lighting, depth of field. "
+            f"Style: {style_prompt}"
+        )
+
+        # Map short names to replicate model IDs
+        model_map = {
+            "nano-banana-2": "google/nano-banana-2",
+            "sdxl": "stability-ai/sdxl:7762fd07cf82c948538e41f63f77d685e02b063e37e496e96eefd46c929f9bdc",
+        }
+        replicate_model = model_map.get(model_name, f"google/{model_name}")
+
+        # Detect source image dimensions for aspect ratio
+        from PIL import Image as _PILImage
+        with _PILImage.open(image_path) as _img:
+            src_w, src_h = _img.size
+        aspect = f"{src_w}:{src_h}"
+        # Map to common aspect ratios
+        ratio = src_w / src_h
+        if abs(ratio - 16/9) < 0.1:
+            aspect = "16:9"
+        elif abs(ratio - 9/16) < 0.1:
+            aspect = "9:16"
+        elif abs(ratio - 4/3) < 0.1:
+            aspect = "4:3"
+        elif abs(ratio - 3/4) < 0.1:
+            aspect = "3:4"
+        elif abs(ratio - 1) < 0.1:
+            aspect = "1:1"
+
+        _log(f"    [replicate] Generating image with {replicate_model} (src={src_w}x{src_h})...")
+        input_data = {"prompt": full_prompt, "output_format": "png"}
+        # Nano Banana uses image_input (array of file handles); SDXL uses width/height
+        if "nano-banana" in replicate_model:
+            input_data["image_input"] = [open(image_path, "rb")]
+        else:
+            input_data["aspect_ratio"] = aspect
+
+        output = replicate.run(replicate_model, input=input_data)
+
+        url = str(output[0]) if isinstance(output, list) else str(output)
+        urllib.request.urlretrieve(url, output_path)
+        _log(f"    [replicate] Saved to {output_path}")
+        return output_path
+
+    def _stylize_vertex(self, image_path: str, style_prompt: str, output_path: str, model: str = "gemini-2.5-flash-image") -> str:
+        """Stylize via Vertex AI Nano Banana."""
         from google.genai import types
 
         with open(image_path, "rb") as f:
             image_bytes = f.read()
 
-        # Detect mime type
         ext = Path(image_path).suffix.lower()
         mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(ext, "image/png")
 
@@ -231,7 +305,6 @@ class GoogleVideoClient:
             ),
         )
 
-        # Find the image part in the response, retry up to 2 times on transient failures
         import time as _time
         for attempt in range(3):
             if attempt > 0:
@@ -268,7 +341,6 @@ class GoogleVideoClient:
                         f.write(part.inline_data.data)
                     return output_path
 
-            # Got candidates but no image part — text-only response, retry
             if attempt < 2:
                 continue
 

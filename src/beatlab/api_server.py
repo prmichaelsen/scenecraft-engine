@@ -629,30 +629,30 @@ def make_handler(work_dir: Path):
 
                         # Generate images
                         from beatlab.render.google_video import GoogleVideoClient
+                        from beatlab.db import get_meta as _get_meta
                         img_client = GoogleVideoClient(vertex=True)
+                        _image_model = _get_meta(project_dir).get("image_model", "replicate/nano-banana-2")
                         candidates_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{kf_id}"
                         candidates_dir.mkdir(parents=True, exist_ok=True)
                         existing = len(list(candidates_dir.glob("v*.png")))
 
+                        from beatlab.db import update_keyframe
                         paths = []
                         for i, prompt in enumerate(prompts[:count]):
                             v = existing + i + 1
                             out_path = str(candidates_dir / f"v{v}.png")
                             job_manager.update_progress(job_id, i, f"Generating v{v}: {prompt[:50]}...")
                             try:
-                                img_client.stylize_image(str(source_img), prompt, out_path)
+                                img_client.stylize_image(str(source_img), prompt, out_path, image_model=_image_model)
                                 paths.append(f"keyframe_candidates/candidates/section_{kf_id}/v{v}.png")
+                                all_cands = sorted([
+                                    f"keyframe_candidates/candidates/section_{kf_id}/{f.name}"
+                                    for f in candidates_dir.glob("v*.png")
+                                ], key=lambda p: int(p.rsplit("v", 1)[-1].split(".")[0]))
+                                update_keyframe(project_dir, kf_id, candidates=all_cands)
                             except Exception as e:
                                 _log(f"  v{v} failed: {e}")
                                 job_manager.update_progress(job_id, i + 1, f"v{v} failed")
-
-                        # Update DB
-                        from beatlab.db import update_keyframe
-                        all_cands = sorted([
-                            f"keyframe_candidates/candidates/section_{kf_id}/{f.name}"
-                            for f in candidates_dir.glob("v*.png")
-                        ], key=lambda p: int(p.rsplit("v", 1)[-1].split(".")[0]))
-                        update_keyframe(project_dir, kf_id, candidates=all_cands)
 
                         job_manager.complete_job(job_id, {"keyframeId": kf_id, "candidates": all_cands, "prompts": prompts[:count]})
                     except Exception as e:
@@ -661,6 +661,111 @@ def make_handler(work_dir: Path):
 
                 import threading
                 threading.Thread(target=_run_variations, daemon=True).start()
+                return self._json_response({"jobId": job_id, "keyframeId": kf_id})
+
+            # POST /api/projects/:name/escalate-keyframe
+            m = re.match(r"^/api/projects/([^/]+)/escalate-keyframe$", path)
+            if m:
+                body = self._read_json_body()
+                if body is None: return
+                kf_id = body.get("keyframeId")
+                count = body.get("count", 2)
+                if not kf_id: return self._error(400, "BAD_REQUEST", "Missing 'keyframeId'")
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+
+                source_img = project_dir / "selected_keyframes" / f"{kf_id}.png"
+                if not source_img.exists():
+                    return self._error(400, "BAD_REQUEST", f"No source image found for {kf_id}")
+
+                from beatlab.db import get_keyframe
+                kf = get_keyframe(project_dir, kf_id)
+                kf_prompt = kf.get("prompt", "") if kf else ""
+
+                from beatlab.ws_server import job_manager
+                job_id = job_manager.create_job("escalate_keyframe", total=count, meta={"keyframeId": kf_id, "project": m.group(1)})
+
+                def _run_escalate():
+                    try:
+                        import os
+                        from anthropic import Anthropic
+                        client_llm = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+                        _log(f"[job {job_id}] Escalating {kf_id} ({count} variants)...")
+                        job_manager.update_progress(job_id, 0, "Generating escalated prompts with Claude...")
+
+                        escalate_instruction = (
+                            f"Take this keyframe and INTENSIFY it. "
+                            f"Push every element further — bolder colors, more dramatic lighting, "
+                            f"stronger contrast, more extreme angles, more vivid details. "
+                            f"Don't change the subject or concept, just amplify what's already there.\n\n"
+                            f"{'Original prompt: ' + kf_prompt[:300] + chr(10) + chr(10) if kf_prompt else ''}"
+                            f"Generate {count} escalation prompts, each more intense than the last:\n"
+                            f"1. Moderate escalation — same scene, pushed 30% more dramatic\n"
+                            f"2. Heavy escalation — same scene, pushed to cinematic extremes\n"
+                            f"{'3. Maximum escalation — same scene at its absolute visual peak' + chr(10) if count >= 3 else ''}"
+                            f"{'4. Beyond — transcendent version, almost abstract in its intensity' + chr(10) if count >= 4 else ''}\n"
+                            f"Each prompt should be 2-3 sentences with specific visual details. "
+                            f"Keep the same subject/composition but push every visual property to its extreme.\n\n"
+                            f"Respond with ONLY a JSON array: [\"prompt 1\", \"prompt 2\", ...]"
+                        )
+
+                        # Always send the image so Claude can see what to intensify
+                        import base64 as _b64
+                        with open(str(source_img), "rb") as _imgf:
+                            img_b64 = _b64.b64encode(_imgf.read()).decode()
+                        img_ext = source_img.suffix.lower()
+                        img_media = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}.get(img_ext.lstrip("."), "image/png")
+
+                        response = client_llm.messages.create(
+                            model="claude-sonnet-4-20250514",
+                            max_tokens=4096,
+                            messages=[{"role": "user", "content": [
+                                {"type": "image", "source": {"type": "base64", "media_type": img_media, "data": img_b64}},
+                                {"type": "text", "text": escalate_instruction},
+                            ]}],
+                        )
+                        import json as _json, re as _re
+                        text = response.content[0].text if response.content else "[]"
+                        json_match = _re.search(r"\[[\s\S]*\]", text)
+                        prompts = _json.loads(json_match.group(0)) if json_match else []
+                        _log(f"[job {job_id}] Got {len(prompts)} escalation prompts")
+
+                        from beatlab.render.google_video import GoogleVideoClient
+                        from beatlab.db import get_meta as _get_meta2
+                        img_client = GoogleVideoClient(vertex=True)
+                        _image_model = _get_meta2(project_dir).get("image_model", "replicate/nano-banana-2")
+                        candidates_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{kf_id}"
+                        candidates_dir.mkdir(parents=True, exist_ok=True)
+                        existing = len(list(candidates_dir.glob("v*.png")))
+
+                        from beatlab.db import update_keyframe
+                        for i, prompt in enumerate(prompts[:count]):
+                            v = existing + i + 1
+                            out_path = str(candidates_dir / f"v{v}.png")
+                            job_manager.update_progress(job_id, i, f"Escalating v{v}: {prompt[:50]}...")
+                            try:
+                                img_client.stylize_image(str(source_img), prompt, out_path, image_model=_image_model)
+                                # Update DB after each image so UI can show it immediately
+                                all_cands = sorted([
+                                    f"keyframe_candidates/candidates/section_{kf_id}/{f.name}"
+                                    for f in candidates_dir.glob("v*.png")
+                                ], key=lambda p: int(p.rsplit("v", 1)[-1].split(".")[0]))
+                                update_keyframe(project_dir, kf_id, candidates=all_cands)
+                            except Exception as e:
+                                import traceback as _tb
+                                _log(f"  v{v} failed: {type(e).__name__}: {e}")
+                                _tb.print_exc()
+                                job_manager.update_progress(job_id, i + 1, f"v{v} failed")
+
+                        job_manager.complete_job(job_id, {"keyframeId": kf_id, "candidates": all_cands, "prompts": prompts[:count]})
+                    except Exception as e:
+                        _log(f"[job {job_id}] FAILED: {e}")
+                        job_manager.fail_job(job_id, str(e))
+
+                import threading
+                threading.Thread(target=_run_escalate, daemon=True).start()
+                _log(f"escalate-keyframe: {kf_id} count={count}")
                 return self._json_response({"jobId": job_id, "keyframeId": kf_id})
 
             # POST /api/projects/:name/duplicate-transition-video
@@ -3695,10 +3800,10 @@ def make_handler(work_dir: Path):
                 return
 
             try:
-                _log(f"update-meta: {list(k for k in ('motion_prompt', 'default_transition_prompt') if k in body)}")
+                _log(f"update-meta: {list(k for k in ('motion_prompt', 'default_transition_prompt', 'image_model') if k in body)}")
                 from beatlab.db import get_meta, set_meta
                 meta = get_meta(project_dir)
-                for key in ("motion_prompt", "default_transition_prompt"):
+                for key in ("motion_prompt", "default_transition_prompt", "image_model"):
                     if key in body:
                         set_meta(project_dir, key, body[key])
                         meta[key] = body[key]
