@@ -9,7 +9,7 @@ import pytest
 
 from beatlab.db import (
     get_db, close_db, get_meta, set_meta,
-    get_keyframes, get_keyframe, add_keyframe, delete_keyframe, next_keyframe_id,
+    get_keyframes, get_keyframe, add_keyframe, update_keyframe, delete_keyframe, next_keyframe_id,
     get_transitions, get_transition, add_transition, delete_transition, restore_transition,
     next_transition_id, get_transitions_involving, update_transition,
     get_transition_effects, get_all_transition_effects,
@@ -448,3 +448,130 @@ class TestBlendFrames:
         base = np.full((2, 2, 3), 150, dtype=np.uint8)
         result = _blend_frames(base, None, "normal", 1.0)
         assert np.array_equal(result, base)
+
+
+class TestCandidatesOnImageAssign:
+    """Test that assigning/setting keyframe images also adds to candidates."""
+
+    def test_set_base_image_adds_candidate(self, project_dir):
+        """set-base-image should copy the still to candidates and update DB."""
+        import shutil
+        # Create a still
+        stills_dir = project_dir / "assets" / "stills"
+        stills_dir.mkdir(parents=True, exist_ok=True)
+        still = stills_dir / "test.png"
+        still.write_bytes(b"fake png data")
+
+        _add_kf(project_dir, "kf_001", "0:00")
+        kf = get_keyframe(project_dir, "kf_001")
+        assert kf["candidates"] == []
+        assert kf["selected"] is None
+
+        # Simulate set-base-image: copy still to selected_keyframes + candidates
+        sel_dir = project_dir / "selected_keyframes"
+        sel_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(still), str(sel_dir / "kf_001.png"))
+
+        cand_dir = project_dir / "keyframe_candidates" / "candidates" / "section_kf_001"
+        cand_dir.mkdir(parents=True, exist_ok=True)
+        existing = len(list(cand_dir.glob("v*.png")))
+        v = existing + 1
+        shutil.copy2(str(still), str(cand_dir / f"v{v}.png"))
+        all_cands = sorted([
+            f"keyframe_candidates/candidates/section_kf_001/{f.name}"
+            for f in cand_dir.glob("v*.png")
+        ], key=lambda p: int(p.rsplit("v", 1)[-1].split(".")[0]))
+        update_keyframe(project_dir, "kf_001", selected=v, candidates=all_cands)
+
+        kf = get_keyframe(project_dir, "kf_001")
+        assert len(kf["candidates"]) == 1
+        assert "v1.png" in kf["candidates"][0]
+        assert kf["selected"] == 1
+
+    def test_assign_keyframe_image_adds_candidate(self, project_dir):
+        """assign-keyframe-image should add the source to candidates."""
+        import shutil
+        # Create source image
+        pool_dir = project_dir / "pool" / "keyframes"
+        pool_dir.mkdir(parents=True, exist_ok=True)
+        source = pool_dir / "source.png"
+        source.write_bytes(b"fake source data")
+
+        _add_kf(project_dir, "kf_001", "0:00")
+
+        # Simulate assign-keyframe-image
+        sel_dir = project_dir / "selected_keyframes"
+        sel_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(source), str(sel_dir / "kf_001.png"))
+
+        cand_dir = project_dir / "keyframe_candidates" / "candidates" / "section_kf_001"
+        cand_dir.mkdir(parents=True, exist_ok=True)
+        existing = len(list(cand_dir.glob("v*.png")))
+        v = existing + 1
+        shutil.copy2(str(source), str(cand_dir / f"v{v}.png"))
+        all_cands = sorted([
+            f"keyframe_candidates/candidates/section_kf_001/{f.name}"
+            for f in cand_dir.glob("v*.png")
+        ], key=lambda p: int(p.rsplit("v", 1)[-1].split(".")[0]))
+        update_keyframe(project_dir, "kf_001", selected=v, candidates=all_cands)
+
+        kf = get_keyframe(project_dir, "kf_001")
+        assert len(kf["candidates"]) == 1
+        assert kf["selected"] == 1
+
+    def test_multiple_assigns_accumulate_candidates(self, project_dir):
+        """Multiple image assignments should accumulate candidates."""
+        import shutil
+        _add_kf(project_dir, "kf_001", "0:00")
+
+        cand_dir = project_dir / "keyframe_candidates" / "candidates" / "section_kf_001"
+        cand_dir.mkdir(parents=True, exist_ok=True)
+        sel_dir = project_dir / "selected_keyframes"
+        sel_dir.mkdir(parents=True, exist_ok=True)
+
+        for i in range(3):
+            img = cand_dir / f"v{i+1}.png"
+            img.write_bytes(f"data{i}".encode())
+
+        all_cands = sorted([
+            f"keyframe_candidates/candidates/section_kf_001/{f.name}"
+            for f in cand_dir.glob("v*.png")
+        ], key=lambda p: int(p.rsplit("v", 1)[-1].split(".")[0]))
+        update_keyframe(project_dir, "kf_001", selected=3, candidates=all_cands)
+
+        kf = get_keyframe(project_dir, "kf_001")
+        assert len(kf["candidates"]) == 3
+        assert kf["selected"] == 3
+
+    def test_split_creates_candidate_for_new_kf(self, project_dir):
+        """Split should create a candidate for the extracted keyframe frame."""
+        import shutil
+        _add_kf(project_dir, "kf_001", "0:00")
+        _add_kf(project_dir, "kf_002", "0:10")
+
+        # Simulate: split creates new kf and extracts a frame
+        new_kf_id = next_keyframe_id(project_dir)
+        add_keyframe(project_dir, {
+            "id": new_kf_id, "timestamp": "0:05", "section": "",
+            "source": f"selected_keyframes/{new_kf_id}.png", "prompt": "",
+            "candidates": [], "selected": None,
+        })
+
+        # Simulate frame extraction + candidate creation
+        sel_dir = project_dir / "selected_keyframes"
+        sel_dir.mkdir(parents=True, exist_ok=True)
+        (sel_dir / f"{new_kf_id}.png").write_bytes(b"extracted frame")
+
+        cand_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{new_kf_id}"
+        cand_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(sel_dir / f"{new_kf_id}.png"), str(cand_dir / "v1.png"))
+
+        update_keyframe(project_dir, new_kf_id, selected=1,
+                       candidates=[f"keyframe_candidates/candidates/section_{new_kf_id}/v1.png"])
+
+        kf = get_keyframe(project_dir, new_kf_id)
+        assert kf["selected"] == 1
+        assert len(kf["candidates"]) == 1
+        assert "v1.png" in kf["candidates"][0]
+        # Verify the file exists
+        assert (cand_dir / "v1.png").exists()

@@ -402,6 +402,7 @@ def make_handler(work_dir: Path):
                 # Add at top (highest z_order = rendered on top in compositor)
                 z_order = max((t["z_order"] for t in existing), default=-1) + 1
                 db_add_track(project_dir, {"id": track_id, "name": body.get("name", f"Track {len(existing) + 1}"), "z_order": z_order, **{k: v for k, v in body.items() if k in ("blend_mode", "base_opacity", "enabled")}})
+                _log(f"tracks/add: {m.group(1)} -> {track_id} (z_order={z_order})")
                 return self._json_response({"success": True, "id": track_id})
 
             # POST /api/projects/:name/tracks/update
@@ -416,6 +417,7 @@ def make_handler(work_dir: Path):
                 if not track_id: return self._error(400, "BAD_REQUEST", "Missing 'id'")
                 field_map = {"blendMode": "blend_mode", "baseOpacity": "base_opacity", "chromaKey": "chroma_key"}
                 mapped = {field_map.get(k, k): v for k, v in body.items() if field_map.get(k, k) in ("name", "blend_mode", "base_opacity", "enabled", "z_order", "chroma_key", "hidden")}
+                _log(f"tracks/update: {track_id} {mapped}")
                 db_update_track(project_dir, track_id, **mapped)
                 return self._json_response({"success": True})
 
@@ -427,7 +429,9 @@ def make_handler(work_dir: Path):
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
                 from beatlab.db import delete_track as db_delete_track
-                db_delete_track(project_dir, body.get("id", ""))
+                del_id = body.get("id", "")
+                _log(f"tracks/delete: {del_id}")
+                db_delete_track(project_dir, del_id)
                 return self._json_response({"success": True})
 
             # POST /api/projects/:name/tracks/reorder
@@ -438,7 +442,9 @@ def make_handler(work_dir: Path):
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
                 from beatlab.db import reorder_tracks as db_reorder_tracks
-                db_reorder_tracks(project_dir, body.get("trackIds", []))
+                track_ids = body.get("trackIds", [])
+                _log(f"tracks/reorder: {track_ids}")
+                db_reorder_tracks(project_dir, track_ids)
                 return self._json_response({"success": True})
 
             # POST /api/projects/:name/update-rules
@@ -723,7 +729,9 @@ def make_handler(work_dir: Path):
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
                 from beatlab.db import update_keyframe
-                update_keyframe(project_dir, body["keyframeId"], label=body.get("label", ""), label_color=body.get("labelColor", ""))
+                kf_id = body["keyframeId"]
+                _log(f"update-keyframe-label: {kf_id} label={body.get('label', '')!r}")
+                update_keyframe(project_dir, kf_id, label=body.get("label", ""), label_color=body.get("labelColor", ""))
                 return self._json_response({"success": True})
 
             # POST /api/projects/:name/update-transition-label
@@ -734,10 +742,12 @@ def make_handler(work_dir: Path):
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
                 from beatlab.db import update_transition
+                tr_id = body["transitionId"]
                 fields = {"label": body.get("label", ""), "label_color": body.get("labelColor", "")}
                 if "tags" in body:
                     fields["tags"] = body["tags"]
-                update_transition(project_dir, body["transitionId"], **fields)
+                _log(f"update-transition-label: {tr_id} label={body.get('label', '')!r} tags={body.get('tags')}")
+                update_transition(project_dir, tr_id, **fields)
                 return self._json_response({"success": True})
 
             # POST /api/projects/:name/update-keyframe-style
@@ -824,6 +834,7 @@ def make_handler(work_dir: Path):
                 params = body.get("params", {})
                 if not tr_id or not etype: return self._error(400, "BAD_REQUEST", "Missing transitionId or type")
                 effect_id = add_transition_effect(project_dir, tr_id, etype, params)
+                _log(f"transition-effects/add: {tr_id} type={etype} -> {effect_id}")
                 return self._json_response({"success": True, "id": effect_id})
 
             # POST /api/projects/:name/transition-effects/update
@@ -836,6 +847,7 @@ def make_handler(work_dir: Path):
                 from beatlab.db import update_transition_effect
                 effect_id = body.pop("id", None)
                 if not effect_id: return self._error(400, "BAD_REQUEST", "Missing id")
+                _log(f"transition-effects/update: {effect_id} {body}")
                 update_transition_effect(project_dir, effect_id, **body)
                 return self._json_response({"success": True})
 
@@ -847,7 +859,9 @@ def make_handler(work_dir: Path):
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
                 from beatlab.db import delete_transition_effect
-                delete_transition_effect(project_dir, body.get("id", ""))
+                fx_id = body.get("id", "")
+                _log(f"transition-effects/delete: {fx_id}")
+                delete_transition_effect(project_dir, fx_id)
                 return self._json_response({"success": True})
 
             # POST /api/projects/:name/save-as-still
@@ -887,6 +901,7 @@ def make_handler(work_dir: Path):
                 if project_dir is None: return
                 from beatlab.db import add_marker
                 marker_id = body.get("id", f"m_{int(__import__('time').time() * 1000)}")
+                _log(f"markers/add: {marker_id} time={body.get('time', 0)} label={body.get('label', '')!r}")
                 add_marker(project_dir, marker_id, body.get("time", 0), body.get("label", ""))
                 return self._json_response({"success": True, "id": marker_id})
 
@@ -900,7 +915,9 @@ def make_handler(work_dir: Path):
                 from beatlab.db import update_marker
                 marker_id = body.pop("id", None)
                 if not marker_id: return self._error(400, "BAD_REQUEST", "Missing 'id'")
-                update_marker(project_dir, marker_id, **{k: v for k, v in body.items() if k in ("time", "label")})
+                updates = {k: v for k, v in body.items() if k in ("time", "label")}
+                _log(f"markers/update: {marker_id} {updates}")
+                update_marker(project_dir, marker_id, **updates)
                 return self._json_response({"success": True})
 
             # POST /api/projects/:name/markers/remove
@@ -911,7 +928,9 @@ def make_handler(work_dir: Path):
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
                 from beatlab.db import delete_marker
-                delete_marker(project_dir, body.get("id", ""))
+                rm_id = body.get("id", "")
+                _log(f"markers/remove: {rm_id}")
+                delete_marker(project_dir, rm_id)
                 return self._json_response({"success": True})
 
             # POST /api/projects/:name/split-transition
@@ -1381,6 +1400,7 @@ def make_handler(work_dir: Path):
             if project_dir is None:
                 return
 
+            _log(f"select-transitions: {len(selections)} selections")
             try:
                 import shutil
                 from beatlab.db import update_transition
@@ -2205,6 +2225,7 @@ def make_handler(work_dir: Path):
 
             try:
                 from beatlab.db import restore_keyframe as db_restore_kf
+                _log(f"restore-keyframe: {kf_id}")
                 db_restore_kf(project_dir, kf_id)
                 self._json_response({"success": True, "keyframe": {"id": kf_id}})
             except Exception as e:
@@ -2235,8 +2256,20 @@ def make_handler(work_dir: Path):
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(str(source), str(dest_dir / f"{kf_id}.png"))
 
+                # Add to candidates so it appears in the candidates panel
+                cand_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{kf_id}"
+                cand_dir.mkdir(parents=True, exist_ok=True)
+                existing = len(list(cand_dir.glob("v*.png")))
+                v = existing + 1
+                shutil.copy2(str(source), str(cand_dir / f"v{v}.png"))
+                all_cands = sorted([
+                    f"keyframe_candidates/candidates/section_{kf_id}/{f.name}"
+                    for f in cand_dir.glob("v*.png")
+                ], key=lambda p: int(p.rsplit("v", 1)[-1].split(".")[0]))
+
                 from beatlab.db import update_keyframe
-                update_keyframe(project_dir, kf_id, source=f"assets/stills/{still_name}")
+                import time as _t
+                update_keyframe(project_dir, kf_id, source=f"assets/stills/{still_name}", selected=v, candidates=all_cands)
 
                 self._json_response({"success": True, "keyframeId": kf_id, "still": still_name})
             except Exception as e:
@@ -2676,10 +2709,14 @@ def make_handler(work_dir: Path):
                             "-vframes", "1", "-q:v", "2",
                             str(sel_kf_dir / f"{new_kf_id}.png")], capture_output=True, timeout=10)
                     _log(f"  Extracted keyframe frame at {split_at:.2f}s -> {new_kf_id}.png")
-                    # Mark keyframe as having a selected image
-                    from beatlab.db import update_keyframe as _upd_kf
+                    # Add to candidates and mark as selected
                     import time as _time
-                    _upd_kf(project_dir, new_kf_id, selected=int(_time.time()))
+                    cand_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{new_kf_id}"
+                    cand_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(sel_kf_dir / f"{new_kf_id}.png"), str(cand_dir / "v1.png"))
+                    from beatlab.db import update_keyframe as _upd_kf
+                    _upd_kf(project_dir, new_kf_id, selected=1,
+                            candidates=[f"keyframe_candidates/candidates/section_{new_kf_id}/v1.png"])
 
                     def _split_video():
                         try:
@@ -2895,6 +2932,7 @@ def make_handler(work_dir: Path):
 
             try:
                 from beatlab.db import restore_transition as db_restore_tr
+                _log(f"restore-transition: {tr_id}")
                 db_restore_tr(project_dir, tr_id)
                 self._json_response({"success": True, "transition": {"id": tr_id}})
             except Exception as e:
