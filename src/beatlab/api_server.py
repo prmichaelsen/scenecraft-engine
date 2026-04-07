@@ -3634,8 +3634,10 @@ def make_handler(work_dir: Path):
             def _run():
                 try:
                     from beatlab.render.google_video import GoogleVideoClient
+                    from beatlab.db import get_meta as _get_meta_gen
                     from concurrent.futures import ThreadPoolExecutor
                     client = GoogleVideoClient(vertex=True)
+                    _img_model = _get_meta_gen(project_dir).get("image_model", "replicate/nano-banana-2")
 
                     def _gen_one(v):
                         out_path = str(candidates_dir / f"v{v}.png")
@@ -3643,7 +3645,7 @@ def make_handler(work_dir: Path):
                             return
                         varied = f"{prompt}, variation {v}" if v > 1 else prompt
                         try:
-                            client.stylize_image(str(source_path), varied, out_path)
+                            client.stylize_image(str(source_path), varied, out_path, image_model=_img_model)
                             _log(f"    {kf_id} v{v} done")
                         except Exception as e:
                             _log(f"    {kf_id} v{v} FAILED: {e}")
@@ -5035,7 +5037,9 @@ def make_handler(work_dir: Path):
             def _run():
                 try:
                     from beatlab.render.google_video import GoogleVideoClient
+                    from beatlab.db import get_meta as _get_meta_stg
                     client = GoogleVideoClient(vertex=True)
+                    _img_model = _get_meta_stg(project_dir).get("image_model", "replicate/nano-banana-2")
 
                     staging_dir = project_dir / "staging" / staging_id
                     staging_dir.mkdir(parents=True, exist_ok=True)
@@ -5050,7 +5054,7 @@ def make_handler(work_dir: Path):
                             continue
                         varied = f"{prompt}, variation {v}" if v > 1 else prompt
                         try:
-                            client.stylize_image(str(source), varied, out_path)
+                            client.stylize_image(str(source), varied, out_path, image_model=_img_model)
                             paths.append(f"staging/{staging_id}/v{v}.png")
                             job_manager.update_progress(job_id, i + 1, f"v{v} done")
                         except Exception as e:
@@ -5160,14 +5164,12 @@ def make_handler(work_dir: Path):
                 _log(f"  Calling Claude for {len(events)} event prompts...")
                 from anthropic import Anthropic
                 client = Anthropic(api_key=api_key)
+                import json as _json
+                import re as _re
 
-                event_list = "\n".join(
-                    f"  {i}: t={ev.get('time', 0):.2f}s, stem={ev.get('stem_source', '?')}, "
-                    f"effect={ev.get('effect', '?')}, intensity={ev.get('intensity', 0) * 100:.0f}%"
-                    for i, ev in enumerate(events)
-                )
+                BATCH_SIZE = 30  # max events per Claude call
 
-                prompt_text = (
+                system_prompt = (
                     f"You are a visionary art director creating keyframe images for a cinematic music video. "
                     f"Each prompt will transform a base photograph (\"{base_still}\") into a vivid scene "
                     f"through Imagen style transfer.\n\n"
@@ -5189,44 +5191,61 @@ def make_handler(work_dir: Path):
                     f"- Descending/fading → dissolution, particles scattering, light dimming into beautiful darkness\n\n"
                     f"Section: \"{section_label}\"\n"
                     f"Musical description:\n{section_content}\n\n"
-                    f"Audio events in this section:\n{event_list}\n\n"
                     f"For each event, write a prompt (2-3 sentences) that:\n"
                     f"- Creates a SPECIFIC visual — whether a real place, an impossible space, or a cosmic abstraction\n"
                     f"- Includes concrete visual details even for abstract scenes: what material, what light, what color, what texture\n"
                     f"- Varies WILDLY across events — alternate between grounded and transcendent\n"
                     f"- Treats the base image as the subject transformed by or placed within this vision\n\n"
-                    f"Respond with ONLY a JSON array, no markdown fences: [{{\"eventIndex\": 0, \"prompt\": \"...\"}}, ...]"
+                    f"Respond with ONLY a JSON array, no markdown fences: [{{\"eventIndex\": N, \"prompt\": \"...\"}}, ...]"
                 )
 
-                import json as _json
-                import re as _re
-                suggestions = None
-                max_retries = 2
+                all_suggestions = []
+                batches = [events[i:i + BATCH_SIZE] for i in range(0, len(events), BATCH_SIZE)]
+                _log(f"  Processing {len(batches)} batch(es) of up to {BATCH_SIZE} events each")
 
-                for attempt in range(max_retries + 1):
-                    response = client.messages.create(
-                        model="claude-sonnet-4-20250514",
-                        max_tokens=16384,
-                        messages=[{"role": "user", "content": prompt_text}],
+                for batch_idx, batch in enumerate(batches):
+                    event_list = "\n".join(
+                        f"  {ev.get('_originalIndex', i)}: t={ev.get('time', 0):.2f}s, stem={ev.get('stem_source', '?')}, "
+                        f"effect={ev.get('effect', '?')}, intensity={ev.get('intensity', 0) * 100:.0f}%"
+                        for i, ev in enumerate(batch)
                     )
+                    # Tag events with their original index for multi-batch
+                    for i, ev in enumerate(batch):
+                        if "_originalIndex" not in ev:
+                            ev["_originalIndex"] = batch_idx * BATCH_SIZE + i
 
-                    text = response.content[0].text if response.content else ""
-                    _log(f"  Attempt {attempt + 1}: response length={len(text)}, stop={response.stop_reason}")
+                    batch_prompt = f"{system_prompt}\n\nAudio events:\n{event_list}"
 
-                    json_match = _re.search(r"\[[\s\S]*\]", text)
-                    if json_match:
-                        try:
-                            suggestions = _json.loads(json_match.group(0))
-                            break
-                        except _json.JSONDecodeError:
-                            _log(f"  Attempt {attempt + 1}: JSON parse error, retrying...")
+                    batch_suggestions = None
+                    for attempt in range(3):
+                        response = client.messages.create(
+                            model="claude-sonnet-4-20250514",
+                            max_tokens=16384,
+                            messages=[{"role": "user", "content": batch_prompt}],
+                        )
+                        text = response.content[0].text if response.content else ""
+                        _log(f"  Batch {batch_idx + 1}/{len(batches)} attempt {attempt + 1}: len={len(text)}, stop={response.stop_reason}")
+
+                        json_match = _re.search(r"\[[\s\S]*\]", text)
+                        if json_match:
+                            try:
+                                batch_suggestions = _json.loads(json_match.group(0))
+                                break
+                            except _json.JSONDecodeError:
+                                _log(f"  Batch {batch_idx + 1} attempt {attempt + 1}: JSON parse error")
+                        else:
+                            _log(f"  Batch {batch_idx + 1} attempt {attempt + 1}: no JSON array found")
+
+                    if batch_suggestions:
+                        all_suggestions.extend(batch_suggestions)
                     else:
-                        _log(f"  Attempt {attempt + 1}: no JSON array found in response: {text[:200]}")
+                        _log(f"  Batch {batch_idx + 1} failed after retries")
 
-                if suggestions is None:
+                suggestions = all_suggestions
+                if not suggestions:
                     return self._error(500, "INTERNAL_ERROR", "Failed to parse prompt suggestions after retries")
 
-                _log(f"  Generated {len(suggestions)} prompt suggestions")
+                _log(f"  Generated {len(suggestions)} prompt suggestions across {len(batches)} batch(es)")
 
                 # Auto-persist suggestions to DB
                 try:

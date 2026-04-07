@@ -1329,11 +1329,12 @@ def _blend_frames(base, overlay, mode: str = "normal", opacity: float = 1.0):
     return np.clip(result * 255, 0, 255).astype(np.uint8)
 
 
-def assemble_final(yaml_path: str, output_path: str, max_time: float | None = None) -> str:
+def assemble_final(yaml_path: str, output_path: str, max_time: float | None = None, crossfade_frames: int | None = None) -> str:
     """Time-remap selected transitions, concatenate, and mux audio.
 
     Args:
         max_time: Stop assembling after this timeline time (seconds). None = full track.
+        crossfade_frames: Number of frames for crossfade transitions. Default from settings.yaml or 8.
     """
     import subprocess
 
@@ -1426,7 +1427,17 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
 
     n_clips = len(clips_info)
     fps = 24.0
-    XFADE_FRAMES = 8
+    # Crossfade frames: CLI arg > settings.yaml > default 8
+    if crossfade_frames is None:
+        import yaml as _yaml
+        settings_path = work_dir / "settings.yaml"
+        if settings_path.exists():
+            with open(settings_path) as f:
+                _settings = _yaml.safe_load(f) or {}
+            crossfade_frames = _settings.get("crossfade_frames", 8)
+        else:
+            crossfade_frames = 8
+    XFADE_FRAMES = crossfade_frames
     HALF = XFADE_FRAMES // 2
 
     # Unified single-pass: remap + stitch + crossfade + effects in one frame loop
@@ -1676,6 +1687,14 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
             except Exception:
                 tr_effects = []
 
+            opacity_curve = tr.get("opacity_curve")
+            if isinstance(opacity_curve, str):
+                import json as _json2
+                try:
+                    opacity_curve = _json2.loads(opacity_curve)
+                except Exception:
+                    opacity_curve = None
+
             if selected.exists():
                 segments.append({
                     "from_ts": from_ts, "to_ts": to_ts,
@@ -1683,6 +1702,7 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                     "remap_method": remap.get("method", "linear"),
                     "curve_points": remap.get("curve_points"),
                     "effects": tr_effects,
+                    "opacity_curve": opacity_curve,
                 })
             else:
                 kf_image = work_dir / "selected_keyframes" / f"{tr.get('from_id') or tr.get('from', '')}.png"
@@ -1692,6 +1712,7 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                         "source": str(kf_image), "is_still": True,
                         "remap_method": "linear", "curve_points": None,
                         "effects": tr_effects,
+                        "opacity_curve": opacity_curve,
                     })
     else:
         # Fallback to YAML-based clips_info
@@ -1906,6 +1927,13 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                     if has_curves:
                         frame = _apply_color_grading(frame, matched_clip, progress)
                     result = _blend_frames(result, frame, clip_blend, clip_opacity)
+            # Release VideoCapture handles for clips we've passed
+            for oclip in otrack["clips"]:
+                if oclip["to_ts"] < t - 1.0 and "_cap" in oclip:
+                    oclip["_cap"].release()
+                    del oclip["_cap"]
+                if oclip["to_ts"] < t - 1.0 and "_img" in oclip:
+                    del oclip["_img"]
         return result
 
     preview = output_path.endswith("_preview.mp4")
@@ -2016,30 +2044,52 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
         else:
             seg = segments[seg_idx]
             seg_dur = seg["to_ts"] - seg["from_ts"]
-            progress = (t - seg["from_ts"]) / seg_dur if seg_dur > 0 else 0
+
+            # Adaptive crossfade: scale down for short segments (max 25% of segment)
+            seg_frames = round(seg_dur * fps)
+            eff_xfade = min(XFADE_FRAMES, max(2, seg_frames // 4))
+            eff_half_xfade = (eff_xfade / 2) / fps
+
+            # Expand progress range to include crossfade extensions
+            ext = min(eff_half_xfade / seg_dur, 0.2) if seg_dur > 0 else 0
+            raw_progress = (t - seg["from_ts"]) / seg_dur if seg_dur > 0 else 0
+            progress = ext + raw_progress * (1.0 - 2 * ext)
             progress = max(0.0, min(0.999, progress))
             frame = _get_frame_at(seg_idx, progress)
 
             # Crossfade at segment boundaries
-            # Start of segment: blend with end of previous segment
-            if seg_idx > 0 and (t - seg["from_ts"]) < half_xfade:
+            if seg_idx > 0 and (t - seg["from_ts"]) < eff_half_xfade:
                 prev_seg = segments[seg_idx - 1]
                 if prev_seg["to_ts"] == seg["from_ts"] and prev_seg["_n"] > 0:
-                    blend_t = (t - seg["from_ts"]) / half_xfade  # 0→1 over half_xfade
-                    alpha = blend_t * 0.5 + 0.5  # 0.5→1.0
-                    prev_progress = max(0.0, min(0.999, (t - prev_seg["from_ts"]) / (prev_seg["to_ts"] - prev_seg["from_ts"])))
+                    blend_t = (t - seg["from_ts"]) / eff_half_xfade
+                    alpha = 0.5 + blend_t * 0.5
+                    prev_dur = prev_seg["to_ts"] - prev_seg["from_ts"]
+                    prev_ext = min(eff_half_xfade / prev_dur, 0.2) if prev_dur > 0 else 0
+                    prev_raw = (t - prev_seg["from_ts"]) / prev_dur if prev_dur > 0 else 0
+                    prev_progress = prev_ext + prev_raw * (1.0 - 2 * prev_ext)
+                    prev_progress = max(0.0, min(0.999, prev_progress))
                     prev_frame = _get_frame_at(seg_idx - 1, prev_progress)
                     frame = cv2.addWeighted(prev_frame, 1.0 - alpha, frame, alpha, 0)
 
-            # End of segment: blend with start of next segment
-            elif seg_idx < len(segments) - 1 and (seg["to_ts"] - t) < half_xfade:
+            if seg_idx < len(segments) - 1 and (seg["to_ts"] - t) < eff_half_xfade:
                 next_seg = segments[seg_idx + 1]
                 if next_seg["from_ts"] == seg["to_ts"] and next_seg["_n"] > 0:
-                    blend_t = (seg["to_ts"] - t) / half_xfade  # 1→0 over half_xfade
-                    alpha = blend_t * 0.5 + 0.5  # 1.0→0.5
-                    next_progress = max(0.0, min(0.999, (t - next_seg["from_ts"]) / (next_seg["to_ts"] - next_seg["from_ts"])))
+                    blend_t = (seg["to_ts"] - t) / eff_half_xfade
+                    alpha = 0.5 + blend_t * 0.5
+                    next_dur = next_seg["to_ts"] - next_seg["from_ts"]
+                    next_ext = min(eff_half_xfade / next_dur, 0.2) if next_dur > 0 else 0
+                    next_raw = (t - next_seg["from_ts"]) / next_dur if next_dur > 0 else 0
+                    next_progress = next_ext + next_raw * (1.0 - 2 * next_ext)
+                    next_progress = max(0.0, min(0.999, next_progress))
                     next_frame = _get_frame_at(seg_idx + 1, next_progress)
                     frame = cv2.addWeighted(frame, alpha, next_frame, 1.0 - alpha, 0)
+
+            # Base track opacity curve (fade to/from black)
+            if seg.get("opacity_curve"):
+                opacity = _evaluate_curve(seg["opacity_curve"], raw_progress)
+                opacity = max(0.0, min(1.0, opacity))
+                if opacity < 0.999:
+                    frame = cv2.convertScaleAbs(frame, alpha=opacity, beta=0)
 
             # Per-transition effects (strobe etc.)
             for efx in seg.get("effects", []):

@@ -267,19 +267,30 @@ class GoogleVideoClient:
             aspect = "1:1"
 
         _log(f"    [replicate] Generating image with {replicate_model} (src={src_w}x{src_h})...")
-        input_data = {"prompt": full_prompt, "output_format": "png"}
-        # Nano Banana uses image_input (array of file handles); SDXL uses width/height
-        if "nano-banana" in replicate_model:
-            input_data["image_input"] = [open(image_path, "rb")]
-        else:
-            input_data["aspect_ratio"] = aspect
 
-        output = replicate.run(replicate_model, input=input_data)
+        last_err = None
+        for attempt in range(3):
+            try:
+                input_data = {"prompt": full_prompt, "output_format": "png"}
+                if "nano-banana" in replicate_model:
+                    input_data["image_input"] = [open(image_path, "rb")]
+                else:
+                    input_data["aspect_ratio"] = aspect
 
-        url = str(output[0]) if isinstance(output, list) else str(output)
-        urllib.request.urlretrieve(url, output_path)
-        _log(f"    [replicate] Saved to {output_path}")
-        return output_path
+                output = replicate.run(replicate_model, input=input_data)
+
+                url = str(output[0]) if isinstance(output, list) else str(output)
+                urllib.request.urlretrieve(url, output_path)
+                _log(f"    [replicate] Saved to {output_path}")
+                return output_path
+            except Exception as e:
+                last_err = e
+                _log(f"    [replicate] Attempt {attempt + 1}/3 failed: {type(e).__name__}: {e}")
+                if attempt < 2:
+                    import time as _t
+                    _t.sleep(2 * (attempt + 1))
+
+        raise RuntimeError(f"Replicate failed after 3 attempts: {last_err}")
 
     def _stylize_vertex(self, image_path: str, style_prompt: str, output_path: str, model: str = "gemini-2.5-flash-image") -> str:
         """Stylize via Vertex AI Nano Banana."""
