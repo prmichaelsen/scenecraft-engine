@@ -389,6 +389,23 @@ def make_handler(work_dir: Path):
             if m:
                 return self._handle_assign_pool_video(m.group(1))
 
+            # POST /api/projects/:name/checkpoint
+            m = re.match(r"^/api/projects/([^/]+)/checkpoint$", path)
+            if m:
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                import shutil
+                from datetime import datetime
+                db_path = project_dir / "project.db"
+                if not db_path.exists():
+                    return self._error(404, "NOT_FOUND", "No project.db found")
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"project.db.checkpoint-{ts}"
+                dst = project_dir / filename
+                shutil.copy2(str(db_path), str(dst))
+                _log(f"checkpoint: {m.group(1)} -> {filename}")
+                return self._json_response({"success": True, "filename": filename})
+
             # POST /api/projects/:name/bench/capture
             m = re.match(r"^/api/projects/([^/]+)/bench/capture$", path)
             if m:
