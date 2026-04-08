@@ -784,7 +784,7 @@ def make_handler(work_dir: Path):
 
                 # Copy style fields
                 style_fields = {}
-                for key in ("blend_mode", "opacity", "opacity_curve", "red_curve", "green_curve", "blue_curve", "black_curve", "hue_shift_curve", "saturation_curve", "invert_curve", "is_adjustment"):
+                for key in ("blend_mode", "opacity", "opacity_curve", "red_curve", "green_curve", "blue_curve", "black_curve", "hue_shift_curve", "saturation_curve", "invert_curve", "is_adjustment", "mask_center_x", "mask_center_y", "mask_radius", "mask_feather", "transform_x", "transform_y"):
                     if src.get(key) is not None:
                         style_fields[key] = src[key]
                     elif key in ("blend_mode",):
@@ -937,6 +937,18 @@ def make_handler(work_dir: Path):
                     fields["saturation_curve"] = body["saturationCurve"]
                 if "invertCurve" in body:
                     fields["invert_curve"] = body["invertCurve"]
+                if "maskCenterX" in body:
+                    fields["mask_center_x"] = body["maskCenterX"]
+                if "maskCenterY" in body:
+                    fields["mask_center_y"] = body["maskCenterY"]
+                if "maskRadius" in body:
+                    fields["mask_radius"] = body["maskRadius"]
+                if "maskFeather" in body:
+                    fields["mask_feather"] = body["maskFeather"]
+                if "transformX" in body:
+                    fields["transform_x"] = body["transformX"]
+                if "transformY" in body:
+                    fields["transform_y"] = body["transformY"]
                 if "chromaKey" in body:
                     fields["chroma_key"] = body["chromaKey"]
                 if "isAdjustment" in body:
@@ -1452,6 +1464,12 @@ def make_handler(work_dir: Path):
                     "hueShiftCurve": tr.get("hue_shift_curve"),
                     "saturationCurve": tr.get("saturation_curve"),
                     "invertCurve": tr.get("invert_curve"),
+                    "maskCenterX": tr.get("mask_center_x"),
+                    "maskCenterY": tr.get("mask_center_y"),
+                    "maskRadius": tr.get("mask_radius"),
+                    "maskFeather": tr.get("mask_feather"),
+                    "transformX": tr.get("transform_x"),
+                    "transformY": tr.get("transform_y"),
                     "chromaKey": tr.get("chroma_key"),
                     "isAdjustment": tr.get("is_adjustment", False),
                     "candidates": slot_candidates,
@@ -2181,6 +2199,12 @@ def make_handler(work_dir: Path):
                         "saturation_curve": src_tr.get("saturation_curve"),
                         "invert_curve": src_tr.get("invert_curve"),
                         "is_adjustment": src_tr.get("is_adjustment", False),
+                        "mask_center_x": src_tr.get("mask_center_x"),
+                        "mask_center_y": src_tr.get("mask_center_y"),
+                        "mask_radius": src_tr.get("mask_radius"),
+                        "mask_feather": src_tr.get("mask_feather"),
+                        "transform_x": src_tr.get("transform_x"),
+                        "transform_y": src_tr.get("transform_y"),
                         "label": src_tr.get("label", ""),
                         "label_color": src_tr.get("label_color", ""),
                         "tags": src_tr.get("tags", []),
@@ -3535,16 +3559,21 @@ def make_handler(work_dir: Path):
                     try:
                         from beatlab.render.google_video import GoogleVideoClient
                         client = GoogleVideoClient(vertex=True)
+                        import time as _time
                         for i in range(count):
                             v = existing_count + i + 1
                             out_path = str(candidates_dir / f"v{v}.png")
                             varied = f"{prompt}, variation {v}" if v > 1 else prompt
-                            try:
-                                client.generate_image(varied, out_path, aspect_ratio=aspect_ratio)
-                                job_manager.update_progress(job_id, i + 1, f"v{v} done")
-                            except Exception as e:
-                                _log(f"  freeform v{v} failed: {e}")
-                                job_manager.update_progress(job_id, i + 1, f"v{v} failed")
+                            while True:
+                                try:
+                                    client.generate_image(varied, out_path, aspect_ratio=aspect_ratio)
+                                    _log(f"  freeform v{v} done")
+                                    break
+                                except Exception as e:
+                                    _log(f"  freeform v{v} failed: {e} — retrying in 60s")
+                                    job_manager.update_progress(job_id, i + 1, f"v{v} failed, retrying in 60s...")
+                                    _time.sleep(60)
+                            job_manager.update_progress(job_id, i + 1, f"v{v} done")
 
                         all_cands = sorted([
                             f"keyframe_candidates/candidates/section_{kf_id}/{f.name}"
@@ -3577,16 +3606,21 @@ def make_handler(work_dir: Path):
                         from beatlab.render.google_video import GoogleVideoClient
                         client = GoogleVideoClient(vertex=True)
                         paths = []
+                        import time as _time
                         for i in range(count):
                             v = existing_count + i + 1
                             out_path = str(candidates_dir / f"v{v}.png")
                             varied = f"{refinement_prompt}, variation {v}" if v > 1 else refinement_prompt
-                            try:
-                                client.transform_image(str(source_img), varied, out_path)
-                                paths.append(f"keyframe_candidates/candidates/section_{kf_id}/v{v}.png")
-                            except Exception as e:
-                                _log(f"  v{v} failed: {e}")
-                                job_manager.update_progress(job_id, i + 1, f"v{v} failed")
+                            while True:
+                                try:
+                                    client.transform_image(str(source_img), varied, out_path)
+                                    paths.append(f"keyframe_candidates/candidates/section_{kf_id}/v{v}.png")
+                                    break
+                                except Exception as e:
+                                    _log(f"  v{v} failed: {e} — retrying in 60s")
+                                    job_manager.update_progress(job_id, i + 1, f"v{v} failed, retrying in 60s...")
+                                    _time.sleep(60)
+                            job_manager.update_progress(job_id, i + 1, f"v{v} done")
 
                         # Persist candidates to DB
                         from beatlab.db import update_keyframe
@@ -3640,15 +3674,21 @@ def make_handler(work_dir: Path):
                     _img_model = _get_meta_gen(project_dir).get("image_model", "replicate/nano-banana-2")
 
                     def _gen_one(v):
+                        import time as _time
                         out_path = str(candidates_dir / f"v{v}.png")
                         if Path(out_path).exists():
+                            job_manager.update_progress(job_id, v - existing_count, f"v{v} cached")
                             return
                         varied = f"{prompt}, variation {v}" if v > 1 else prompt
-                        try:
-                            client.stylize_image(str(source_path), varied, out_path, image_model=_img_model)
-                            _log(f"    {kf_id} v{v} done")
-                        except Exception as e:
-                            _log(f"    {kf_id} v{v} FAILED: {e}")
+                        while True:
+                            try:
+                                client.stylize_image(str(source_path), varied, out_path, image_model=_img_model)
+                                _log(f"    {kf_id} v{v} done")
+                                break
+                            except Exception as e:
+                                _log(f"    {kf_id} v{v} FAILED: {e} — retrying in 60s")
+                                job_manager.update_progress(job_id, v - existing_count, f"v{v} failed, retrying in 60s...")
+                                _time.sleep(60)
                         job_manager.update_progress(job_id, v - existing_count, f"v{v}")
 
                     variants = list(range(existing_count + 1, existing_count + count + 1))
