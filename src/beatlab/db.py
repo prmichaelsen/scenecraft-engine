@@ -217,6 +217,9 @@ def _ensure_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE transitions ADD COLUMN is_adjustment INTEGER NOT NULL DEFAULT 0")
     if "chroma_key" not in tr_cols2:
         conn.execute("ALTER TABLE transitions ADD COLUMN chroma_key TEXT")
+    for mask_col in ("mask_center_x", "mask_center_y", "mask_radius", "mask_feather", "transform_x", "transform_y"):
+        if mask_col not in tr_cols2:
+            conn.execute(f"ALTER TABLE transitions ADD COLUMN {mask_col} REAL")
 
     # Add layer_effect_types to suppressions if missing
     sup_cols = {row[1] for row in conn.execute("PRAGMA table_info(suppressions)").fetchall()}
@@ -401,6 +404,12 @@ def _row_to_transition(row: sqlite3.Row) -> dict:
         "invert_curve": json.loads(row["invert_curve"]) if "invert_curve" in row.keys() and row["invert_curve"] else None,
         "chroma_key": json.loads(row["chroma_key"]) if "chroma_key" in row.keys() and row["chroma_key"] else None,
         "is_adjustment": bool(row["is_adjustment"]) if "is_adjustment" in row.keys() else False,
+        "mask_center_x": row["mask_center_x"] if "mask_center_x" in row.keys() else None,
+        "mask_center_y": row["mask_center_y"] if "mask_center_y" in row.keys() else None,
+        "mask_radius": row["mask_radius"] if "mask_radius" in row.keys() else None,
+        "mask_feather": row["mask_feather"] if "mask_feather" in row.keys() else None,
+        "transform_x": row["transform_x"] if "transform_x" in row.keys() else None,
+        "transform_y": row["transform_y"] if "transform_y" in row.keys() else None,
         "deleted_at": row["deleted_at"],
         "include_section_desc": bool(row["include_section_desc"]) if "include_section_desc" in row.keys() else True,
     }
@@ -448,8 +457,8 @@ def add_transition(project_dir: Path, tr: dict):
 
     def _do_insert():
         conn.execute(
-            """INSERT OR REPLACE INTO transitions (id, from_kf, to_kf, duration_seconds, slots, action, use_global_prompt, selected, remap, deleted_at, track_id, label, label_color, tags, blend_mode, opacity, opacity_curve, red_curve, green_curve, blue_curve, black_curve, hue_shift_curve, saturation_curve, invert_curve, is_adjustment)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT OR REPLACE INTO transitions (id, from_kf, to_kf, duration_seconds, slots, action, use_global_prompt, selected, remap, deleted_at, track_id, label, label_color, tags, blend_mode, opacity, opacity_curve, red_curve, green_curve, blue_curve, black_curve, hue_shift_curve, saturation_curve, invert_curve, is_adjustment, mask_center_x, mask_center_y, mask_radius, mask_feather, transform_x, transform_y)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (tr["id"], tr.get("from", ""), tr.get("to", ""), tr.get("duration_seconds", 0),
              tr.get("slots", 1), tr.get("action", ""), int(tr.get("use_global_prompt", False)),
              json.dumps(selected), json.dumps(tr.get("remap", {"method": "linear", "target_duration": 0})),
@@ -465,7 +474,9 @@ def add_transition(project_dir: Path, tr: dict):
              _json_or_none(tr.get("hue_shift_curve")),
              _json_or_none(tr.get("saturation_curve")),
              _json_or_none(tr.get("invert_curve")),
-             int(tr.get("is_adjustment", False))),
+             int(tr.get("is_adjustment", False)),
+             tr.get("mask_center_x"), tr.get("mask_center_y"), tr.get("mask_radius"), tr.get("mask_feather"),
+             tr.get("transform_x"), tr.get("transform_y")),
         )
         conn.commit()
     _retry_on_locked(_do_insert)

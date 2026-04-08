@@ -1792,6 +1792,8 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                     "black_curve": tr.get("black_curve"), "saturation_curve": tr.get("saturation_curve"),
                     "hue_shift_curve": tr.get("hue_shift_curve"), "invert_curve": tr.get("invert_curve"),
                     "is_adjustment": tr.get("is_adjustment", False),
+                    "mask_center_x": tr.get("mask_center_x"), "mask_center_y": tr.get("mask_center_y"),
+                    "mask_radius": tr.get("mask_radius"), "mask_feather": tr.get("mask_feather"),
                 }
                 if sel and sel not in (0, "null") and video_path.exists():
                     clip_data.update({"video": str(video_path), "still": None})
@@ -1918,14 +1920,34 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                         frame = oclip["_img"]
                     break
             if matched_clip is not None:
+                # Apply radial mask
+                def _apply_radial_mask(img, clip_data):
+                    mask_r = clip_data.get("mask_radius")
+                    if mask_r is not None and mask_r < 1.0:
+                        import numpy as np
+                        h, w = img.shape[:2]
+                        cx = clip_data.get("mask_center_x", 0.5) * w
+                        cy = clip_data.get("mask_center_y", 0.5) * h
+                        feather = clip_data.get("mask_feather", 0.0)
+                        diag = (w**2 + h**2) ** 0.5
+                        Y, X = np.ogrid[:h, :w]
+                        dist = np.sqrt((X - cx)**2 + (Y - cy)**2) / diag
+                        inner = mask_r * (1.0 - feather)
+                        mask = np.clip(1.0 - (dist - inner) / max(mask_r - inner, 0.001), 0, 1).astype(np.float32)
+                        mask = mask[:, :, np.newaxis]
+                        img = (img.astype(np.float32) * mask).astype(np.uint8)
+                    return img
+
                 if matched_clip.get("is_adjustment"):
                     # Adjustment layer: apply color grading directly to the composite
                     result = _apply_color_grading(result, matched_clip, progress)
+                    result = _apply_radial_mask(result, matched_clip)
                 elif frame is not None:
                     # Apply color grading to the layer frame before blending
                     has_curves = any(matched_clip.get(k) for k in ("red_curve", "green_curve", "blue_curve", "black_curve", "saturation_curve", "hue_shift_curve", "invert_curve"))
                     if has_curves:
                         frame = _apply_color_grading(frame, matched_clip, progress)
+                    frame = _apply_radial_mask(frame, matched_clip)
                     result = _blend_frames(result, frame, clip_blend, clip_opacity)
             # Release VideoCapture handles for clips we've passed
             for oclip in otrack["clips"]:
