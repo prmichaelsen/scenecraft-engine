@@ -1,4 +1,4 @@
-"""Google AI video pipeline — Nano Banana (image stylization) + Veo (video generation)."""
+"""Video generation pipeline — supports Vertex AI (Google) and Runway backends."""
 
 from __future__ import annotations
 
@@ -673,3 +673,160 @@ class GoogleVideoClient:
         generated = _retry_video_generation(_generate, self.client, output_path)
         self._save_generated_video(generated, output_path)
         return output_path
+
+
+class RunwayVideoClient:
+    """Video generation via Runway API — supports Veo 3.1 and Gen-4.5."""
+
+    def __init__(self, api_key: str | None = None, model: str = "veo3.1_fast"):
+        import os
+        self.api_key = api_key or os.environ.get("RUNWAY_API_KEY", "")
+        self.model = model
+        if not self.api_key:
+            raise RuntimeError("RUNWAY_API_KEY not set")
+
+    def generate_video_from_image(
+        self,
+        image_path: str,
+        prompt: str,
+        output_path: str,
+        duration_seconds: int = 8,
+        on_status=None,
+        **kwargs,
+    ) -> str:
+        """Generate video from image via Runway API."""
+        return self._run_image_to_video(
+            image_path=image_path,
+            prompt=prompt,
+            output_path=output_path,
+            duration=duration_seconds,
+            on_status=on_status,
+        )
+
+    def generate_video_transition(
+        self,
+        start_frame_path: str,
+        end_frame_path: str,
+        prompt: str,
+        output_path: str,
+        duration_seconds: int = 8,
+        on_status=None,
+        **kwargs,
+    ) -> str:
+        """Generate transition video via Runway API.
+
+        Note: Runway's image-to-video doesn't support last_frame conditioning natively.
+        We use the start frame as input and include end frame description in the prompt.
+        """
+        enhanced_prompt = f"{prompt}. The video should transition smoothly toward the end state."
+        return self._run_image_to_video(
+            image_path=start_frame_path,
+            prompt=enhanced_prompt,
+            output_path=output_path,
+            duration=max(4, min(8, duration_seconds)),
+            on_status=on_status,
+        )
+
+    def _run_image_to_video(
+        self,
+        image_path: str,
+        prompt: str,
+        output_path: str,
+        duration: int = 8,
+        on_status=None,
+    ) -> str:
+        """Core Runway image-to-video API call with polling."""
+        import base64
+        import json
+        import urllib.request
+        import urllib.error
+
+        # Encode image as base64 data URI
+        ext = Path(image_path).suffix.lower()
+        mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(ext, "image/png")
+        with open(image_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        data_uri = f"data:{mime};base64,{b64}"
+
+        # Submit generation request
+        payload = json.dumps({
+            "model": self.model,
+            "promptImage": data_uri,
+            "promptText": prompt,
+            "ratio": "1280:720",
+            "duration": duration,
+        }).encode()
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+            "X-Runway-Version": "2024-11-06",
+        }
+
+        _log(f"    [runway] Submitting {self.model} generation ({duration}s)...")
+        req = urllib.request.Request(
+            "https://api.dev.runwayml.com/v1/image_to_video",
+            data=payload,
+            headers=headers,
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req) as resp:
+                result = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode() if e.fp else ""
+            raise RuntimeError(f"Runway API error {e.code}: {body}")
+
+        task_id = result.get("id")
+        if not task_id:
+            raise RuntimeError(f"Runway returned no task ID: {result}")
+
+        _log(f"    [runway] Task {task_id} submitted, polling...")
+
+        # Poll for completion
+        poll_url = f"https://api.dev.runwayml.com/v1/tasks/{task_id}"
+        poll_headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "X-Runway-Version": "2024-11-06",
+        }
+
+        while True:
+            time.sleep(10)
+            poll_req = urllib.request.Request(poll_url, headers=poll_headers)
+            try:
+                with urllib.request.urlopen(poll_req) as resp:
+                    task = json.loads(resp.read())
+            except urllib.error.HTTPError as e:
+                _log(f"    [runway] Poll error {e.code}, retrying...")
+                continue
+
+            status = task.get("status", "")
+            if on_status:
+                on_status(f"Runway: {status}")
+
+            if status == "SUCCEEDED":
+                output_url = None
+                output_list = task.get("output", [])
+                if isinstance(output_list, list) and output_list:
+                    output_url = output_list[0]
+                elif isinstance(task.get("output"), str):
+                    output_url = task["output"]
+
+                if not output_url:
+                    raise RuntimeError(f"Runway task succeeded but no output URL: {task}")
+
+                _log(f"    [runway] Downloading {output_url[:80]}...")
+                urllib.request.urlretrieve(output_url, output_path)
+                _log(f"    [runway] Saved to {output_path}")
+                return output_path
+
+            elif status == "FAILED":
+                error = task.get("failure", task.get("error", "unknown"))
+                raise RuntimeError(f"Runway generation failed: {error}")
+
+            elif status in ("PENDING", "RUNNING", "THROTTLED"):
+                progress = task.get("progress", 0)
+                _log(f"    [runway] {status} ({progress:.0%})...")
+            else:
+                _log(f"    [runway] Unknown status: {status}")

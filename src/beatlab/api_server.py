@@ -3817,14 +3817,22 @@ def make_handler(work_dir: Path):
             from beatlab.ws_server import job_manager
             job_id = job_manager.create_job("transition_candidates", total=count, meta={"transitionId": tr_id, "project": project_name})
 
+            vid_backend = _get_video_backend(project_dir)
+
             def _run():
                 try:
                     from beatlab.render.google_video import GoogleVideoClient, PromptRejectedError
                     from concurrent.futures import ThreadPoolExecutor, as_completed
                     from pathlib import Path as _Path
 
-                    client = GoogleVideoClient(vertex=True)
-                    job_manager.update_progress(job_id, 0, "Starting Veo generation...")
+                    if vid_backend.startswith("runway"):
+                        from beatlab.render.google_video import RunwayVideoClient
+                        _, _, runway_model = vid_backend.partition("/")
+                        client = RunwayVideoClient(model=runway_model or "veo3.1_fast")
+                        _log(f"  Using Runway backend: {runway_model or 'veo3.1_fast'}")
+                    else:
+                        client = GoogleVideoClient(vertex=True)
+                    job_manager.update_progress(job_id, 0, f"Starting video generation ({vid_backend})...")
 
                     # Build jobs for each slot + variant
                     gen_jobs = []
