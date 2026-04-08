@@ -713,18 +713,14 @@ class RunwayVideoClient:
         on_status=None,
         **kwargs,
     ) -> str:
-        """Generate transition video via Runway API.
-
-        Note: Runway's image-to-video doesn't support last_frame conditioning natively.
-        We use the start frame as input and include end frame description in the prompt.
-        """
-        enhanced_prompt = f"{prompt}. The video should transition smoothly toward the end state."
+        """Generate transition video via Runway API with first+last frame conditioning."""
         return self._run_image_to_video(
             image_path=start_frame_path,
-            prompt=enhanced_prompt,
+            prompt=prompt,
             output_path=output_path,
             duration=max(4, min(8, duration_seconds)),
             on_status=on_status,
+            last_frame_path=end_frame_path,
         )
 
     def _run_image_to_video(
@@ -734,6 +730,7 @@ class RunwayVideoClient:
         output_path: str,
         duration: int = 8,
         on_status=None,
+        last_frame_path: str | None = None,
     ) -> str:
         """Core Runway image-to-video API call with polling."""
         import base64
@@ -741,19 +738,28 @@ class RunwayVideoClient:
         import urllib.request
         import urllib.error
 
-        # Encode image as base64 data URI
-        ext = Path(image_path).suffix.lower()
-        mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(ext, "image/png")
-        with open(image_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
-        data_uri = f"data:{mime};base64,{b64}"
+        def _to_data_uri(path):
+            ext = Path(path).suffix.lower()
+            mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(ext, "image/png")
+            with open(path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+            return f"data:{mime};base64,{b64}"
+
+        # Build promptImage — single URI or array of keyframe objects
+        if last_frame_path and Path(last_frame_path).exists():
+            prompt_image = [
+                {"uri": _to_data_uri(image_path), "position": "first"},
+                {"uri": _to_data_uri(last_frame_path), "position": "last"},
+            ]
+        else:
+            prompt_image = _to_data_uri(image_path)
 
         # Submit generation request
         payload = json.dumps({
             "model": self.model,
-            "promptImage": data_uri,
+            "promptImage": prompt_image,
             "promptText": prompt,
-            "ratio": "1280:720",
+            "ratio": "1920:1080",
             "duration": duration,
         }).encode()
 
