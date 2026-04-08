@@ -363,18 +363,24 @@ class GoogleVideoClient:
         output_path: str,
         aspect_ratio: str = "16:9",
         model: str = "imagen-3.0-generate-002",
+        image_backend: str | None = None,
     ) -> str:
-        """Generate an image from text prompt only using the Imagen API.
+        """Generate an image from text prompt only.
 
         Args:
             prompt: Text description of the image to generate.
             output_path: Where to save the generated image.
             aspect_ratio: Aspect ratio string (e.g. "16:9", "1:1", "9:16").
-            model: Imagen model name.
+            model: Imagen model name (for vertex).
+            image_backend: Override backend ("vertex", "replicate/<model>").
 
         Returns:
             output_path
         """
+        backend = image_backend or "vertex"
+        if backend.startswith("replicate"):
+            return self._generate_image_replicate(prompt, output_path, aspect_ratio, backend)
+
         from google.genai import types
 
         full_prompt = (
@@ -401,18 +407,62 @@ class GoogleVideoClient:
         img.save(output_path)
         return output_path
 
+    def _generate_image_replicate(self, prompt: str, output_path: str, aspect_ratio: str, backend: str) -> str:
+        """Generate image via Replicate."""
+        import replicate
+        import urllib.request
+
+        _, _, model_name = backend.partition("/")
+        model_name = model_name or "nano-banana-2"
+
+        model_map = {
+            "nano-banana-2": "google/nano-banana-2",
+            "sdxl": "stability-ai/sdxl:7762fd07cf82c948538e41f63f77d685e02b063e37e496e96eefd46c929f9bdc",
+        }
+        replicate_model = model_map.get(model_name, f"google/{model_name}")
+
+        full_prompt = (
+            f"Hyper-realistic, photorealistic image. Like a still from a big-budget "
+            f"film shot on 35mm. Rich intricate detail, complex natural textures, "
+            f"sophisticated cinematic lighting, depth of field. Scene: {prompt}"
+        )
+
+        _log(f"    [replicate] Generating image with {replicate_model}...")
+        last_err = None
+        for attempt in range(3):
+            try:
+                input_data = {"prompt": full_prompt, "output_format": "png", "aspect_ratio": aspect_ratio}
+                output = replicate.run(replicate_model, input=input_data)
+                url = str(output[0]) if isinstance(output, list) else str(output)
+                urllib.request.urlretrieve(url, output_path)
+                _log(f"    [replicate] Saved to {output_path}")
+                return output_path
+            except Exception as e:
+                last_err = e
+                _log(f"    [replicate] Attempt {attempt + 1}/3 failed: {type(e).__name__}: {e}")
+                if attempt < 2:
+                    import time as _t
+                    _t.sleep(2 * (attempt + 1))
+        raise RuntimeError(f"Replicate generate_image failed after 3 attempts: {last_err}")
+
     def transform_image(
         self,
         image_path: str,
         prompt: str,
         output_path: str,
         model: str = "gemini-2.5-flash-image",
+        image_backend: str | None = None,
     ) -> str:
         """Transform an image based on a prompt, allowing significant changes to content and composition.
 
         Unlike stylize_image which preserves composition, this method encourages
         the model to modify the scene according to the prompt.
         """
+        backend = image_backend or "vertex"
+        if backend.startswith("replicate"):
+            return self._stylize_replicate(image_path, prompt, output_path,
+                                           backend.partition("/")[2] or "nano-banana-2")
+
         from google.genai import types
 
         with open(image_path, "rb") as f:

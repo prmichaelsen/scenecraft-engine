@@ -1794,6 +1794,7 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                     "is_adjustment": tr.get("is_adjustment", False),
                     "mask_center_x": tr.get("mask_center_x"), "mask_center_y": tr.get("mask_center_y"),
                     "mask_radius": tr.get("mask_radius"), "mask_feather": tr.get("mask_feather"),
+                    "transform_x": tr.get("transform_x"), "transform_y": tr.get("transform_y"),
                 }
                 if sel and sel not in (0, "null") and video_path.exists():
                     clip_data.update({"video": str(video_path), "still": None})
@@ -1920,6 +1921,19 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                         frame = oclip["_img"]
                     break
             if matched_clip is not None:
+                # Apply transform (shift the frame)
+                def _apply_transform(img, clip_data):
+                    tx = clip_data.get("transform_x")
+                    ty = clip_data.get("transform_y")
+                    if tx or ty:
+                        import numpy as np
+                        h, w = img.shape[:2]
+                        dx = int((tx or 0) * w)
+                        dy = int((ty or 0) * h)
+                        M = np.float32([[1, 0, dx], [0, 1, dy]])
+                        img = cv2.warpAffine(img, M, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+                    return img
+
                 # Apply radial mask
                 def _apply_radial_mask(img, clip_data):
                     mask_r = clip_data.get("mask_radius")
@@ -1939,14 +1953,13 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                     return img
 
                 if matched_clip.get("is_adjustment"):
-                    # Adjustment layer: apply color grading directly to the composite
                     result = _apply_color_grading(result, matched_clip, progress)
                     result = _apply_radial_mask(result, matched_clip)
                 elif frame is not None:
-                    # Apply color grading to the layer frame before blending
                     has_curves = any(matched_clip.get(k) for k in ("red_curve", "green_curve", "blue_curve", "black_curve", "saturation_curve", "hue_shift_curve", "invert_curve"))
                     if has_curves:
                         frame = _apply_color_grading(frame, matched_clip, progress)
+                    frame = _apply_transform(frame, matched_clip)
                     frame = _apply_radial_mask(frame, matched_clip)
                     result = _blend_frames(result, frame, clip_blend, clip_opacity)
             # Release VideoCapture handles for clips we've passed

@@ -19,6 +19,26 @@ def _log(msg: str):
     print(f"[{ts}] {msg}", file=sys.stderr, flush=True)
 
 
+def _get_project_settings(project_dir: Path) -> dict:
+    """Read settings.yaml for a project."""
+    import yaml
+    settings_path = project_dir / "settings.yaml"
+    if settings_path.exists():
+        with open(settings_path) as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+def _get_image_backend(project_dir: Path) -> str:
+    """Get image generation backend from project settings."""
+    return _get_project_settings(project_dir).get("image_backend", "vertex")
+
+
+def _get_video_backend(project_dir: Path) -> str:
+    """Get video generation backend from project settings."""
+    return _get_project_settings(project_dir).get("video_backend", "vertex")
+
+
 def make_handler(work_dir: Path):
     """Create a request handler class with the work_dir baked in."""
     import threading
@@ -3555,6 +3575,8 @@ def make_handler(work_dir: Path):
                 from beatlab.ws_server import job_manager
                 job_id = job_manager.create_job("keyframe_candidates", total=count, meta={"keyframeId": kf_id, "project": project_name})
 
+                img_backend = _get_image_backend(project_dir)
+
                 def _run_freeform():
                     try:
                         from beatlab.render.google_video import GoogleVideoClient
@@ -3566,7 +3588,7 @@ def make_handler(work_dir: Path):
                             varied = f"{prompt}, variation {v}" if v > 1 else prompt
                             while True:
                                 try:
-                                    client.generate_image(varied, out_path, aspect_ratio=aspect_ratio)
+                                    client.generate_image(varied, out_path, aspect_ratio=aspect_ratio, image_backend=img_backend)
                                     _log(f"  freeform v{v} done")
                                     break
                                 except Exception as e:
@@ -3601,6 +3623,8 @@ def make_handler(work_dir: Path):
                 from beatlab.ws_server import job_manager
                 job_id = job_manager.create_job("keyframe_candidates", total=count, meta={"keyframeId": kf_id, "project": project_name})
 
+                img_backend = _get_image_backend(project_dir)
+
                 def _run_refine():
                     try:
                         from beatlab.render.google_video import GoogleVideoClient
@@ -3613,7 +3637,7 @@ def make_handler(work_dir: Path):
                             varied = f"{refinement_prompt}, variation {v}" if v > 1 else refinement_prompt
                             while True:
                                 try:
-                                    client.transform_image(str(source_img), varied, out_path)
+                                    client.transform_image(str(source_img), varied, out_path, image_backend=img_backend)
                                     paths.append(f"keyframe_candidates/candidates/section_{kf_id}/v{v}.png")
                                     break
                                 except Exception as e:
