@@ -138,6 +138,22 @@ def make_handler(work_dir: Path):
             if m:
                 return self._handle_get_timelines(m.group(1))
 
+            # GET /api/projects/:name/checkpoints
+            m = re.match(r"^/api/projects/([^/]+)/checkpoints$", path)
+            if m:
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                from datetime import datetime as _dt
+                checkpoints = []
+                for f in sorted(project_dir.glob("project.db.checkpoint-*"), reverse=True):
+                    stat = f.stat()
+                    checkpoints.append({
+                        "filename": f.name,
+                        "created": _dt.fromtimestamp(stat.st_mtime).isoformat(),
+                        "size_bytes": stat.st_size,
+                    })
+                return self._json_response({"checkpoints": checkpoints, "active": "project.db"})
+
             # GET /api/projects/:name/settings
             m = re.match(r"^/api/projects/([^/]+)/settings$", path)
             if m:
@@ -422,7 +438,7 @@ def make_handler(work_dir: Path):
             if m:
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                import shutil
+                import sqlite3 as _sqlite3
                 from datetime import datetime
                 db_path = project_dir / "project.db"
                 if not db_path.exists():
@@ -430,9 +446,59 @@ def make_handler(work_dir: Path):
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 filename = f"project.db.checkpoint-{ts}"
                 dst = project_dir / filename
-                shutil.copy2(str(db_path), str(dst))
+                # Use SQLite backup API — safe for WAL-mode databases
+                src_conn = _sqlite3.connect(str(db_path))
+                dst_conn = _sqlite3.connect(str(dst))
+                try:
+                    src_conn.backup(dst_conn)
+                finally:
+                    dst_conn.close()
+                    src_conn.close()
                 _log(f"checkpoint: {m.group(1)} -> {filename}")
                 return self._json_response({"success": True, "filename": filename})
+
+            # POST /api/projects/:name/checkpoint/restore
+            m = re.match(r"^/api/projects/([^/]+)/checkpoint/restore$", path)
+            if m:
+                project_name = m.group(1)
+                project_dir = self._require_project_dir(project_name)
+                if project_dir is None: return
+                body = self._read_json_body()
+                if body is None: return
+                filename = body.get("filename", "")
+                checkpoint_path = project_dir / filename
+                if not filename.startswith("project.db.checkpoint-") or not checkpoint_path.exists():
+                    return self._error(404, "NOT_FOUND", f"Checkpoint not found: {filename}")
+                db_path = project_dir / "project.db"
+                # Close all existing connections to this project's DB
+                from beatlab.db import close_db
+                close_db(project_dir)
+                # Use SQLite backup API to restore checkpoint over the active DB
+                import sqlite3 as _sqlite3
+                src_conn = _sqlite3.connect(str(checkpoint_path))
+                dst_conn = _sqlite3.connect(str(db_path))
+                try:
+                    src_conn.backup(dst_conn)
+                finally:
+                    dst_conn.close()
+                    src_conn.close()
+                _log(f"checkpoint restore: {project_name} <- {filename}")
+                return self._json_response({"success": True, "message": f"Restored from {filename}"})
+
+            # POST /api/projects/:name/checkpoint/delete
+            m = re.match(r"^/api/projects/([^/]+)/checkpoint/delete$", path)
+            if m:
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                body = self._read_json_body()
+                if body is None: return
+                filename = body.get("filename", "")
+                checkpoint_path = project_dir / filename
+                if not filename.startswith("project.db.checkpoint-") or not checkpoint_path.exists():
+                    return self._error(404, "NOT_FOUND", f"Checkpoint not found: {filename}")
+                checkpoint_path.unlink()
+                _log(f"checkpoint deleted: {m.group(1)} / {filename}")
+                return self._json_response({"success": True})
 
             # POST /api/projects/:name/bench/capture
             m = re.match(r"^/api/projects/([^/]+)/bench/capture$", path)
@@ -4731,22 +4797,6 @@ def make_handler(work_dir: Path):
 
         def _do_version_commit(self, project_dir, message):
             import subprocess as sp
-            import shutil
-            from datetime import datetime
-
-            # Create DB checkpoint before committing (throttled: max once per 5 minutes)
-            db_path = project_dir / "project.db"
-            if db_path.exists():
-                checkpoints = sorted(project_dir.glob("project.db.checkpoint-*"))
-                should_checkpoint = True
-                if checkpoints:
-                    last_cp_mtime = checkpoints[-1].stat().st_mtime
-                    import time as _time
-                    if _time.time() - last_cp_mtime < 300:  # 5 minutes
-                        should_checkpoint = False
-                if should_checkpoint:
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    shutil.copy2(str(db_path), str(project_dir / f"project.db.checkpoint-{ts}"))
 
             # Stage all changes
             sp.run(["git", "add", "-A"], cwd=project_dir, capture_output=True, check=True)
