@@ -4731,6 +4731,23 @@ def make_handler(work_dir: Path):
 
         def _do_version_commit(self, project_dir, message):
             import subprocess as sp
+            import shutil
+            from datetime import datetime
+
+            # Create DB checkpoint before committing (throttled: max once per 5 minutes)
+            db_path = project_dir / "project.db"
+            if db_path.exists():
+                checkpoints = sorted(project_dir.glob("project.db.checkpoint-*"))
+                should_checkpoint = True
+                if checkpoints:
+                    last_cp_mtime = checkpoints[-1].stat().st_mtime
+                    import time as _time
+                    if _time.time() - last_cp_mtime < 300:  # 5 minutes
+                        should_checkpoint = False
+                if should_checkpoint:
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    shutil.copy2(str(db_path), str(project_dir / f"project.db.checkpoint-{ts}"))
+
             # Stage all changes
             sp.run(["git", "add", "-A"], cwd=project_dir, capture_output=True, check=True)
 
