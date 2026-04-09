@@ -19,6 +19,17 @@ def _log(msg: str):
     print(f"[{ts}] {msg}", file=sys.stderr, flush=True)
 
 
+def _next_variant(directory: Path, ext: str = ".png") -> int:
+    """Find the next available variant number in a directory (max existing + 1)."""
+    import re as _re
+    max_v = 0
+    for f in directory.glob(f"v*{ext}"):
+        m = _re.match(r"v(\d+)", f.stem)
+        if m:
+            max_v = max(max_v, int(m.group(1)))
+    return max_v + 1
+
+
 def _get_project_settings(project_dir: Path) -> dict:
     """Read settings.yaml for a project."""
     import yaml
@@ -229,6 +240,11 @@ def make_handler(work_dir: Path):
             if m:
                 return self._handle_get_effects(m.group(1))
 
+            # GET /api/projects/:name/thumb/(.*)  — resized image thumbnail (cached to disk)
+            m = re.match(r"^/api/projects/([^/]+)/thumb/(.+)$", path)
+            if m:
+                return self._handle_image_thumb(m.group(1), m.group(2))
+
             # GET /api/projects/:name/thumbnail/(.*)  — first-frame JPEG for video files
             m = re.match(r"^/api/projects/([^/]+)/thumbnail/(.+)$", path)
             if m:
@@ -343,6 +359,11 @@ def make_handler(work_dir: Path):
             m = re.match(r"^/api/projects/([^/]+)/restore-keyframe$", path)
             if m:
                 return self._handle_restore_keyframe(m.group(1))
+
+            # POST /api/projects/:name/batch-set-base-image
+            m = re.match(r"^/api/projects/([^/]+)/batch-set-base-image$", path)
+            if m:
+                return self._handle_batch_set_base_image(m.group(1))
 
             # POST /api/projects/:name/set-base-image
             m = re.match(r"^/api/projects/([^/]+)/set-base-image$", path)
@@ -671,7 +692,7 @@ def make_handler(work_dir: Path):
                         _image_model = _get_meta(project_dir).get("image_model", "replicate/nano-banana-2")
                         candidates_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{kf_id}"
                         candidates_dir.mkdir(parents=True, exist_ok=True)
-                        existing = len(list(candidates_dir.glob("v*.png")))
+                        existing = _next_variant(candidates_dir, ".png") - 1
 
                         from beatlab.db import update_keyframe
                         paths = []
@@ -774,7 +795,7 @@ def make_handler(work_dir: Path):
                         _image_model = _get_meta2(project_dir).get("image_model", "replicate/nano-banana-2")
                         candidates_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{kf_id}"
                         candidates_dir.mkdir(parents=True, exist_ok=True)
-                        existing = len(list(candidates_dir.glob("v*.png")))
+                        existing = _next_variant(candidates_dir, ".png") - 1
 
                         from beatlab.db import update_keyframe
                         for i, prompt in enumerate(prompts[:count]):
@@ -1018,7 +1039,7 @@ def make_handler(work_dir: Path):
                 # Also create as v1 candidate so it appears in the candidates panel
                 cand_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{kf_id}"
                 cand_dir.mkdir(parents=True, exist_ok=True)
-                existing = len(list(cand_dir.glob("v*.png")))
+                existing = _next_variant(cand_dir, ".png") - 1
                 v = existing + 1
                 shutil.copy2(str(src), str(cand_dir / f"v{v}.png"))
                 from beatlab.db import update_keyframe
@@ -2521,7 +2542,7 @@ def make_handler(work_dir: Path):
                 # Add to candidates so it appears in the candidates panel
                 cand_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{kf_id}"
                 cand_dir.mkdir(parents=True, exist_ok=True)
-                existing = len(list(cand_dir.glob("v*.png")))
+                existing = _next_variant(cand_dir, ".png") - 1
                 v = existing + 1
                 shutil.copy2(str(source), str(cand_dir / f"v{v}.png"))
                 all_cands = sorted([
@@ -2534,6 +2555,62 @@ def make_handler(work_dir: Path):
                 update_keyframe(project_dir, kf_id, source=f"assets/stills/{still_name}", selected=v, candidates=all_cands)
 
                 self._json_response({"success": True, "keyframeId": kf_id, "still": still_name})
+            except Exception as e:
+                self._error(500, "INTERNAL_ERROR", str(e))
+
+        def _handle_batch_set_base_image(self, project_name: str):
+            """POST /api/projects/:name/batch-set-base-image — set base image for multiple keyframes at once."""
+            body = self._read_json_body()
+            if body is None:
+                return
+
+            items = body.get("items", [])
+            if not items:
+                return self._error(400, "BAD_REQUEST", "Missing 'items' array of {keyframeId, stillName}")
+
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+
+            try:
+                import shutil
+                from beatlab.db import update_keyframe
+
+                dest_dir = project_dir / "selected_keyframes"
+                dest_dir.mkdir(parents=True, exist_ok=True)
+
+                results = []
+                for item in items:
+                    kf_id = item.get("keyframeId")
+                    still_name = item.get("stillName")
+                    if not kf_id or not still_name:
+                        continue
+
+                    source = project_dir / "assets" / "stills" / still_name
+                    if not source.exists():
+                        # Also check pool/keyframes
+                        source = project_dir / "pool" / "keyframes" / still_name
+                    if not source.exists():
+                        results.append({"keyframeId": kf_id, "error": f"Still not found: {still_name}"})
+                        continue
+
+                    shutil.copy2(str(source), str(dest_dir / f"{kf_id}.png"))
+
+                    cand_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{kf_id}"
+                    cand_dir.mkdir(parents=True, exist_ok=True)
+                    existing = _next_variant(cand_dir, ".png") - 1
+                    v = existing + 1
+                    shutil.copy2(str(source), str(cand_dir / f"v{v}.png"))
+                    all_cands = sorted([
+                        f"keyframe_candidates/candidates/section_{kf_id}/{f.name}"
+                        for f in cand_dir.glob("v*.png")
+                    ], key=lambda p: int(p.rsplit("v", 1)[-1].split(".")[0]))
+
+                    update_keyframe(project_dir, kf_id, source=still_name, selected=v, candidates=all_cands)
+                    results.append({"keyframeId": kf_id, "success": True})
+
+                _log(f"batch-set-base-image: {len(results)} keyframes updated")
+                self._json_response({"success": True, "results": results})
             except Exception as e:
                 self._error(500, "INTERNAL_ERROR", str(e))
 
@@ -2569,7 +2646,7 @@ def make_handler(work_dir: Path):
                 # Copy as candidate v(N+1)
                 cand_dir = project_dir / "transition_candidates" / tr_id / "slot_0"
                 cand_dir.mkdir(parents=True, exist_ok=True)
-                existing = len(list(cand_dir.glob("v*.mp4")))
+                existing = _next_variant(cand_dir, ".mp4") - 1
                 variant = existing + 1
                 shutil.copy2(str(source), str(cand_dir / f"v{variant}.mp4"))
 
@@ -3594,7 +3671,7 @@ def make_handler(work_dir: Path):
 
                 candidates_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{kf_id}"
                 candidates_dir.mkdir(parents=True, exist_ok=True)
-                existing_count = len(list(candidates_dir.glob("v*.png")))
+                existing_count = _next_variant(candidates_dir, ".png") - 1
 
                 from beatlab.ws_server import job_manager
                 job_id = job_manager.create_job("keyframe_candidates", total=count, meta={"keyframeId": kf_id, "project": project_name})
@@ -3642,7 +3719,7 @@ def make_handler(work_dir: Path):
 
                 candidates_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{kf_id}"
                 candidates_dir.mkdir(parents=True, exist_ok=True)
-                existing_count = len(list(candidates_dir.glob("v*.png")))
+                existing_count = _next_variant(candidates_dir, ".png") - 1
 
                 from beatlab.ws_server import job_manager
                 job_id = job_manager.create_job("keyframe_candidates", total=count, meta={"keyframeId": kf_id, "project": project_name})
@@ -3706,7 +3783,7 @@ def make_handler(work_dir: Path):
 
             candidates_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{kf_id}"
             candidates_dir.mkdir(parents=True, exist_ok=True)
-            existing_count = len(list(candidates_dir.glob("v*.png")))
+            existing_count = _next_variant(candidates_dir, ".png") - 1
 
             from beatlab.ws_server import job_manager
             job_id = job_manager.create_job("keyframe_candidates", total=count, meta={"keyframeId": kf_id, "project": project_name})
@@ -3807,7 +3884,7 @@ def make_handler(work_dir: Path):
                 if slot_index is not None:
                     slot_dir = tr_candidates_dir / f"slot_{slot_index}"
                     if slot_dir.exists():
-                        existing_count = len(list(slot_dir.glob("v*.mp4")))
+                        existing_count = _next_variant(slot_dir, ".mp4") - 1
                 else:
                     for sd in tr_candidates_dir.iterdir():
                         if sd.is_dir():
@@ -3857,7 +3934,7 @@ def make_handler(work_dir: Path):
                         if not _Path(e_img).exists():
                             e_img = end_img
 
-                        slot_existing = len(list(slot_dir.glob("v*.mp4")))
+                        slot_existing = _next_variant(slot_dir, ".mp4") - 1
                         for v in range(slot_existing + 1, slot_existing + count + 1):
                             output = str(slot_dir / f"v{v}.mp4")
                             if _Path(output).exists():
@@ -4348,6 +4425,36 @@ def make_handler(work_dir: Path):
                     entries.append(info)
 
             self._json_response(entries)
+
+        def _handle_image_thumb(self, project_name: str, file_path: str):
+            """GET /api/projects/:name/thumb/{path} — serve a resized thumbnail of an image, cached to .thumbs/."""
+            project_dir = self._get_project_dir(project_name)
+            if project_dir is None:
+                return self._error(404, "NOT_FOUND", "Project not found")
+
+            source = project_dir / file_path
+            if not source.exists() or source.suffix.lower() not in ('.png', '.jpg', '.jpeg', '.webp'):
+                return self._error(404, "NOT_FOUND", f"Image not found: {file_path}")
+
+            # Cache dir: .thumbs/ mirrors the source path
+            thumb_dir = project_dir / ".thumbs" / Path(file_path).parent
+            thumb_dir.mkdir(parents=True, exist_ok=True)
+            thumb_path = thumb_dir / source.name
+
+            if not thumb_path.exists() or thumb_path.stat().st_mtime < source.stat().st_mtime:
+                from PIL import Image as _PILImage
+                with _PILImage.open(str(source)) as img:
+                    img.thumbnail((256, 256), _PILImage.LANCZOS)
+                    img.save(str(thumb_path), "JPEG", quality=80)
+
+            with open(str(thumb_path), "rb") as f:
+                data = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(data)
 
         def _handle_video_thumbnail(self, project_name: str, file_path: str):
             """GET /api/projects/:name/thumbnail/* — extract and serve first frame of a video as JPEG."""
@@ -5141,7 +5248,7 @@ def make_handler(work_dir: Path):
                     staging_dir.mkdir(parents=True, exist_ok=True)
 
                     paths = []
-                    existing = len(list(staging_dir.glob("v*.png")))
+                    existing = _next_variant(staging_dir, ".png") - 1
                     for i in range(count):
                         v = existing + i + 1
                         out_path = str(staging_dir / f"v{v}.png")
