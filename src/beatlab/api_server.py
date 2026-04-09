@@ -940,6 +940,8 @@ def make_handler(work_dir: Path):
                     fields["blend_mode"] = body["blendMode"]
                 if "opacity" in body:
                     fields["opacity"] = body["opacity"]
+                if "refinementPrompt" in body:
+                    fields["refinement_prompt"] = body["refinementPrompt"]
                 kf_id = body["keyframeId"]
                 _log(f"update-keyframe-style: {kf_id} {fields}")
                 update_keyframe(project_dir, kf_id, **fields)
@@ -1404,6 +1406,7 @@ def make_handler(work_dir: Path):
                     "label": kf.get("label", ""),
                     "labelColor": kf.get("label_color", ""),
                     "blendMode": kf.get("blend_mode", ""),
+                    "refinementPrompt": kf.get("refinement_prompt", ""),
                     "opacity": kf.get("opacity"),
                     "candidates": candidate_files,
                     "context": {

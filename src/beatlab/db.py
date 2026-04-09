@@ -201,6 +201,8 @@ def _ensure_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE keyframes ADD COLUMN blend_mode TEXT NOT NULL DEFAULT ''")
     if "opacity" not in kf_cols:
         conn.execute("ALTER TABLE keyframes ADD COLUMN opacity REAL")
+    if "refinement_prompt" not in kf_cols:
+        conn.execute("ALTER TABLE keyframes ADD COLUMN refinement_prompt TEXT NOT NULL DEFAULT ''")
 
     # Add blend_mode/opacity columns to transitions if missing
     tr_cols2 = {row[1] for row in conn.execute("PRAGMA table_info(transitions)").fetchall()}
@@ -293,6 +295,7 @@ def _row_to_keyframe(row: sqlite3.Row) -> dict:
         "label_color": row["label_color"] if "label_color" in row.keys() else "",
         "blend_mode": row["blend_mode"] if "blend_mode" in row.keys() else "",
         "opacity": row["opacity"] if "opacity" in row.keys() else None,
+        "refinement_prompt": row["refinement_prompt"] if "refinement_prompt" in row.keys() else "",
         "deleted_at": row["deleted_at"],
     }
 
@@ -322,13 +325,13 @@ def add_keyframe(project_dir: Path, kf: dict):
     conn = get_db(project_dir)
     def _do():
         conn.execute(
-            """INSERT OR REPLACE INTO keyframes (id, timestamp, section, source, prompt, selected, candidates, context, deleted_at, track_id, label, label_color, blend_mode, opacity)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT OR REPLACE INTO keyframes (id, timestamp, section, source, prompt, selected, candidates, context, deleted_at, track_id, label, label_color, blend_mode, opacity, refinement_prompt)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (kf["id"], kf["timestamp"], kf.get("section", ""), kf.get("source", ""),
              kf.get("prompt", ""), kf.get("selected"), json.dumps(kf.get("candidates", [])),
              json.dumps(kf.get("context")) if kf.get("context") else None, kf.get("deleted_at"),
              kf.get("track_id", "track_1"), kf.get("label", ""), kf.get("label_color", ""),
-             kf.get("blend_mode", ""), kf.get("opacity")),
+             kf.get("blend_mode", ""), kf.get("opacity"), kf.get("refinement_prompt", "")),
         )
         conn.commit()
     _retry_on_locked(_do)
