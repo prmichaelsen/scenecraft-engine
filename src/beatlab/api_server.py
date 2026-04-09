@@ -821,7 +821,7 @@ def make_handler(work_dir: Path):
 
                 # Copy style fields
                 style_fields = {}
-                for key in ("blend_mode", "opacity", "opacity_curve", "red_curve", "green_curve", "blue_curve", "black_curve", "hue_shift_curve", "saturation_curve", "invert_curve", "is_adjustment", "mask_center_x", "mask_center_y", "mask_radius", "mask_feather", "transform_x", "transform_y"):
+                for key in ("blend_mode", "opacity", "opacity_curve", "red_curve", "green_curve", "blue_curve", "black_curve", "hue_shift_curve", "saturation_curve", "invert_curve", "is_adjustment", "hidden", "mask_center_x", "mask_center_y", "mask_radius", "mask_feather", "transform_x", "transform_y"):
                     if src.get(key) is not None:
                         style_fields[key] = src[key]
                     elif key in ("blend_mode",):
@@ -990,6 +990,8 @@ def make_handler(work_dir: Path):
                     fields["chroma_key"] = body["chromaKey"]
                 if "isAdjustment" in body:
                     fields["is_adjustment"] = int(body["isAdjustment"])
+                if "hidden" in body:
+                    fields["hidden"] = body["hidden"]
                 tr_id = body["transitionId"]
                 _log(f"update-transition-style: {tr_id} {fields}")
                 update_transition(project_dir, tr_id, **fields)
@@ -1509,6 +1511,7 @@ def make_handler(work_dir: Path):
                     "transformY": tr.get("transform_y"),
                     "chromaKey": tr.get("chroma_key"),
                     "isAdjustment": tr.get("is_adjustment", False),
+                    "hidden": tr.get("hidden", False),
                     "candidates": slot_candidates,
                     "hasSelectedVideos": has_selected_videos,
                     "selected": selected_list,
@@ -2236,6 +2239,7 @@ def make_handler(work_dir: Path):
                         "saturation_curve": src_tr.get("saturation_curve"),
                         "invert_curve": src_tr.get("invert_curve"),
                         "is_adjustment": src_tr.get("is_adjustment", False),
+                        "hidden": src_tr.get("hidden", False),
                         "mask_center_x": src_tr.get("mask_center_x"),
                         "mask_center_y": src_tr.get("mask_center_y"),
                         "mask_radius": src_tr.get("mask_radius"),

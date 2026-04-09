@@ -220,6 +220,8 @@ def _ensure_schema(conn: sqlite3.Connection):
     for mask_col in ("mask_center_x", "mask_center_y", "mask_radius", "mask_feather", "transform_x", "transform_y"):
         if mask_col not in tr_cols2:
             conn.execute(f"ALTER TABLE transitions ADD COLUMN {mask_col} REAL")
+    if "hidden" not in tr_cols2:
+        conn.execute("ALTER TABLE transitions ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
 
     # Add layer_effect_types to suppressions if missing
     sup_cols = {row[1] for row in conn.execute("PRAGMA table_info(suppressions)").fetchall()}
@@ -412,6 +414,7 @@ def _row_to_transition(row: sqlite3.Row) -> dict:
         "transform_y": row["transform_y"] if "transform_y" in row.keys() else None,
         "deleted_at": row["deleted_at"],
         "include_section_desc": bool(row["include_section_desc"]) if "include_section_desc" in row.keys() else True,
+        "hidden": bool(row["hidden"]) if "hidden" in row.keys() else False,
     }
 
 
@@ -457,8 +460,8 @@ def add_transition(project_dir: Path, tr: dict):
 
     def _do_insert():
         conn.execute(
-            """INSERT OR REPLACE INTO transitions (id, from_kf, to_kf, duration_seconds, slots, action, use_global_prompt, selected, remap, deleted_at, track_id, label, label_color, tags, blend_mode, opacity, opacity_curve, red_curve, green_curve, blue_curve, black_curve, hue_shift_curve, saturation_curve, invert_curve, is_adjustment, mask_center_x, mask_center_y, mask_radius, mask_feather, transform_x, transform_y)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT OR REPLACE INTO transitions (id, from_kf, to_kf, duration_seconds, slots, action, use_global_prompt, selected, remap, deleted_at, track_id, label, label_color, tags, blend_mode, opacity, opacity_curve, red_curve, green_curve, blue_curve, black_curve, hue_shift_curve, saturation_curve, invert_curve, is_adjustment, mask_center_x, mask_center_y, mask_radius, mask_feather, transform_x, transform_y, hidden)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (tr["id"], tr.get("from", ""), tr.get("to", ""), tr.get("duration_seconds", 0),
              tr.get("slots", 1), tr.get("action", ""), int(tr.get("use_global_prompt", False)),
              json.dumps(selected), json.dumps(tr.get("remap", {"method": "linear", "target_duration": 0})),
@@ -476,7 +479,8 @@ def add_transition(project_dir: Path, tr: dict):
              _json_or_none(tr.get("invert_curve")),
              int(tr.get("is_adjustment", False)),
              tr.get("mask_center_x"), tr.get("mask_center_y"), tr.get("mask_radius"), tr.get("mask_feather"),
-             tr.get("transform_x"), tr.get("transform_y")),
+             tr.get("transform_x"), tr.get("transform_y"),
+             int(tr.get("hidden", False))),
         )
         conn.commit()
     _retry_on_locked(_do_insert)
@@ -506,6 +510,8 @@ def update_transition(project_dir: Path, tr_id: str, **fields):
         elif key == "include_section_desc":
             val = int(val)
         elif key == "is_adjustment":
+            val = int(val)
+        elif key == "hidden":
             val = int(val)
         elif key == "tags":
             val = json.dumps(val) if isinstance(val, list) else val

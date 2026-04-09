@@ -1773,6 +1773,8 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
             # Pre-load overlay clips: for each transition, load video frames; for keyframes, load still
             overlay_clips = []
             for tr in ttrs:
+                if tr.get("hidden"):
+                    continue
                 from_kf = next((k for k in tkfs if k["id"] == tr["from"]), None)
                 to_kf = next((k for k in tkfs if k["id"] == tr["to"]), None)
                 if not from_kf or not to_kf:
