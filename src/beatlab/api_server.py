@@ -13,10 +13,17 @@ from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, unquote
 
 
-def _log(msg: str):
+def _log(msg: str, level: str = "info"):
     from datetime import datetime
-    ts = datetime.now().strftime("%H:%M:%S")
+    now = datetime.now()
+    ts = now.strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", file=sys.stderr, flush=True)
+    # Broadcast to WebSocket clients
+    try:
+        from beatlab.ws_server import job_manager
+        job_manager._broadcast({"type": "log", "message": msg, "timestamp": now.isoformat(), "level": level})
+    except Exception:
+        pass
 
 
 def _next_variant(directory: Path, ext: str = ".png") -> int:
