@@ -1695,6 +1695,26 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                 except Exception:
                     opacity_curve = None
 
+            # Color grading curves
+            def _parse_curve(val):
+                if isinstance(val, str):
+                    try:
+                        return _json2.loads(val)
+                    except Exception:
+                        return None
+                return val
+
+            color_grading = {
+                "red_curve": _parse_curve(tr.get("red_curve")),
+                "green_curve": _parse_curve(tr.get("green_curve")),
+                "blue_curve": _parse_curve(tr.get("blue_curve")),
+                "black_curve": _parse_curve(tr.get("black_curve")),
+                "saturation_curve": _parse_curve(tr.get("saturation_curve")),
+                "hue_shift_curve": _parse_curve(tr.get("hue_shift_curve")),
+                "invert_curve": _parse_curve(tr.get("invert_curve")),
+            }
+            has_grading = any(color_grading.values())
+
             if selected.exists():
                 segments.append({
                     "from_ts": from_ts, "to_ts": to_ts,
@@ -1703,6 +1723,7 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                     "curve_points": remap.get("curve_points"),
                     "effects": tr_effects,
                     "opacity_curve": opacity_curve,
+                    **({k: v for k, v in color_grading.items() if v} if has_grading else {}),
                 })
             else:
                 kf_image = work_dir / "selected_keyframes" / f"{tr.get('from_id') or tr.get('from', '')}.png"
@@ -1713,6 +1734,7 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                         "remap_method": "linear", "curve_points": None,
                         "effects": tr_effects,
                         "opacity_curve": opacity_curve,
+                        **({k: v for k, v in color_grading.items() if v} if has_grading else {}),
                     })
     else:
         # Fallback to YAML-based clips_info
@@ -2127,6 +2149,11 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                 opacity = max(0.0, min(1.0, opacity))
                 if opacity < 0.999:
                     frame = cv2.convertScaleAbs(frame, alpha=opacity, beta=0)
+
+            # Color grading (saturation, RGB curves, etc.)
+            has_curves = any(seg.get(k) for k in ("red_curve", "green_curve", "blue_curve", "black_curve", "saturation_curve", "hue_shift_curve", "invert_curve"))
+            if has_curves:
+                frame = _apply_color_grading(frame, seg, raw_progress)
 
             # Per-transition effects (strobe etc.)
             for efx in seg.get("effects", []):
