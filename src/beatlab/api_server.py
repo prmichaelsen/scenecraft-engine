@@ -971,7 +971,7 @@ def make_handler(work_dir: Path):
 
                 # Copy style fields
                 style_fields = {}
-                for key in ("blend_mode", "opacity", "opacity_curve", "red_curve", "green_curve", "blue_curve", "black_curve", "hue_shift_curve", "saturation_curve", "invert_curve", "chroma_key", "is_adjustment", "hidden", "mask_center_x", "mask_center_y", "mask_radius", "mask_feather", "transform_x", "transform_y"):
+                for key in ("blend_mode", "opacity", "opacity_curve", "red_curve", "green_curve", "blue_curve", "black_curve", "hue_shift_curve", "saturation_curve", "invert_curve", "chroma_key", "is_adjustment", "hidden", "mask_center_x", "mask_center_y", "mask_radius", "mask_feather", "transform_x", "transform_y", "transform_x_curve", "transform_y_curve", "transform_z_curve"):
                     if src.get(key) is not None:
                         style_fields[key] = src[key]
                     elif key in ("blend_mode",):
@@ -1142,6 +1142,12 @@ def make_handler(work_dir: Path):
                     fields["transform_x"] = body["transformX"]
                 if "transformY" in body:
                     fields["transform_y"] = body["transformY"]
+                if "transformXCurve" in body:
+                    fields["transform_x_curve"] = body["transformXCurve"]
+                if "transformYCurve" in body:
+                    fields["transform_y_curve"] = body["transformYCurve"]
+                if "transformZCurve" in body:
+                    fields["transform_z_curve"] = body["transformZCurve"]
                 if "chromaKey" in body:
                     fields["chroma_key"] = body["chromaKey"]
                 if "isAdjustment" in body:
@@ -1666,6 +1672,9 @@ def make_handler(work_dir: Path):
                     "maskFeather": tr.get("mask_feather"),
                     "transformX": tr.get("transform_x"),
                     "transformY": tr.get("transform_y"),
+                    "transformXCurve": tr.get("transform_x_curve"),
+                    "transformYCurve": tr.get("transform_y_curve"),
+                    "transformZCurve": tr.get("transform_z_curve"),
                     "chromaKey": tr.get("chroma_key"),
                     "isAdjustment": tr.get("is_adjustment", False),
                     "hidden": tr.get("hidden", False),
@@ -2416,6 +2425,9 @@ def make_handler(work_dir: Path):
                         "mask_feather": src_tr.get("mask_feather"),
                         "transform_x": src_tr.get("transform_x"),
                         "transform_y": src_tr.get("transform_y"),
+                        "transform_x_curve": src_tr.get("transform_x_curve"),
+                        "transform_y_curve": src_tr.get("transform_y_curve"),
+                        "transform_z_curve": src_tr.get("transform_z_curve"),
                         "label": src_tr.get("label", ""),
                         "label_color": src_tr.get("label_color", ""),
                         "tags": src_tr.get("tags", []),
@@ -3310,30 +3322,46 @@ def make_handler(work_dir: Path):
                         "selected": 1,
                     })
 
-                    # Find neighbors and split spanning transition
-                    all_kfs = db_get_kfs(project_dir)
+                    # Find neighbors ON THE SAME TRACK and split spanning transition
+                    track_id = body.get("trackId", "track_1")
+                    all_kfs = [k for k in db_get_kfs(project_dir)
+                               if k.get("track_id", "track_1") == track_id and not k.get("deleted_at")]
                     sorted_kfs = sorted(all_kfs, key=lambda k: parse_ts(k["timestamp"]))
                     new_idx = next((i for i, k in enumerate(sorted_kfs) if k["id"] == kf_id), -1)
                     prev_kf = sorted_kfs[new_idx - 1] if new_idx > 0 else None
                     next_kf = sorted_kfs[new_idx + 1] if new_idx < len(sorted_kfs) - 1 else None
 
                     if prev_kf and next_kf:
-                        all_trs = db_get_trs(project_dir)
+                        all_trs = [t for t in db_get_trs(project_dir)
+                                   if t.get("track_id", "track_1") == track_id and not t.get("deleted_at")]
+                        # Find spanning transition between neighbors
                         old_tr = next((t for t in all_trs if t["from"] == prev_kf["id"] and t["to"] == next_kf["id"]), None)
+
+                        # Check no transition already exists from prev/next to new kf
+                        existing_from_prev = any(t["from"] == prev_kf["id"] and t["to"] == kf_id for t in all_trs)
+                        existing_to_next = any(t["from"] == kf_id and t["to"] == next_kf["id"] for t in all_trs)
+
                         if old_tr:
                             now = datetime.now(timezone.utc).isoformat()
                             db_del_tr(project_dir, old_tr["id"], now)
-                            pt = parse_ts(prev_kf["timestamp"])
-                            nt = parse_ts(next_kf["timestamp"])
-                            d1, d2 = round(at_time - pt, 2), round(nt - at_time, 2)
+
+                        pt = parse_ts(prev_kf["timestamp"])
+                        nt = parse_ts(next_kf["timestamp"])
+                        d1, d2 = round(at_time - pt, 2), round(nt - at_time, 2)
+
+                        # Only create transitions if they don't already exist and have positive duration
+                        if not existing_from_prev and d1 > 0.05:
                             tr1_id = next_transition_id(project_dir)
                             db_add_tr(project_dir, {"id": tr1_id, "from": prev_kf["id"], "to": kf_id,
                                 "duration_seconds": d1, "slots": 1, "action": "", "use_global_prompt": False,
-                                "selected": None, "remap": {"method": "linear", "target_duration": d1}})
+                                "selected": None, "remap": {"method": "linear", "target_duration": d1},
+                                "track_id": track_id})
+                        if not existing_to_next and d2 > 0.05:
                             tr2_id = next_transition_id(project_dir)
                             db_add_tr(project_dir, {"id": tr2_id, "from": kf_id, "to": next_kf["id"],
                                 "duration_seconds": d2, "slots": 1, "action": "", "use_global_prompt": False,
-                                "selected": None, "remap": {"method": "linear", "target_duration": d2}})
+                                "selected": None, "remap": {"method": "linear", "target_duration": d2},
+                                "track_id": track_id})
 
                     self._json_response({"success": True, "type": "keyframe", "id": kf_id})
                 else:
