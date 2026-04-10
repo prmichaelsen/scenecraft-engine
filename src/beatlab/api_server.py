@@ -2272,41 +2272,124 @@ def make_handler(work_dir: Path):
                 }
                 db_add_kf(project_dir, new_kf)
 
-                # Wire up transitions (same logic as add-keyframe — filter by track)
-                all_kfs = [k for k in db_get_kfs(project_dir) if k.get("track_id", "track_1") == track_id]
+                # Wire up transitions — filter by track, check overlaps, copy properties from spanning tr
+                all_kfs = [k for k in db_get_kfs(project_dir)
+                           if k.get("track_id", "track_1") == track_id and not k.get("deleted_at")]
                 sorted_kfs = sorted(all_kfs, key=lambda k: parse_ts(k["timestamp"]))
                 new_idx = next((i for i, k in enumerate(sorted_kfs) if k["id"] == new_id), -1)
                 prev_kf = sorted_kfs[new_idx - 1] if new_idx > 0 else None
                 next_kf = sorted_kfs[new_idx + 1] if new_idx < len(sorted_kfs) - 1 else None
 
                 from datetime import datetime, timezone
+                all_trs = [t for t in db_get_trs(project_dir)
+                           if t.get("track_id", "track_1") == track_id and not t.get("deleted_at")]
+
+                # Find and remove spanning transition, preserving its properties
+                old_tr = None
                 if prev_kf and next_kf:
-                    all_trs = db_get_trs(project_dir)
                     old_tr = next((t for t in all_trs if t["from"] == prev_kf["id"] and t["to"] == next_kf["id"]), None)
                     if old_tr:
                         db_del_tr(project_dir, old_tr["id"], datetime.now(timezone.utc).isoformat())
 
+                # Check for existing transitions to avoid duplicates
+                existing_from_prev = any(t["from"] == prev_kf["id"] and t["to"] == new_id for t in all_trs) if prev_kf else False
+                existing_to_next = any(t["from"] == new_id and t["to"] == next_kf["id"] for t in all_trs) if next_kf else False
+
                 prev_time = parse_ts(prev_kf["timestamp"]) if prev_kf else None
                 next_time = parse_ts(next_kf["timestamp"]) if next_kf else None
 
-                if prev_kf:
+                # Build base properties from old spanning transition (if any)
+                tr_props = {}
+                if old_tr:
+                    for prop in ("action", "use_global_prompt", "blend_mode", "opacity",
+                                 "opacity_curve", "red_curve", "green_curve", "blue_curve",
+                                 "black_curve", "saturation_curve", "hue_shift_curve",
+                                 "invert_curve", "chroma_key", "is_adjustment",
+                                 "mask_center_x", "mask_center_y", "mask_radius", "mask_feather",
+                                 "transform_x", "transform_y", "hidden",
+                                 "label", "label_color", "tags"):
+                        if old_tr.get(prop) is not None:
+                            tr_props[prop] = old_tr[prop]
+
+                if prev_kf and not existing_from_prev:
                     dur_before = round(new_time - prev_time, 2)
-                    tr1_id = next_transition_id(project_dir)
-                    db_add_tr(project_dir, {
-                        "id": tr1_id, "from": prev_kf["id"], "to": new_id,
-                        "duration_seconds": dur_before, "slots": 1,
-                        "action": "", "use_global_prompt": False, "selected": None,
-                        "remap": {"method": "linear", "target_duration": dur_before},
-                    })
-                if next_kf:
+                    if dur_before > 0.05:
+                        tr1_id = next_transition_id(project_dir)
+                        # Copy video candidates and selected from old_tr if it exists
+                        tr1_data = {
+                            "id": tr1_id, "from": prev_kf["id"], "to": new_id,
+                            "duration_seconds": dur_before, "slots": 1,
+                            "selected": None,
+                            "remap": {"method": "linear", "target_duration": dur_before},
+                            "track_id": track_id,
+                            **tr_props,
+                        }
+                        db_add_tr(project_dir, tr1_data)
+
+                        # Copy selected video from old spanning transition
+                        if old_tr:
+                            old_sel = project_dir / "selected_transitions" / f"{old_tr['id']}_slot_0.mp4"
+                            if old_sel.exists():
+                                new_sel = project_dir / "selected_transitions" / f"{tr1_id}_slot_0.mp4"
+                                new_sel.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(str(old_sel), str(new_sel))
+                                from beatlab.db import update_transition
+                                update_transition(project_dir, tr1_id, selected=[1])
+
+                            # Copy transition candidates
+                            old_cand = project_dir / "transition_candidates" / old_tr["id"]
+                            if old_cand.is_dir():
+                                new_cand = project_dir / "transition_candidates" / tr1_id
+                                new_cand.mkdir(parents=True, exist_ok=True)
+                                for slot_dir in old_cand.iterdir():
+                                    if slot_dir.is_dir():
+                                        dst_slot = new_cand / slot_dir.name
+                                        dst_slot.mkdir(parents=True, exist_ok=True)
+                                        for f in slot_dir.iterdir():
+                                            shutil.copy2(str(f), str(dst_slot / f.name))
+
+                            # Copy transition effects
+                            from beatlab.db import get_transition_effects, add_transition_effect
+                            for fx in get_transition_effects(project_dir, old_tr["id"]):
+                                add_transition_effect(project_dir, tr1_id, fx["type"], fx.get("params"))
+
+                if next_kf and not existing_to_next:
                     dur_after = round(next_time - new_time, 2)
-                    tr2_id = next_transition_id(project_dir)
-                    db_add_tr(project_dir, {
-                        "id": tr2_id, "from": new_id, "to": next_kf["id"],
-                        "duration_seconds": dur_after, "slots": 1,
-                        "action": "", "use_global_prompt": False, "selected": None,
-                        "remap": {"method": "linear", "target_duration": dur_after},
-                    })
+                    if dur_after > 0.05:
+                        tr2_id = next_transition_id(project_dir)
+                        tr2_data = {
+                            "id": tr2_id, "from": new_id, "to": next_kf["id"],
+                            "duration_seconds": dur_after, "slots": 1,
+                            "selected": None,
+                            "remap": {"method": "linear", "target_duration": dur_after},
+                            "track_id": track_id,
+                            **tr_props,
+                        }
+                        db_add_tr(project_dir, tr2_data)
+
+                        # Copy video + candidates to second transition too
+                        if old_tr:
+                            old_sel = project_dir / "selected_transitions" / f"{old_tr['id']}_slot_0.mp4"
+                            if old_sel.exists():
+                                new_sel = project_dir / "selected_transitions" / f"{tr2_id}_slot_0.mp4"
+                                shutil.copy2(str(old_sel), str(new_sel))
+                                from beatlab.db import update_transition
+                                update_transition(project_dir, tr2_id, selected=[1])
+
+                            old_cand = project_dir / "transition_candidates" / old_tr["id"]
+                            if old_cand.is_dir():
+                                new_cand = project_dir / "transition_candidates" / tr2_id
+                                new_cand.mkdir(parents=True, exist_ok=True)
+                                for slot_dir in old_cand.iterdir():
+                                    if slot_dir.is_dir():
+                                        dst_slot = new_cand / slot_dir.name
+                                        dst_slot.mkdir(parents=True, exist_ok=True)
+                                        for f in slot_dir.iterdir():
+                                            shutil.copy2(str(f), str(dst_slot / f.name))
+
+                            from beatlab.db import get_transition_effects, add_transition_effect
+                            for fx in get_transition_effects(project_dir, old_tr["id"]):
+                                add_transition_effect(project_dir, tr2_id, fx["type"], fx.get("params"))
 
                 _log(f"  Duplicated {source_id} -> {new_id} at {timestamp} ({len(new_candidates)} candidates copied)")
                 self._json_response({"success": True, "keyframe": {"id": new_id, "timestamp": timestamp}})
