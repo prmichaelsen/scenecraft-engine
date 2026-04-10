@@ -2417,13 +2417,38 @@ def make_handler(work_dir: Path):
                 # 3. Find transitions between source kfs and duplicate them
                 src_kf_set = set(kf_ids)
                 all_trs = db_get_trs(project_dir)
-                internal_trs = [t for t in all_trs if t["from"] in src_kf_set and t["to"] in src_kf_set]
+                internal_trs = [t for t in all_trs
+                                if t["from"] in src_kf_set and t["to"] in src_kf_set
+                                and not t.get("deleted_at")]
+
+                # Build existing time ranges on target track for overlap check
+                from beatlab.db import get_keyframes as db_get_kfs_paste
+                all_kfs_paste = {k["id"]: k for k in db_get_kfs_paste(project_dir) if not k.get("deleted_at")}
+                target_trs = [t for t in all_trs
+                              if t.get("track_id") == target_track and not t.get("deleted_at")]
+                existing_ranges = []
+                for t in target_trs:
+                    fk = all_kfs_paste.get(t["from"])
+                    tk = all_kfs_paste.get(t["to"])
+                    if fk and tk:
+                        existing_ranges.append((parse_ts(fk["timestamp"]), parse_ts(tk["timestamp"])))
 
                 created_trs = []
                 for src_tr in internal_trs:
                     new_from = id_map.get(src_tr["from"])
                     new_to = id_map.get(src_tr["to"])
                     if not new_from or not new_to:
+                        continue
+
+                    # Skip zero-length transitions
+                    from_ts = parse_ts(next((k["timestamp"] for k in created_kfs if k["id"] == new_from), "0"))
+                    to_ts = parse_ts(next((k["timestamp"] for k in created_kfs if k["id"] == new_to), "0"))
+                    if to_ts - from_ts <= 0.05:
+                        continue
+
+                    # Skip if overlaps an existing transition on the target track
+                    overlaps = any(ef < to_ts and et > from_ts for ef, et in existing_ranges)
+                    if overlaps:
                         continue
 
                     new_tr_id = next_transition_id(project_dir)
@@ -4082,7 +4107,9 @@ def make_handler(work_dir: Path):
             count = body.get("count", 4)  # how many NEW candidates to generate
             slot_index = body.get("slotIndex")  # optional: generate for a single slot only
             duration = body.get("duration")  # optional: 4, 6, or 8 seconds
-            _log(f"[generate-transition-candidates] tr={tr_id} count={count} duration={duration} (body keys: {list(body.keys())})")
+            use_next_tr_frame = body.get("useNextTransitionFrame", False)  # use first frame of next transition's video as end frame
+            no_end_frame = body.get("noEndFrame", False)  # generate from start image only, no end frame conditioning
+            _log(f"[generate-transition-candidates] tr={tr_id} count={count} duration={duration} useNextTrFrame={use_next_tr_frame} noEndFrame={no_end_frame} (body keys: {list(body.keys())})")
             if not tr_id:
                 return self._error(400, "BAD_REQUEST", "Missing 'transitionId'")
 
@@ -4111,7 +4138,33 @@ def make_handler(work_dir: Path):
             from pathlib import Path as _Path
             if not _Path(start_img).exists():
                 return self._error(400, "BAD_REQUEST", f"Start keyframe image not found: {from_kf_id}")
-            if not _Path(end_img).exists():
+
+            # If useNextTransitionFrame: extract first frame from the next transition's selected video as end frame
+            if use_next_tr_frame:
+                from beatlab.db import get_transitions as _get_all_trs
+                all_trs = _get_all_trs(project_dir)
+                # Find transitions starting from to_kf on the same track
+                next_tr = next((t for t in all_trs if t["from"] == to_kf_id and t.get("track_id") == tr.get("track_id")), None)
+                if next_tr:
+                    next_sel_video = project_dir / "selected_transitions" / f"{next_tr['id']}_slot_0.mp4"
+                    if next_sel_video.exists():
+                        # Extract first frame
+                        import subprocess as _sp
+                        extracted = project_dir / "selected_keyframes" / f"_next_tr_start_{tr_id}.png"
+                        extracted.parent.mkdir(parents=True, exist_ok=True)
+                        _sp.run(["ffmpeg", "-y", "-i", str(next_sel_video), "-vframes", "1", "-q:v", "2", str(extracted)],
+                                capture_output=True, timeout=10)
+                        if extracted.exists():
+                            end_img = str(extracted)
+                            _log(f"  useNextTransitionFrame: using first frame of {next_tr['id']} as end image")
+                        else:
+                            _log(f"  useNextTransitionFrame: ffmpeg extraction failed, falling back to keyframe")
+                    else:
+                        _log(f"  useNextTransitionFrame: next transition {next_tr['id']} has no selected video, falling back to keyframe")
+                else:
+                    _log(f"  useNextTransitionFrame: no next transition from {to_kf_id}, falling back to keyframe")
+
+            if not no_end_frame and not _Path(end_img).exists():
                 return self._error(400, "BAD_REQUEST", f"End keyframe image not found: {to_kf_id}")
 
             # Count existing candidates
@@ -4188,14 +4241,22 @@ def make_handler(work_dir: Path):
 
                     def _gen(j):
                         try:
-                            client.generate_video_transition(
-                                start_frame_path=j["start"],
-                                end_frame_path=j["end"],
-                                prompt=prompt,
-                                output_path=j["output"],
-                                duration_seconds=int(slot_duration),
-                                on_status=lambda msg: job_manager.update_progress(job_id, completed_count[0], msg),
-                            )
+                            if no_end_frame:
+                                client.generate_video_from_image(
+                                    image_path=j["start"],
+                                    prompt=prompt,
+                                    output_path=j["output"],
+                                    duration_seconds=int(slot_duration),
+                                )
+                            else:
+                                client.generate_video_transition(
+                                    start_frame_path=j["start"],
+                                    end_frame_path=j["end"],
+                                    prompt=prompt,
+                                    output_path=j["output"],
+                                    duration_seconds=int(slot_duration),
+                                    on_status=lambda msg: job_manager.update_progress(job_id, completed_count[0], msg),
+                                )
                             completed_count[0] += 1
                             _log(f"    {tr_id} slot_{j['slot']} v{j['variant']} done")
                         except PromptRejectedError as e:
