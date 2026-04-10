@@ -132,6 +132,13 @@ def _ensure_schema(conn: sqlite3.Connection):
             added_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS prompt_roster (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            template TEXT NOT NULL DEFAULT '',
+            category TEXT NOT NULL DEFAULT 'general'
+        );
+
         CREATE TABLE IF NOT EXISTS markers (
             id TEXT PRIMARY KEY,
             time REAL NOT NULL,
@@ -978,6 +985,38 @@ def update_marker(project_dir: Path, marker_id: str, **fields):
 def delete_marker(project_dir: Path, marker_id: str):
     conn = get_db(project_dir)
     conn.execute("DELETE FROM markers WHERE id = ?", (marker_id,))
+    conn.commit()
+
+
+# ── Prompt Roster ─────────────────────────────────────────────────────
+
+def get_prompt_roster(project_dir: Path) -> list[dict]:
+    conn = get_db(project_dir)
+    rows = conn.execute("SELECT id, name, template, category FROM prompt_roster ORDER BY category, name").fetchall()
+    return [{"id": r["id"], "name": r["name"], "template": r["template"], "category": r["category"]} for r in rows]
+
+
+def add_prompt_roster(project_dir: Path, prompt_id: str, name: str, template: str, category: str = "general"):
+    conn = get_db(project_dir)
+    conn.execute("INSERT OR REPLACE INTO prompt_roster (id, name, template, category) VALUES (?, ?, ?, ?)", (prompt_id, name, template, category))
+    conn.commit()
+
+
+def update_prompt_roster(project_dir: Path, prompt_id: str, **fields):
+    conn = get_db(project_dir)
+    sets = []
+    values = []
+    for key, val in fields.items():
+        sets.append(f"{key} = ?")
+        values.append(val)
+    values.append(prompt_id)
+    conn.execute(f"UPDATE prompt_roster SET {', '.join(sets)} WHERE id = ?", values)
+    conn.commit()
+
+
+def delete_prompt_roster(project_dir: Path, prompt_id: str):
+    conn = get_db(project_dir)
+    conn.execute("DELETE FROM prompt_roster WHERE id = ?", (prompt_id,))
     conn.commit()
 
 

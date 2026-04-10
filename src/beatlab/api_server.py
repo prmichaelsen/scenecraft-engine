@@ -283,6 +283,14 @@ def make_handler(work_dir: Path):
                 from beatlab.db import get_markers
                 return self._json_response({"markers": get_markers(project_dir)})
 
+            # GET /api/projects/:name/prompt-roster
+            m = re.match(r"^/api/projects/([^/]+)/prompt-roster$", path)
+            if m:
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                from beatlab.db import get_prompt_roster
+                return self._json_response({"prompts": get_prompt_roster(project_dir)})
+
             # GET /api/projects/:name/pool
             m = re.match(r"^/api/projects/([^/]+)/pool$", path)
             if m:
@@ -1350,6 +1358,43 @@ def make_handler(work_dir: Path):
                 rm_id = body.get("id", "")
                 _log(f"markers/remove: {rm_id}")
                 delete_marker(project_dir, rm_id)
+                return self._json_response({"success": True})
+
+            # POST /api/projects/:name/prompt-roster/add
+            m = re.match(r"^/api/projects/([^/]+)/prompt-roster/add$", path)
+            if m:
+                body = self._read_json_body()
+                if body is None: return
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                from beatlab.db import add_prompt_roster
+                pid = body.get("id", f"pr_{int(__import__('time').time() * 1000)}")
+                add_prompt_roster(project_dir, pid, body.get("name", ""), body.get("template", ""), body.get("category", "general"))
+                return self._json_response({"success": True, "id": pid})
+
+            # POST /api/projects/:name/prompt-roster/update
+            m = re.match(r"^/api/projects/([^/]+)/prompt-roster/update$", path)
+            if m:
+                body = self._read_json_body()
+                if body is None: return
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                from beatlab.db import update_prompt_roster
+                pid = body.pop("id", None)
+                if not pid: return self._error(400, "BAD_REQUEST", "Missing 'id'")
+                updates = {k: v for k, v in body.items() if k in ("name", "template", "category")}
+                update_prompt_roster(project_dir, pid, **updates)
+                return self._json_response({"success": True})
+
+            # POST /api/projects/:name/prompt-roster/remove
+            m = re.match(r"^/api/projects/([^/]+)/prompt-roster/remove$", path)
+            if m:
+                body = self._read_json_body()
+                if body is None: return
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                from beatlab.db import delete_prompt_roster
+                delete_prompt_roster(project_dir, body.get("id", ""))
                 return self._json_response({"success": True})
 
             # POST /api/projects/:name/split-transition
