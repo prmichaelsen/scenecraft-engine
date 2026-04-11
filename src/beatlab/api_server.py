@@ -476,6 +476,29 @@ def make_handler(work_dir: Path):
             if m:
                 return self._handle_enhance_transition_action(m.group(1))
 
+            # POST /api/projects/:name/pool/add
+            m = re.match(r"^/api/projects/([^/]+)/pool/add$", path)
+            if m:
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                body = self._read_json_body()
+                if body is None: return
+                source_path = body.get("sourcePath", "")
+                item_type = body.get("type", "transition")
+                src = project_dir / source_path
+                if not src.exists():
+                    return self._error(404, "NOT_FOUND", f"Source not found: {source_path}")
+                import shutil
+                if item_type == "keyframe":
+                    dest_dir = project_dir / "pool" / "keyframes"
+                else:
+                    dest_dir = project_dir / "pool" / "segments"
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                dest = dest_dir / src.name
+                shutil.copy2(str(src), str(dest))
+                _log(f"pool/add: {source_path} -> {dest.relative_to(project_dir)}")
+                return self._json_response({"success": True, "path": str(dest.relative_to(project_dir))})
+
             # POST /api/projects/:name/assign-pool-video
             m = re.match(r"^/api/projects/([^/]+)/assign-pool-video$", path)
             if m:
