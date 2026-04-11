@@ -584,6 +584,7 @@ class GoogleVideoClient:
         model: str = "veo-3.0-generate-001",
         aspect_ratio: str = "16:9",
         ingredients: list[str] | None = None,
+        on_status=None,
     ) -> str:
         """Generate a video clip from a reference image using Veo.
 
