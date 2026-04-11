@@ -3154,7 +3154,7 @@ def make_handler(work_dir: Path):
                 from beatlab.db import get_keyframes, get_transitions, add_to_bench
 
                 track_id = body.get("trackId", "track_1")
-                _log(f"bench-capture: {project_name} time={time_sec} track={track_id}")
+                _log(f"bench-capture: {project_name} time={time_sec} track={track_id} body_keys={list(body.keys())}")
 
                 def parse_ts(ts):
                     parts = str(ts).split(":")
@@ -3207,14 +3207,28 @@ def make_handler(work_dir: Path):
 
                 if active_tr:
                     video_path = project_dir / "selected_transitions" / f"{active_tr['id']}_slot_0.mp4"
-                    _log(f"  transition path: {video_path} exists={video_path.exists()}")
+                    _log(f"  transition: {active_tr['id']} path={video_path} exists={video_path.exists()}")
+                    _log(f"  tr_from={tr_from_time:.2f} tr_to={tr_to_time:.2f} selected={active_tr.get('selected')}")
                     if not video_path.exists():
+                        _log(f"  ERROR: video file missing for {active_tr['id']}")
                         return self._error(404, "NOT_FOUND", f"Transition video not found: {active_tr['id']}")
 
                     timeline_dur = tr_to_time - tr_from_time
                     progress = (time_sec - tr_from_time) / timeline_dur if timeline_dur > 0 else 0
-                    video_dur = active_tr.get("duration_seconds", timeline_dur)
+                    # Probe actual video duration — DB duration_seconds is the
+                    # timeline span, not the file length (Veo clamps to 4-8s).
+                    probe = sp.run(
+                        ["ffprobe", "-v", "error", "-show_entries",
+                         "format=duration", "-of", "csv=p=0", str(video_path)],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    probe_dur = probe.stdout.strip() if probe.returncode == 0 else ""
+                    video_dur = float(probe_dur) if probe_dur else active_tr.get("duration_seconds", timeline_dur)
                     video_time = progress * video_dur
+                    # Clamp to at least 1 frame from the end (avoid seeking past last decodable frame)
+                    max_seek = max(0, video_dur - 0.1)
+                    video_time = min(video_time, max_seek)
+                    _log(f"  probe_dur={probe_dur} video_dur={video_dur:.3f} progress={progress:.3f} video_time={video_time:.3f} (clamped to max {max_seek:.3f})")
                     _log(f"  ffmpeg: -ss {video_time:.3f} from {video_path.name} -> {snap_path}")
 
                     result = sp.run(
@@ -3223,7 +3237,9 @@ def make_handler(work_dir: Path):
                         capture_output=True, text=True, timeout=10,
                     )
                     if result.returncode != 0:
-                        _log(f"  ffmpeg failed: {result.stderr[:300]}")
+                        _log(f"  ffmpeg FAILED (rc={result.returncode}): {result.stderr[:500]}")
+                    else:
+                        _log(f"  ffmpeg OK, output exists={snap_path.exists()}")
                     label = f"frame @ {int(time_sec // 60)}:{time_sec % 60:05.2f} ({active_tr['id']})"
                 elif current_kf:
                     import shutil
@@ -3247,9 +3263,9 @@ def make_handler(work_dir: Path):
                 _log(f"  success: {source_path} ({bench_id})")
                 self._json_response({"success": True, "benchId": bench_id, "sourcePath": source_path})
             except Exception as e:
-                _log(f"bench-capture error: {e}")
+                _log(f"bench-capture ERROR: {type(e).__name__}: {e}")
                 _tb.print_exc()
-                self._error(500, "INTERNAL_ERROR", str(e))
+                self._error(500, "INTERNAL_ERROR", f"{type(e).__name__}: {e}")
 
         def _handle_bench_upload(self, project_name: str):
             """POST /api/projects/:name/bench/upload — upload a frame snapshot and add to bench."""
@@ -4394,7 +4410,11 @@ def make_handler(work_dir: Path):
                         if sd.is_dir():
                             existing_count = max(existing_count, len(list(sd.glob("v*.mp4"))))
 
-            prompt = f"{action}. Camera and motion: {motion_prompt}" if motion_prompt else action
+            use_global = tr.get("use_global_prompt", True)
+            if use_global and motion_prompt:
+                prompt = f"{action}. Camera and motion style: {motion_prompt}. Do not render any text on screen."
+            else:
+                prompt = f"{action}. Do not render any text on screen."
             if duration:
                 slot_duration = duration
             else:
