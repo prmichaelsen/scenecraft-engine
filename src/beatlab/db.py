@@ -212,6 +212,11 @@ def _ensure_schema(conn: sqlite3.Connection):
             key TEXT PRIMARY KEY,
             value INTEGER
         );
+        CREATE TABLE IF NOT EXISTS redo_log (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            undo_group INTEGER NOT NULL,
+            sql_text TEXT NOT NULL
+        );
         INSERT OR IGNORE INTO undo_state VALUES ('current_group', 0);
         INSERT OR IGNORE INTO undo_state VALUES ('active', 1);
     """)
@@ -1245,7 +1250,8 @@ def undo_begin(project_dir: Path, description: str) -> int:
         "INSERT INTO undo_groups (id, description, timestamp) VALUES (?, ?, ?)",
         (group_id, description, datetime.now(timezone.utc).isoformat())
     )
-    # Clear redo history
+    # Clear redo history (new operation invalidates redo stack)
+    conn.execute("DELETE FROM redo_log WHERE undo_group IN (SELECT id FROM undo_groups WHERE undone = 1)")
     conn.execute("DELETE FROM undo_log WHERE undo_group IN (SELECT id FROM undo_groups WHERE undone = 1)")
     conn.execute("DELETE FROM undo_groups WHERE undone = 1")
     # Prune old history (keep max 1000 groups)
@@ -1270,30 +1276,70 @@ def undo_execute(project_dir: Path) -> dict | None:
         return None
     group_id = group["id"]
 
-    conn.execute("UPDATE undo_state SET value = 0 WHERE key = 'active'")
+    # Use a temporary redo_group to capture redo data via triggers.
+    # Keep triggers ENABLED while running inverse SQL — triggers capture
+    # the inverse-of-inverse (= original forward SQL) into undo_log.
+    # Then move those entries to redo_log for later redo.
+    redo_capture_group = -group_id  # negative ID to avoid collision
+    conn.execute("UPDATE undo_state SET value = ? WHERE key = 'current_group'", (redo_capture_group,))
+
     rows = conn.execute(
         "SELECT sql_text FROM undo_log WHERE undo_group = ? ORDER BY seq DESC",
         (group_id,)
     ).fetchall()
     for row in rows:
         conn.execute(row["sql_text"])
+
+    # Move captured entries from undo_log to redo_log
+    conn.execute(
+        "INSERT INTO redo_log (undo_group, sql_text) SELECT ?, sql_text FROM undo_log WHERE undo_group = ? ORDER BY seq",
+        (group_id, redo_capture_group),
+    )
+    conn.execute("DELETE FROM undo_log WHERE undo_group = ?", (redo_capture_group,))
+
+    # Restore current_group and mark as undone
+    conn.execute("UPDATE undo_state SET value = ? WHERE key = 'current_group'", (group_id,))
     conn.execute("UPDATE undo_groups SET undone = 1 WHERE id = ?", (group_id,))
-    conn.execute("UPDATE undo_state SET value = 1 WHERE key = 'active'")
     conn.commit()
     return {"id": group_id, "description": group["description"], "timestamp": group["timestamp"]}
 
 
 def redo_execute(project_dir: Path) -> dict | None:
+    """Redo the last undone operation.
+
+    Redo works by re-executing the redo_log entries captured during undo.
+    When undo_execute runs, triggers are temporarily re-enabled while executing
+    the inverse SQL, which captures the "forward" SQL into a redo group.
+    """
     conn = get_db(project_dir)
     group = conn.execute(
         "SELECT id, description, timestamp FROM undo_groups WHERE undone = 1 ORDER BY id ASC LIMIT 1"
     ).fetchone()
     if not group:
         return None
-    # Re-execute: we need to replay the original operation, but we don't store forward SQL.
-    # Instead, redo by undoing the undo: the undo_log for this group was the INVERSE of the original.
-    # We can't redo with this design — return None for now.
-    return None
+    group_id = group["id"]
+
+    # Check if we have redo data (captured during undo)
+    redo_rows = conn.execute(
+        "SELECT sql_text FROM redo_log WHERE undo_group = ? ORDER BY seq ASC",
+        (group_id,)
+    ).fetchall()
+    if not redo_rows:
+        return None
+
+    # Disable triggers during redo replay
+    conn.execute("UPDATE undo_state SET value = 0 WHERE key = 'active'")
+    for row in redo_rows:
+        conn.execute(row["sql_text"])
+    conn.execute("UPDATE undo_state SET value = 1 WHERE key = 'active'")
+
+    # Mark as no longer undone
+    conn.execute("UPDATE undo_groups SET undone = 0 WHERE id = ?", (group_id,))
+    # Clean up redo data
+    conn.execute("DELETE FROM redo_log WHERE undo_group = ?", (group_id,))
+    conn.commit()
+
+    return {"id": group_id, "description": group["description"], "timestamp": group["timestamp"]}
 
 
 def undo_history(project_dir: Path, limit: int = 50) -> list[dict]:
