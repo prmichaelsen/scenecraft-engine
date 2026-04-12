@@ -274,20 +274,29 @@ def make_handler(work_dir: Path):
                             })
                 return self._json_response({"candidates": candidates})
 
-            # GET /api/projects/:name/video-candidates
-            m = re.match(r"^/api/projects/([^/]+)/video-candidates$", path)
+            # GET /api/projects/:name/video-candidates?limit=100
+            m = re.match(r"^/api/projects/([^/]+)/video-candidates", path)
             if m:
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
+                limit = 100
+                if "?" in self.path:
+                    qs = dict(p.split("=", 1) for p in self.path.split("?", 1)[1].split("&") if "=" in p)
+                    limit = int(qs.get("limit", "100"))
                 tr_cand_root = project_dir / "transition_candidates"
                 candidates = []
                 if tr_cand_root.is_dir():
-                    for tr_dir in sorted(tr_cand_root.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-                        if not tr_dir.is_dir(): continue
+                    tr_dirs = sorted(
+                        [d for d in tr_cand_root.iterdir() if d.is_dir()],
+                        key=lambda p: p.stat().st_mtime, reverse=True
+                    )
+                    for tr_dir in tr_dirs:
+                        if len(candidates) >= limit: break
                         tr_id = tr_dir.name
                         for slot_dir in sorted(tr_dir.iterdir()):
                             if not slot_dir.is_dir(): continue
                             for f in sorted(slot_dir.glob("v*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True):
+                                if len(candidates) >= limit: break
                                 vnum = int(f.stem.replace("v", ""))
                                 candidates.append({
                                     "transitionId": tr_id,
