@@ -3065,6 +3065,8 @@ def make_handler(work_dir: Path):
                 import shutil
                 source = project_dir / "assets" / "stills" / still_name
                 if not source.exists():
+                    source = project_dir / "pool" / "keyframes" / still_name
+                if not source.exists():
                     return self._error(404, "NOT_FOUND", f"Still not found: {still_name}")
 
                 dest_dir = project_dir / "selected_keyframes"
