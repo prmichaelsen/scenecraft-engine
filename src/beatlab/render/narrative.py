@@ -1712,6 +1712,9 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                 "saturation_curve": _parse_curve(tr.get("saturation_curve")),
                 "hue_shift_curve": _parse_curve(tr.get("hue_shift_curve")),
                 "invert_curve": _parse_curve(tr.get("invert_curve")),
+                "brightness_curve": _parse_curve(tr.get("brightness_curve")),
+                "contrast_curve": _parse_curve(tr.get("contrast_curve")),
+                "exposure_curve": _parse_curve(tr.get("exposure_curve")),
             }
             has_grading = any(color_grading.values())
 
@@ -1815,6 +1818,7 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                     "red_curve": tr.get("red_curve"), "green_curve": tr.get("green_curve"), "blue_curve": tr.get("blue_curve"),
                     "black_curve": tr.get("black_curve"), "saturation_curve": tr.get("saturation_curve"),
                     "hue_shift_curve": tr.get("hue_shift_curve"), "invert_curve": tr.get("invert_curve"),
+                    "brightness_curve": tr.get("brightness_curve"), "contrast_curve": tr.get("contrast_curve"), "exposure_curve": tr.get("exposure_curve"),
                     "is_adjustment": tr.get("is_adjustment", False),
                     "mask_center_x": tr.get("mask_center_x"), "mask_center_y": tr.get("mask_center_y"),
                     "mask_radius": tr.get("mask_radius"), "mask_feather": tr.get("mask_feather"),
@@ -1888,6 +1892,27 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
             inv = max(inv, clip["_effect_invert"])
         if inv > 0.001:
             f = f * (1.0 - inv) + (1.0 - f) * inv
+
+        # Brightness (offset)
+        bright_curve = clip.get("brightness_curve")
+        if bright_curve:
+            bright = _evaluate_curve(bright_curve, progress)
+            if abs(bright) > 0.001:
+                f += bright
+
+        # Contrast (scale around 0.5)
+        con_curve = clip.get("contrast_curve")
+        if con_curve:
+            con = _evaluate_curve(con_curve, progress)
+            if abs(con - 1.0) > 0.001:
+                f = (f - 0.5) * con + 0.5
+
+        # Exposure (2^stops)
+        exp_curve = clip.get("exposure_curve")
+        if exp_curve:
+            exp_val = _evaluate_curve(exp_curve, progress)
+            if abs(exp_val) > 0.001:
+                f *= (2.0 ** exp_val)
 
         return np.clip(f * 255, 0, 255).astype(np.uint8)
 
