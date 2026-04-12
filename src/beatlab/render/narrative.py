@@ -1891,129 +1891,197 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
 
         return np.clip(f * 255, 0, 255).astype(np.uint8)
 
+    def _read_overlay_frame(oclip, progress, ow, oh):
+        """Read a frame from an overlay clip at the given progress (0-1)."""
+        frame = None
+        if oclip.get("video"):
+            if "_cap" not in oclip:
+                oclip["_cap"] = cv2.VideoCapture(oclip["video"])
+                oclip["_nframes"] = int(oclip["_cap"].get(cv2.CAP_PROP_FRAME_COUNT))
+            cap = oclip["_cap"]
+            n = oclip["_nframes"]
+            if n > 0:
+                idx = min(int(progress * n), n - 1)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ret, f = cap.read()
+                if ret:
+                    frame = cv2.resize(f, (ow, oh), interpolation=cv2.INTER_LINEAR)
+        elif oclip.get("still"):
+            if "_img" not in oclip:
+                oclip["_img"] = cv2.imread(oclip["still"])
+                if oclip["_img"] is not None:
+                    oclip["_img"] = cv2.resize(oclip["_img"], (ow, oh), interpolation=cv2.INTER_LINEAR)
+            frame = oclip["_img"]
+        return frame
+
+    # Transform + mask helpers (defined once, used by overlay compositor)
+    def _apply_transform(img, clip_data, progress=0):
+        import numpy as np
+        tx_curve = clip_data.get("transform_x_curve")
+        ty_curve = clip_data.get("transform_y_curve")
+        tz_curve = clip_data.get("transform_z_curve")
+        tx = _evaluate_curve(tx_curve, progress) if tx_curve else (clip_data.get("transform_x") or 0)
+        ty = _evaluate_curve(ty_curve, progress) if ty_curve else (clip_data.get("transform_y") or 0)
+        scale = _evaluate_curve(tz_curve, progress) if tz_curve else 1.0
+        h, w = img.shape[:2]
+        if abs(scale - 1.0) > 0.001:
+            new_w, new_h = int(w * scale), int(h * scale)
+            if new_w > 0 and new_h > 0:
+                scaled = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                if scale > 1.0:
+                    x0, y0 = (new_w - w) // 2, (new_h - h) // 2
+                    img = scaled[y0:y0+h, x0:x0+w]
+                else:
+                    result = np.zeros_like(img)
+                    x0, y0 = (w - new_w) // 2, (h - new_h) // 2
+                    result[y0:y0+new_h, x0:x0+new_w] = scaled
+                    img = result
+        is_adjustment = clip_data.get("is_adjustment", False)
+        if tx or ty:
+            dx = int(tx * w)
+            dy = int((-ty if not is_adjustment else ty) * h)
+            M = np.float32([[1, 0, dx], [0, 1, dy]])
+            img = cv2.warpAffine(img, M, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+        return img
+
+    def _apply_radial_mask(img, clip_data):
+        mask_r = clip_data.get("mask_radius")
+        if mask_r is not None and mask_r < 1.0:
+            import numpy as np
+            h, w = img.shape[:2]
+            cx = clip_data.get("mask_center_x", 0.5) * w
+            cy = clip_data.get("mask_center_y", 0.5) * h
+            feather = clip_data.get("mask_feather", 0.0)
+            diag = (w**2 + h**2) ** 0.5
+            Y, X = np.ogrid[:h, :w]
+            dist = np.sqrt((X - cx)**2 + (Y - cy)**2) / diag
+            inner = mask_r * (1.0 - feather)
+            mask = np.clip(1.0 - (dist - inner) / max(mask_r - inner, 0.001), 0, 1).astype(np.float32)
+            mask = mask[:, :, np.newaxis]
+            img = (img.astype(np.float32) * mask).astype(np.uint8)
+        return img
+
+    def _process_overlay_clip(oclip, t, progress, ow, oh):
+        """Read + fully process an overlay clip frame: source read → color grading → transform → mask.
+        Returns (frame, opacity, blend_mode) or (None, ...) if no frame."""
+        frame = _read_overlay_frame(oclip, progress, ow, oh)
+        if frame is None:
+            return None, 0, "normal"
+
+        # Clip opacity
+        opacity = 1.0
+        if oclip.get("opacity_curve"):
+            opacity = _evaluate_curve(oclip["opacity_curve"], progress)
+        elif oclip.get("opacity") is not None:
+            opacity = oclip["opacity"]
+
+        blend = oclip.get("blend_mode") or "normal"
+
+        # Effects (strobe, invert)
+        clip_invert = 0.0
+        for efx in oclip.get("effects", []):
+            if not efx.get("enabled", True):
+                continue
+            if efx["type"] == "strobe":
+                period = efx["params"].get("period", 1.0 / efx["params"].get("frequency", 8))
+                duty = efx["params"].get("duty", 0.5)
+                elapsed = t - oclip["from_ts"]
+                if (elapsed / period) % 1 > duty:
+                    opacity = 0
+            elif efx["type"] == "invert":
+                clip_invert = efx["params"].get("amount", 1.0)
+        if clip_invert > 0 and not oclip.get("invert_curve"):
+            oclip["_effect_invert"] = clip_invert
+
+        # Color grading
+        has_curves = any(oclip.get(k) for k in ("red_curve", "green_curve", "blue_curve", "black_curve", "saturation_curve", "hue_shift_curve", "invert_curve"))
+        if has_curves:
+            frame = _apply_color_grading(frame, oclip, progress)
+
+        frame = _apply_transform(frame, oclip, progress)
+        frame = _apply_radial_mask(frame, oclip)
+        return frame, opacity, blend
+
+    # Sort overlay clips by from_ts for crossfade boundary detection
+    for otrack in overlay_tracks:
+        otrack["clips"].sort(key=lambda c: c["from_ts"])
+
+    # Per-track state for crossfade: last processed frame + clip index
+    _overlay_prev = {}  # track_idx -> {"clip_idx": int, "frame": ndarray}
+
     def _composite_overlays(base_frame, t, ow, oh):
-        """Composite overlay tracks onto base frame at timeline time t."""
+        """Composite overlay tracks onto base frame at timeline time t, with crossfade at clip boundaries."""
         result = base_frame
-        for otrack in overlay_tracks:
-            frame = None
-            clip_opacity = otrack["opacity"]
-            clip_blend = otrack["blend_mode"]
+        for ti, otrack in enumerate(overlay_tracks):
+            track_opacity = otrack["opacity"]
+            track_blend = otrack["blend_mode"]
+            clips = otrack["clips"]
+
+            # Find active clip
+            active_idx = -1
             matched_clip = None
             progress = 0.0
-            for oclip in otrack["clips"]:
+            for ci, oclip in enumerate(clips):
                 if oclip["from_ts"] <= t < oclip["to_ts"]:
+                    active_idx = ci
                     matched_clip = oclip
-                    progress = (t - oclip["from_ts"]) / (oclip["to_ts"] - oclip["from_ts"]) if oclip["to_ts"] > oclip["from_ts"] else 0
-                    # Per-clip opacity
-                    if oclip.get("opacity_curve"):
-                        clip_opacity = _evaluate_curve(oclip["opacity_curve"], progress)
-                    elif oclip.get("opacity") is not None:
-                        clip_opacity = oclip["opacity"]
-                    # Per-clip blend mode
-                    if oclip.get("blend_mode"):
-                        clip_blend = oclip["blend_mode"]
-                    # Per-clip effects (e.g. strobe, invert)
-                    clip_invert = 0.0
-                    for efx in oclip.get("effects", []):
-                        if not efx.get("enabled", True):
-                            continue
-                        if efx["type"] == "strobe":
-                            period = efx["params"].get("period", 1.0 / efx["params"].get("frequency", 8))
-                            duty = efx["params"].get("duty", 0.5)
-                            elapsed = t - oclip["from_ts"]
-                            if (elapsed / period) % 1 > duty:
-                                clip_opacity = 0
-                        elif efx["type"] == "invert":
-                            clip_invert = efx["params"].get("amount", 1.0)
-                    # Store effect-driven invert for _apply_color_grading
-                    if clip_invert > 0 and not oclip.get("invert_curve"):
-                        oclip["_effect_invert"] = clip_invert
-                    if oclip.get("video"):
-                        if "_cap" not in oclip:
-                            oclip["_cap"] = cv2.VideoCapture(oclip["video"])
-                            oclip["_nframes"] = int(oclip["_cap"].get(cv2.CAP_PROP_FRAME_COUNT))
-                        cap = oclip["_cap"]
-                        idx = min(int(progress * oclip["_nframes"]), oclip["_nframes"] - 1)
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                        ret, f = cap.read()
-                        if ret:
-                            frame = cv2.resize(f, (ow, oh), interpolation=cv2.INTER_LINEAR)
-                    elif oclip.get("still"):
-                        if "_img" not in oclip:
-                            oclip["_img"] = cv2.imread(oclip["still"])
-                            if oclip["_img"] is not None:
-                                oclip["_img"] = cv2.resize(oclip["_img"], (ow, oh), interpolation=cv2.INTER_LINEAR)
-                        frame = oclip["_img"]
+                    clip_dur = oclip["to_ts"] - oclip["from_ts"]
+                    progress = (t - oclip["from_ts"]) / clip_dur if clip_dur > 0 else 0
                     break
-            if matched_clip is not None:
-                # Apply transform (shift the frame)
-                def _apply_transform(img, clip_data, progress=0):
-                    import numpy as np
-                    # Evaluate transform curves if present, fall back to static values
-                    tx_curve = clip_data.get("transform_x_curve")
-                    ty_curve = clip_data.get("transform_y_curve")
-                    tz_curve = clip_data.get("transform_z_curve")
-                    tx = _evaluate_curve(tx_curve, progress) if tx_curve else (clip_data.get("transform_x") or 0)
-                    ty = _evaluate_curve(ty_curve, progress) if ty_curve else (clip_data.get("transform_y") or 0)
-                    scale = _evaluate_curve(tz_curve, progress) if tz_curve else 1.0
 
-                    h, w = img.shape[:2]
+            if matched_clip is None:
+                _overlay_prev.pop(ti, None)
+                continue
 
-                    # Apply Z scale (centered on frame center)
-                    if abs(scale - 1.0) > 0.001:
-                        new_w, new_h = int(w * scale), int(h * scale)
-                        if new_w > 0 and new_h > 0:
-                            scaled = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-                            if scale > 1.0:
-                                x0 = (new_w - w) // 2
-                                y0 = (new_h - h) // 2
-                                img = scaled[y0:y0+h, x0:x0+w]
-                            else:
-                                result = np.zeros_like(img)
-                                x0 = (w - new_w) // 2
-                                y0 = (h - new_h) // 2
-                                result[y0:y0+new_h, x0:x0+new_w] = scaled
-                                img = result
+            if matched_clip.get("is_adjustment"):
+                # Adjustment layers apply grading directly to composite
+                result = _apply_color_grading(result, matched_clip, progress)
+                result = _apply_radial_mask(result, matched_clip)
+                continue
 
-                    # Apply X/Y shift (negate Y to match frontend shader which flips Y for non-adjustment layers)
-                    is_adjustment = clip_data.get("is_adjustment", False)
-                    if tx or ty:
-                        dx = int(tx * w)
-                        dy = int((-ty if not is_adjustment else ty) * h)
-                        M = np.float32([[1, 0, dx], [0, 1, dy]])
-                        img = cv2.warpAffine(img, M, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
-                    return img
+            # Process current clip frame
+            frame, clip_opacity, clip_blend = _process_overlay_clip(matched_clip, t, progress, ow, oh)
+            if frame is None:
+                continue
 
-                # Apply radial mask
-                def _apply_radial_mask(img, clip_data):
-                    mask_r = clip_data.get("mask_radius")
-                    if mask_r is not None and mask_r < 1.0:
-                        import numpy as np
-                        h, w = img.shape[:2]
-                        cx = clip_data.get("mask_center_x", 0.5) * w
-                        cy = clip_data.get("mask_center_y", 0.5) * h
-                        feather = clip_data.get("mask_feather", 0.0)
-                        diag = (w**2 + h**2) ** 0.5
-                        Y, X = np.ogrid[:h, :w]
-                        dist = np.sqrt((X - cx)**2 + (Y - cy)**2) / diag
-                        inner = mask_r * (1.0 - feather)
-                        mask = np.clip(1.0 - (dist - inner) / max(mask_r - inner, 0.001), 0, 1).astype(np.float32)
-                        mask = mask[:, :, np.newaxis]
-                        img = (img.astype(np.float32) * mask).astype(np.uint8)
-                    return img
+            # Use track-level blend/opacity as defaults
+            if not matched_clip.get("blend_mode"):
+                clip_blend = track_blend
+            if matched_clip.get("opacity") is None and not matched_clip.get("opacity_curve"):
+                clip_opacity = track_opacity
 
-                if matched_clip.get("is_adjustment"):
-                    result = _apply_color_grading(result, matched_clip, progress)
-                    result = _apply_radial_mask(result, matched_clip)
-                elif frame is not None:
-                    has_curves = any(matched_clip.get(k) for k in ("red_curve", "green_curve", "blue_curve", "black_curve", "saturation_curve", "hue_shift_curve", "invert_curve"))
-                    if has_curves:
-                        frame = _apply_color_grading(frame, matched_clip, progress)
-                    frame = _apply_transform(frame, matched_clip, progress)
-                    frame = _apply_radial_mask(frame, matched_clip)
-                    result = _blend_frames(result, frame, clip_blend, clip_opacity)
-            # Release VideoCapture handles for clips we've passed
-            for oclip in otrack["clips"]:
+            # Crossfade at clip boundaries
+            prev_state = _overlay_prev.get(ti)
+            clip_dur = matched_clip["to_ts"] - matched_clip["from_ts"]
+            seg_frames = round(clip_dur * fps)
+            eff_xfade = min(XFADE_FRAMES, max(2, seg_frames // 4))
+            eff_half_xfade_s = (eff_xfade / 2) / fps
+
+            # Start of clip: blend with previous clip's last frame
+            if prev_state and prev_state["clip_idx"] != active_idx and (t - matched_clip["from_ts"]) < eff_half_xfade_s:
+                prev_frame = prev_state.get("frame")
+                if prev_frame is not None:
+                    blend_t = (t - matched_clip["from_ts"]) / eff_half_xfade_s
+                    alpha = 0.5 + blend_t * 0.5
+                    frame = cv2.addWeighted(prev_frame, 1.0 - alpha, frame, alpha, 0)
+
+            # End of clip: read next clip's first frame and start blending
+            if active_idx < len(clips) - 1 and (matched_clip["to_ts"] - t) < eff_half_xfade_s:
+                next_clip = clips[active_idx + 1]
+                if abs(next_clip["from_ts"] - matched_clip["to_ts"]) < 0.1:
+                    next_frame, _, _ = _process_overlay_clip(next_clip, t, 0.0, ow, oh)
+                    if next_frame is not None:
+                        blend_t = (matched_clip["to_ts"] - t) / eff_half_xfade_s
+                        alpha = 0.5 + blend_t * 0.5
+                        frame = cv2.addWeighted(frame, alpha, next_frame, 1.0 - alpha, 0)
+
+            # Store for next frame's crossfade
+            _overlay_prev[ti] = {"clip_idx": active_idx, "frame": frame.copy()}
+
+            result = _blend_frames(result, frame, clip_blend, clip_opacity)
+
+            # Release handles for passed clips
+            for oclip in clips:
                 if oclip["to_ts"] < t - 1.0 and "_cap" in oclip:
                     oclip["_cap"].release()
                     del oclip["_cap"]
