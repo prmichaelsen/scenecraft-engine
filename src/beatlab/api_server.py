@@ -257,8 +257,10 @@ def make_handler(work_dir: Path):
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
                 from beatlab.db import get_keyframes
+                import hashlib
                 kfs = get_keyframes(project_dir)
                 candidates = []
+                seen_hashes = set()
                 for kf in kfs:
                     kf_id = kf["id"]
                     selected = kf.get("selected")
@@ -267,6 +269,12 @@ def make_handler(work_dir: Path):
                     for f in sorted(cand_dir.glob("v*.png"), key=lambda p: int(p.stem.replace("v", ""))):
                         vnum = int(f.stem.replace("v", ""))
                         if vnum != selected:
+                            # Dedupe by file content hash (first 8KB is enough for images)
+                            with open(f, "rb") as fh:
+                                file_hash = hashlib.md5(fh.read(8192)).hexdigest()
+                            if file_hash in seen_hashes:
+                                continue
+                            seen_hashes.add(file_hash)
                             candidates.append({
                                 "keyframeId": kf_id,
                                 "variant": vnum,
