@@ -3197,12 +3197,28 @@ def make_handler(work_dir: Path):
                 if from_kf_id:
                     def _extract():
                         try:
+                            from beatlab.db import update_keyframe
                             sel_kf_dir = project_dir / "selected_keyframes"
                             sel_kf_dir.mkdir(parents=True, exist_ok=True)
+                            tmp_frame = sel_kf_dir / f"_tmp_{from_kf_id}.png"
                             sp.run(["ffmpeg", "-y", "-i", str(source), "-vframes", "1", "-q:v", "2",
-                                    str(sel_kf_dir / f"{from_kf_id}.png")], capture_output=True, timeout=10)
-                        except Exception:
-                            pass
+                                    str(tmp_frame)], capture_output=True, timeout=10)
+                            if tmp_frame.exists():
+                                # Add as candidate
+                                kf_cand_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{from_kf_id}"
+                                kf_cand_dir.mkdir(parents=True, exist_ok=True)
+                                kf_v = _next_variant(kf_cand_dir, ".png")
+                                shutil.copy2(str(tmp_frame), str(kf_cand_dir / f"v{kf_v}.png"))
+                                # Set as selected keyframe image
+                                shutil.move(str(tmp_frame), str(sel_kf_dir / f"{from_kf_id}.png"))
+                                all_cands = sorted([
+                                    f"keyframe_candidates/candidates/section_{from_kf_id}/{f.name}"
+                                    for f in kf_cand_dir.glob("v*.png")
+                                ], key=lambda p: int(p.rsplit("v", 1)[-1].split(".")[0]))
+                                update_keyframe(project_dir, from_kf_id, selected=kf_v, candidates=all_cands)
+                                _log(f"  Extracted first frame as {from_kf_id} candidate v{kf_v}")
+                        except Exception as ex:
+                            _log(f"  First frame extraction failed: {ex}")
                     threading.Thread(target=_extract, daemon=True).start()
 
                 _log(f"  Assigned v{variant} to {tr_id}")
