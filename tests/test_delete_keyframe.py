@@ -21,7 +21,7 @@ def _make_mp4():
 
 
 def _setup_project(tmp_path):
-    from beatlab.db import add_keyframe, add_transition
+    from scenecraft.db import add_keyframe, add_transition
 
     project_dir = tmp_path / "test_project"
     project_dir.mkdir()
@@ -81,20 +81,20 @@ def _parse_ts(ts):
 
 
 def _get_active_trs(project_dir, track="track_1"):
-    from beatlab.db import get_transitions
+    from scenecraft.db import get_transitions
     return [t for t in get_transitions(project_dir)
             if t.get("track_id") == track and not t.get("deleted_at")]
 
 
 def _get_active_kfs(project_dir, track="track_1"):
-    from beatlab.db import get_keyframes
+    from scenecraft.db import get_keyframes
     return [k for k in get_keyframes(project_dir)
             if k.get("track_id", "track_1") == track and not k.get("deleted_at")]
 
 
 def _simulate_delete(project_dir, kf_id):
     """Simulate delete-keyframe logic matching the fixed API server."""
-    from beatlab.db import (
+    from scenecraft.db import (
         get_keyframe, delete_keyframe as db_del_kf,
         get_transitions_involving, delete_transition as db_del_tr,
         get_keyframes as db_get_kfs, get_transitions as db_get_trs,
@@ -205,7 +205,7 @@ class TestDeleteKeyframe:
         project_dir = _setup_project(tmp_path)
         bridge_id = _simulate_delete(project_dir, "kf_002")
 
-        from beatlab.db import get_transitions
+        from scenecraft.db import get_transitions
         bridge = next(t for t in get_transitions(project_dir) if t["id"] == bridge_id)
         # tr_001 had no properties, tr_002 had blend_mode=add + opacity_curve
         # inherited_tr_id should be tr_002 (has selected video)

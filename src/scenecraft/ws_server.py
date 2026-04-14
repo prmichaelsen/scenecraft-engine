@@ -302,7 +302,7 @@ class FolderWatcher:
         """Import new files into the project bin."""
         import shutil
         from datetime import datetime, timezone
-        from beatlab.project import load_project, save_project
+        from scenecraft.project import load_project, save_project
 
         project_dir = self._work_dir / project
         if not project_dir.is_dir():

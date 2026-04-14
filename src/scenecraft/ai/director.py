@@ -6,9 +6,9 @@ import json
 import sys
 from datetime import datetime
 
-from beatlab.ai.plan import EffectPlan, SectionPlan, parse_effect_plan, validate_effect_plan
-from beatlab.ai.prompt import build_system_prompt, build_user_prompt
-from beatlab.ai.provider import LLMProvider
+from scenecraft.ai.plan import EffectPlan, SectionPlan, parse_effect_plan, validate_effect_plan
+from scenecraft.ai.prompt import build_system_prompt, build_user_prompt
+from scenecraft.ai.provider import LLMProvider
 
 
 BATCH_SIZE = 25  # Max sections per LLM call

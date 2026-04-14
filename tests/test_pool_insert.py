@@ -11,7 +11,7 @@ import pytest
 
 def _setup_project(tmp_path: Path):
     """Create a minimal project with DB, keyframes, and transitions."""
-    from beatlab.db import get_db, add_keyframe, add_transition
+    from scenecraft.db import get_db, add_keyframe, add_transition
 
     project_dir = tmp_path / "test_project"
     project_dir.mkdir()
@@ -74,13 +74,13 @@ def _setup_project(tmp_path: Path):
 
 
 def _get_active_transitions(project_dir: Path, track_id: str = "track_1") -> list:
-    from beatlab.db import get_transitions
+    from scenecraft.db import get_transitions
     return [t for t in get_transitions(project_dir)
             if t.get("track_id") == track_id and not t.get("deleted_at")]
 
 
 def _get_active_keyframes(project_dir: Path, track_id: str = "track_1") -> list:
-    from beatlab.db import get_keyframes
+    from scenecraft.db import get_keyframes
     return [k for k in get_keyframes(project_dir)
             if k.get("track_id", "track_1") == track_id and not k.get("deleted_at")]
 
@@ -122,7 +122,7 @@ class TestPoolInsert:
         assert len(trs_before) == 2
 
         # Simulate pool insert at 1:05 (between kf_001 and kf_002)
-        from beatlab.db import (
+        from scenecraft.db import (
             add_keyframe as db_add_kf, get_keyframes as db_get_kfs,
             next_keyframe_id, next_transition_id,
             add_transition as db_add_tr, delete_transition as db_del_tr,
@@ -198,7 +198,7 @@ class TestPoolInsert:
         """Inserting on track_1 should not pick neighbors from track_2."""
         project_dir, pool_img = _setup_project(tmp_path)
 
-        from beatlab.db import get_keyframes as db_get_kfs
+        from scenecraft.db import get_keyframes as db_get_kfs
 
         # Track_2 has kf_t2_001 at 1:04. Track_1 neighbors at 1:00 and 1:10.
         # Inserting at 1:05 on track_1 should find kf_001 and kf_002 as neighbors, NOT kf_t2_001.
@@ -214,7 +214,7 @@ class TestPoolInsert:
         """Inserting at the exact same timestamp as an existing keyframe should not create zero-length transitions."""
         project_dir, pool_img = _setup_project(tmp_path)
 
-        from beatlab.db import (
+        from scenecraft.db import (
             add_keyframe as db_add_kf, get_keyframes as db_get_kfs,
             next_keyframe_id, next_transition_id,
             add_transition as db_add_tr, delete_transition as db_del_tr,
@@ -259,7 +259,7 @@ class TestPoolInsert:
         """Inserting twice at the same position should not create duplicate transitions."""
         project_dir, pool_img = _setup_project(tmp_path)
 
-        from beatlab.db import (
+        from scenecraft.db import (
             add_keyframe as db_add_kf, get_keyframes as db_get_kfs,
             next_keyframe_id, next_transition_id,
             add_transition as db_add_tr, delete_transition as db_del_tr,

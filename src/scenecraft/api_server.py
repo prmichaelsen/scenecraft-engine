@@ -20,7 +20,7 @@ def _log(msg: str, level: str = "info"):
     print(f"[{ts}] {msg}", file=sys.stderr, flush=True)
     # Broadcast to WebSocket clients
     try:
-        from beatlab.ws_server import job_manager
+        from scenecraft.ws_server import job_manager
         job_manager._broadcast({"type": "log", "message": msg, "timestamp": now.isoformat(), "level": level})
     except Exception:
         pass
@@ -87,7 +87,7 @@ def make_handler(work_dir: Path):
             if path == "/api/projects":
                 return self._handle_list_projects()
 
-            # GET /api/browse?path=subdir (browse .beatlab_work root)
+            # GET /api/browse?path=subdir (browse .scenecraft_work root)
             if path == "/api/browse":
                 query = parsed.query
                 subpath = ""
@@ -143,7 +143,7 @@ def make_handler(work_dir: Path):
             if m:
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import get_meta
+                from scenecraft.db import get_meta
                 meta = get_meta(project_dir)
                 views = {k.replace("workspace_view:", ""): v for k, v in meta.items() if k.startswith("workspace_view:")}
                 return self._json_response({"views": views})
@@ -153,7 +153,7 @@ def make_handler(work_dir: Path):
             if m:
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import get_meta
+                from scenecraft.db import get_meta
                 meta = get_meta(project_dir)
                 layout = meta.get(f"workspace_view:{m.group(2)}")
                 if layout is None:
@@ -191,7 +191,7 @@ def make_handler(work_dir: Path):
             if m:
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import undo_history
+                from scenecraft.db import undo_history
                 return self._json_response({"history": undo_history(project_dir)})
 
             # GET /api/projects/:name/settings
@@ -245,7 +245,7 @@ def make_handler(work_dir: Path):
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None:
                     return
-                from beatlab.db import get_tracks, get_opacity_keyframes
+                from scenecraft.db import get_tracks, get_opacity_keyframes
                 tracks = get_tracks(project_dir)
                 for t in tracks:
                     t["opacityKeyframes"] = get_opacity_keyframes(project_dir, t["id"])
@@ -257,7 +257,7 @@ def make_handler(work_dir: Path):
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None:
                     return
-                from beatlab.db import get_audio_tracks, get_audio_clips
+                from scenecraft.db import get_audio_tracks, get_audio_clips
                 tracks = get_audio_tracks(project_dir)
                 for t in tracks:
                     t["clips"] = get_audio_clips(project_dir, t["id"])
@@ -269,7 +269,7 @@ def make_handler(work_dir: Path):
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None:
                     return
-                from beatlab.db import get_audio_clips
+                from scenecraft.db import get_audio_clips
                 track_id = None
                 if "?" in self.path:
                     from urllib.parse import parse_qs, urlparse
@@ -283,7 +283,7 @@ def make_handler(work_dir: Path):
             if m:
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import get_keyframes
+                from scenecraft.db import get_keyframes
                 import hashlib
                 kfs = get_keyframes(project_dir)
                 candidates = []
@@ -348,7 +348,7 @@ def make_handler(work_dir: Path):
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None:
                     return
-                from beatlab.db import get_markers
+                from scenecraft.db import get_markers
                 return self._json_response({"markers": get_markers(project_dir)})
 
             # GET /api/projects/:name/prompt-roster
@@ -356,7 +356,7 @@ def make_handler(work_dir: Path):
             if m:
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import get_prompt_roster
+                from scenecraft.db import get_prompt_roster
                 return self._json_response({"prompts": get_prompt_roster(project_dir)})
 
             # GET /api/projects/:name/pool
@@ -421,7 +421,7 @@ def make_handler(work_dir: Path):
                 # Validate timeline after structural mutations
                 if _use_lock and _proj_name:
                     try:
-                        from beatlab.db import validate_timeline
+                        from scenecraft.db import validate_timeline
                         project_dir = work_dir / _proj_name
                         if (project_dir / "project.db").exists():
                             warnings = validate_timeline(project_dir)
@@ -431,7 +431,7 @@ def make_handler(work_dir: Path):
                                     _log(f"  - {w}")
                                 # Send warnings via WebSocket
                                 try:
-                                    from beatlab.ws_server import job_manager as _jm
+                                    from scenecraft.ws_server import job_manager as _jm
                                     _jm._broadcast({"type": "timeline_warning", "route": _route_name, "warnings": warnings})
                                 except Exception:
                                     pass
@@ -457,7 +457,7 @@ def make_handler(work_dir: Path):
                 try:
                     project_dir.mkdir(parents=True)
                     # Initialize DB with schema
-                    from beatlab.db import get_db, set_meta_bulk
+                    from scenecraft.db import get_db, set_meta_bulk
                     get_db(project_dir)
                     # Set default meta
                     meta = {
@@ -607,7 +607,7 @@ def make_handler(work_dir: Path):
             if m:
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import undo_execute
+                from scenecraft.db import undo_execute
                 result = undo_execute(project_dir)
                 if result:
                     _log(f"undo: {result['description']}")
@@ -619,7 +619,7 @@ def make_handler(work_dir: Path):
             if m:
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import redo_execute
+                from scenecraft.db import redo_execute
                 result = redo_execute(project_dir)
                 if result:
                     _log(f"redo: {result['description']}")
@@ -633,7 +633,7 @@ def make_handler(work_dir: Path):
                 if project_dir is None: return
                 body = self._read_json_body()
                 if body is None: return
-                from beatlab.db import set_meta
+                from scenecraft.db import set_meta
                 set_meta(project_dir, f"workspace_view:{m.group(2)}", body.get("layout", {}))
                 _log(f"workspace-view saved: {m.group(1)} / {m.group(2)}")
                 return self._json_response({"success": True})
@@ -643,7 +643,7 @@ def make_handler(work_dir: Path):
             if m:
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import get_db
+                from scenecraft.db import get_db
                 conn = get_db(project_dir)
                 conn.execute("DELETE FROM meta WHERE key = ?", (f"workspace_view:{m.group(2)}",))
                 conn.commit()
@@ -702,7 +702,7 @@ def make_handler(work_dir: Path):
                     return self._error(404, "NOT_FOUND", f"Checkpoint not found: {filename}")
                 db_path = project_dir / "project.db"
                 # Close all existing connections to this project's DB
-                from beatlab.db import close_db
+                from scenecraft.db import close_db
                 close_db(project_dir)
                 # Use SQLite backup API to restore checkpoint over the active DB
                 import sqlite3 as _sqlite3
@@ -758,7 +758,7 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import add_track as db_add_track, get_tracks as db_get_tracks
+                from scenecraft.db import add_track as db_add_track, get_tracks as db_get_tracks
                 existing = db_get_tracks(project_dir)
                 max_num = max((int(t["id"].replace("track_", "")) for t in existing if t["id"].startswith("track_")), default=0)
                 track_id = f"track_{max_num + 1}"
@@ -775,7 +775,7 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import update_track as db_update_track
+                from scenecraft.db import update_track as db_update_track
                 track_id = body.pop("id", None)
                 if not track_id: return self._error(400, "BAD_REQUEST", "Missing 'id'")
                 field_map = {"blendMode": "blend_mode", "baseOpacity": "base_opacity", "chromaKey": "chroma_key"}
@@ -791,7 +791,7 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import delete_track as db_delete_track
+                from scenecraft.db import delete_track as db_delete_track
                 del_id = body.get("id", "")
                 _log(f"tracks/delete: {del_id}")
                 db_delete_track(project_dir, del_id)
@@ -804,7 +804,7 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import reorder_tracks as db_reorder_tracks
+                from scenecraft.db import reorder_tracks as db_reorder_tracks
                 track_ids = body.get("trackIds", [])
                 _log(f"tracks/reorder: {track_ids}")
                 db_reorder_tracks(project_dir, track_ids)
@@ -817,7 +817,7 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import add_audio_track as db_add_audio_track, get_audio_tracks as db_get_audio_tracks
+                from scenecraft.db import add_audio_track as db_add_audio_track, get_audio_tracks as db_get_audio_tracks
                 existing = db_get_audio_tracks(project_dir)
                 max_num = max((int(t["id"].replace("audio_track_", "")) for t in existing if t["id"].startswith("audio_track_")), default=0)
                 track_id = f"audio_track_{max_num + 1}"
@@ -833,7 +833,7 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import update_audio_track as db_update_audio_track
+                from scenecraft.db import update_audio_track as db_update_audio_track
                 track_id = body.pop("id", None)
                 if not track_id: return self._error(400, "BAD_REQUEST", "Missing 'id'")
                 field_map = {"displayOrder": "display_order"}
@@ -849,7 +849,7 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import delete_audio_track as db_delete_audio_track
+                from scenecraft.db import delete_audio_track as db_delete_audio_track
                 del_id = body.get("id", "")
                 _log(f"audio-tracks/delete: {del_id}")
                 db_delete_audio_track(project_dir, del_id)
@@ -862,7 +862,7 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import reorder_audio_tracks as db_reorder_audio_tracks
+                from scenecraft.db import reorder_audio_tracks as db_reorder_audio_tracks
                 track_ids = body.get("trackIds", [])
                 _log(f"audio-tracks/reorder: {track_ids}")
                 db_reorder_audio_tracks(project_dir, track_ids)
@@ -875,7 +875,7 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import add_audio_clip as db_add_audio_clip, get_audio_clips as db_get_audio_clips
+                from scenecraft.db import add_audio_clip as db_add_audio_clip, get_audio_clips as db_get_audio_clips
                 existing = db_get_audio_clips(project_dir)
                 max_num = max((int(c["id"].replace("audio_clip_", "")) for c in existing if c["id"].startswith("audio_clip_")), default=0)
                 clip_id = f"audio_clip_{max_num + 1}"
@@ -902,7 +902,7 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import update_audio_clip as db_update_audio_clip
+                from scenecraft.db import update_audio_clip as db_update_audio_clip
                 clip_id = body.pop("id", None)
                 if not clip_id: return self._error(400, "BAD_REQUEST", "Missing 'id'")
                 field_map = {"trackId": "track_id", "sourcePath": "source_path", "startTime": "start_time", "endTime": "end_time", "sourceOffset": "source_offset"}
@@ -918,7 +918,7 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import delete_audio_clip as db_delete_audio_clip
+                from scenecraft.db import delete_audio_clip as db_delete_audio_clip
                 del_id = body.get("id", "")
                 _log(f"audio-clips/delete: {del_id}")
                 db_delete_audio_clip(project_dir, del_id)
@@ -1003,7 +1003,7 @@ def make_handler(work_dir: Path):
                     section_rules = [r for r in all_rules if r.get("_group_start") == section_start and r.get("_group_end") == section_end]
                     _log(f"reapply-rules: targeted {len(section_rules)} rules for {section_start}s-{section_end}s")
 
-                    from beatlab.audio_intelligence import apply_rules as _apply
+                    from scenecraft.audio_intelligence import apply_rules as _apply
                     new_events = _apply(layer1, section_rules)
 
                     # Splice: remove old events in this range, add new ones
@@ -1019,13 +1019,13 @@ def make_handler(work_dir: Path):
                     return self._json_response({"success": True, "eventCount": len(merged)})
 
                 # Full reapply in background thread
-                from beatlab.ws_server import job_manager
+                from scenecraft.ws_server import job_manager
                 job_id = job_manager.create_job("reapply_rules", total=1, meta={"project": m.group(1)})
                 rules = all_rules
 
                 def _run():
                     try:
-                        from beatlab.audio_intelligence import apply_rules as _apply
+                        from scenecraft.audio_intelligence import apply_rules as _apply
                         _log(f"[job {job_id}] Applying {len(rules)} rules...")
                         events = _apply(layer1, rules)
                         import json as _j
@@ -1064,11 +1064,11 @@ def make_handler(work_dir: Path):
                 if not source_img.exists():
                     return self._error(400, "BAD_REQUEST", f"No source image found for {kf_id}")
 
-                from beatlab.db import get_keyframe
+                from scenecraft.db import get_keyframe
                 kf = get_keyframe(project_dir, kf_id)
                 kf_prompt = kf.get("prompt", "") if kf else ""
 
-                from beatlab.ws_server import job_manager
+                from scenecraft.ws_server import job_manager
                 job_id = job_manager.create_job("keyframe_variations", total=count, meta={"keyframeId": kf_id, "project": m.group(1)})
 
                 def _run_variations():
@@ -1104,15 +1104,15 @@ def make_handler(work_dir: Path):
                         _log(f"[job {job_id}] Got {len(prompts)} prompts")
 
                         # Generate images
-                        from beatlab.render.google_video import GoogleVideoClient
-                        from beatlab.db import get_meta as _get_meta
+                        from scenecraft.render.google_video import GoogleVideoClient
+                        from scenecraft.db import get_meta as _get_meta
                         img_client = GoogleVideoClient(vertex=True)
                         _image_model = _get_meta(project_dir).get("image_model", "replicate/nano-banana-2")
                         candidates_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{kf_id}"
                         candidates_dir.mkdir(parents=True, exist_ok=True)
                         existing = _next_variant(candidates_dir, ".png") - 1
 
-                        from beatlab.db import update_keyframe
+                        from scenecraft.db import update_keyframe
                         paths = []
                         for i, prompt in enumerate(prompts[:count]):
                             v = existing + i + 1
@@ -1154,11 +1154,11 @@ def make_handler(work_dir: Path):
                 if not source_img.exists():
                     return self._error(400, "BAD_REQUEST", f"No source image found for {kf_id}")
 
-                from beatlab.db import get_keyframe
+                from scenecraft.db import get_keyframe
                 kf = get_keyframe(project_dir, kf_id)
                 kf_prompt = kf.get("prompt", "") if kf else ""
 
-                from beatlab.ws_server import job_manager
+                from scenecraft.ws_server import job_manager
                 job_id = job_manager.create_job("escalate_keyframe", total=count, meta={"keyframeId": kf_id, "project": m.group(1)})
 
                 def _run_escalate():
@@ -1207,15 +1207,15 @@ def make_handler(work_dir: Path):
                         prompts = _json.loads(json_match.group(0)) if json_match else []
                         _log(f"[job {job_id}] Got {len(prompts)} escalation prompts")
 
-                        from beatlab.render.google_video import GoogleVideoClient
-                        from beatlab.db import get_meta as _get_meta2
+                        from scenecraft.render.google_video import GoogleVideoClient
+                        from scenecraft.db import get_meta as _get_meta2
                         img_client = GoogleVideoClient(vertex=True)
                         _image_model = _get_meta2(project_dir).get("image_model", "replicate/nano-banana-2")
                         candidates_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{kf_id}"
                         candidates_dir.mkdir(parents=True, exist_ok=True)
                         existing = _next_variant(candidates_dir, ".png") - 1
 
-                        from beatlab.db import update_keyframe
+                        from scenecraft.db import update_keyframe
                         for i, prompt in enumerate(prompts[:count]):
                             v = existing + i + 1
                             out_path = str(candidates_dir / f"v{v}.png")
@@ -1254,7 +1254,7 @@ def make_handler(work_dir: Path):
                 if not source_id or not target_id: return self._error(400, "BAD_REQUEST", "Missing sourceId or targetId")
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import get_transition, update_transition, get_transition_effects, add_transition_effect, delete_transition_effect
+                from scenecraft.db import get_transition, update_transition, get_transition_effects, add_transition_effect, delete_transition_effect
                 src = get_transition(project_dir, source_id)
                 if not src: return self._error(404, "NOT_FOUND", f"Source {source_id} not found")
 
@@ -1303,7 +1303,7 @@ def make_handler(work_dir: Path):
                             for f in slot_dir.iterdir():
                                 if not (dst_slot / f.name).exists():
                                     shutil.copy2(str(f), str(dst_slot / f.name))
-                from beatlab.db import get_transition, update_transition
+                from scenecraft.db import get_transition, update_transition
                 src_tr = get_transition(project_dir, source_id)
                 if src_tr:
                     updates = {}
@@ -1342,7 +1342,7 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import update_keyframe
+                from scenecraft.db import update_keyframe
                 kf_id = body["keyframeId"]
                 _log(f"update-keyframe-label: {kf_id} label={body.get('label', '')!r}")
                 update_keyframe(project_dir, kf_id, label=body.get("label", ""), label_color=body.get("labelColor", ""))
@@ -1355,7 +1355,7 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import update_transition
+                from scenecraft.db import update_transition
                 tr_id = body["transitionId"]
                 fields = {"label": body.get("label", ""), "label_color": body.get("labelColor", "")}
                 if "tags" in body:
@@ -1371,8 +1371,8 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import update_keyframe
-                from beatlab.db import undo_begin as _ub
+                from scenecraft.db import update_keyframe
+                from scenecraft.db import undo_begin as _ub
                 _ub(project_dir, f"Update keyframe style {body.get('keyframeId', '')}")
                 fields = {}
                 if "blendMode" in body:
@@ -1393,8 +1393,8 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import update_transition
-                from beatlab.db import undo_begin as _ub
+                from scenecraft.db import update_transition
+                from scenecraft.db import undo_begin as _ub
                 _ub(project_dir, f"Update transition style {body.get('transitionId', '')}")
                 fields = {}
                 if "blendMode" in body:
@@ -1478,7 +1478,7 @@ def make_handler(work_dir: Path):
                 existing = _next_variant(cand_dir, ".png") - 1
                 v = existing + 1
                 shutil.copy2(str(src), str(cand_dir / f"v{v}.png"))
-                from beatlab.db import update_keyframe
+                from scenecraft.db import update_keyframe
                 import time as _t
                 cache_bust = int(_t.time())
                 all_cands = sorted([
@@ -1496,7 +1496,7 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import add_transition_effect
+                from scenecraft.db import add_transition_effect
                 tr_id = body.get("transitionId")
                 etype = body.get("type")
                 params = body.get("params", {})
@@ -1512,7 +1512,7 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import update_transition_effect
+                from scenecraft.db import update_transition_effect
                 effect_id = body.pop("id", None)
                 if not effect_id: return self._error(400, "BAD_REQUEST", "Missing id")
                 _log(f"transition-effects/update: {effect_id} {body}")
@@ -1526,7 +1526,7 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import delete_transition_effect
+                from scenecraft.db import delete_transition_effect
                 fx_id = body.get("id", "")
                 _log(f"transition-effects/delete: {fx_id}")
                 delete_transition_effect(project_dir, fx_id)
@@ -1567,7 +1567,7 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import add_marker
+                from scenecraft.db import add_marker
                 marker_id = body.get("id", f"m_{int(__import__('time').time() * 1000)}")
                 _log(f"markers/add: {marker_id} time={body.get('time', 0)} label={body.get('label', '')!r}")
                 add_marker(project_dir, marker_id, body.get("time", 0), body.get("label", ""), body.get("type", "note"))
@@ -1580,7 +1580,7 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import update_marker
+                from scenecraft.db import update_marker
                 marker_id = body.pop("id", None)
                 if not marker_id: return self._error(400, "BAD_REQUEST", "Missing 'id'")
                 updates = {k: v for k, v in body.items() if k in ("time", "label", "type")}
@@ -1595,7 +1595,7 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import delete_marker
+                from scenecraft.db import delete_marker
                 rm_id = body.get("id", "")
                 _log(f"markers/remove: {rm_id}")
                 delete_marker(project_dir, rm_id)
@@ -1608,7 +1608,7 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import add_prompt_roster
+                from scenecraft.db import add_prompt_roster
                 pid = body.get("id", f"pr_{int(__import__('time').time() * 1000)}")
                 add_prompt_roster(project_dir, pid, body.get("name", ""), body.get("template", ""), body.get("category", "general"))
                 return self._json_response({"success": True, "id": pid})
@@ -1620,7 +1620,7 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import update_prompt_roster
+                from scenecraft.db import update_prompt_roster
                 pid = body.pop("id", None)
                 if not pid: return self._error(400, "BAD_REQUEST", "Missing 'id'")
                 updates = {k: v for k, v in body.items() if k in ("name", "template", "category")}
@@ -1634,7 +1634,7 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from beatlab.db import delete_prompt_roster
+                from scenecraft.db import delete_prompt_roster
                 delete_prompt_roster(project_dir, body.get("id", ""))
                 return self._json_response({"success": True})
 
@@ -1792,7 +1792,7 @@ def make_handler(work_dir: Path):
         # ── Handlers ─────────────────────────────────────────────
 
         def _handle_browse(self, subpath: str):
-            """GET /api/browse?path=subdir — browse .beatlab_work directory tree."""
+            """GET /api/browse?path=subdir — browse .scenecraft_work directory tree."""
             _log(f"browse: path={subpath or '/'}")
             target = (work_dir / subpath).resolve() if subpath else work_dir.resolve()
 
@@ -1855,7 +1855,7 @@ def make_handler(work_dir: Path):
             if project_dir is None:
                 return self._error(404, "NOT_FOUND", f"Project not found: {project_name}")
 
-            from beatlab.db import get_meta, get_keyframes as db_get_keyframes, get_transitions as db_get_transitions, get_tracks
+            from scenecraft.db import get_meta, get_keyframes as db_get_keyframes, get_transitions as db_get_transitions, get_tracks
 
             # Check if DB exists (auto-import happens in _get_project_dir)
             if not (project_dir / "project.db").exists():
@@ -1922,7 +1922,7 @@ def make_handler(work_dir: Path):
                     break
 
             # Parse transitions from DB
-            from beatlab.db import get_all_transition_effects
+            from scenecraft.db import get_all_transition_effects
             all_tr_effects = get_all_transition_effects(project_dir)
             transitions = []
             tr_candidates_root = project_dir / "transition_candidates"
@@ -2067,7 +2067,7 @@ def make_handler(work_dir: Path):
 
             try:
                 import shutil
-                from beatlab.db import update_keyframe
+                from scenecraft.db import update_keyframe
                 selected_dir = project_dir / "selected_keyframes"
                 selected_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2138,7 +2138,7 @@ def make_handler(work_dir: Path):
             _log(f"select-transitions: {len(selections)} selections")
             try:
                 import shutil
-                from beatlab.db import update_transition
+                from scenecraft.db import update_transition
                 selected_dir = project_dir / "selected_transitions"
                 selected_dir.mkdir(parents=True, exist_ok=True)
                 tr_candidates_root = project_dir / "transition_candidates"
@@ -2183,12 +2183,12 @@ def make_handler(work_dir: Path):
             if project_dir is None:
                 return
 
-            from beatlab.db import undo_begin as _ub
+            from scenecraft.db import undo_begin as _ub
             _ub(project_dir, f"Update timestamp {kf_id} to {new_timestamp}")
 
             try:
                 _log(f"update-timestamp: {kf_id} -> {new_timestamp}")
-                from beatlab.db import update_keyframe, get_transitions, update_transition
+                from scenecraft.db import update_keyframe, get_transitions, update_transition
 
                 def parse_ts(ts):
                     parts = str(ts).split(":")
@@ -2204,7 +2204,7 @@ def make_handler(work_dir: Path):
                 for tr in all_trs:
                     if tr["from"] == kf_id or tr["to"] == kf_id:
                         other_id = tr["to"] if tr["from"] == kf_id else tr["from"]
-                        from beatlab.db import get_keyframe
+                        from scenecraft.db import get_keyframe
                         other_kf = get_keyframe(project_dir, other_id)
                         if other_kf:
                             other_time = parse_ts(other_kf["timestamp"])
@@ -2231,7 +2231,7 @@ def make_handler(work_dir: Path):
                 return
 
             try:
-                from beatlab.db import update_keyframe, get_keyframe
+                from scenecraft.db import update_keyframe, get_keyframe
                 _log(f"update-prompt: {kf_id} prompt={repr(prompt[:60])}")
                 kf = get_keyframe(project_dir, kf_id)
                 if not kf:
@@ -2252,7 +2252,7 @@ def make_handler(work_dir: Path):
             if project_dir is None:
                 return self._json_response({"bin": [], "transitionBin": []})
 
-            from beatlab.db import get_binned_keyframes, get_binned_transitions
+            from scenecraft.db import get_binned_keyframes, get_binned_transitions
 
             bin_entries = []
             for kf in get_binned_keyframes(project_dir):
@@ -2385,11 +2385,11 @@ def make_handler(work_dir: Path):
             if project_dir is None:
                 return
 
-            from beatlab.db import undo_begin
+            from scenecraft.db import undo_begin
             undo_begin(project_dir, f"Add keyframe at {timestamp}")
 
             try:
-                from beatlab.db import (
+                from scenecraft.db import (
                     add_keyframe as db_add_kf, get_keyframes as db_get_kfs,
                     next_keyframe_id, next_transition_id,
                     add_transition as db_add_tr, update_transition as db_update_tr,
@@ -2492,11 +2492,11 @@ def make_handler(work_dir: Path):
             if project_dir is None:
                 return
 
-            from beatlab.db import undo_begin
+            from scenecraft.db import undo_begin
             undo_begin(project_dir, f"Duplicate keyframe {source_id}")
 
             try:
-                from beatlab.db import (
+                from scenecraft.db import (
                     add_keyframe as db_add_kf, get_keyframes as db_get_kfs,
                     get_keyframe as db_get_kf,
                     next_keyframe_id, next_transition_id,
@@ -2631,7 +2631,7 @@ def make_handler(work_dir: Path):
                                 new_sel = project_dir / "selected_transitions" / f"{tr1_id}_slot_0.mp4"
                                 new_sel.parent.mkdir(parents=True, exist_ok=True)
                                 shutil.copy2(str(old_sel), str(new_sel))
-                                from beatlab.db import update_transition
+                                from scenecraft.db import update_transition
                                 update_transition(project_dir, tr1_id, selected=[1])
 
                             # Copy transition candidates
@@ -2647,7 +2647,7 @@ def make_handler(work_dir: Path):
                                             shutil.copy2(str(f), str(dst_slot / f.name))
 
                             # Copy transition effects
-                            from beatlab.db import get_transition_effects, add_transition_effect
+                            from scenecraft.db import get_transition_effects, add_transition_effect
                             for fx in get_transition_effects(project_dir, old_tr["id"]):
                                 add_transition_effect(project_dir, tr1_id, fx["type"], fx.get("params"))
 
@@ -2671,7 +2671,7 @@ def make_handler(work_dir: Path):
                             if old_sel.exists():
                                 new_sel = project_dir / "selected_transitions" / f"{tr2_id}_slot_0.mp4"
                                 shutil.copy2(str(old_sel), str(new_sel))
-                                from beatlab.db import update_transition
+                                from scenecraft.db import update_transition
                                 update_transition(project_dir, tr2_id, selected=[1])
 
                             old_cand = project_dir / "transition_candidates" / old_tr["id"]
@@ -2685,7 +2685,7 @@ def make_handler(work_dir: Path):
                                         for f in slot_dir.iterdir():
                                             shutil.copy2(str(f), str(dst_slot / f.name))
 
-                            from beatlab.db import get_transition_effects, add_transition_effect
+                            from scenecraft.db import get_transition_effects, add_transition_effect
                             for fx in get_transition_effects(project_dir, old_tr["id"]):
                                 add_transition_effect(project_dir, tr2_id, fx["type"], fx.get("params"))
 
@@ -2716,11 +2716,11 @@ def make_handler(work_dir: Path):
             if project_dir is None:
                 return
 
-            from beatlab.db import undo_begin
+            from scenecraft.db import undo_begin
             undo_begin(project_dir, f"Paste {len(kf_ids)} keyframes")
 
             try:
-                from beatlab.db import (
+                from scenecraft.db import (
                     get_keyframe as db_get_kf, add_keyframe as db_add_kf,
                     get_transitions as db_get_trs, add_transition as db_add_tr,
                     next_keyframe_id, next_transition_id, update_transition,
@@ -2803,7 +2803,7 @@ def make_handler(work_dir: Path):
                                 and not t.get("deleted_at")]
 
                 # Build existing time ranges on target track for overlap check
-                from beatlab.db import get_keyframes as db_get_kfs_paste
+                from scenecraft.db import get_keyframes as db_get_kfs_paste
                 all_kfs_paste = {k["id"]: k for k in db_get_kfs_paste(project_dir) if not k.get("deleted_at")}
                 target_trs = [t for t in all_trs
                               if t.get("track_id") == target_track and not t.get("deleted_at")]
@@ -2895,7 +2895,7 @@ def make_handler(work_dir: Path):
                     })
 
                     # Copy transition effects
-                    from beatlab.db import get_transition_effects, add_transition_effect
+                    from scenecraft.db import get_transition_effects, add_transition_effect
                     for fx in get_transition_effects(project_dir, src_tr["id"]):
                         add_transition_effect(project_dir, new_tr_id, fx["type"], fx.get("params"))
 
@@ -2927,11 +2927,11 @@ def make_handler(work_dir: Path):
             if project_dir is None:
                 return
 
-            from beatlab.db import undo_begin
+            from scenecraft.db import undo_begin
             undo_begin(project_dir, f"Delete keyframe {kf_id}")
 
             try:
-                from beatlab.db import (
+                from scenecraft.db import (
                     get_keyframe, delete_keyframe as db_del_kf,
                     get_transitions_involving, delete_transition as db_del_tr,
                 )
@@ -2961,7 +2961,7 @@ def make_handler(work_dir: Path):
 
                 # Bridge neighbors SYNCHRONOUSLY before responding
                 try:
-                    from beatlab.db import (
+                    from scenecraft.db import (
                         get_keyframes as db_get_kfs, get_transitions as db_get_trs,
                         next_transition_id, add_transition as db_add_tr,
                     )
@@ -3039,7 +3039,7 @@ def make_handler(work_dir: Path):
                                             shutil.copy2(str(f), str(new_cand_dir / f.name))
 
                                 # Copy transition effects
-                                from beatlab.db import get_transition_effects, add_transition_effect
+                                from scenecraft.db import get_transition_effects, add_transition_effect
                                 for fx in get_transition_effects(project_dir, inherited_tr_id):
                                     add_transition_effect(project_dir, new_tr_id, fx["type"], fx.get("params"))
 
@@ -3082,7 +3082,7 @@ def make_handler(work_dir: Path):
                 return
 
             try:
-                from beatlab.db import (
+                from scenecraft.db import (
                     get_keyframe, delete_keyframe as db_del_kf, get_keyframes as db_get_kfs,
                     get_transitions_involving, delete_transition as db_del_tr,
                     next_transition_id, add_transition as db_add_tr, get_transitions as db_get_trs,
@@ -3122,7 +3122,7 @@ def make_handler(work_dir: Path):
                         tracks_affected.add(kf.get("track_id", "track_1"))
 
                 import os, shutil
-                from beatlab.db import get_transition_effects, add_transition_effect
+                from scenecraft.db import get_transition_effects, add_transition_effect
 
                 for track in tracks_affected:
                     track_kfs = [k for k in db_get_kfs(project_dir)
@@ -3209,7 +3209,7 @@ def make_handler(work_dir: Path):
                 return
 
             try:
-                from beatlab.db import restore_keyframe as db_restore_kf
+                from scenecraft.db import restore_keyframe as db_restore_kf
                 _log(f"restore-keyframe: {kf_id}")
                 db_restore_kf(project_dir, kf_id)
                 self._json_response({"success": True, "keyframe": {"id": kf_id}})
@@ -3255,7 +3255,7 @@ def make_handler(work_dir: Path):
                     for f in cand_dir.glob("v*.png")
                 ], key=lambda p: int(p.rsplit("v", 1)[-1].split(".")[0]))
 
-                from beatlab.db import update_keyframe
+                from scenecraft.db import update_keyframe
                 import time as _t
                 update_keyframe(project_dir, kf_id, source=f"assets/stills/{still_name}", selected=v, candidates=all_cands)
 
@@ -3279,7 +3279,7 @@ def make_handler(work_dir: Path):
 
             try:
                 import shutil
-                from beatlab.db import update_keyframe
+                from scenecraft.db import update_keyframe
 
                 dest_dir = project_dir / "selected_keyframes"
                 dest_dir.mkdir(parents=True, exist_ok=True)
@@ -3338,7 +3338,7 @@ def make_handler(work_dir: Path):
 
             try:
                 import shutil
-                from beatlab.db import get_transition, update_transition
+                from scenecraft.db import get_transition, update_transition
 
                 source = project_dir / pool_path
                 if not source.exists():
@@ -3368,7 +3368,7 @@ def make_handler(work_dir: Path):
                 if from_kf_id:
                     def _extract():
                         try:
-                            from beatlab.db import update_keyframe
+                            from scenecraft.db import update_keyframe
                             sel_kf_dir = project_dir / "selected_keyframes"
                             sel_kf_dir.mkdir(parents=True, exist_ok=True)
                             tmp_frame = sel_kf_dir / f"_tmp_{from_kf_id}.png"
@@ -3406,7 +3406,7 @@ def make_handler(work_dir: Path):
             if project_dir is None:
                 return self._json_response({"items": []})
             try:
-                from beatlab.db import get_bench
+                from scenecraft.db import get_bench
                 items = get_bench(project_dir)
                 self._json_response({"items": items})
             except Exception as e:
@@ -3429,7 +3429,7 @@ def make_handler(work_dir: Path):
             try:
                 import subprocess as sp
                 import traceback as _tb
-                from beatlab.db import get_keyframes, get_transitions, add_to_bench
+                from scenecraft.db import get_keyframes, get_transitions, add_to_bench
 
                 track_id = body.get("trackId", "track_1")
                 _log(f"bench-capture: {project_name} time={time_sec} track={track_id} body_keys={list(body.keys())}")
@@ -3598,7 +3598,7 @@ def make_handler(work_dir: Path):
                 out_path.write_bytes(file_data)
 
                 # Add to bench DB
-                from beatlab.db import add_to_bench
+                from scenecraft.db import add_to_bench
                 source_path = f"bench_snapshots/{file_name}"
                 bench_id = add_to_bench(project_dir, "keyframe", source_path, label or file_name)
                 _log(f"bench-upload: {project_name} {source_path} -> {bench_id}")
@@ -3626,7 +3626,7 @@ def make_handler(work_dir: Path):
                 return
 
             try:
-                from beatlab.db import add_to_bench, get_transition, get_keyframe
+                from scenecraft.db import add_to_bench, get_transition, get_keyframe
 
                 # Resolve source path from entity if not provided directly
                 if not source_path and entity_id:
@@ -3668,7 +3668,7 @@ def make_handler(work_dir: Path):
 
             try:
                 _log(f"bench-remove: {bench_id}")
-                from beatlab.db import remove_from_bench
+                from scenecraft.db import remove_from_bench
                 remove_from_bench(project_dir, bench_id)
                 self._json_response({"success": True})
             except Exception as e:
@@ -3690,7 +3690,7 @@ def make_handler(work_dir: Path):
                 return
 
             try:
-                from beatlab.db import (
+                from scenecraft.db import (
                     get_transition, get_keyframe, delete_transition as db_del_tr,
                     add_keyframe as db_add_kf, add_transition as db_add_tr,
                     next_keyframe_id, next_transition_id,
@@ -3793,7 +3793,7 @@ def make_handler(work_dir: Path):
                     cand_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{new_kf_id}"
                     cand_dir.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(str(sel_kf_dir / f"{new_kf_id}.png"), str(cand_dir / "v1.png"))
-                    from beatlab.db import update_keyframe as _upd_kf
+                    from scenecraft.db import update_keyframe as _upd_kf
                     _upd_kf(project_dir, new_kf_id, selected=1,
                             candidates=[f"keyframe_candidates/candidates/section_{new_kf_id}/v1.png"])
 
@@ -3822,7 +3822,7 @@ def make_handler(work_dir: Path):
                             shutil.copy2(str(part2), str(sel2))
 
                             # Update DB with selected variants
-                            from beatlab.db import update_transition
+                            from scenecraft.db import update_transition
                             update_transition(project_dir, tr1_id, selected=1)
                             update_transition(project_dir, tr2_id, selected=1)
 
@@ -3860,7 +3860,7 @@ def make_handler(work_dir: Path):
 
             try:
                 import shutil
-                from beatlab.db import (
+                from scenecraft.db import (
                     add_keyframe as db_add_kf, get_keyframes as db_get_kfs,
                     next_keyframe_id, next_transition_id,
                     add_transition as db_add_tr, delete_transition as db_del_tr,
@@ -3968,11 +3968,11 @@ def make_handler(work_dir: Path):
             if project_dir is None:
                 return
 
-            from beatlab.db import undo_begin
+            from scenecraft.db import undo_begin
             undo_begin(project_dir, f"Unlink keyframe {kf_id}")
 
             try:
-                from beatlab.db import get_transitions_involving, delete_transition as db_del_tr
+                from scenecraft.db import get_transitions_involving, delete_transition as db_del_tr
                 from datetime import datetime, timezone
                 now = datetime.now(timezone.utc).isoformat()
 
@@ -4005,12 +4005,12 @@ def make_handler(work_dir: Path):
             if project_dir is None:
                 return
 
-            from beatlab.db import undo_begin as _ub
+            from scenecraft.db import undo_begin as _ub
             _ub(project_dir, f"Delete transition {tr_id}")
 
             try:
                 _log(f"delete-transition: {tr_id}")
-                from beatlab.db import delete_transition as db_del_tr
+                from scenecraft.db import delete_transition as db_del_tr
                 from datetime import datetime, timezone
                 now = datetime.now(timezone.utc).isoformat()
                 db_del_tr(project_dir, tr_id, now)
@@ -4033,7 +4033,7 @@ def make_handler(work_dir: Path):
                 return
 
             try:
-                from beatlab.db import restore_transition as db_restore_tr
+                from scenecraft.db import restore_transition as db_restore_tr
                 _log(f"restore-transition: {tr_id}")
                 db_restore_tr(project_dir, tr_id)
                 self._json_response({"success": True, "transition": {"id": tr_id}})
@@ -4059,7 +4059,7 @@ def make_handler(work_dir: Path):
                 return
 
             try:
-                from beatlab.db import update_transition, get_transition
+                from scenecraft.db import update_transition, get_transition
                 tr = get_transition(project_dir, tr_id)
                 if not tr:
                     return self._error(404, "NOT_FOUND", f"Transition {tr_id} not found")
@@ -4097,10 +4097,10 @@ def make_handler(work_dir: Path):
                 return
 
             try:
-                from beatlab.db import undo_begin as _ub_remap
+                from scenecraft.db import undo_begin as _ub_remap
                 _ub_remap(project_dir, f"Update transition remap {tr_id}")
                 _log(f"update-transition-remap: {tr_id} method={method}")
-                from beatlab.db import get_transition, update_transition
+                from scenecraft.db import get_transition, update_transition
                 tr = get_transition(project_dir, tr_id)
                 if not tr:
                     return self._error(404, "NOT_FOUND", f"Transition {tr_id} not found")
@@ -4140,7 +4140,7 @@ def make_handler(work_dir: Path):
             try:
                 import base64
                 import os
-                from beatlab.db import get_transition, get_keyframe, get_meta, update_transition
+                from scenecraft.db import get_transition, get_keyframe, get_meta, update_transition
 
                 tr = get_transition(project_dir, tr_id)
                 if not tr:
@@ -4301,7 +4301,7 @@ def make_handler(work_dir: Path):
                 _log(f"enhance-transition-action: {tr_id}")
                 import base64
                 import os
-                from beatlab.db import get_transition
+                from scenecraft.db import get_transition
 
                 tr = get_transition(project_dir, tr_id)
                 if not tr:
@@ -4370,12 +4370,12 @@ def make_handler(work_dir: Path):
                 return
 
             _log(f"generate-slot-keyframe-candidates: tr_id={tr_id or 'all'}")
-            from beatlab.ws_server import job_manager
+            from scenecraft.ws_server import job_manager
             job_id = job_manager.create_job("slot_keyframe_candidates", total=0, meta={"transitionId": tr_id or "all", "project": project_name})
 
             def _run():
                 try:
-                    from beatlab.render.narrative import generate_slot_keyframe_candidates
+                    from scenecraft.render.narrative import generate_slot_keyframe_candidates
                     generate_slot_keyframe_candidates(str(yaml_path), vertex=False)
 
                     # Collect results
@@ -4419,7 +4419,7 @@ def make_handler(work_dir: Path):
 
             # Freeform: generate from prompt text only, no source image needed
             if freeform:
-                from beatlab.db import get_keyframe, update_keyframe, get_meta
+                from scenecraft.db import get_keyframe, update_keyframe, get_meta
                 kf = get_keyframe(project_dir, kf_id)
                 if not kf:
                     return self._error(404, "NOT_FOUND", f"Keyframe {kf_id} not found")
@@ -4443,14 +4443,14 @@ def make_handler(work_dir: Path):
                 candidates_dir.mkdir(parents=True, exist_ok=True)
                 existing_count = _next_variant(candidates_dir, ".png") - 1
 
-                from beatlab.ws_server import job_manager
+                from scenecraft.ws_server import job_manager
                 job_id = job_manager.create_job("keyframe_candidates", total=count, meta={"keyframeId": kf_id, "project": project_name})
 
                 img_backend = _get_image_backend(project_dir)
 
                 def _run_freeform():
                     try:
-                        from beatlab.render.google_video import GoogleVideoClient
+                        from scenecraft.render.google_video import GoogleVideoClient
                         client = GoogleVideoClient(vertex=True)
                         import time as _time
                         for i in range(count):
@@ -4491,14 +4491,14 @@ def make_handler(work_dir: Path):
                 candidates_dir.mkdir(parents=True, exist_ok=True)
                 existing_count = _next_variant(candidates_dir, ".png") - 1
 
-                from beatlab.ws_server import job_manager
+                from scenecraft.ws_server import job_manager
                 job_id = job_manager.create_job("keyframe_candidates", total=count, meta={"keyframeId": kf_id, "project": project_name})
 
                 img_backend = _get_image_backend(project_dir)
 
                 def _run_refine():
                     try:
-                        from beatlab.render.google_video import GoogleVideoClient
+                        from scenecraft.render.google_video import GoogleVideoClient
                         client = GoogleVideoClient(vertex=True)
                         paths = []
                         import time as _time
@@ -4518,7 +4518,7 @@ def make_handler(work_dir: Path):
                             job_manager.update_progress(job_id, i + 1, f"v{v} done")
 
                         # Persist candidates to DB
-                        from beatlab.db import update_keyframe
+                        from scenecraft.db import update_keyframe
                         all_cands = sorted([
                             f"keyframe_candidates/candidates/section_{kf_id}/{f.name}"
                             for f in candidates_dir.glob("v*.png")
@@ -4534,7 +4534,7 @@ def make_handler(work_dir: Path):
                 return self._json_response({"jobId": job_id, "keyframeId": kf_id})
 
             # Read keyframe directly from DB — no YAML export needed
-            from beatlab.db import get_keyframe, update_keyframe
+            from scenecraft.db import get_keyframe, update_keyframe
             kf = get_keyframe(project_dir, kf_id)
             if not kf:
                 return self._error(404, "NOT_FOUND", f"Keyframe {kf_id} not found")
@@ -4555,15 +4555,15 @@ def make_handler(work_dir: Path):
             candidates_dir.mkdir(parents=True, exist_ok=True)
             existing_count = _next_variant(candidates_dir, ".png") - 1
 
-            from beatlab.ws_server import job_manager
+            from scenecraft.ws_server import job_manager
             job_id = job_manager.create_job("keyframe_candidates", total=count, meta={"keyframeId": kf_id, "project": project_name})
 
             _log(f"  stylize: {kf_id} source={source_path.name} prompt={prompt[:60]!r} count={count} existing={existing_count}")
 
             def _run():
                 try:
-                    from beatlab.render.google_video import GoogleVideoClient
-                    from beatlab.db import get_meta as _get_meta_gen
+                    from scenecraft.render.google_video import GoogleVideoClient
+                    from scenecraft.db import get_meta as _get_meta_gen
                     from concurrent.futures import ThreadPoolExecutor
                     client = GoogleVideoClient(vertex=True)
                     _img_model = _get_meta_gen(project_dir).get("image_model", "replicate/nano-banana-2")
@@ -4624,7 +4624,7 @@ def make_handler(work_dir: Path):
             project_dir = work_dir / project_name
 
             # Read transition directly from DB — no YAML export needed
-            from beatlab.db import get_transition, get_meta
+            from scenecraft.db import get_transition, get_meta
             tr = get_transition(project_dir, tr_id)
             if not tr:
                 return self._error(404, "NOT_FOUND", f"Transition {tr_id} not found")
@@ -4649,7 +4649,7 @@ def make_handler(work_dir: Path):
 
             # If useNextTransitionFrame: extract first frame from the next transition's selected video as end frame
             if use_next_tr_frame:
-                from beatlab.db import get_transitions as _get_all_trs
+                from scenecraft.db import get_transitions as _get_all_trs
                 all_trs = _get_all_trs(project_dir)
                 # Find transitions starting from to_kf on the same track
                 next_tr = next((t for t in all_trs if t["from"] == to_kf_id and t.get("track_id") == tr.get("track_id")), None)
@@ -4700,19 +4700,19 @@ def make_handler(work_dir: Path):
 
             _log(f"  veo: {tr_id} {from_kf_id}→{to_kf_id} prompt={prompt[:60]!r} dur={slot_duration}s count={count} existing={existing_count}")
 
-            from beatlab.ws_server import job_manager
+            from scenecraft.ws_server import job_manager
             job_id = job_manager.create_job("transition_candidates", total=count, meta={"transitionId": tr_id, "project": project_name})
 
             vid_backend = _get_video_backend(project_dir)
 
             def _run():
                 try:
-                    from beatlab.render.google_video import GoogleVideoClient, PromptRejectedError
+                    from scenecraft.render.google_video import GoogleVideoClient, PromptRejectedError
                     from concurrent.futures import ThreadPoolExecutor, as_completed
                     from pathlib import Path as _Path
 
                     if vid_backend.startswith("runway"):
-                        from beatlab.render.google_video import RunwayVideoClient
+                        from scenecraft.render.google_video import RunwayVideoClient
                         _, _, runway_model = vid_backend.partition("/")
                         client = RunwayVideoClient(model=runway_model or "veo3.1_fast")
                         _log(f"  Using Runway backend: {runway_model or 'veo3.1_fast'}")
@@ -4862,7 +4862,7 @@ def make_handler(work_dir: Path):
 
             try:
                 _log(f"update-meta: {list(k for k in ('motion_prompt', 'default_transition_prompt', 'image_model') if k in body)}")
-                from beatlab.db import get_meta, set_meta
+                from scenecraft.db import get_meta, set_meta
                 meta = get_meta(project_dir)
                 for key in ("motion_prompt", "default_transition_prompt", "image_model"):
                     if key in body:
@@ -4985,7 +4985,7 @@ def make_handler(work_dir: Path):
             if project_dir is None:
                 return self._json_response({"watchedFolders": []})
             try:
-                from beatlab.db import get_meta
+                from scenecraft.db import get_meta
                 import json
                 meta = get_meta(project_dir)
                 wf = meta.get("watched_folders", [])
@@ -5002,7 +5002,7 @@ def make_handler(work_dir: Path):
             if project_dir is None:
                 return self._json_response({"effects": [], "suppressions": []})
             try:
-                from beatlab.db import get_effects, get_suppressions
+                from scenecraft.db import get_effects, get_suppressions
                 self._json_response({
                     "effects": get_effects(project_dir),
                     "suppressions": get_suppressions(project_dir),
@@ -5024,7 +5024,7 @@ def make_handler(work_dir: Path):
                 return
 
             try:
-                from beatlab.db import save_effects, get_suppressions
+                from scenecraft.db import save_effects, get_suppressions
                 effects = body.get("effects", [])
                 # Only update suppressions if explicitly provided in the request
                 if "suppressions" in body:
@@ -5047,7 +5047,7 @@ def make_handler(work_dir: Path):
             if not folder_path:
                 return self._error(400, "BAD_REQUEST", "Missing 'folderPath'")
 
-            from beatlab.ws_server import folder_watcher
+            from scenecraft.ws_server import folder_watcher
             if not folder_watcher:
                 return self._error(500, "INTERNAL_ERROR", "Folder watcher not initialized")
 
@@ -5056,7 +5056,7 @@ def make_handler(work_dir: Path):
                 result = folder_watcher.add_watch(project_name, folder_path)
 
                 # Persist to DB
-                from beatlab.db import get_meta, set_meta
+                from scenecraft.db import get_meta, set_meta
                 project_dir = work_dir / project_name
                 meta = get_meta(project_dir)
                 watched = meta.get("watched_folders", [])
@@ -5081,12 +5081,12 @@ def make_handler(work_dir: Path):
                 return self._error(400, "BAD_REQUEST", "Missing 'folderPath'")
 
             _log(f"unwatch-folder: {folder_path}")
-            from beatlab.ws_server import folder_watcher
+            from scenecraft.ws_server import folder_watcher
             if folder_watcher:
                 folder_watcher.remove_watch(project_name, folder_path)
 
             # Remove from DB
-            from beatlab.db import get_meta, set_meta
+            from scenecraft.db import get_meta, set_meta
             project_dir = work_dir / project_name
             if project_dir.is_dir():
                 meta = get_meta(project_dir)
@@ -5128,7 +5128,7 @@ def make_handler(work_dir: Path):
 
             try:
                 _log(f"import: source={source_path}")
-                from beatlab.db import get_db, add_keyframe, add_transition, next_keyframe_id, next_transition_id
+                from scenecraft.db import get_db, add_keyframe, add_transition, next_keyframe_id, next_transition_id
                 import shutil
                 from datetime import datetime, timezone
 
@@ -5422,7 +5422,7 @@ def make_handler(work_dir: Path):
             _log(f"get-narrative: {project_name}")
             project_dir = self._require_project_dir(project_name)
             if project_dir is None: return
-            from beatlab.db import get_sections
+            from scenecraft.db import get_sections
             self._json_response({"sections": get_sections(project_dir)})
 
         def _handle_update_narrative(self, project_name: str):
@@ -5432,7 +5432,7 @@ def make_handler(work_dir: Path):
                 return
             project_dir = self._require_project_dir(project_name)
             if project_dir is None: return
-            from beatlab.db import get_sections, set_sections
+            from scenecraft.db import get_sections, set_sections
             sections = body.get("sections")
             if sections is not None:
                 _log(f"update-narrative: {len(sections)} sections")
@@ -5443,7 +5443,7 @@ def make_handler(work_dir: Path):
         def _handle_get_timelines(self, project_name: str):
             """GET /api/projects/:name/timelines — list available timelines."""
             _log(f"get-timelines: {project_name}")
-            from beatlab.project import get_timelines
+            from scenecraft.project import get_timelines
             project_dir = work_dir / project_name
             if not project_dir.is_dir():
                 return self._error(404, "NOT_FOUND", f"Project not found: {project_name}")
@@ -5455,7 +5455,7 @@ def make_handler(work_dir: Path):
 
         def _handle_timeline_switch(self, project_name: str):
             """POST /api/projects/:name/timeline/switch — switch active timeline."""
-            from beatlab.project import switch_timeline
+            from scenecraft.project import switch_timeline
             body = self._read_json_body()
             if body is None:
                 return
@@ -5474,7 +5474,7 @@ def make_handler(work_dir: Path):
 
         def _handle_timeline_import(self, project_name: str):
             """POST /api/projects/:name/timeline/import — import timeline from source."""
-            from beatlab.project import import_timeline
+            from scenecraft.project import import_timeline
             body = self._read_json_body()
             if body is None:
                 return
@@ -5494,7 +5494,7 @@ def make_handler(work_dir: Path):
 
         def _handle_timeline_create(self, project_name: str):
             """POST /api/projects/:name/timeline/create — create new timeline."""
-            from beatlab.project import create_timeline
+            from scenecraft.project import create_timeline
             body = self._read_json_body()
             if body is None:
                 return
@@ -5755,7 +5755,7 @@ def make_handler(work_dir: Path):
                 # Auto-import from YAML on first access
                 yaml_exists = (project_dir / "timeline.yaml").exists() or (project_dir / "narrative_keyframes.yaml").exists()
                 if yaml_exists:
-                    from beatlab.db import import_from_yaml
+                    from scenecraft.db import import_from_yaml
                     _log(f"Auto-importing {project_name} from YAML to SQLite...")
                     import_from_yaml(project_dir)
                     _log(f"  Import complete")
@@ -5900,7 +5900,7 @@ def make_handler(work_dir: Path):
                 return self._json_response({})
 
             try:
-                from beatlab.db import get_meta
+                from scenecraft.db import get_meta
                 import json
                 meta = get_meta(project_dir)
                 still = meta.get(f"section_still:{section_label}", None)
@@ -5929,7 +5929,7 @@ def make_handler(work_dir: Path):
 
             try:
                 _log(f"section-settings: {section_label}")
-                from beatlab.db import set_meta
+                from scenecraft.db import set_meta
                 import json
 
                 if "still" in body:
@@ -5963,7 +5963,7 @@ def make_handler(work_dir: Path):
 
             try:
                 import shutil
-                from beatlab.db import update_keyframe
+                from scenecraft.db import update_keyframe
 
                 staging_file = project_dir / "staging" / staging_id / f"v{variant}.png"
                 if not staging_file.exists():
@@ -6014,13 +6014,13 @@ def make_handler(work_dir: Path):
             if not source.exists():
                 return self._error(404, "NOT_FOUND", f"Still not found: {still_name}")
 
-            from beatlab.ws_server import job_manager
+            from scenecraft.ws_server import job_manager
             job_id = job_manager.create_job("staged_candidate", total=count, meta={"stagingId": staging_id, "project": project_name})
 
             def _run():
                 try:
-                    from beatlab.render.google_video import GoogleVideoClient
-                    from beatlab.db import get_meta as _get_meta_stg
+                    from scenecraft.render.google_video import GoogleVideoClient
+                    from scenecraft.db import get_meta as _get_meta_stg
                     client = GoogleVideoClient(vertex=True)
                     _img_model = _get_meta_stg(project_dir).get("image_model", "replicate/nano-banana-2")
 
@@ -6232,7 +6232,7 @@ def make_handler(work_dir: Path):
 
                 # Auto-persist suggestions to DB
                 try:
-                    from beatlab.db import set_meta
+                    from scenecraft.db import set_meta
                     import json as _json2
                     project_dir = self._get_project_dir(project_name)
                     if project_dir:
@@ -6257,7 +6257,7 @@ def make_handler(work_dir: Path):
 
 def run_server(host: str = "0.0.0.0", port: int = 8888, work_dir: str | None = None):
     """Start the SceneCraft REST API server."""
-    wd = Path(work_dir) if work_dir else Path.cwd() / ".beatlab_work"
+    wd = Path(work_dir) if work_dir else Path.cwd() / ".scenecraft_work"
     if not wd.exists():
         print(f"Work directory not found: {wd}", file=sys.stderr)
         print("Run from the project root or specify --work-dir.", file=sys.stderr)
@@ -6271,8 +6271,8 @@ def run_server(host: str = "0.0.0.0", port: int = 8888, work_dir: str | None = N
 
     # Start WebSocket server for real-time job progress
     ws_port = port + 1
-    from beatlab.ws_server import start_ws_server, FolderWatcher
-    import beatlab.ws_server as _ws_mod
+    from scenecraft.ws_server import start_ws_server, FolderWatcher
+    import scenecraft.ws_server as _ws_mod
     _ws_mod.folder_watcher = FolderWatcher(wd)
     start_ws_server(host, ws_port)
 

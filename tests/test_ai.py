@@ -2,9 +2,9 @@
 
 import json
 
-from beatlab.ai.plan import EffectPlan, SectionPlan, parse_effect_plan, validate_effect_plan
-from beatlab.ai.prompt import build_system_prompt, build_user_prompt
-from beatlab.ai.provider import LLMProvider
+from scenecraft.ai.plan import EffectPlan, SectionPlan, parse_effect_plan, validate_effect_plan
+from scenecraft.ai.prompt import build_system_prompt, build_user_prompt
+from scenecraft.ai.provider import LLMProvider
 
 
 class MockProvider(LLMProvider):
@@ -139,7 +139,7 @@ class TestPrompt:
 
 class TestDirector:
     def test_create_effect_plan_with_mock(self):
-        from beatlab.ai.director import create_effect_plan
+        from scenecraft.ai.director import create_effect_plan
 
         response = json.dumps({
             "sections": [
@@ -164,7 +164,7 @@ class TestDirector:
 
 class TestGeneratorWithPlan:
     def test_generate_from_plan(self):
-        from beatlab.generator import generate_comp
+        from scenecraft.generator import generate_comp
 
         beat_map = {
             "version": "1.1", "source_file": "test.mp3",
@@ -191,7 +191,7 @@ class TestGeneratorWithPlan:
         assert "BezierSpline" in output
 
     def test_generate_from_plan_with_custom_effect(self):
-        from beatlab.generator import generate_comp
+        from scenecraft.generator import generate_comp
 
         beat_map = {
             "version": "1.1", "source_file": "test.mp3",

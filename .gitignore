@@ -26,6 +26,7 @@ out/
 *~
 
 # Project work directory (backed up via volume snapshots)
+.scenecraft_work/
 .beatlab_work/
 
 # OS

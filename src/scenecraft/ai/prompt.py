@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from beatlab.presets import PRESETS
+from scenecraft.presets import PRESETS
 
 
 def build_system_prompt() -> str:

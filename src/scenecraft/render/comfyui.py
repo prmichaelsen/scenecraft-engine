@@ -245,7 +245,7 @@ def build_img2img_workflow(
             "class_type": "SaveImage",
             "inputs": {
                 "images": ["7", 0],
-                "filename_prefix": "beatlab_render",
+                "filename_prefix": "scenecraft_render",
             },
         },
     }

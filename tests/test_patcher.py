@@ -1,6 +1,6 @@
 """Tests for plan patching."""
 
-from beatlab.render.patcher import merge_plan, generate_patch_from_updates
+from scenecraft.render.patcher import merge_plan, generate_patch_from_updates
 
 
 class TestMergePlan:

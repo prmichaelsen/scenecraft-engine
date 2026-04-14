@@ -289,7 +289,7 @@ def build_workflow(image_name, prompt, negative_prompt, denoise, seed, model):
             "latent_image": ["3", 0], "seed": seed, "steps": 20, "cfg": 7.0,
             "sampler_name": "euler_ancestral", "scheduler": "normal", "denoise": denoise}},
         "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["1", 2]}},
-        "8": {"class_type": "SaveImage", "inputs": {"images": ["7", 0], "filename_prefix": "beatlab_render"}},
+        "8": {"class_type": "SaveImage", "inputs": {"images": ["7", 0], "filename_prefix": "scenecraft_render"}},
     }
 
 

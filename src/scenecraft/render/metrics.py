@@ -42,7 +42,7 @@ def record_step(
     """Record a completed step's timing and metadata.
 
     Args:
-        work_dir: Root work directory (e.g. ".beatlab_work")
+        work_dir: Root work directory (e.g. ".scenecraft_work")
         video_name: Name of the video being processed
         step: Step name (e.g. "audio_extract", "beat_analysis", "veo_render", "crossfade")
         duration_seconds: How long the step took

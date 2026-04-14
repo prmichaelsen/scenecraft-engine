@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from beatlab.render.wan import chunk_section_frames, frames_to_clip
+from scenecraft.render.wan import chunk_section_frames, frames_to_clip
 
 
 def _log(msg: str) -> None:
@@ -155,7 +155,7 @@ def render_wan_pipeline(
     # ── Phase 2: Remote execution ──
     if local_comfyui:
         # Local mode — run the remote script directly as a subprocess
-        import beatlab.render.remote_wan_script as rws
+        import scenecraft.render.remote_wan_script as rws
         script_path = rws.__file__
         _run_local(script_path, str(wan_input_dir), str(wan_output_dir), model, progress_callback)
     else:
@@ -195,7 +195,7 @@ def _run_local(script_path: str, input_dir: str, output_dir: str, model: str,
 def _run_remote(input_dir: str, output_dir: str, model: str,
                 progress_callback: Callable | None) -> None:
     """Upload to Vast.ai instance, run via SSH, download results."""
-    from beatlab.render.cloud import VastAIManager
+    from scenecraft.render.cloud import VastAIManager
 
     vast = VastAIManager()
 
@@ -216,7 +216,7 @@ def _run_remote(input_dir: str, output_dir: str, model: str,
         ssh_base = f"ssh {key_opt}-o StrictHostKeyChecking=no -p {port} root@{host}"
 
         # Upload remote script
-        import beatlab.render.remote_wan_script as rws
+        import scenecraft.render.remote_wan_script as rws
         script_path = rws.__file__
         _log("[wan] Uploading render script...")
         vast.ssh_run(instance_id, "mkdir -p /workspace")

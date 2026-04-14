@@ -635,7 +635,7 @@ Leave blank to skip (will need selection before render).
 
 When done filling in selections, run:
 ```
-beatlab apply-selections beyond_the_veil selections.md
+scenecraft apply-selections beyond_the_veil selections.md
 ```
 
 Or give the file to Claude and say "apply these selections".

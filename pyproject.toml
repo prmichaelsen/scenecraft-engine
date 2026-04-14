@@ -3,9 +3,9 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "davinci-beat-lab"
+name = "scenecraft-engine"
 version = "0.1.0"
-description = "AI-powered beat detection and auto-generated visual effects for DaVinci Resolve"
+description = "AI video editor"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 dependencies = [
@@ -38,14 +38,14 @@ describe-local = [
     "accelerate>=0.27.0",
 ]
 all = [
-    "davinci-beat-lab[ai,describe]",
+    "scenecraft-engine[ai,describe]",
 ]
 dev = [
     "pytest>=7.0.0",
 ]
 
 [project.scripts]
-beatlab = "beatlab.cli:main"
+scenecraft = "scenecraft.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from beatlab.fusion.keyframes import KeyframeTrack
+from scenecraft.fusion.keyframes import KeyframeTrack
 
 
 @dataclass

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from beatlab.beat_map import load_beat_map
-from beatlab.fusion.keyframes import KeyframeTrack
-from beatlab.fusion.nodes import (
+from scenecraft.beat_map import load_beat_map
+from scenecraft.fusion.keyframes import KeyframeTrack
+from scenecraft.fusion.nodes import (
     make_brightness_contrast,
     make_camera_shake,
     make_color_corrector,
@@ -14,8 +14,8 @@ from beatlab.fusion.nodes import (
     make_transform,
     FusionNode,
 )
-from beatlab.fusion.setting_writer import FusionComp
-from beatlab.presets import PRESETS, EffectPreset, apply_intensity, presets_for_section, presets_for_sensation
+from scenecraft.fusion.setting_writer import FusionComp
+from scenecraft.presets import PRESETS, EffectPreset, apply_intensity, presets_for_section, presets_for_sensation
 
 
 NODE_MAKERS = {
@@ -251,7 +251,7 @@ def _generate_sustained_effects(
     start_pos_x: float,
 ) -> None:
     """Generate sustained (hold) effect nodes from the plan."""
-    from beatlab.beat_map import time_to_frame
+    from scenecraft.beat_map import time_to_frame
 
     # Collect all sustained params across all sections, grouped by node_type
     # node_type → param_name → list of (section, value, transition_frames)

@@ -1,7 +1,7 @@
-"""SQLite storage layer for beatlab projects.
+"""SQLite storage layer for scenecraft projects.
 
 Replaces YAML read/write with instant SQL operations.
-Each project gets its own `project.db` in its .beatlab_work directory.
+Each project gets its own `project.db` in its .scenecraft_work directory.
 """
 
 from __future__ import annotations
@@ -1114,7 +1114,7 @@ def validate_timeline(project_dir: Path) -> list[str]:
 
 def import_from_yaml(project_dir: Path):
     """Import project data from YAML files into SQLite."""
-    from beatlab.project import load_project
+    from scenecraft.project import load_project
 
     data = load_project(project_dir)
     if data.get("_format") == "empty":

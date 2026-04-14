@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from beatlab.fusion.nodes import FusionNode
+from scenecraft.fusion.nodes import FusionNode
 
 
 class FusionComp:

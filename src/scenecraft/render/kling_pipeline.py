@@ -8,8 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from beatlab.render.google_video import GoogleVideoClient
-from beatlab.render.kling_video import KlingClient
+from scenecraft.render.google_video import GoogleVideoClient
+from scenecraft.render.kling_video import KlingClient
 
 
 def _log(msg: str) -> None:
@@ -151,7 +151,7 @@ def render_kling_pipeline(
         _log("Phase 4: Using cached muxed video")
     else:
         _log("Phase 4: Assembling with 8-frame crossfades...")
-        from beatlab.render.crossfade import concat_with_crossfade
+        from scenecraft.render.crossfade import concat_with_crossfade
         concat_output = str(work / "kling_concat.mp4")
         concat_with_crossfade(segment_paths, concat_output, crossfade_frames=8, fps=video_fps)
 
@@ -167,7 +167,7 @@ def render_kling_pipeline(
 
     # ── Phase 5: Apply beat-synced effects ──
     _log("Phase 5: Applying beat-synced effects (zoom, shake, flash, color)...")
-    from beatlab.render.effects import apply_effects
+    from scenecraft.render.effects import apply_effects
 
     apply_effects(
         video_path=muxed_output,

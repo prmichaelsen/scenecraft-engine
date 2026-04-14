@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 
-INSTANCE_STATE_DIR = Path.home() / ".beatlab"
+INSTANCE_STATE_DIR = Path.home() / ".scenecraft"
 INSTANCE_STATE_FILE = INSTANCE_STATE_DIR / "vast_instance.json"
 
 

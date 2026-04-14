@@ -22,7 +22,7 @@ def _make_mp4():
 
 
 def _setup_project(tmp_path):
-    from beatlab.db import add_keyframe, add_transition
+    from scenecraft.db import add_keyframe, add_transition
 
     project_dir = tmp_path / "test_project"
     project_dir.mkdir()
@@ -79,13 +79,13 @@ def _parse_ts(ts):
 
 
 def _get_active_trs(project_dir, track="track_1"):
-    from beatlab.db import get_transitions
+    from scenecraft.db import get_transitions
     return [t for t in get_transitions(project_dir)
             if t.get("track_id") == track and not t.get("deleted_at")]
 
 
 def _get_active_kfs(project_dir, track="track_1"):
-    from beatlab.db import get_keyframes
+    from scenecraft.db import get_keyframes
     return [k for k in get_keyframes(project_dir)
             if k.get("track_id", "track_1") == track and not k.get("deleted_at")]
 
@@ -109,7 +109,7 @@ def _find_overlaps(transitions, keyframes):
 
 def _simulate_duplicate(project_dir, source_id, timestamp):
     """Simulate duplicate-keyframe logic matching the API server."""
-    from beatlab.db import (
+    from scenecraft.db import (
         add_keyframe as db_add_kf, get_keyframes as db_get_kfs,
         get_keyframe as db_get_kf, get_transitions as db_get_trs,
         add_transition as db_add_tr, delete_transition as db_del_tr,
@@ -252,7 +252,7 @@ class TestDuplicateKeyframe:
         project_dir = _setup_project(tmp_path)
 
         new_id, tr_ids = _simulate_duplicate(project_dir, "kf_001", "1:05.00")
-        from beatlab.db import get_transitions
+        from scenecraft.db import get_transitions
         for tr_id in tr_ids:
             tr = next(t for t in get_transitions(project_dir) if t["id"] == tr_id)
             assert tr.get("blend_mode") == "add", f"{tr_id} missing blend_mode"
@@ -310,7 +310,7 @@ class TestDuplicateKeyframe:
         """Regression: duplicating a keyframe into the middle of a transition that spans
         across multiple keyframes (e.g., tr from kf_001 to kf_003, insert between kf_002 and kf_003)
         should still find and remove the spanning transition, not leave it as a ghost."""
-        from beatlab.db import add_keyframe, add_transition, get_transitions, get_keyframes
+        from scenecraft.db import add_keyframe, add_transition, get_transitions, get_keyframes
 
         project_dir = tmp_path / "test_span"
         project_dir.mkdir()
@@ -372,7 +372,7 @@ class TestDuplicateKeyframe:
         project_dir = _setup_project(tmp_path)
 
         new_id, tr_ids = _simulate_duplicate(project_dir, "kf_001", "1:05.00")
-        from beatlab.db import get_transitions
+        from scenecraft.db import get_transitions
         for tr_id in tr_ids:
             tr = next(t for t in get_transitions(project_dir) if t["id"] == tr_id)
             assert tr.get("track_id") == "track_1", f"{tr_id} on wrong track: {tr.get('track_id')}"

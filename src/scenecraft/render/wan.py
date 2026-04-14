@@ -231,7 +231,7 @@ def build_wan21_v2v_workflow(
                 "images": ["7", 0],
                 "frame_rate": 30,
                 "loop_count": 0,
-                "filename_prefix": "beatlab_wan",
+                "filename_prefix": "scenecraft_wan",
                 "format": "video/h264-mp4",
                 "pingpong": False,
                 "save_output": True,

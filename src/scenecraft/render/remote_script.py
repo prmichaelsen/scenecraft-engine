@@ -114,7 +114,7 @@ def build_workflow(image_name, prompt, negative_prompt, denoise, seed, model,
               "inputs": {"samples": ["6", 0], "vae": ["1", 2]}},
         "8": {"class_type": "SaveImage",
               "inputs": {"images": ["7", 0],
-                         "filename_prefix": "beatlab_render"}},
+                         "filename_prefix": "scenecraft_render"}},
     }
 
     if controlnet_model:

@@ -1,8 +1,8 @@
 """Tests for the render pipeline — frame params, ComfyUI workflow, cost estimation."""
 
-from beatlab.render.frames import generate_frame_params
-from beatlab.render.comfyui import build_img2img_workflow
-from beatlab.render.cloud import estimate_cost
+from scenecraft.render.frames import generate_frame_params
+from scenecraft.render.comfyui import build_img2img_workflow
+from scenecraft.render.cloud import estimate_cost
 
 
 class TestFrameParams:
@@ -115,7 +115,7 @@ class TestCostEstimation:
 class TestPlanStylePrompt:
     def test_parse_style_prompt(self):
         import json
-        from beatlab.ai.plan import parse_effect_plan
+        from scenecraft.ai.plan import parse_effect_plan
         text = json.dumps({
             "sections": [{
                 "section_index": 0,
@@ -128,7 +128,7 @@ class TestPlanStylePrompt:
 
     def test_parse_no_style_prompt(self):
         import json
-        from beatlab.ai.plan import parse_effect_plan
+        from scenecraft.ai.plan import parse_effect_plan
         text = json.dumps({
             "sections": [{"section_index": 0, "presets": ["flash"]}]
         })

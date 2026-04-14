@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from beatlab.render.google_video import GoogleVideoClient
+from scenecraft.render.google_video import GoogleVideoClient
 
 
 def _log(msg: str) -> None:
@@ -34,7 +34,7 @@ def _expand_sections_with_splits(
 
     Returns (expanded_sections, expanded_plan_map).
     """
-    from beatlab.render.section_splitter import load_splits
+    from scenecraft.render.section_splitter import load_splits
 
     splits = load_splits(str(splits_path))
     split_map = splits.get("splits", {})
@@ -191,7 +191,7 @@ def render_google_pipeline(
     else:
         _log(f"Phase 2: Stylizing {total_sections} keyframes with Nano Banana...")
 
-    from beatlab.render.candidates import generate_image_candidates, make_contact_sheet
+    from scenecraft.render.candidates import generate_image_candidates, make_contact_sheet
 
     styled_paths: list[str] = []
     needs_selection: list[int] = []  # sections that have candidates but no selection yet
@@ -291,7 +291,7 @@ def render_google_pipeline(
             _log(f"  Sections: {fk_list}")
             video_name = work.name
             select_args = " ".join(f"{file_keys[i]}:v1" for i in unselected[:5])
-            _log(f"  Run: beatlab select {video_name} {select_args} ...")
+            _log(f"  Run: scenecraft select {video_name} {select_args} ...")
             _log(f"  Then re-run this render command to continue.\n")
             return str(output_path)  # Exit early — user needs to select
 
@@ -318,7 +318,7 @@ def render_google_pipeline(
     ai_intra_prompts: dict[int, str] = {}  # segment index → claude-generated prompt
     if ai_transitions and not intra_transition_prompt:
         _log("Phase 2.75: Claude describing intra-section transitions...")
-        from beatlab.render.transition_describer import describe_transitions_batch
+        from scenecraft.render.transition_describer import describe_transitions_batch
 
         # Collect intra-section pairs that need generation
         intra_pairs = []
@@ -563,7 +563,7 @@ def render_google_pipeline(
     # ── Phase 3.75: Burn section labels (optional) ──
     if labels:
         _log("Phase 3.75: Burning section labels...")
-        from beatlab.render.crossfade import burn_section_labels
+        from scenecraft.render.crossfade import burn_section_labels
         labeled_dir = str(work / "google_labeled")
         section_indices = list(range(num_segments))  # segment i = section i→i+1
         remapped_paths = burn_section_labels(remapped_paths, section_indices, labeled_dir)
@@ -574,7 +574,7 @@ def render_google_pipeline(
         _log("Phase 4: Concat cached, skipping...")
     else:
         _log("Phase 4: Assembling with 8-frame crossfades...")
-        from beatlab.render.crossfade import concat_with_crossfade
+        from scenecraft.render.crossfade import concat_with_crossfade
         concat_with_crossfade(remapped_paths, concat_output, crossfade_frames=8, fps=video_fps)
 
     # Mux audio from original video
@@ -595,7 +595,7 @@ def render_google_pipeline(
 
     # ── Phase 5: Apply beat-synced effects (OpenCV) ──
     _log("Phase 5: Applying beat-synced effects (OpenCV)...")
-    from beatlab.render.effects_opencv import apply_effects
+    from scenecraft.render.effects_opencv import apply_effects
 
     apply_effects(
         video_path=muxed_output,

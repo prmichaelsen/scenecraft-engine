@@ -1,6 +1,6 @@
 """Tests for keyframe selection."""
 
-from beatlab.render.keyframe_selector import select_keyframes
+from scenecraft.render.keyframe_selector import select_keyframes
 
 
 def _make_beat_map():

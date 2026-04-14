@@ -21,7 +21,7 @@ def _make_mp4():
 
 
 def _setup_project(tmp_path):
-    from beatlab.db import add_keyframe, add_transition
+    from scenecraft.db import add_keyframe, add_transition
 
     project_dir = tmp_path / "test_project"
     project_dir.mkdir()
@@ -85,10 +85,10 @@ def _parse_ts(ts):
 
 def _get_active(project_dir, table, track=None):
     if table == "transitions":
-        from beatlab.db import get_transitions
+        from scenecraft.db import get_transitions
         items = [t for t in get_transitions(project_dir) if not t.get("deleted_at")]
     else:
-        from beatlab.db import get_keyframes
+        from scenecraft.db import get_keyframes
         items = [k for k in get_keyframes(project_dir) if not k.get("deleted_at")]
     if track:
         items = [i for i in items if i.get("track_id", "track_1") == track]
@@ -97,7 +97,7 @@ def _get_active(project_dir, table, track=None):
 
 def _simulate_batch_delete(project_dir, kf_ids):
     """Simulate batch-delete-keyframes matching the fixed API server."""
-    from beatlab.db import (
+    from scenecraft.db import (
         get_keyframe, delete_keyframe as db_del_kf, get_keyframes as db_get_kfs,
         get_transitions_involving, delete_transition as db_del_tr,
         next_transition_id, add_transition as db_add_tr, get_transitions as db_get_trs,

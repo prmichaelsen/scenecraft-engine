@@ -1,7 +1,7 @@
 """Tests for the audio analyzer and beat map modules."""
 
 import pytest
-from beatlab.beat_map import time_to_frame
+from scenecraft.beat_map import time_to_frame
 
 
 class TestTimeToFrame:

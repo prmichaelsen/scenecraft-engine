@@ -4,10 +4,10 @@ import json
 import tempfile
 from pathlib import Path
 
-from beatlab.fusion.keyframes import Keyframe, KeyframeTrack
-from beatlab.fusion.nodes import make_transform, make_brightness_contrast
-from beatlab.fusion.setting_writer import FusionComp
-from beatlab.generator import generate_comp
+from scenecraft.fusion.keyframes import Keyframe, KeyframeTrack
+from scenecraft.fusion.nodes import make_transform, make_brightness_contrast
+from scenecraft.fusion.setting_writer import FusionComp
+from scenecraft.generator import generate_comp
 
 
 class TestKeyframe:
@@ -159,7 +159,7 @@ class TestGenerator:
 
     def test_generate_from_file(self):
         import tempfile
-        from beatlab.generator import generate_from_file
+        from scenecraft.generator import generate_from_file
 
         beat_map = self._make_beat_map()
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:

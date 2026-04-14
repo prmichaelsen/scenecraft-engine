@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from beatlab.db import (
+from scenecraft.db import (
     get_db, close_db, get_meta, set_meta,
     get_keyframes, get_keyframe, add_keyframe, update_keyframe, delete_keyframe, next_keyframe_id,
     get_transitions, get_transition, add_transition, delete_transition, restore_transition,
@@ -397,7 +397,7 @@ class TestBlendFrames:
 
     def test_normal_blend_replaces(self):
         import numpy as np
-        from beatlab.render.narrative import _blend_frames
+        from scenecraft.render.narrative import _blend_frames
 
         base = np.full((2, 2, 3), 100, dtype=np.uint8)
         overlay = np.full((2, 2, 3), 200, dtype=np.uint8)
@@ -406,7 +406,7 @@ class TestBlendFrames:
 
     def test_normal_blend_half_opacity(self):
         import numpy as np
-        from beatlab.render.narrative import _blend_frames
+        from scenecraft.render.narrative import _blend_frames
 
         base = np.full((2, 2, 3), 0, dtype=np.uint8)
         overlay = np.full((2, 2, 3), 200, dtype=np.uint8)
@@ -415,7 +415,7 @@ class TestBlendFrames:
 
     def test_screen_blend(self):
         import numpy as np
-        from beatlab.render.narrative import _blend_frames
+        from scenecraft.render.narrative import _blend_frames
 
         base = np.full((2, 2, 3), 128, dtype=np.uint8)
         overlay = np.full((2, 2, 3), 128, dtype=np.uint8)
@@ -425,7 +425,7 @@ class TestBlendFrames:
 
     def test_multiply_blend(self):
         import numpy as np
-        from beatlab.render.narrative import _blend_frames
+        from scenecraft.render.narrative import _blend_frames
 
         base = np.full((2, 2, 3), 200, dtype=np.uint8)
         overlay = np.full((2, 2, 3), 128, dtype=np.uint8)
@@ -435,7 +435,7 @@ class TestBlendFrames:
 
     def test_none_base_returns_overlay(self):
         import numpy as np
-        from beatlab.render.narrative import _blend_frames
+        from scenecraft.render.narrative import _blend_frames
 
         overlay = np.full((2, 2, 3), 150, dtype=np.uint8)
         result = _blend_frames(None, overlay, "normal", 1.0)
@@ -443,7 +443,7 @@ class TestBlendFrames:
 
     def test_none_overlay_returns_base(self):
         import numpy as np
-        from beatlab.render.narrative import _blend_frames
+        from scenecraft.render.narrative import _blend_frames
 
         base = np.full((2, 2, 3), 150, dtype=np.uint8)
         result = _blend_frames(base, None, "normal", 1.0)

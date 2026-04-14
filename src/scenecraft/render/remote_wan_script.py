@@ -190,7 +190,7 @@ def build_video_workflow(video_name, prompt, negative_prompt, denoise, seed, mod
         "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["1", 2]}},
         "8": {"class_type": "VHS_VideoCombine", "inputs": {
             "images": ["7", 0], "frame_rate": 24, "loop_count": 0,
-            "filename_prefix": "beatlab_wan", "format": "video/h264-mp4",
+            "filename_prefix": "scenecraft_wan", "format": "video/h264-mp4",
             "pingpong": False, "save_output": True}},
     }
 

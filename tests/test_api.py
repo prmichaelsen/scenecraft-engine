@@ -14,8 +14,8 @@ from urllib.request import Request, urlopen
 
 import pytest
 
-from beatlab.api_server import make_handler
-from beatlab.db import (
+from scenecraft.api_server import make_handler
+from scenecraft.db import (
     close_db, get_keyframes, get_transitions, set_meta,
     _migrated_dbs,
 )
@@ -312,7 +312,7 @@ class TestTracks:
             "base_opacity": 0.5,
         })
 
-        from beatlab.db import get_tracks
+        from scenecraft.db import get_tracks
         tracks = get_tracks(env["project_dir"])
         track = next(t for t in tracks if t["id"] == track_id)
         assert track["name"] == "My Track"
@@ -335,7 +335,7 @@ class TestStyle:
             "opacity": 0.7,
         })
 
-        from beatlab.db import get_keyframe
+        from scenecraft.db import get_keyframe
         kf = get_keyframe(env["project_dir"], kf_id)
         assert kf["blend_mode"] == "screen"
         assert kf["opacity"] == pytest.approx(0.7)
@@ -356,7 +356,7 @@ class TestStyle:
             "opacityCurve": curve,
         })
 
-        from beatlab.db import get_transition
+        from scenecraft.db import get_transition
         tr = get_transition(env["project_dir"], tr_id)
         assert tr["blend_mode"] == "overlay"
         assert tr["opacity_curve"] == curve
@@ -377,7 +377,7 @@ class TestLabels:
             "labelColor": "#ff0000",
         })
 
-        from beatlab.db import get_keyframe
+        from scenecraft.db import get_keyframe
         kf = get_keyframe(env["project_dir"], kf_id)
         assert kf["label"] == "Intro Shot"
         assert kf["label_color"] == "#ff0000"
@@ -397,7 +397,7 @@ class TestLabels:
             "tags": ["dissolve", "smooth"],
         })
 
-        from beatlab.db import get_transition
+        from scenecraft.db import get_transition
         tr = get_transition(env["project_dir"], tr_id)
         assert tr["label"] == "Cross Dissolve"
         assert tr["label_color"] == "#00ff00"
@@ -516,7 +516,7 @@ class TestAssignPoolVideo:
         assert sel.exists()
 
         # DB should reflect selected variant
-        from beatlab.db import get_transition
+        from scenecraft.db import get_transition
         tr = get_transition(pd, tr_id)
         assert tr["selected"] == 1
 
@@ -576,7 +576,7 @@ class TestDuplicateTransitionVideo:
         src_sel.parent.mkdir(parents=True, exist_ok=True)
         src_sel.write_bytes(b"selected_video")
 
-        from beatlab.db import update_transition
+        from scenecraft.db import update_transition
         update_transition(pd, source_tr["id"], selected=1)
 
         # Duplicate
@@ -598,7 +598,7 @@ class TestDuplicateTransitionVideo:
         assert dst_sel.read_bytes() == b"selected_video"
 
         # Target DB should have selected variant set
-        from beatlab.db import get_transition
+        from scenecraft.db import get_transition
         tr = get_transition(pd, target_tr["id"])
         assert tr["selected"] == 1
 
@@ -616,7 +616,7 @@ class TestDuplicateTransitionVideo:
         target_tr = trs[1]
 
         # Set action on source
-        from beatlab.db import update_transition
+        from scenecraft.db import update_transition
         update_transition(pd, source_tr["id"], action="Slow zoom into face")
 
         # Need a selected video for the copy to trigger
@@ -630,7 +630,7 @@ class TestDuplicateTransitionVideo:
             "targetId": target_tr["id"],
         })
 
-        from beatlab.db import get_transition
+        from scenecraft.db import get_transition
         tr = get_transition(pd, target_tr["id"])
         assert tr["action"] == "Slow zoom into face"
 
@@ -697,7 +697,7 @@ class TestAssignKeyframeImage:
         assert cand.exists()
 
         # DB should reflect selected variant
-        from beatlab.db import get_keyframe
+        from scenecraft.db import get_keyframe
         kf = get_keyframe(pd, kf_id)
         assert kf["selected"] == 1
 
@@ -923,7 +923,7 @@ class TestTransitionUpdates:
             "action": "Dolly zoom into subject",
         })
 
-        from beatlab.db import get_transition
+        from scenecraft.db import get_transition
         tr = get_transition(env["project_dir"], tr_id)
         assert tr["action"] == "Dolly zoom into subject"
 
@@ -944,7 +944,7 @@ class TestTransitionUpdates:
             "curvePoints": curve,
         })
 
-        from beatlab.db import get_transition
+        from scenecraft.db import get_transition
         tr = get_transition(env["project_dir"], tr_id)
         assert tr["remap"]["method"] == "curve"
         assert tr["remap"]["target_duration"] == 8.0
@@ -993,7 +993,7 @@ class TestSelections:
             "selections": {kf_id: 2},
         })
 
-        from beatlab.db import get_keyframe
+        from scenecraft.db import get_keyframe
         kf = get_keyframe(pd, kf_id)
         assert kf["selected"] == 2
 
@@ -1019,7 +1019,7 @@ class TestSelections:
             "selections": {tr_id: [2]},
         })
 
-        from beatlab.db import get_transition
+        from scenecraft.db import get_transition
         tr = get_transition(pd, tr_id)
         assert tr["selected"] == 2
 
@@ -1123,7 +1123,7 @@ class TestUpdatePrompt:
             "prompt": "Ethereal forest with glowing mushrooms",
         })
 
-        from beatlab.db import get_keyframe
+        from scenecraft.db import get_keyframe
         kf = get_keyframe(env["project_dir"], kf_id)
         assert kf["prompt"] == "Ethereal forest with glowing mushrooms"
 
@@ -1139,7 +1139,7 @@ class TestUpdateMeta:
             "motion_prompt": "Slow cinematic pans with shallow depth of field",
         })
 
-        from beatlab.db import get_meta
+        from scenecraft.db import get_meta
         meta = get_meta(env["project_dir"])
         assert meta["motion_prompt"] == "Slow cinematic pans with shallow depth of field"
 
@@ -1154,7 +1154,7 @@ class TestTrackReorder:
         api(env, "POST", f"/api/projects/{env['project_name']}/tracks/add", {})
         api(env, "POST", f"/api/projects/{env['project_name']}/tracks/add", {})
 
-        from beatlab.db import get_tracks
+        from scenecraft.db import get_tracks
         tracks = get_tracks(env["project_dir"])
         ids = [t["id"] for t in sorted(tracks, key=lambda t: t["z_order"])]
 
@@ -1178,7 +1178,7 @@ class TestTrackDelete:
         r = api(env, "POST", f"/api/projects/{env['project_name']}/tracks/add", {})
         track_id = r["id"]
 
-        from beatlab.db import get_tracks
+        from scenecraft.db import get_tracks
         assert any(t["id"] == track_id for t in get_tracks(env["project_dir"]))
 
         api(env, "POST", f"/api/projects/{env['project_name']}/tracks/delete", {
@@ -1903,7 +1903,7 @@ class TestPasteGroup:
         sel_dir.mkdir(parents=True, exist_ok=True)
         (sel_dir / f"{tr_id}_slot_0.mp4").write_bytes(b"selected_video")
 
-        from beatlab.db import update_transition
+        from scenecraft.db import update_transition
         update_transition(pd, tr_id, selected=1, action="Slow zoom")
 
         result = api(env, "POST", f"/api/projects/{env['project_name']}/paste-group", {
@@ -1925,7 +1925,7 @@ class TestPasteGroup:
         assert new_sel.exists()
 
         # Action prompt copied
-        from beatlab.db import get_transition
+        from scenecraft.db import get_transition
         tr = get_transition(pd, new_tr_id)
         assert tr["action"] == "Slow zoom"
 
@@ -2498,7 +2498,7 @@ class TestUndoKeyframeStyle:
             "keyframeId": kf_id, "blendMode": "screen", "opacity": 0.5,
         })
 
-        from beatlab.db import get_keyframe
+        from scenecraft.db import get_keyframe
         kf = get_keyframe(env["project_dir"], kf_id)
         assert kf["blend_mode"] == "screen"
         assert kf["opacity"] == pytest.approx(0.5)
@@ -2524,7 +2524,7 @@ class TestUndoTransitionStyle:
             "transitionId": tr_id, "blendMode": "multiply",
         })
 
-        from beatlab.db import get_transition
+        from scenecraft.db import get_transition
         tr = get_transition(env["project_dir"], tr_id)
         assert tr["blend_mode"] == "multiply"
 

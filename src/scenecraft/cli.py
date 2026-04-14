@@ -1,4 +1,4 @@
-"""CLI interface for beatlab."""
+"""CLI interface for scenecraft."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ CURVE_CHOICES = click.Choice(["linear", "exponential", "logarithmic"])
 @click.group()
 @click.version_option(package_name="davinci-beat-lab")
 def main():
-    """beatlab — AI-powered beat detection and visual effects for DaVinci Resolve."""
+    """scenecraft — AI-powered beat detection and visual effects for DaVinci Resolve."""
     pass
 
 
@@ -38,19 +38,19 @@ def main():
 @click.option("--stems-local/--no-stems-local", default=False, help="Run Demucs locally on CPU instead of Vast.ai (slow)")
 @click.option("--reanalyze/--no-reanalyze", default=False, help="Re-run stem analysis on cached stems (skip separation)")
 @click.option("--skip-separation", is_flag=True, default=False, hidden=True, help="Alias for --reanalyze")
-@click.option("--work-dir", default=".beatlab_work", type=str, help="Work directory for caching (default: .beatlab_work)")
+@click.option("--work-dir", default=".scenecraft_work", type=str, help="Work directory for caching (default: .scenecraft_work)")
 @click.option("--fresh/--resume", default=False, help="Re-analyze from scratch (default: resume/use cache)")
 def analyze(video_file: str, fps: float | None, output: str | None, sr: int, sections: bool,
             stems: bool, stems_local: bool, reanalyze: bool, skip_separation: bool,
             work_dir: str, fresh: bool):
     """Analyze audio from a video file — beat detection, sections, and optional stem separation.
 
-    Caches audio, stems, and beats.json in .beatlab_work/<video_name>/.
+    Caches audio, stems, and beats.json in .scenecraft_work/<video_name>/.
     """
-    from beatlab.render.frames import detect_fps, extract_audio
-    from beatlab.render.workdir import WorkDir
-    from beatlab.analyzer import analyze_audio
-    from beatlab.beat_map import create_beat_map, save_beat_map
+    from scenecraft.render.frames import detect_fps, extract_audio
+    from scenecraft.render.workdir import WorkDir
+    from scenecraft.analyzer import analyze_audio
+    from scenecraft.beat_map import create_beat_map, save_beat_map
 
     # --skip-separation is an alias for --reanalyze
     reanalyze = reanalyze or skip_separation
@@ -87,7 +87,7 @@ def analyze(video_file: str, fps: float | None, output: str | None, sr: int, sec
     # Stem separation + per-stem analysis
     stem_analyses = None
     if stems:
-        from beatlab.stems import separate_stems_remote, separate_stems_local, analyze_all_stems
+        from scenecraft.stems import separate_stems_remote, separate_stems_local, analyze_all_stems
 
         if reanalyze and work.has_stems():
             _log("  Stems: using cached (reanalyze mode — skipping separation)")
@@ -100,7 +100,7 @@ def analyze(video_file: str, fps: float | None, output: str | None, sr: int, sec
         else:
             if reanalyze:
                 raise click.ClickException("--reanalyze requires cached stems but none found. Run with --stems first.")
-            from beatlab.render.cloud import VastAIManager
+            from scenecraft.render.cloud import VastAIManager
             vast = VastAIManager()
             stem_paths = separate_stems_remote(audio_path, str(work.stems_dir), vast)
 
@@ -121,7 +121,7 @@ def analyze(video_file: str, fps: float | None, output: str | None, sr: int, sec
 @main.command(name="presets")
 def list_presets():
     """List available effect presets."""
-    from beatlab.presets import list_presets as _list
+    from scenecraft.presets import list_presets as _list
 
     click.echo("Available presets:\n")
     for p in _list():
@@ -138,7 +138,7 @@ def list_presets():
 @click.option("--port", default=8080, type=int, help="Server port (default: 8080)")
 def marker_ui(audio_file: str, beats: str | None, hits: str, fps: float, port: int):
     """Launch the hit marker web UI for manual effect placement."""
-    from beatlab.marker_server import start_server
+    from scenecraft.marker_server import start_server
 
     start_server(
         audio_path=audio_file,
@@ -169,9 +169,9 @@ def generate(
     hits: str | None,
 ):
     """Generate a Fusion .setting file from a beat map JSON."""
-    from beatlab.beat_map import load_beat_map
-    from beatlab.generator import generate_comp, load_hits, _apply_hits
-    from beatlab.fusion.nodes import make_media_out
+    from scenecraft.beat_map import load_beat_map
+    from scenecraft.generator import generate_comp, load_hits, _apply_hits
+    from scenecraft.fusion.nodes import make_media_out
 
     beat_map = load_beat_map(beats_json)
     plan = None
@@ -235,9 +235,9 @@ def run(
     describe: str | None,
 ):
     """Full pipeline: audio file → beat analysis → Fusion .setting file."""
-    from beatlab.analyzer import analyze_audio
-    from beatlab.beat_map import create_beat_map, save_beat_map
-    from beatlab.generator import generate_comp
+    from scenecraft.analyzer import analyze_audio
+    from scenecraft.beat_map import create_beat_map, save_beat_map
+    from scenecraft.generator import generate_comp
 
     # AI or describe mode always needs sections
     detect_sections = section_mode or ai or (describe is not None)
@@ -300,7 +300,7 @@ def resolve():
 @resolve.command(name="status")
 def resolve_status():
     """Show Resolve connection status and timeline info."""
-    from beatlab.resolve import connect
+    from scenecraft.resolve import connect
 
     try:
         session = connect(timeout=10)
@@ -325,7 +325,7 @@ def resolve_status():
 @click.option("--item", default=0, type=int, help="Item index on track (0-based, default: 0)")
 def resolve_inject(setting_file: str, track: int, item: int):
     """Import a Fusion .setting file directly into the current timeline item."""
-    from beatlab.resolve import connect
+    from scenecraft.resolve import connect
 
     session = connect()
     _log(f"Importing {setting_file} into timeline...")
@@ -343,7 +343,7 @@ def resolve_inject(setting_file: str, track: int, item: int):
 @click.option("--wait/--no-wait", default=True, help="Wait for render to complete (default: yes)")
 def resolve_render(output_dir: str, filename: str, wait: bool):
     """Add a render job and optionally wait for completion."""
-    from beatlab.resolve import connect
+    from scenecraft.resolve import connect
 
     session = connect()
     job_id = session.add_render_job(output_dir, filename=filename)
@@ -379,10 +379,10 @@ def resolve_render(output_dir: str, filename: str, wait: bool):
 @click.option("--render-dir", default=None, type=click.Path(), help="If set, also queue and run a render to this dir")
 def resolve_pipeline(audio_file: str, output: str, ai: bool, prompt: str | None, hits: str | None, track: int, item: int, render_dir: str | None):
     """Full pipeline: analyze → generate → inject into Resolve → optional render."""
-    from beatlab.analyzer import analyze_audio
-    from beatlab.beat_map import create_beat_map
-    from beatlab.generator import generate_comp, load_hits, _apply_hits
-    from beatlab.resolve import connect
+    from scenecraft.analyzer import analyze_audio
+    from scenecraft.beat_map import create_beat_map
+    from scenecraft.generator import generate_comp, load_hits, _apply_hits
+    from scenecraft.resolve import connect
 
     # Connect to Resolve first to get FPS
     session = connect()
@@ -414,7 +414,7 @@ def resolve_pipeline(audio_file: str, output: str, ai: bool, prompt: str | None,
 
     # Layer hits
     if hits:
-        from beatlab.fusion.nodes import make_media_out
+        from scenecraft.fusion.nodes import make_media_out
         hit_data = load_hits(hits)
         if hit_data:
             _log(f"  Layering {len(hit_data)} manual hit accents")
@@ -483,7 +483,7 @@ def _parse_segment_filter(spec: str) -> set[int]:
 @click.option("--dry-run/--no-dry-run", default=False, help="Show cost estimate without rendering")
 @click.option("--destroy/--keep-alive", default=False, help="Destroy instance after render (default: keep alive)")
 @click.option("--fresh/--resume", default=False, help="Wipe work dir and start fresh (default: resume)")
-@click.option("--work-dir", default=".beatlab_work", type=str, help="Work directory for caching (default: .beatlab_work)")
+@click.option("--work-dir", default=".scenecraft_work", type=str, help="Work directory for caching (default: .scenecraft_work)")
 @click.option("--engine", default="ebsynth", type=click.Choice(["ebsynth", "wan", "google", "kling"]), help="Render engine: ebsynth, wan, google (Nano Banana+Veo), kling (Nano Banana+Kling 3.0)")
 @click.option("--preview/--no-preview", default=False, help="Render at 512x512 for fast preview (Wan2.1 only)")
 @click.option("--describe", default=None, is_flag=False, flag_value="generate", help="Describe sections with Gemini. Pass a .md file to reuse existing descriptions.")
@@ -512,17 +512,17 @@ def render(
 ):
     """Render AI-stylized video: extract frames → SD img2img → reassemble.
 
-    Caches intermediate results in .beatlab_work/ for resume on failure.
+    Caches intermediate results in .scenecraft_work/ for resume on failure.
     Re-run the same command to pick up where it left off.
     Use --fresh to start over.
     """
     import subprocess
-    from beatlab.render.frames import (
+    from scenecraft.render.frames import (
         detect_fps, extract_audio, extract_frames,
         generate_frame_params, reassemble_video, save_frame_params,
     )
-    from beatlab.render.cloud import estimate_cost
-    from beatlab.render.workdir import WorkDir
+    from scenecraft.render.cloud import estimate_cost
+    from scenecraft.render.workdir import WorkDir
 
     # Set up persistent work directory
     work = WorkDir(video_file, base_dir=work_dir)
@@ -542,7 +542,7 @@ def render(
 
     # ── Step 2: Audio analysis → beat map ──
     if beats:
-        from beatlab.beat_map import load_beat_map
+        from scenecraft.beat_map import load_beat_map
         beat_map = load_beat_map(beats)
         work.save_beats(beat_map)
     elif work.has_beats():
@@ -557,20 +557,20 @@ def render(
             extract_audio(video_file, str(work.audio_path), sr=sr)
             audio_path = str(work.audio_path)
 
-        from beatlab.analyzer import analyze_audio
-        from beatlab.beat_map import create_beat_map
+        from scenecraft.analyzer import analyze_audio
+        from scenecraft.beat_map import create_beat_map
         _log("  Analyzing beats and sections...")
         analysis = analyze_audio(audio_path, sr=sr, detect_sections_flag=True)
 
         # Stem separation (optional)
         stem_analyses = None
         if stems:
-            from beatlab.stems import separate_stems_remote, analyze_all_stems
+            from scenecraft.stems import separate_stems_remote, analyze_all_stems
             if work.has_stems():
                 _log("  Stems: using cached")
                 stem_paths = work.stem_paths()
             else:
-                from beatlab.render.cloud import VastAIManager
+                from scenecraft.render.cloud import VastAIManager
                 vast = VastAIManager()
                 stem_paths = separate_stems_remote(audio_path, str(work.stems_dir), vast)
             _log("  Analyzing stems locally...")
@@ -607,7 +607,7 @@ def render(
         if work.has_plan() and not fresh:
             _log("  AI plan: using cached")
             plan_data = work.load_plan()
-            from beatlab.ai.plan import parse_effect_plan
+            from scenecraft.ai.plan import parse_effect_plan
             plan = parse_effect_plan(json.dumps(plan_data))
         else:
             plan = _get_ai_plan(beat_map, prompt, audio_descriptions=audio_descriptions)
@@ -638,7 +638,7 @@ def render(
     # ── Step 3.5: Apply plan patch if provided ──
     changed_indices: list[int] = []
     if plan_patch:
-        from beatlab.render.patcher import load_patch, merge_plan, detect_stale_outputs, save_plan
+        from scenecraft.render.patcher import load_patch, merge_plan, detect_stale_outputs, save_plan
 
         _log(f"  Applying plan patch: {plan_patch}")
         patch = load_patch(plan_patch)
@@ -669,8 +669,8 @@ def render(
             if s.get("candidates")
         ]
         if candidate_sections:
-            from beatlab.render.candidates import generate_image_candidates, make_contact_sheet
-            from beatlab.render.google_video import GoogleVideoClient
+            from scenecraft.render.candidates import generate_image_candidates, make_contact_sheet
+            from scenecraft.render.google_video import GoogleVideoClient
 
             _log(f"  Generating candidates for {len(candidate_sections)} sections...")
             cand_client = GoogleVideoClient(vertex=vertex)
@@ -718,11 +718,11 @@ def render(
                 make_contact_sheet(paths, grid_path, idx)
                 _log(f"    Section {idx}: contact sheet → candidates/section_{idx:03d}_grid.png")
 
-            _log(f"  Review contact sheets, then run: beatlab select {Path(work.root).name} <idx>:<variant> ...")
+            _log(f"  Review contact sheets, then run: scenecraft select {Path(work.root).name} <idx>:<variant> ...")
             _log(f"  Then re-run render to apply selections.")
 
         # Re-parse the merged plan
-        from beatlab.ai.plan import parse_effect_plan
+        from scenecraft.ai.plan import parse_effect_plan
         plan = parse_effect_plan(json.dumps(merged))
 
         # Rebuild section styles from patched plan
@@ -750,7 +750,7 @@ def render(
 
     # ── Wan2.1 engine branch ──
     if engine == "wan":
-        from beatlab.render.wan_pipeline import render_wan_pipeline
+        from scenecraft.render.wan_pipeline import render_wan_pipeline
 
         def _wan_progress(stage, done, total):
             _log(f"  [{stage}] {done}/{total}")
@@ -779,7 +779,7 @@ def render(
 
     # ── Google engine branch (Nano Banana + Veo) ──
     if engine == "google":
-        from beatlab.render.google_pipeline import render_google_pipeline
+        from scenecraft.render.google_pipeline import render_google_pipeline
 
         def _google_progress(stage, done, total):
             _log(f"  [{stage}] {done}/{total}")
@@ -813,7 +813,7 @@ def render(
 
     # ── Kling engine branch (Nano Banana + Kling 3.0) ──
     if engine == "kling":
-        from beatlab.render.kling_pipeline import render_kling_pipeline
+        from scenecraft.render.kling_pipeline import render_kling_pipeline
 
         def _kling_progress(stage, done, total):
             _log(f"  [{stage}] {done}/{total}")
@@ -836,7 +836,7 @@ def render(
         return
 
     # ── Step 5: Select keyframes (EbSynth path) ──
-    from beatlab.render.keyframe_selector import select_keyframes
+    from scenecraft.render.keyframe_selector import select_keyframes
     keyframes_path = work.root / "keyframes.json"
 
     if keyframes_path.exists() and not fresh:
@@ -876,7 +876,7 @@ def render(
     styled_dir = work.ensure_styled_dir()
 
     if local_comfyui:
-        from beatlab.render.comfyui import ComfyUIClient
+        from scenecraft.render.comfyui import ComfyUIClient
         host, port = local_comfyui.replace("http://", "").split(":")
         client = ComfyUIClient(host=host, port=int(port))
 
@@ -888,7 +888,7 @@ def render(
                 progress_callback=lambda done, total: bar.update(1),
             )
     else:
-        from beatlab.render.cloud import VastAIManager
+        from scenecraft.render.cloud import VastAIManager
         vast = VastAIManager()
 
         _log("  Looking for GPU instance...")
@@ -906,7 +906,7 @@ def render(
             shutil.copy2(str(keyframes_path), f"{frames_dir}/keyframes.json")
 
             # Upload v2 render script
-            import beatlab.render.remote_script_v2 as rs
+            import scenecraft.render.remote_script_v2 as rs
             script_path = rs.__file__
             _log("  Uploading render script (v2 — keyframe + EbSynth)...")
             vast.ssh_run(instance_id, "mkdir -p /workspace")
@@ -955,13 +955,13 @@ def render(
             else:
                 _log(
                     f"  Instance {instance_id} kept alive. "
-                    f"Run 'beatlab destroy-gpu' to stop it."
+                    f"Run 'scenecraft destroy-gpu' to stop it."
                     )
         except Exception as e:
             _log(
                 f"\n  Error: {e}\n"
                 f"  Instance {instance_id} kept alive — fix the issue and retry.\n"
-                f"  Run 'beatlab destroy-gpu' to stop it when done."
+                f"  Run 'scenecraft destroy-gpu' to stop it when done."
                 )
             raise
 
@@ -977,12 +977,12 @@ def render(
 @main.command(name="make-patch")
 @click.argument("video_name", type=str)
 @click.argument("patch_file", type=click.Path())
-@click.option("--work-dir", default=".beatlab_work", type=str, help="Work directory")
+@click.option("--work-dir", default=".scenecraft_work", type=str, help="Work directory")
 @click.option("--sections", "-s", type=str, help="Comma-separated section indices to include in patch")
 def make_patch(video_name: str, patch_file: str, work_dir: str, sections: str | None):
     """Extract sections from a cached plan into a patch file for editing.
 
-    Example: beatlab make-patch beyond_the_veil patch_001.json -s 88,89,90,91
+    Example: scenecraft make-patch beyond_the_veil patch_001.json -s 88,89,90,91
     """
     plan_path = Path(work_dir) / video_name / "plan.json"
     if not plan_path.exists():
@@ -1003,21 +1003,21 @@ def make_patch(video_name: str, patch_file: str, work_dir: str, sections: str | 
         json.dump(patch, f, indent=2)
 
     _log(f"Extracted {len(patch_sections)} sections to {patch_file}")
-    _log(f"Edit the file, then run: beatlab render <video> --plan-patch {patch_file}")
+    _log(f"Edit the file, then run: scenecraft render <video> --plan-patch {patch_file}")
 
 
 @main.command(name="candidates")
 @click.argument("video_name", type=str)
 @click.option("--sections", "-s", required=True, type=str, help="Comma-separated section indices")
 @click.option("--count", "-n", default=4, type=int, help="Number of candidates per section (default: 4)")
-@click.option("--work-dir", default=".beatlab_work", type=str, help="Work directory")
+@click.option("--work-dir", default=".scenecraft_work", type=str, help="Work directory")
 @click.option("--vertex/--no-vertex", default=False, help="Use Vertex AI")
 def candidates_cmd(video_name: str, sections: str, count: int, work_dir: str, vertex: bool):
     """Generate candidate styled images for sections to choose from.
 
-    Example: beatlab candidates beyond_the_veil -s 88,92 -n 4
+    Example: scenecraft candidates beyond_the_veil -s 88,92 -n 4
     """
-    from beatlab.render.candidates import generate_image_candidates, make_contact_sheet
+    from scenecraft.render.candidates import generate_image_candidates, make_contact_sheet
 
     work = Path(work_dir) / video_name
     plan_path = work / "plan.json"
@@ -1034,7 +1034,7 @@ def candidates_cmd(video_name: str, sections: str, count: int, work_dir: str, ve
     plan_by_idx = {s["section_index"]: s for s in plan.get("sections", [])}
 
     # Set up stylize function
-    from beatlab.render.google_video import GoogleVideoClient
+    from scenecraft.render.google_video import GoogleVideoClient
     client = GoogleVideoClient(vertex=vertex)
 
     def stylize_fn(source_path, style_prompt, output_path):
@@ -1081,24 +1081,24 @@ def candidates_cmd(video_name: str, sections: str, count: int, work_dir: str, ve
         _log(f"  Section {idx}: contact sheet → {grid_path}")
 
     _log(f"\nReview contact sheets in {work}/candidates/")
-    _log(f"Then run: beatlab select {video_name} <idx>:<variant> ...")
+    _log(f"Then run: scenecraft select {video_name} <idx>:<variant> ...")
 
 
 @main.command(name="select")
 @click.argument("video_name", type=str)
 @click.argument("selections", nargs=-1, type=str)
-@click.option("--work-dir", default=".beatlab_work", type=str, help="Work directory")
+@click.option("--work-dir", default=".scenecraft_work", type=str, help="Work directory")
 def select_cmd(video_name: str, selections: tuple[str], work_dir: str):
     """Apply candidate selections — copies chosen variant to styled image.
 
     Examples:
-      beatlab select beyond_the_veil 88:v2 92:v4
-      beatlab select beyond_the_veil 016_001:v2
-      beatlab select beyond_the_veil 016_002:016_001/v3  (cross-section)
-      beatlab select beyond_the_veil 016_001:v2+v4       (sequence: two clips filling the slot)
-      beatlab select beyond_the_veil 016_002:016_001/v3+v1  (cross + sequence)
+      scenecraft select beyond_the_veil 88:v2 92:v4
+      scenecraft select beyond_the_veil 016_001:v2
+      scenecraft select beyond_the_veil 016_002:016_001/v3  (cross-section)
+      scenecraft select beyond_the_veil 016_001:v2+v4       (sequence: two clips filling the slot)
+      scenecraft select beyond_the_veil 016_002:016_001/v3+v1  (cross + sequence)
     """
-    from beatlab.render.candidates import apply_selection, apply_cross_selection, apply_sequence_selection
+    from scenecraft.render.candidates import apply_selection, apply_cross_selection, apply_sequence_selection
 
     work = str(Path(work_dir) / video_name)
 
@@ -1168,15 +1168,15 @@ def select_cmd(video_name: str, selections: tuple[str], work_dir: str):
 @main.command(name="split-sections")
 @click.argument("video_name", type=str)
 @click.option("--max-duration", default=8.0, type=float, help="Max section duration in seconds (default: 8)")
-@click.option("--work-dir", default=".beatlab_work", type=str, help="Work directory")
+@click.option("--work-dir", default=".scenecraft_work", type=str, help="Work directory")
 @click.option("--dry-run/--no-dry-run", default=False, help="Show what would be split without modifying anything")
 @click.option("--clean/--no-clean", default=False, help="Delete stale files for split sections")
 def split_sections(video_name: str, max_duration: float, work_dir: str, dry_run: bool, clean: bool):
     """Analyze cached plan for long sections and generate splits.json.
 
-    Example: beatlab split-sections beyond_the_veil --max-duration 8
+    Example: scenecraft split-sections beyond_the_veil --max-duration 8
     """
-    from beatlab.render.section_splitter import (
+    from scenecraft.render.section_splitter import (
         generate_splits, save_splits, load_splits, find_long_sections, get_stale_files, get_keyframe_timestamps,
     )
 
@@ -1242,14 +1242,14 @@ def split_sections(video_name: str, max_duration: float, work_dir: str, dry_run:
             _log("No stale files to clean.")
 
     _log(f"\nNext: re-run render to generate new styled images + transitions for split sections.")
-    _log(f"  beatlab render <video> --engine google --vertex -o output.mp4")
+    _log(f"  scenecraft render <video> --engine google --vertex -o output.mp4")
 
 
 @main.command(name="destroy-gpu")
 @click.option("--all", "destroy_all", is_flag=True, default=False, help="Destroy all instances (default + stems)")
 def destroy_gpu(destroy_all: bool):
     """Destroy the kept-alive Vast.ai GPU instance."""
-    from beatlab.render.cloud import _load_instance_state, _clear_instance_state, VastAIManager
+    from scenecraft.render.cloud import _load_instance_state, _clear_instance_state, VastAIManager
 
     keys = ["default", "stems"] if destroy_all else ["default", "stems"]
     destroyed_any = False
@@ -1279,16 +1279,16 @@ def destroy_gpu(destroy_all: bool):
 @main.command()
 @click.option("--port", default=8888, type=int, help="Server port (default: 8888)")
 @click.option("--host", default="0.0.0.0", type=str, help="Bind address (default: 0.0.0.0)")
-@click.option("--work-dir", default=".beatlab_work", type=str, help="Work directory (default: .beatlab_work)")
+@click.option("--work-dir", default=".scenecraft_work", type=str, help="Work directory (default: .scenecraft_work)")
 def server(port: int, host: str, work_dir: str):
     """Start SceneCraft REST API server for the synthesizer frontend."""
-    from beatlab.api_server import run_server
+    from scenecraft.api_server import run_server
     run_server(host, port, work_dir=work_dir)
 
 
 @main.command(name="audio-intelligence")
 @click.argument("video_file", type=click.Path(exists=True))
-@click.option("--work-dir", default=".beatlab_work", type=str, help="Work directory")
+@click.option("--work-dir", default=".scenecraft_work", type=str, help="Work directory")
 @click.option("--output", "-o", default=None, type=click.Path(), help="Output JSON (default: work dir audio_intelligence.json)")
 @click.option("--chunk-duration", default=30.0, type=float, help="Gemini chunk duration in seconds (default: 30)")
 @click.option("--creative-direction", default=None, type=str, help="Creative direction for Claude")
@@ -1319,20 +1319,20 @@ def audio_intelligence(video_file: str, work_dir: str, output: str | None,
                        vocal_bleed_threshold: float, stats: bool):
     """Run multi-layer audio intelligence pipeline (DSP + Gemini + Claude).
 
-    Requires cached stems in work dir. Run 'beatlab analyze --stems' first.
+    Requires cached stems in work dir. Run 'scenecraft analyze --stems' first.
     """
-    from beatlab.render.frames import detect_fps
-    from beatlab.render.workdir import WorkDir
-    from beatlab.audio_intelligence import run_audio_intelligence
+    from scenecraft.render.frames import detect_fps
+    from scenecraft.render.workdir import WorkDir
+    from scenecraft.audio_intelligence import run_audio_intelligence
 
     work = WorkDir(video_file, base_dir=work_dir)
     video_fps = fps or detect_fps(video_file)
 
     if not work.has_stems():
-        raise click.ClickException("No cached stems found. Run 'beatlab analyze --stems' first.")
+        raise click.ClickException("No cached stems found. Run 'scenecraft analyze --stems' first.")
 
     if not work.has_audio():
-        raise click.ClickException("No cached audio found. Run 'beatlab analyze' first.")
+        raise click.ClickException("No cached audio found. Run 'scenecraft analyze' first.")
 
     # Auto-detect descriptions.md in work dir if not specified
     descriptions_path = descriptions
@@ -1406,7 +1406,7 @@ def audio_intelligence(video_file: str, work_dir: str, output: str | None,
 @click.option("--descriptions", default=None, type=click.Path(exists=True), help="descriptions.md fallback")
 @click.option("--creative-direction", default=None, type=str, help="Creative direction")
 @click.option("--vocal-bleed-threshold", default=0.25, type=float, help="Bleed threshold (default: 0.25)")
-@click.option("--work-dir", default=".beatlab_work", type=str, help="Work directory")
+@click.option("--work-dir", default=".scenecraft_work", type=str, help="Work directory")
 @click.option("--fps", default=None, type=float, help="Video frame rate")
 @click.option("--sr", default=22050, type=int, help="Sample rate")
 @click.option("--sections-yaml", default=None, type=click.Path(exists=True), help="Manual sections.yaml for per-section rule generation")
@@ -1426,12 +1426,12 @@ def audio_intelligence_multimodel(
       Manual: Provide pre-separated stem paths via --vocals, --kick, etc.
 
     Examples:
-        beatlab audio-intelligence-multimodel video.mov --auto-separate
-        beatlab audio-intelligence-multimodel video.mov --vocals v.wav --kick k.wav --snare s.wav --hh h.wav --bass b.wav
+        scenecraft audio-intelligence-multimodel video.mov --auto-separate
+        scenecraft audio-intelligence-multimodel video.mov --vocals v.wav --kick k.wav --snare s.wav --hh h.wav --bass b.wav
     """
-    from beatlab.render.frames import detect_fps, extract_audio
-    from beatlab.render.workdir import WorkDir
-    from beatlab.audio_intelligence import run_audio_intelligence_multimodel
+    from scenecraft.render.frames import detect_fps, extract_audio
+    from scenecraft.render.workdir import WorkDir
+    from scenecraft.audio_intelligence import run_audio_intelligence_multimodel
 
     work = WorkDir(video_file, base_dir=work_dir)
     video_fps = fps or detect_fps(video_file)
@@ -1452,7 +1452,7 @@ def audio_intelligence_multimodel(
 
     # Auto-separate: run the 3-model pipeline
     if auto_separate:
-        from beatlab.stems import separate_stems_multimodel
+        from scenecraft.stems import separate_stems_multimodel
         stems_dir = str(work.root / "stems_v2")
         all_stems = separate_stems_multimodel(audio_path, stems_dir)
 
@@ -1521,7 +1521,7 @@ def audio_intelligence_multimodel(
 @main.command(name="effects")
 @click.argument("video_file", type=click.Path(exists=True))
 @click.option("--beats", default=None, type=click.Path(exists=True), help="Beat map JSON (with optional stem data)")
-@click.option("--ai-events", default=None, type=click.Path(exists=True), help="Audio intelligence JSON from 'beatlab audio-intelligence' (Layer 3 events)")
+@click.option("--ai-events", default=None, type=click.Path(exists=True), help="Audio intelligence JSON from 'scenecraft audio-intelligence' (Layer 3 events)")
 @click.option("--output", "-o", default=None, type=click.Path(), help="Output video path (default: <input>_effects.mp4)")
 @click.option("--glow/--no-glow", default=False, help="Enable glow/bloom effect (slower)")
 @click.option("--fps", default=None, type=float, help="Override frame rate")
@@ -1543,8 +1543,8 @@ def effects(video_file: str, beats: str | None, ai_events: str | None, output: s
     Add --remote to run on Vast.ai GPU for ~10x faster encoding.
 
     Examples:
-        beatlab effects video.mp4 --ai-events ai.json --config scenecraft.yaml
-        beatlab effects video.mp4 --beats beats.json
+        scenecraft effects video.mp4 --ai-events ai.json --config scenecraft.yaml
+        scenecraft effects video.mp4 --beats beats.json
     """
     # Load config if provided
     effect_offsets = None
@@ -1581,14 +1581,14 @@ def effects(video_file: str, beats: str | None, ai_events: str | None, output: s
 
     # AI-directed mode (local)
     if ai_events:
-        from beatlab.render.effects_opencv import apply_effects_ai
+        from scenecraft.render.effects_opencv import apply_effects_ai
 
         with open(ai_events) as f:
             ai_data = json.load(f)
 
         # Re-apply rules from config threshold if layer1 + rules are available
         if config_bleed_threshold is not None and "layer1" in ai_data and "layer3_rules" in ai_data:
-            from beatlab.audio_intelligence import apply_rules_in_range
+            from scenecraft.audio_intelligence import apply_rules_in_range
             from collections import defaultdict
             _log(f"Re-applying rules with vocal_bleed_threshold={config_bleed_threshold}...")
             layer1 = ai_data["layer1"]
@@ -1612,8 +1612,8 @@ def effects(video_file: str, beats: str | None, ai_events: str | None, output: s
         return
 
     # Classic beat map mode (local)
-    from beatlab.beat_map import load_beat_map
-    from beatlab.render.effects_opencv import apply_effects
+    from scenecraft.beat_map import load_beat_map
+    from scenecraft.render.effects_opencv import apply_effects
 
     beat_map = load_beat_map(beats)
     stems = beat_map.get("stems", {})
@@ -1626,7 +1626,7 @@ def effects(video_file: str, beats: str | None, ai_events: str | None, output: s
     if plan:
         with open(plan) as f:
             plan_data = json.load(f)
-        from beatlab.ai.plan import parse_effect_plan
+        from scenecraft.ai.plan import parse_effect_plan
         effect_plan = parse_effect_plan(json.dumps(plan_data))
         _log(f"  Plan: {len(effect_plan.sections)} sections")
 
@@ -1642,7 +1642,7 @@ def _run_effects_remote(video_file: str, output: str, beats: str | None = None,
     import shutil
     import tempfile
     from pathlib import Path
-    from beatlab.render.cloud import VastAIManager
+    from scenecraft.render.cloud import VastAIManager
 
     vast = VastAIManager()
 
@@ -1738,7 +1738,7 @@ def _write_remote_effects_script(staging_path, video_file: str, ai_events: str |
     output_name = Path(video_file).stem + "_effects.mp4"
 
     script = f'''#!/usr/bin/env python3
-"""Remote effects runner — self-contained, no beatlab install needed."""
+"""Remote effects runner — self-contained, no scenecraft install needed."""
 import cv2
 import math
 import json
@@ -1930,14 +1930,14 @@ _log(f"Done: {{output_path}}")
 
 @main.command()
 @click.argument("file_path", type=click.Path())
-@click.option("--work-dir", default=".beatlab_work", type=str, help="Work directory (default: .beatlab_work)")
+@click.option("--work-dir", default=".scenecraft_work", type=str, help="Work directory (default: .scenecraft_work)")
 def delete(file_path: str, work_dir: str):
     """Delete a cached file and cascade-delete all downstream artifacts.
 
     Examples:
-        beatlab delete google_styled/styled_042.png
-        beatlab delete google_segments/segment_042_043.mp4
-        beatlab delete google_remapped/remapped_042.mp4
+        scenecraft delete google_styled/styled_042.png
+        scenecraft delete google_segments/segment_042_043.mp4
+        scenecraft delete google_remapped/remapped_042.mp4
 
     Cascading logic:
         styled_NNN.png → deletes segments using that section, remapped, concat, muxed, output
@@ -2082,8 +2082,8 @@ def _describe_sections(audio_file: str, sr: int, sections: list[dict], output_pa
     from pathlib import Path
 
     try:
-        from beatlab.ai.audio_describer import GeminiAudioDescriber, describe_sections
-        from beatlab.analyzer import load_audio
+        from scenecraft.ai.audio_describer import GeminiAudioDescriber, describe_sections
+        from scenecraft.analyzer import load_audio
     except ImportError as e:
         raise click.ClickException(str(e))
 
@@ -2102,7 +2102,7 @@ def _describe_sections(audio_file: str, sr: int, sections: list[dict], output_pa
     # Write header immediately
     with open(md_path, "w") as f:
         f.write(f"# Audio Descriptions: {Path(audio_file).name}\n\n")
-        f.write(f"Generated by beatlab using Gemini Flash\n\n")
+        f.write(f"Generated by scenecraft using Gemini Flash\n\n")
         f.write(f"---\n\n")
 
     bar = None
@@ -2140,8 +2140,8 @@ def _describe_sections(audio_file: str, sr: int, sections: list[dict], output_pa
 def _get_ai_plan(beat_map: dict, user_prompt: str | None, audio_descriptions: list[str] | None = None):
     """Get an AI effect plan, handling errors."""
     try:
-        from beatlab.ai.provider import AnthropicProvider
-        from beatlab.ai.director import create_effect_plan
+        from scenecraft.ai.provider import AnthropicProvider
+        from scenecraft.ai.director import create_effect_plan
     except ImportError as e:
         raise click.ClickException(str(e))
 
@@ -2181,7 +2181,7 @@ def narrative():
 @click.option("--regen", default=None, help="Regen targets: 'kf_005/v1,v2;kf_007/v2' or 'kf_005;kf_007' (all variants)")
 def keyframes(yaml_path, vertex, segments, n_candidates, dry_run, use_replicate, regen):
     """Generate keyframe candidates from narrative YAML."""
-    from beatlab.render.narrative import load_narrative, narrative_stats, generate_keyframe_candidates
+    from scenecraft.render.narrative import load_narrative, narrative_stats, generate_keyframe_candidates
 
     data = load_narrative(yaml_path)
     stats = narrative_stats(data)
@@ -2218,7 +2218,7 @@ def keyframes(yaml_path, vertex, segments, n_candidates, dry_run, use_replicate,
 @click.argument("selections", nargs=-1, required=True)
 def select_keyframes_cmd(yaml_path, selections):
     """Apply keyframe selections. E.g.: kf_001:v2 kf_005:v3"""
-    from beatlab.render.narrative import apply_keyframe_selection
+    from scenecraft.render.narrative import apply_keyframe_selection
 
     parsed = {}
     for sel in selections:
@@ -2236,7 +2236,7 @@ def select_keyframes_cmd(yaml_path, selections):
 @click.argument("yaml_path", type=click.Path(exists=True))
 def resolve_existing_cmd(yaml_path):
     """Extract boundary frames from existing transition segments into selected_keyframes/."""
-    from beatlab.render.narrative import resolve_existing_boundary_frames
+    from scenecraft.render.narrative import resolve_existing_boundary_frames
     resolve_existing_boundary_frames(yaml_path)
 
 
@@ -2244,7 +2244,7 @@ def resolve_existing_cmd(yaml_path):
 @click.argument("yaml_path", type=click.Path(exists=True))
 def actions(yaml_path):
     """Generate LLM transition actions for empty transitions."""
-    from beatlab.render.narrative import generate_transition_actions
+    from scenecraft.render.narrative import generate_transition_actions
     generate_transition_actions(yaml_path)
 
 
@@ -2255,7 +2255,7 @@ def actions(yaml_path):
 @click.option("--replicate", "use_replicate", is_flag=True, help="Use Replicate API")
 def slot_keyframes_cmd(yaml_path, vertex, n_candidates, use_replicate):
     """Generate intermediate keyframe candidates for multi-slot transitions."""
-    from beatlab.render.narrative import generate_slot_keyframe_candidates
+    from scenecraft.render.narrative import generate_slot_keyframe_candidates
     generate_slot_keyframe_candidates(yaml_path, vertex=vertex, candidates_per_slot=n_candidates, use_replicate=use_replicate)
 
 
@@ -2264,7 +2264,7 @@ def slot_keyframes_cmd(yaml_path, vertex, n_candidates, use_replicate):
 @click.argument("selections", nargs=-1, required=True)
 def select_slot_keyframes_cmd(yaml_path, selections):
     """Apply slot keyframe selections. E.g.: tr_041_slot_0:v2"""
-    from beatlab.render.narrative import apply_slot_keyframe_selection
+    from scenecraft.render.narrative import apply_slot_keyframe_selection
 
     parsed = {}
     for sel in selections:
@@ -2285,7 +2285,7 @@ def select_slot_keyframes_cmd(yaml_path, selections):
 @click.option("--candidates", "n_candidates", default=None, type=int)
 def transitions(yaml_path, vertex, segments, n_candidates):
     """Generate Veo transition video candidates."""
-    from beatlab.render.narrative import generate_transition_candidates
+    from scenecraft.render.narrative import generate_transition_candidates
 
     seg_filter = _parse_kf_filter(segments) if segments else None
     generate_transition_candidates(yaml_path, vertex=vertex, candidates_per_slot=n_candidates, segment_filter=seg_filter)
@@ -2296,7 +2296,7 @@ def transitions(yaml_path, vertex, segments, n_candidates):
 @click.argument("selections", nargs=-1, required=True)
 def select_transitions_cmd(yaml_path, selections):
     """Apply transition selections. E.g.: tr_001:v2 tr_005_slot_0:v3"""
-    from beatlab.render.narrative import apply_transition_selection
+    from scenecraft.render.narrative import apply_transition_selection
 
     parsed = {}
     for sel in selections:
@@ -2315,7 +2315,7 @@ def select_transitions_cmd(yaml_path, selections):
 @click.option("--output", "-o", default="narrative_output.mp4", help="Output video path")
 def assemble(yaml_path, output):
     """Time-remap, concatenate, and mux audio into final video."""
-    from beatlab.render.narrative import assemble_final
+    from scenecraft.render.narrative import assemble_final
     assemble_final(yaml_path, output)
 
 
@@ -2326,7 +2326,7 @@ def assemble(yaml_path, output):
 @click.option("--fps", default=24.0, type=float, help="Frame rate (default: 24)")
 @click.option("--chunk-size", default=10, type=int, help="Segments per ffmpeg call (default: 10)")
 @click.option("--audio", default=None, type=click.Path(exists=True), help="Audio file to mux into output")
-@click.option("--work-dir", default=".beatlab_work", type=str, help="Work directory")
+@click.option("--work-dir", default=".scenecraft_work", type=str, help="Work directory")
 def crossfade_cmd(video_file: str, output: str | None, crossfade_frames: int,
                   fps: float, chunk_size: int, audio: str | None, work_dir: str):
     """Crossfade-stitch selected transitions from a project into a final video.
@@ -2335,14 +2335,14 @@ def crossfade_cmd(video_file: str, output: str | None, crossfade_frames: int,
     crossfades them together, and muxes audio.
 
     Examples:
-        beatlab crossfade assets/beyond_the_veil.mov
-        beatlab crossfade assets/beyond_the_veil.mov --crossfade-frames 12 --audio audio.wav
+        scenecraft crossfade assets/beyond_the_veil.mov
+        scenecraft crossfade assets/beyond_the_veil.mov --crossfade-frames 12 --audio audio.wav
     """
     import subprocess
     from pathlib import Path
-    from beatlab.render.workdir import WorkDir
-    from beatlab.project import load_project
-    from beatlab.render.crossfade import concat_with_crossfade
+    from scenecraft.render.workdir import WorkDir
+    from scenecraft.project import load_project
+    from scenecraft.render.crossfade import concat_with_crossfade
 
     work = WorkDir(video_file, base_dir=work_dir)
     data = load_project(work.root)

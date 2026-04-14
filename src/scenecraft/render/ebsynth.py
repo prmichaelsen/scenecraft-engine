@@ -9,7 +9,7 @@ import urllib.request
 from pathlib import Path
 from typing import Callable
 
-EBSYNTH_DIR = Path.home() / ".beatlab" / "ebsynth"
+EBSYNTH_DIR = Path.home() / ".scenecraft" / "ebsynth"
 
 # GitHub release URLs for ebsynth binary
 EBSYNTH_URLS = {
@@ -21,7 +21,7 @@ EBSYNTH_URLS = {
 def ensure_ebsynth(install_dir: str | None = None) -> str:
     """Find or download the EbSynth binary. Returns path to binary.
 
-    Checks: PATH → install_dir → ~/.beatlab/ebsynth → downloads.
+    Checks: PATH → install_dir → ~/.scenecraft/ebsynth → downloads.
     """
     # Check PATH
     for name in ("ebsynth", "EbSynth"):

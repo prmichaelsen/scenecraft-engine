@@ -2,7 +2,7 @@
 
 import math
 
-from beatlab.presets import (
+from scenecraft.presets import (
     PRESETS,
     EffectPreset,
     apply_intensity,

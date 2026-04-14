@@ -14,7 +14,7 @@ class WorkDir:
     output already exists and skip if so.
     """
 
-    def __init__(self, video_path: str, base_dir: str = ".beatlab_work"):
+    def __init__(self, video_path: str, base_dir: str = ".scenecraft_work"):
         video_name = Path(video_path).stem
         self.root = Path(base_dir) / video_name
         self.root.mkdir(parents=True, exist_ok=True)

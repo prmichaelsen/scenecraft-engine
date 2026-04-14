@@ -6,7 +6,7 @@ import json
 import re
 from dataclasses import dataclass, field
 
-from beatlab.presets import PRESETS
+from scenecraft.presets import PRESETS
 
 
 @dataclass

@@ -6,7 +6,7 @@ on the same audio clip. Measures separation quality by checking bleed at a known
 vocals-only section.
 
 Usage:
-    python scripts/benchmark_separation.py .beatlab_work/beyond_the_veil/test_clips/mix_9_11m.wav
+    python scripts/benchmark_separation.py .scenecraft_work/beyond_the_veil/test_clips/mix_9_11m.wav
 """
 
 import json

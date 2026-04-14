@@ -440,7 +440,7 @@ def apply_effects_ai(
     suppressions = []
     if project_dir:
         from pathlib import Path as _Path
-        from beatlab.db import get_effects, get_suppressions
+        from scenecraft.db import get_effects, get_suppressions
         _pdir = _Path(project_dir)
         if (_pdir / "project.db").exists():
             user_effects = get_effects(_pdir)

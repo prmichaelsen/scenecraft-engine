@@ -7,7 +7,7 @@ import pytest
 
 def _setup_project(tmp_path: Path):
     """Create a minimal project with keyframes and transitions for paste testing."""
-    from beatlab.db import add_keyframe, add_transition
+    from scenecraft.db import add_keyframe, add_transition
 
     project_dir = tmp_path / "test_project"
     project_dir.mkdir()
@@ -60,10 +60,10 @@ def _parse_ts(ts):
 
 def _get_active(project_dir, table="transitions", track=None):
     if table == "transitions":
-        from beatlab.db import get_transitions
+        from scenecraft.db import get_transitions
         items = [t for t in get_transitions(project_dir) if not t.get("deleted_at")]
     else:
-        from beatlab.db import get_keyframes
+        from scenecraft.db import get_keyframes
         items = [k for k in get_keyframes(project_dir) if not k.get("deleted_at")]
     if track:
         items = [i for i in items if i.get("track_id", "track_1") == track]
@@ -91,7 +91,7 @@ def _find_overlaps(transitions, keyframes):
 
 def _simulate_paste(project_dir, kf_ids, target_time, target_track):
     """Simulate the paste-group logic."""
-    from beatlab.db import (
+    from scenecraft.db import (
         get_keyframe as db_get_kf, add_keyframe as db_add_kf,
         get_transitions as db_get_trs, add_transition as db_add_tr,
         next_keyframe_id, next_transition_id,
@@ -136,7 +136,7 @@ def _simulate_paste(project_dir, kf_ids, target_time, target_track):
                     if t["from"] in src_kf_set and t["to"] in src_kf_set
                     and not t.get("deleted_at")]
 
-    from beatlab.db import get_keyframes as db_get_kfs_paste
+    from scenecraft.db import get_keyframes as db_get_kfs_paste
     all_kfs_paste = {k["id"]: k for k in db_get_kfs_paste(project_dir) if not k.get("deleted_at")}
     target_trs = [t for t in all_trs
                   if t.get("track_id") == target_track and not t.get("deleted_at")]
@@ -257,7 +257,7 @@ class TestPasteGroup:
         )
 
         assert len(created_trs) == 1
-        from beatlab.db import get_transitions
+        from scenecraft.db import get_transitions
         new_tr = next(t for t in get_transitions(project_dir) if t["id"] == created_trs[0]["id"])
         # tr_001 had an opacity_curve
         assert new_tr.get("opacity_curve") is not None, "Opacity curve should be preserved"
@@ -266,7 +266,7 @@ class TestPasteGroup:
         """Deleted source transitions should not be pasted."""
         project_dir = _setup_project(tmp_path)
 
-        from beatlab.db import delete_transition
+        from scenecraft.db import delete_transition
         from datetime import datetime, UTC
         delete_transition(project_dir, "tr_001", datetime.now(UTC).isoformat())
 
@@ -280,7 +280,7 @@ class TestPasteGroup:
 
     def test_paste_preserves_selected_video_index(self, tmp_path):
         """Pasted transition should have correct selected index matching the copied candidate."""
-        from beatlab.db import add_transition, add_keyframe, get_transitions, update_transition
+        from scenecraft.db import add_transition, add_keyframe, get_transitions, update_transition
         import hashlib
 
         project_dir = _setup_project(tmp_path)

@@ -459,7 +459,7 @@ def analyze_stem(path: str, stem_type: str, sr: int = 22050) -> dict:
     Returns:
         Analysis dict with keys appropriate to the stem type.
     """
-    from beatlab.analyzer import load_audio, detect_drops, detect_presence, detect_sections
+    from scenecraft.analyzer import load_audio, detect_drops, detect_presence, detect_sections
     import librosa
     import numpy as np
 

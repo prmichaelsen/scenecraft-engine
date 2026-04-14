@@ -84,7 +84,7 @@ def load_narrative(yaml_path: str) -> dict:
 
     # Split format: timeline.yaml exists alongside project.yaml + narrative.yaml
     if yaml_path.name == "timeline.yaml" or (yaml_path.parent / "timeline.yaml").exists():
-        from beatlab.project import load_project
+        from scenecraft.project import load_project
         data = load_project(yaml_path.parent)
     else:
         with open(yaml_path) as f:
@@ -173,7 +173,7 @@ def save_narrative(data: dict, yaml_path: str | None = None) -> None:
     fmt = data.get("_format")
     work_dir = data.get("_work_dir")
     if fmt == "split" or (work_dir and (Path(work_dir) / "timeline.yaml").exists()):
-        from beatlab.project import save_project
+        from scenecraft.project import save_project
         save_project(data, Path(work_dir))
         return
 
@@ -457,12 +457,12 @@ def generate_keyframe_candidates(
     work_dir = Path(data["_work_dir"])
     n_candidates = candidates_per_slot or data["meta"]["candidates_per_slot"]
 
-    from beatlab.render.candidates import generate_image_candidates, make_contact_sheet
+    from scenecraft.render.candidates import generate_image_candidates, make_contact_sheet
 
     if use_replicate:
         stylize_fn = _make_replicate_stylize_fn()
     else:
-        from beatlab.render.google_video import GoogleVideoClient
+        from scenecraft.render.google_video import GoogleVideoClient
         client = GoogleVideoClient(vertex=vertex)
 
         def stylize_fn(source_path: str, style_prompt: str, output_path: str) -> str:
@@ -812,12 +812,12 @@ def generate_slot_keyframe_candidates(
         _log("No multi-slot transitions. Skipping.")
         return
 
-    from beatlab.render.candidates import generate_image_candidates
+    from scenecraft.render.candidates import generate_image_candidates
 
     if use_replicate:
         stylize_fn = _make_replicate_stylize_fn()
     else:
-        from beatlab.render.google_video import GoogleVideoClient
+        from scenecraft.render.google_video import GoogleVideoClient
         client = GoogleVideoClient(vertex=vertex)
         def stylize_fn(source_path: str, style_prompt: str, output_path: str) -> str:
             return client.stylize_image(source_path, style_prompt, output_path)
@@ -998,7 +998,7 @@ def generate_transition_candidates(
     tr_candidates_dir = work_dir / "transition_candidates"
     tr_candidates_dir.mkdir(parents=True, exist_ok=True)
 
-    from beatlab.render.google_video import GoogleVideoClient
+    from scenecraft.render.google_video import GoogleVideoClient
     client = GoogleVideoClient(vertex=vertex)
 
     transitions = data["transitions"]
@@ -1083,7 +1083,7 @@ def generate_transition_candidates(
         _log("All transition candidates already generated.")
         return
 
-    from beatlab.render.google_video import PromptRejectedError
+    from scenecraft.render.google_video import PromptRejectedError
     from concurrent.futures import ThreadPoolExecutor, as_completed
     rejected = []
     completed_count = [0]
@@ -1341,7 +1341,7 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
     # Export DB to YAML first so curve_points and other DB-only edits are included
     yaml_dir = Path(yaml_path).parent
     if (yaml_dir / "project.db").exists():
-        from beatlab.db import export_to_yaml
+        from scenecraft.db import export_to_yaml
         export_to_yaml(yaml_dir)
         _log("  Exported DB to YAML before assembly")
 
@@ -1462,7 +1462,7 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
         import json as _json
         with open(intel_path) as f:
             intel_data = _json.load(f)
-        from beatlab.render.effects_opencv import _apply_rules_client
+        from scenecraft.render.effects_opencv import _apply_rules_client
         onsets = {}
         for stem, bands in intel_data.get("layer1", {}).items():
             onsets[stem] = {}
@@ -1475,7 +1475,7 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
 
     # Load user effects and suppressions
     if (work_dir / "project.db").exists():
-        from beatlab.db import get_effects, get_suppressions
+        from scenecraft.db import get_effects, get_suppressions
         user_effects = get_effects(work_dir)
         suppressions = get_suppressions(work_dir)
         if user_effects:
@@ -1655,7 +1655,7 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
     # Sorted by from_ts, non-overlapping on the base track
     segments = []
     if (work_dir / "project.db").exists():
-        from beatlab.db import get_transitions as db_get_trs_base, get_keyframes as db_get_kfs_base
+        from scenecraft.db import get_transitions as db_get_trs_base, get_keyframes as db_get_kfs_base
         db_trs = [tr for tr in db_get_trs_base(work_dir)
                   if tr.get("track_id") == "track_1" and not tr.get("deleted_at")]
         db_kfs = {kf["id"]: kf for kf in db_get_kfs_base(work_dir)
@@ -1682,7 +1682,7 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
 
             # Get per-transition effects
             try:
-                from beatlab.db import get_transition_effects
+                from scenecraft.db import get_transition_effects
                 tr_effects = get_transition_effects(work_dir, tr_id)
             except Exception:
                 tr_effects = []
@@ -1790,7 +1790,7 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
     # Load overlay tracks from DB for multi-track compositing
     overlay_tracks = []
     if (work_dir / "project.db").exists():
-        from beatlab.db import get_tracks, get_keyframes as db_get_kfs, get_transitions as db_get_trs
+        from scenecraft.db import get_tracks, get_keyframes as db_get_kfs, get_transitions as db_get_trs
         tracks = get_tracks(work_dir)
         # Sort by zOrder ascending — track_1 (zOrder 0) is base, higher zOrder overlays on top
         tracks.sort(key=lambda t: t.get("z_order", 0))
@@ -1825,7 +1825,7 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                 tr_opacity = tr.get("opacity")
                 tr_opacity_curve = tr.get("opacity_curve")
                 tr_blend = tr.get("blend_mode") or blend_mode
-                from beatlab.db import get_transition_effects
+                from scenecraft.db import get_transition_effects
                 tr_effects = get_transition_effects(work_dir, tr["id"])
                 clip_data = {
                     "from_ts": ft, "to_ts": tt, "opacity": tr_opacity, "opacity_curve": tr_opacity_curve, "blend_mode": tr_blend, "effects": tr_effects,

@@ -1,10 +1,10 @@
 """Tests for sustained effects, hold keyframes, and ColorCorrector."""
 
-from beatlab.fusion.keyframes import KeyframeTrack
-from beatlab.fusion.nodes import make_color_corrector
-from beatlab.fusion.setting_writer import FusionComp
-from beatlab.ai.plan import EffectPlan, SectionPlan, parse_effect_plan
-from beatlab.generator import generate_comp
+from scenecraft.fusion.keyframes import KeyframeTrack
+from scenecraft.fusion.nodes import make_color_corrector
+from scenecraft.fusion.setting_writer import FusionComp
+from scenecraft.ai.plan import EffectPlan, SectionPlan, parse_effect_plan
+from scenecraft.generator import generate_comp
 
 
 class TestHoldKeyframes:
@@ -140,7 +140,7 @@ class TestPlanWithSustained:
 
 class TestPromptIncludesColor:
     def test_system_prompt_has_color_params(self):
-        from beatlab.ai.prompt import build_system_prompt
+        from scenecraft.ai.prompt import build_system_prompt
         prompt = build_system_prompt()
         assert "ColorCorrector" in prompt
         assert "MasterSaturation" in prompt
