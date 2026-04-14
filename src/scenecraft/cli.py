@@ -135,7 +135,7 @@ def list_presets():
 @click.option("--beats", default=None, type=click.Path(exists=True), help="Path to beats.json from analysis")
 @click.option("--hits", default="hits.json", type=click.Path(), help="Path to save/load hits.json (default: hits.json)")
 @click.option("--fps", default=30.0, type=float, help="Timeline frame rate (default: 30)")
-@click.option("--port", default=8080, type=int, help="Server port (default: 8080)")
+@click.option("--port", default=8082, type=int, help="Server port (default: 8082)")
 def marker_ui(audio_file: str, beats: str | None, hits: str, fps: float, port: int):
     """Launch the hit marker web UI for manual effect placement."""
     from scenecraft.marker_server import start_server
@@ -1277,7 +1277,7 @@ def destroy_gpu(destroy_all: bool):
 
 
 @main.command()
-@click.option("--port", default=8888, type=int, help="Server port (default: 8888)")
+@click.option("--port", default=8890, type=int, help="Server port (default: 8890)")
 @click.option("--host", default="0.0.0.0", type=str, help="Bind address (default: 0.0.0.0)")
 @click.option("--work-dir", default=".scenecraft_work", type=str, help="Work directory (default: .scenecraft_work)")
 def server(port: int, host: str, work_dir: str):

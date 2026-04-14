@@ -397,7 +397,7 @@ class FolderWatcher:
 folder_watcher: FolderWatcher | None = None
 
 
-def start_ws_server(host: str = "0.0.0.0", port: int = 8889):
+def start_ws_server(host: str = "0.0.0.0", port: int = 8891):
     """Start the WebSocket server in a background thread."""
     def _run():
         asyncio.run(_run_ws_server(host, port))

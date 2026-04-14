@@ -6255,7 +6255,7 @@ def make_handler(work_dir: Path):
     return SceneCraftHandler
 
 
-def run_server(host: str = "0.0.0.0", port: int = 8888, work_dir: str | None = None):
+def run_server(host: str = "0.0.0.0", port: int = 8890, work_dir: str | None = None):
     """Start the SceneCraft REST API server."""
     wd = Path(work_dir) if work_dir else Path.cwd() / ".scenecraft_work"
     if not wd.exists():
