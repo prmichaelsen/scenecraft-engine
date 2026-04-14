@@ -441,9 +441,7 @@ def make_handler(work_dir: Path):
                         "default_transition_prompt": body.get("defaultTransitionPrompt", "Smooth cinematic transition"),
                     }
                     set_meta_bulk(project_dir, meta)
-                    # Create default track
-                    from beatlab.db import add_track
-                    add_track(project_dir, {"id": "track_1", "name": "Track 1", "z_order": 0})
+                    # Default track is created by _ensure_schema in get_db()
                     _log(f"create-project: {name}")
                     return self._json_response({"success": True, "name": name})
                 except Exception as e:
