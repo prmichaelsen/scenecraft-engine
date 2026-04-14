@@ -251,6 +251,33 @@ def make_handler(work_dir: Path):
                     t["opacityKeyframes"] = get_opacity_keyframes(project_dir, t["id"])
                 return self._json_response({"tracks": tracks})
 
+            # GET /api/projects/:name/audio-tracks
+            m = re.match(r"^/api/projects/([^/]+)/audio-tracks$", path)
+            if m:
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None:
+                    return
+                from beatlab.db import get_audio_tracks, get_audio_clips
+                tracks = get_audio_tracks(project_dir)
+                for t in tracks:
+                    t["clips"] = get_audio_clips(project_dir, t["id"])
+                return self._json_response({"audioTracks": tracks})
+
+            # GET /api/projects/:name/audio-clips
+            m = re.match(r"^/api/projects/([^/]+)/audio-clips$", path)
+            if m:
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None:
+                    return
+                from beatlab.db import get_audio_clips
+                track_id = None
+                if "?" in self.path:
+                    from urllib.parse import parse_qs, urlparse
+                    qs = parse_qs(urlparse(self.path).query)
+                    track_id = qs.get("trackId", [None])[0]
+                clips = get_audio_clips(project_dir, track_id)
+                return self._json_response({"audioClips": clips})
+
             # GET /api/projects/:name/unselected-candidates
             m = re.match(r"^/api/projects/([^/]+)/unselected-candidates$", path)
             if m:
@@ -781,6 +808,120 @@ def make_handler(work_dir: Path):
                 track_ids = body.get("trackIds", [])
                 _log(f"tracks/reorder: {track_ids}")
                 db_reorder_tracks(project_dir, track_ids)
+                return self._json_response({"success": True})
+
+            # POST /api/projects/:name/audio-tracks/add
+            m = re.match(r"^/api/projects/([^/]+)/audio-tracks/add$", path)
+            if m:
+                body = self._read_json_body()
+                if body is None: return
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                from beatlab.db import add_audio_track as db_add_audio_track, get_audio_tracks as db_get_audio_tracks
+                existing = db_get_audio_tracks(project_dir)
+                max_num = max((int(t["id"].replace("audio_track_", "")) for t in existing if t["id"].startswith("audio_track_")), default=0)
+                track_id = f"audio_track_{max_num + 1}"
+                display_order = max((t["display_order"] for t in existing), default=-1) + 1
+                db_add_audio_track(project_dir, {"id": track_id, "name": body.get("name", f"Audio Track {len(existing) + 1}"), "display_order": display_order, **{k: v for k, v in body.items() if k in ("enabled", "hidden", "muted", "volume")}})
+                _log(f"audio-tracks/add: {m.group(1)} -> {track_id} (display_order={display_order})")
+                return self._json_response({"success": True, "id": track_id})
+
+            # POST /api/projects/:name/audio-tracks/update
+            m = re.match(r"^/api/projects/([^/]+)/audio-tracks/update$", path)
+            if m:
+                body = self._read_json_body()
+                if body is None: return
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                from beatlab.db import update_audio_track as db_update_audio_track
+                track_id = body.pop("id", None)
+                if not track_id: return self._error(400, "BAD_REQUEST", "Missing 'id'")
+                field_map = {"displayOrder": "display_order"}
+                mapped = {field_map.get(k, k): v for k, v in body.items() if field_map.get(k, k) in ("name", "display_order", "enabled", "hidden", "muted", "volume")}
+                _log(f"audio-tracks/update: {track_id} {mapped}")
+                db_update_audio_track(project_dir, track_id, **mapped)
+                return self._json_response({"success": True})
+
+            # POST /api/projects/:name/audio-tracks/delete
+            m = re.match(r"^/api/projects/([^/]+)/audio-tracks/delete$", path)
+            if m:
+                body = self._read_json_body()
+                if body is None: return
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                from beatlab.db import delete_audio_track as db_delete_audio_track
+                del_id = body.get("id", "")
+                _log(f"audio-tracks/delete: {del_id}")
+                db_delete_audio_track(project_dir, del_id)
+                return self._json_response({"success": True})
+
+            # POST /api/projects/:name/audio-tracks/reorder
+            m = re.match(r"^/api/projects/([^/]+)/audio-tracks/reorder$", path)
+            if m:
+                body = self._read_json_body()
+                if body is None: return
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                from beatlab.db import reorder_audio_tracks as db_reorder_audio_tracks
+                track_ids = body.get("trackIds", [])
+                _log(f"audio-tracks/reorder: {track_ids}")
+                db_reorder_audio_tracks(project_dir, track_ids)
+                return self._json_response({"success": True})
+
+            # POST /api/projects/:name/audio-clips/add
+            m = re.match(r"^/api/projects/([^/]+)/audio-clips/add$", path)
+            if m:
+                body = self._read_json_body()
+                if body is None: return
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                from beatlab.db import add_audio_clip as db_add_audio_clip, get_audio_clips as db_get_audio_clips
+                existing = db_get_audio_clips(project_dir)
+                max_num = max((int(c["id"].replace("audio_clip_", "")) for c in existing if c["id"].startswith("audio_clip_")), default=0)
+                clip_id = f"audio_clip_{max_num + 1}"
+                clip = {
+                    "id": clip_id,
+                    "track_id": body.get("trackId", body.get("track_id", "")),
+                    "source_path": body.get("sourcePath", body.get("source_path", "")),
+                    "start_time": body.get("startTime", body.get("start_time", 0)),
+                    "end_time": body.get("endTime", body.get("end_time", 0)),
+                    "source_offset": body.get("sourceOffset", body.get("source_offset", 0)),
+                    "volume": body.get("volume", 1.0),
+                    "muted": body.get("muted", False),
+                    "remap": body.get("remap", {"method": "linear", "target_duration": 0}),
+                }
+                if not clip["track_id"]: return self._error(400, "BAD_REQUEST", "Missing 'trackId'")
+                db_add_audio_clip(project_dir, clip)
+                _log(f"audio-clips/add: {m.group(1)} -> {clip_id} on {clip['track_id']}")
+                return self._json_response({"success": True, "id": clip_id})
+
+            # POST /api/projects/:name/audio-clips/update
+            m = re.match(r"^/api/projects/([^/]+)/audio-clips/update$", path)
+            if m:
+                body = self._read_json_body()
+                if body is None: return
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                from beatlab.db import update_audio_clip as db_update_audio_clip
+                clip_id = body.pop("id", None)
+                if not clip_id: return self._error(400, "BAD_REQUEST", "Missing 'id'")
+                field_map = {"trackId": "track_id", "sourcePath": "source_path", "startTime": "start_time", "endTime": "end_time", "sourceOffset": "source_offset"}
+                mapped = {field_map.get(k, k): v for k, v in body.items() if field_map.get(k, k) in ("track_id", "source_path", "start_time", "end_time", "source_offset", "volume", "muted", "remap")}
+                _log(f"audio-clips/update: {clip_id} {mapped}")
+                db_update_audio_clip(project_dir, clip_id, **mapped)
+                return self._json_response({"success": True})
+
+            # POST /api/projects/:name/audio-clips/delete
+            m = re.match(r"^/api/projects/([^/]+)/audio-clips/delete$", path)
+            if m:
+                body = self._read_json_body()
+                if body is None: return
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                from beatlab.db import delete_audio_clip as db_delete_audio_clip
+                del_id = body.get("id", "")
+                _log(f"audio-clips/delete: {del_id}")
+                db_delete_audio_clip(project_dir, del_id)
                 return self._json_response({"success": True})
 
             # POST /api/projects/:name/update-rules

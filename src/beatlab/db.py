@@ -179,6 +179,32 @@ def _ensure_schema(conn: sqlite3.Connection):
         );
         CREATE INDEX IF NOT EXISTS idx_tr_effects ON transition_effects(transition_id);
 
+        CREATE TABLE IF NOT EXISTS audio_tracks (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL DEFAULT 'Audio Track 1',
+            display_order INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            hidden INTEGER NOT NULL DEFAULT 0,
+            muted INTEGER NOT NULL DEFAULT 0,
+            volume REAL NOT NULL DEFAULT 1.0
+        );
+
+        CREATE TABLE IF NOT EXISTS audio_clips (
+            id TEXT PRIMARY KEY,
+            track_id TEXT NOT NULL,
+            source_path TEXT NOT NULL DEFAULT '',
+            start_time REAL NOT NULL DEFAULT 0,
+            end_time REAL NOT NULL DEFAULT 0,
+            source_offset REAL NOT NULL DEFAULT 0,
+            volume REAL NOT NULL DEFAULT 1.0,
+            muted INTEGER NOT NULL DEFAULT 0,
+            remap TEXT NOT NULL DEFAULT '{"method":"linear","target_duration":0}',
+            deleted_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_audio_clips_track ON audio_clips(track_id);
+        CREATE INDEX IF NOT EXISTS idx_audio_clips_deleted ON audio_clips(deleted_at);
+
         CREATE TABLE IF NOT EXISTS sections (
             id TEXT PRIMARY KEY,
             label TEXT NOT NULL DEFAULT '',
@@ -321,7 +347,7 @@ def _ensure_schema(conn: sqlite3.Connection):
         pass  # another thread may have inserted it
 
     # ── Undo triggers (AFTER all migrations so PRAGMA table_info sees all columns) ──
-    _undo_tracked_tables = ["keyframes", "transitions", "suppressions", "effects", "tracks", "transition_effects", "markers"]
+    _undo_tracked_tables = ["keyframes", "transitions", "suppressions", "effects", "tracks", "transition_effects", "markers", "audio_tracks", "audio_clips"]
     for table in _undo_tracked_tables:
         cols_info = conn.execute(f"PRAGMA table_info({table})").fetchall()
         col_names = [row[1] for row in cols_info]
@@ -1434,4 +1460,120 @@ def set_sections(project_dir: Path, sections: list[dict]):
         )
     # Mark migrated so get_sections doesn't re-check yaml
     conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('sections_migrated', '1')")
+    conn.commit()
+
+
+# ── Audio track operations ────────────────────────────────────────
+
+def get_audio_tracks(project_dir: Path) -> list[dict]:
+    conn = get_db(project_dir)
+    rows = conn.execute("SELECT * FROM audio_tracks ORDER BY display_order").fetchall()
+    return [{
+        "id": r["id"], "name": r["name"], "display_order": r["display_order"],
+        "enabled": bool(r["enabled"]), "hidden": bool(r["hidden"]),
+        "muted": bool(r["muted"]), "volume": r["volume"],
+    } for r in rows]
+
+
+def add_audio_track(project_dir: Path, track: dict):
+    conn = get_db(project_dir)
+    conn.execute(
+        "INSERT INTO audio_tracks (id, name, display_order, enabled, hidden, muted, volume) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (track["id"], track.get("name", "Audio Track"),
+         track.get("display_order", 0),
+         1 if track.get("enabled", True) else 0,
+         1 if track.get("hidden", False) else 0,
+         1 if track.get("muted", False) else 0,
+         track.get("volume", 1.0)),
+    )
+    conn.commit()
+
+
+def update_audio_track(project_dir: Path, track_id: str, **fields):
+    conn = get_db(project_dir)
+    sets = []
+    values = []
+    for key, val in fields.items():
+        if key in ("enabled", "hidden", "muted"):
+            val = 1 if val else 0
+        sets.append(f"{key} = ?")
+        values.append(val)
+    values.append(track_id)
+    conn.execute(f"UPDATE audio_tracks SET {', '.join(sets)} WHERE id = ?", values)
+    conn.commit()
+
+
+def delete_audio_track(project_dir: Path, track_id: str):
+    conn = get_db(project_dir)
+    conn.execute("DELETE FROM audio_tracks WHERE id = ?", (track_id,))
+    # Soft-delete audio clips on this track
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE audio_clips SET deleted_at = ? WHERE track_id = ? AND deleted_at IS NULL", (now, track_id))
+    conn.commit()
+
+
+def reorder_audio_tracks(project_dir: Path, track_ids: list[str]):
+    conn = get_db(project_dir)
+    for i, tid in enumerate(track_ids):
+        conn.execute("UPDATE audio_tracks SET display_order = ? WHERE id = ?", (i, tid))
+    conn.commit()
+
+
+# ── Audio clip operations ─────────────────────────────────────────
+
+def get_audio_clips(project_dir: Path, track_id: str | None = None) -> list[dict]:
+    conn = get_db(project_dir)
+    if track_id:
+        rows = conn.execute(
+            "SELECT * FROM audio_clips WHERE track_id = ? AND deleted_at IS NULL ORDER BY start_time",
+            (track_id,)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM audio_clips WHERE deleted_at IS NULL ORDER BY track_id, start_time").fetchall()
+    return [{
+        "id": r["id"], "track_id": r["track_id"],
+        "source_path": r["source_path"],
+        "start_time": r["start_time"], "end_time": r["end_time"],
+        "source_offset": r["source_offset"],
+        "volume": r["volume"], "muted": bool(r["muted"]),
+        "remap": json.loads(r["remap"]) if r["remap"] else {"method": "linear", "target_duration": 0},
+    } for r in rows]
+
+
+def add_audio_clip(project_dir: Path, clip: dict):
+    conn = get_db(project_dir)
+    conn.execute(
+        """INSERT INTO audio_clips (id, track_id, source_path, start_time, end_time, source_offset, volume, muted, remap)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (clip["id"], clip["track_id"], clip.get("source_path", ""),
+         clip.get("start_time", 0), clip.get("end_time", 0),
+         clip.get("source_offset", 0), clip.get("volume", 1.0),
+         1 if clip.get("muted", False) else 0,
+         json.dumps(clip.get("remap", {"method": "linear", "target_duration": 0}))),
+    )
+    conn.commit()
+
+
+def update_audio_clip(project_dir: Path, clip_id: str, **fields):
+    conn = get_db(project_dir)
+    sets = []
+    values = []
+    for key, val in fields.items():
+        if key == "muted":
+            val = 1 if val else 0
+        elif key == "remap":
+            val = json.dumps(val) if isinstance(val, dict) else val
+        sets.append(f"{key} = ?")
+        values.append(val)
+    values.append(clip_id)
+    conn.execute(f"UPDATE audio_clips SET {', '.join(sets)} WHERE id = ?", values)
+    conn.commit()
+
+
+def delete_audio_clip(project_dir: Path, clip_id: str):
+    conn = get_db(project_dir)
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE audio_clips SET deleted_at = ? WHERE id = ?", (now, clip_id))
     conn.commit()
