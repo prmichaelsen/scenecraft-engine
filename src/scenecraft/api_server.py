@@ -83,11 +83,16 @@ def make_handler(work_dir: Path):
             parsed = urlparse(self.path)
             path = unquote(parsed.path)
 
+            # GET /api/config
+            if path == "/api/config":
+                from scenecraft.config import load_config
+                return self._json_response(load_config())
+
             # GET /api/projects
             if path == "/api/projects":
                 return self._handle_list_projects()
 
-            # GET /api/browse?path=subdir (browse .scenecraft_work root)
+            # GET /api/browse?path=subdir (browse projects root)
             if path == "/api/browse":
                 query = parsed.query
                 subpath = ""
@@ -443,6 +448,21 @@ def make_handler(work_dir: Path):
                     _get_project_lock(_proj_name).release()
 
         def _do_POST(self, path):
+
+            # POST /api/config
+            if path == "/api/config":
+                body = self._read_json_body()
+                if body is None: return
+                from scenecraft.config import load_config, save_config, set_projects_dir
+                config = load_config()
+                if "projects_dir" in body:
+                    set_projects_dir(body["projects_dir"])
+                    _log(f"config: projects_dir set to {body['projects_dir']}")
+                else:
+                    config.update(body)
+                    save_config(config)
+                    _log(f"config: updated {list(body.keys())}")
+                return self._json_response({"success": True})
 
             # POST /api/projects/create
             if path == "/api/projects/create":
@@ -6257,10 +6277,14 @@ def make_handler(work_dir: Path):
 
 def run_server(host: str = "0.0.0.0", port: int = 8890, work_dir: str | None = None):
     """Start the SceneCraft REST API server."""
-    wd = Path(work_dir) if work_dir else Path.cwd() / ".scenecraft_work"
-    if not wd.exists():
+    if work_dir:
+        wd = Path(work_dir)
+    else:
+        from scenecraft.config import resolve_work_dir
+        wd = resolve_work_dir()
+    if wd is None or not wd.exists():
         print(f"Work directory not found: {wd}", file=sys.stderr)
-        print("Run from the project root or specify --work-dir.", file=sys.stderr)
+        print("Run 'scenecraft server' to configure, or specify --work-dir.", file=sys.stderr)
         raise SystemExit(1)
 
     handler = make_handler(wd)

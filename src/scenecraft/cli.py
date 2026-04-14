@@ -1279,11 +1279,26 @@ def destroy_gpu(destroy_all: bool):
 @main.command()
 @click.option("--port", default=8890, type=int, help="Server port (default: 8890)")
 @click.option("--host", default="0.0.0.0", type=str, help="Bind address (default: 0.0.0.0)")
-@click.option("--work-dir", default=".scenecraft_work", type=str, help="Work directory (default: .scenecraft_work)")
-def server(port: int, host: str, work_dir: str):
+@click.option("--work-dir", default=None, type=str, help="Work directory (overrides config)")
+def server(port: int, host: str, work_dir: str | None):
     """Start SceneCraft REST API server for the synthesizer frontend."""
+    from scenecraft.config import resolve_work_dir, set_projects_dir
+
+    wd = resolve_work_dir(work_dir)
+    if wd is None:
+        default_path = str(Path.home() / ".scenecraft" / "projects")
+        chosen = click.prompt(
+            "No projects directory configured. Where should SceneCraft store projects?",
+            default=default_path,
+        )
+        wd = set_projects_dir(chosen)
+        _log(f"Projects directory set to: {wd}")
+    else:
+        wd = Path(wd)
+        wd.mkdir(parents=True, exist_ok=True)
+
     from scenecraft.api_server import run_server
-    run_server(host, port, work_dir=work_dir)
+    run_server(host, port, work_dir=str(wd))
 
 
 @main.command(name="audio-intelligence")
