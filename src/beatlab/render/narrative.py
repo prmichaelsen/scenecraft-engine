@@ -1718,6 +1718,18 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
             }
             has_grading = any(color_grading.values())
 
+            transform_data = {
+                "transform_x": tr.get("transform_x"),
+                "transform_y": tr.get("transform_y"),
+                "transform_x_curve": _parse_curve(tr.get("transform_x_curve")),
+                "transform_y_curve": _parse_curve(tr.get("transform_y_curve")),
+                "transform_z_curve": _parse_curve(tr.get("transform_z_curve")),
+                "anchor_x": tr.get("anchor_x"),
+                "anchor_y": tr.get("anchor_y"),
+                "is_adjustment": tr.get("is_adjustment", False),
+            }
+            has_transform = any(transform_data.get(k) for k in ("transform_x", "transform_y", "transform_x_curve", "transform_y_curve", "transform_z_curve"))
+
             if selected.exists():
                 segments.append({
                     "from_ts": from_ts, "to_ts": to_ts,
@@ -1727,6 +1739,7 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                     "effects": tr_effects,
                     "opacity_curve": opacity_curve,
                     **({k: v for k, v in color_grading.items() if v} if has_grading else {}),
+                    **(transform_data if has_transform else {}),
                 })
             else:
                 kf_image = work_dir / "selected_keyframes" / f"{tr.get('from_id') or tr.get('from', '')}.png"
@@ -1738,6 +1751,7 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                         "effects": tr_effects,
                         "opacity_curve": opacity_curve,
                         **({k: v for k, v in color_grading.items() if v} if has_grading else {}),
+                        **(transform_data if has_transform else {}),
                     })
     else:
         # Fallback to YAML-based clips_info
@@ -2329,6 +2343,10 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
                     duty = efx["params"].get("duty", 0.5)
                     if (progress * freq) % 1 > duty:
                         frame = np.zeros_like(frame)
+
+            # Base track transform (X/Y/Z)
+            if any(seg.get(k) for k in ("transform_x", "transform_y", "transform_x_curve", "transform_y_curve", "transform_z_curve")):
+                frame = _apply_transform(frame, seg, raw_progress)
 
         # Composite overlays first, then apply beat-synced effects to the final frame
         frame = _composite_overlays(frame, t, w, h)

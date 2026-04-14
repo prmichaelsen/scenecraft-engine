@@ -1247,7 +1247,17 @@ def export_to_yaml(project_dir: Path):
 def undo_begin(project_dir: Path, description: str) -> int:
     conn = get_db(project_dir)
     conn.execute("UPDATE undo_state SET value = value + 1 WHERE key = 'current_group'")
-    group_id = conn.execute("SELECT value FROM undo_state WHERE key = 'current_group'").fetchone()[0]
+    row = conn.execute("SELECT value FROM undo_state WHERE key = 'current_group'").fetchone()
+    if row is None:
+        conn.execute("INSERT INTO undo_state (key, value) VALUES ('current_group', 1)")
+        group_id = 1
+    else:
+        group_id = row[0]
+    # If this group_id already exists (stale counter), bump past it
+    existing = conn.execute("SELECT MAX(id) FROM undo_groups").fetchone()
+    if existing and existing[0] is not None and group_id <= existing[0]:
+        group_id = existing[0] + 1
+        conn.execute("UPDATE undo_state SET value = ? WHERE key = 'current_group'", (group_id,))
     from datetime import datetime, timezone
     conn.execute(
         "INSERT INTO undo_groups (id, description, timestamp) VALUES (?, ?, ?)",
