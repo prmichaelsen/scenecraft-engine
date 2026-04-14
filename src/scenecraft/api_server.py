@@ -277,8 +277,8 @@ def make_handler(work_dir: Path):
                 from scenecraft.db import get_audio_clips
                 track_id = None
                 if "?" in self.path:
-                    from urllib.parse import parse_qs, urlparse
-                    qs = parse_qs(urlparse(self.path).query)
+                    from urllib.parse import parse_qs
+                    qs = parse_qs(parsed.query)
                     track_id = qs.get("trackId", [None])[0]
                 clips = get_audio_clips(project_dir, track_id)
                 return self._json_response({"audioClips": clips})
