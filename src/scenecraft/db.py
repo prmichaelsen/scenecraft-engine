@@ -346,6 +346,12 @@ def _ensure_schema(conn: sqlite3.Connection):
     except Exception:
         pass  # another thread may have inserted it
 
+    # Add last_modified_by column for attribution
+    for table in ("keyframes", "transitions", "effects", "tracks"):
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if "last_modified_by" not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN last_modified_by TEXT NOT NULL DEFAULT ''")
+
     # ── Undo triggers (AFTER all migrations so PRAGMA table_info sees all columns) ──
     _undo_tracked_tables = ["keyframes", "transitions", "suppressions", "effects", "tracks", "transition_effects", "markers", "audio_tracks", "audio_clips"]
     for table in _undo_tracked_tables:

@@ -16,6 +16,7 @@ from .bootstrap import (
     list_users,
     list_org_members,
 )
+from .auth import generate_token
 
 
 def _require_root() -> Path:
@@ -44,6 +45,20 @@ def init(org: str, admin: str | None, root: str):
         click.echo(f"  Org: {org}")
         click.echo(f"  Admin: {admin or 'current OS user'}")
     except FileExistsError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
+
+
+@vcs_group.command()
+@click.option("--user", default=None, help="Username (default: current OS user)")
+@click.option("--expiry", default=24, type=int, help="Token expiry in hours (default: 24)")
+def token(user: str | None, expiry: int):
+    """Generate a JWT authentication token for the current user."""
+    root = _require_root()
+    try:
+        tok = generate_token(root, username=user, expiry_hours=expiry)
+        click.echo(tok)
+    except ValueError as e:
         click.echo(f"Error: {e}", err=True)
         raise SystemExit(1)
 

@@ -63,6 +63,14 @@ def make_handler(work_dir: Path):
     _project_locks: dict[str, threading.Lock] = {}
     _locks_lock = threading.Lock()
 
+    # Auth: detect .scenecraft root for JWT validation (opt-in — no .scenecraft = no auth)
+    _sc_root = None
+    try:
+        from scenecraft.vcs.bootstrap import find_root
+        _sc_root = find_root(work_dir)
+    except Exception:
+        pass
+
     def _get_project_lock(project_name: str) -> threading.Lock:
         """Get a per-project lock for serializing YAML and git operations."""
         with _locks_lock:
@@ -77,9 +85,34 @@ def make_handler(work_dir: Path):
     class SceneCraftHandler(BaseHTTPRequestHandler):
         """REST API handler for SceneCraft pipeline operations."""
 
+        _authenticated_user: str | None = None
+
+        def _authenticate(self) -> bool:
+            """Validate JWT from Authorization header. Returns True if auth passes or is not required."""
+            if _sc_root is None:
+                return True  # No .scenecraft = auth disabled
+            auth_header = self.headers.get("Authorization")
+            if not auth_header:
+                self._error(401, "UNAUTHORIZED", "Missing Authorization header")
+                return False
+            from scenecraft.vcs.auth import extract_bearer_token, validate_token
+            token = extract_bearer_token(auth_header)
+            if not token:
+                self._error(401, "UNAUTHORIZED", "Invalid Authorization header format")
+                return False
+            try:
+                payload = validate_token(_sc_root, token)
+                self._authenticated_user = payload.get("sub")
+                return True
+            except Exception:
+                self._error(401, "UNAUTHORIZED", "Invalid or expired token")
+                return False
+
         # ── Routing ──────────────────────────────────────────────
 
         def do_GET(self):
+            if not self._authenticate():
+                return
             parsed = urlparse(self.path)
             path = unquote(parsed.path)
 
@@ -402,6 +435,8 @@ def make_handler(work_dir: Path):
             self._error(404, "NOT_FOUND", f"No route: GET {path}")
 
         def do_POST(self):
+            if not self._authenticate():
+                return
             parsed = urlparse(self.path)
             path = unquote(parsed.path)
 
@@ -5906,7 +5941,7 @@ def make_handler(work_dir: Path):
             """Add CORS headers for cross-origin requests from the synthesizer."""
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
         def _handle_get_section_settings(self, project_name: str):
             """GET /api/projects/:name/section-settings?section=label — get persisted settings for a section."""
