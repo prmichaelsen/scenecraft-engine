@@ -813,10 +813,9 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from scenecraft.db import add_track as db_add_track, get_tracks as db_get_tracks
+                from scenecraft.db import add_track as db_add_track, get_tracks as db_get_tracks, generate_id
                 existing = db_get_tracks(project_dir)
-                max_num = max((int(t["id"].replace("track_", "")) for t in existing if t["id"].startswith("track_")), default=0)
-                track_id = f"track_{max_num + 1}"
+                track_id = generate_id("track")
                 # Add at top (highest z_order = rendered on top in compositor)
                 z_order = max((t["z_order"] for t in existing), default=-1) + 1
                 db_add_track(project_dir, {"id": track_id, "name": body.get("name", f"Track {len(existing) + 1}"), "z_order": z_order, **{k: v for k, v in body.items() if k in ("blend_mode", "base_opacity", "enabled")}})
@@ -872,10 +871,9 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from scenecraft.db import add_audio_track as db_add_audio_track, get_audio_tracks as db_get_audio_tracks
+                from scenecraft.db import add_audio_track as db_add_audio_track, get_audio_tracks as db_get_audio_tracks, generate_id
                 existing = db_get_audio_tracks(project_dir)
-                max_num = max((int(t["id"].replace("audio_track_", "")) for t in existing if t["id"].startswith("audio_track_")), default=0)
-                track_id = f"audio_track_{max_num + 1}"
+                track_id = generate_id("audio_track")
                 display_order = max((t["display_order"] for t in existing), default=-1) + 1
                 db_add_audio_track(project_dir, {"id": track_id, "name": body.get("name", f"Audio Track {len(existing) + 1}"), "display_order": display_order, **{k: v for k, v in body.items() if k in ("enabled", "hidden", "muted", "volume")}})
                 _log(f"audio-tracks/add: {m.group(1)} -> {track_id} (display_order={display_order})")
@@ -930,10 +928,9 @@ def make_handler(work_dir: Path):
                 if body is None: return
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
-                from scenecraft.db import add_audio_clip as db_add_audio_clip, get_audio_clips as db_get_audio_clips
+                from scenecraft.db import add_audio_clip as db_add_audio_clip, get_audio_clips as db_get_audio_clips, generate_id
                 existing = db_get_audio_clips(project_dir)
-                max_num = max((int(c["id"].replace("audio_clip_", "")) for c in existing if c["id"].startswith("audio_clip_")), default=0)
-                clip_id = f"audio_clip_{max_num + 1}"
+                clip_id = generate_id("audio_clip")
                 clip = {
                     "id": clip_id,
                     "track_id": body.get("trackId", body.get("track_id", "")),

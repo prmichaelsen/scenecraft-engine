@@ -10,8 +10,17 @@ import json
 import sqlite3
 import threading
 import time as _time
+import uuid
 from pathlib import Path
 from contextlib import contextmanager
+
+
+def generate_id(prefix: str) -> str:
+    """Generate a UUID-based entity ID with a prefix.
+
+    Format: {prefix}_{hex8} (e.g., kf_a3f7c21b, tr_9e4b0d12).
+    """
+    return f"{prefix}_{uuid.uuid4().hex[:8]}"
 
 
 def _retry_on_locked(fn, max_retries=5, delay=0.2):
@@ -495,15 +504,7 @@ def restore_keyframe(project_dir: Path, kf_id: str):
 
 
 def next_keyframe_id(project_dir: Path) -> str:
-    conn = get_db(project_dir)
-    row = conn.execute(
-        "SELECT id FROM keyframes ORDER BY CAST(SUBSTR(id, 4) AS INTEGER) DESC LIMIT 1"
-    ).fetchone()
-    if row:
-        num = int(row["id"].replace("kf_", "")) + 1
-    else:
-        num = 1
-    return f"kf_{num:03d}"
+    return generate_id("kf")
 
 
 # ── Transition operations ───────────────────────────────────────────
@@ -710,14 +711,9 @@ def get_all_transition_effects(project_dir: Path) -> dict[str, list[dict]]:
     return result
 
 
-_tfx_counter = 0
-
 def add_transition_effect(project_dir: Path, transition_id: str, effect_type: str, params: dict | None = None) -> str:
-    global _tfx_counter
     conn = get_db(project_dir)
-    import time as _t
-    _tfx_counter += 1
-    effect_id = f"tfx_{int(_t.time() * 1000)}_{_tfx_counter}"
+    effect_id = generate_id("tfx")
     max_z = conn.execute("SELECT COALESCE(MAX(z_order), -1) FROM transition_effects WHERE transition_id = ?", (transition_id,)).fetchone()[0]
     conn.execute(
         "INSERT INTO transition_effects (id, transition_id, type, params, enabled, z_order) VALUES (?, ?, ?, ?, 1, ?)",
@@ -750,15 +746,7 @@ def delete_transition_effect(project_dir: Path, effect_id: str):
 
 
 def next_transition_id(project_dir: Path) -> str:
-    conn = get_db(project_dir)
-    row = conn.execute(
-        "SELECT id FROM transitions ORDER BY CAST(SUBSTR(id, 4) AS INTEGER) DESC LIMIT 1"
-    ).fetchone()
-    if row:
-        num = int(row["id"].replace("tr_", "")) + 1
-    else:
-        num = 1
-    return f"tr_{num:03d}"
+    return generate_id("tr")
 
 
 def get_transitions_involving(project_dir: Path, kf_id: str) -> list[dict]:
