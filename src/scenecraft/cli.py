@@ -28,6 +28,11 @@ def main():
     pass
 
 
+# Register VCS subcommands
+from scenecraft.vcs.cli import vcs_group  # noqa: E402
+main.add_command(vcs_group)
+
+
 @main.command()
 @click.argument("video_file", type=click.Path(exists=True))
 @click.option("--fps", default=None, type=float, help="Timeline frame rate (default: auto-detect from video)")
