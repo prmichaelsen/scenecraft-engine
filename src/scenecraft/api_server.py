@@ -38,13 +38,18 @@ def _next_variant(directory: Path, ext: str = ".png") -> int:
 
 
 def _get_project_settings(project_dir: Path) -> dict:
-    """Read settings.yaml for a project."""
-    import yaml
-    settings_path = project_dir / "settings.yaml"
-    if settings_path.exists():
-        with open(settings_path) as f:
-            return yaml.safe_load(f) or {}
-    return {}
+    """Read project settings from the meta table in project.db."""
+    import sqlite3
+    db_path = project_dir / "project.db"
+    if not db_path.exists():
+        return {}
+    try:
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute("SELECT key, value FROM meta").fetchall()
+        conn.close()
+        return {k: v for k, v in rows}
+    except Exception:
+        return {}
 
 
 def _get_image_backend(project_dir: Path) -> str:
@@ -57,7 +62,7 @@ def _get_video_backend(project_dir: Path) -> str:
     return _get_project_settings(project_dir).get("video_backend", "vertex")
 
 
-def make_handler(work_dir: Path):
+def make_handler(work_dir: Path, no_auth: bool = False):
     """Create a request handler class with the work_dir baked in."""
     import threading
     _project_locks: dict[str, threading.Lock] = {}
@@ -65,11 +70,12 @@ def make_handler(work_dir: Path):
 
     # Auth: detect .scenecraft root for JWT validation (opt-in — no .scenecraft = no auth)
     _sc_root = None
-    try:
-        from scenecraft.vcs.bootstrap import find_root
-        _sc_root = find_root(work_dir)
-    except Exception:
-        pass
+    if not no_auth:
+        try:
+            from scenecraft.vcs.bootstrap import find_root
+            _sc_root = find_root(work_dir)
+        except Exception:
+            pass
 
     def _get_project_lock(project_name: str) -> threading.Lock:
         """Get a per-project lock for serializing YAML and git operations."""
@@ -198,6 +204,21 @@ def make_handler(work_dir: Path):
                     return self._error(404, "NOT_FOUND", f"Workspace view not found: {m.group(2)}")
                 return self._json_response({"layout": layout})
 
+            # GET /api/projects/:name/chat?limit=50
+            m = re.match(r"^/api/projects/([^/]+)/chat$", path)
+            if m:
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                limit = 50
+                if parsed.query:
+                    for param in parsed.query.split("&"):
+                        if param.startswith("limit="):
+                            try: limit = int(param[6:])
+                            except ValueError: pass
+                from scenecraft.chat import _get_messages
+                messages = _get_messages(project_dir, "local", limit)
+                return self._json_response({"messages": messages})
+
             # GET /api/projects/:name/checkpoints
             m = re.match(r"^/api/projects/([^/]+)/checkpoints$", path)
             if m:
@@ -247,10 +268,10 @@ def make_handler(work_dir: Path):
             if m:
                 return self._handle_get_section_settings(m.group(1))
 
-            # GET /api/projects/:name/audio-intelligence
+            # GET /api/projects/:name/audio-intelligence (stub — returns empty)
             m = re.match(r"^/api/projects/([^/]+)/audio-intelligence$", path)
             if m:
-                return self._handle_get_audio_intelligence(m.group(1))
+                return self._json_response({"activeFile": None, "events": [], "sections": [], "rules": [], "ruleCount": 0, "onsets": {}})
 
             # GET /api/projects/:name/descriptions
             m = re.match(r"^/api/projects/([^/]+)/descriptions$", path)
@@ -976,125 +997,17 @@ def make_handler(work_dir: Path):
                 db_delete_audio_clip(project_dir, del_id)
                 return self._json_response({"success": True})
 
-            # POST /api/projects/:name/update-rules
+            # POST /api/projects/:name/update-rules (stub — audio intelligence removed)
             m = re.match(r"^/api/projects/([^/]+)/update-rules$", path)
             if m:
-                body = self._read_json_body()
-                if body is None: return
-                project_dir = self._require_project_dir(m.group(1))
-                if project_dir is None: return
-                rules = body.get("rules", [])
-                # Update the active audio intelligence file with new rules
-                import yaml as pyyaml
-                settings_path = project_dir / "settings.yaml"
-                ai_file = None
-                if settings_path.exists():
-                    with open(settings_path) as f:
-                        s = pyyaml.safe_load(f) or {}
-                    ai_file = s.get("audio_intelligence_file")
-                if not ai_file:
-                    candidates = sorted(project_dir.glob("audio_intelligence*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-                    if candidates:
-                        ai_file = candidates[0].name
-                if ai_file and (project_dir / ai_file).exists():
-                    import json as _json
-                    ai_path = project_dir / ai_file
-                    with open(ai_path) as f:
-                        data = _json.load(f)
-                    data["layer3_rules"] = rules
-                    with open(ai_path, "w") as f:
-                        _json.dump(data, f, indent=2)
-                    _log(f"update-rules: saved {len(rules)} rules to {ai_file}")
-                    return self._json_response({"success": True, "count": len(rules)})
-                return self._error(404, "NOT_FOUND", "No audio intelligence file found")
+                self._read_json_body()
+                return self._json_response({"success": True, "count": 0})
 
-            # POST /api/projects/:name/reapply-rules
+            # POST /api/projects/:name/reapply-rules (stub — audio intelligence removed)
             m = re.match(r"^/api/projects/([^/]+)/reapply-rules$", path)
             if m:
-                body = self._read_json_body()
-                if body is None: return
-                project_dir = self._require_project_dir(m.group(1))
-                if project_dir is None: return
-
-                import yaml as pyyaml
-                settings_path = project_dir / "settings.yaml"
-                ai_file = None
-                if settings_path.exists():
-                    with open(settings_path) as f:
-                        s = pyyaml.safe_load(f) or {}
-                    ai_file = s.get("audio_intelligence_file")
-                if not ai_file:
-                    candidates = sorted(project_dir.glob("audio_intelligence*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-                    if candidates:
-                        ai_file = candidates[0].name
-                if not ai_file or not (project_dir / ai_file).exists():
-                    return self._error(404, "NOT_FOUND", "No audio intelligence file found")
-
-                import json as _json
-                ai_path = project_dir / ai_file
-                with open(ai_path) as f:
-                    data = _json.load(f)
-
-                # Save rules immediately if provided
-                if "rules" in body:
-                    data["layer3_rules"] = body["rules"]
-                    with open(ai_path, "w") as f:
-                        _json.dump(data, f, indent=2)
-                    _log(f"reapply-rules: saved {len(body['rules'])} rules")
-
-                layer1 = data.get("layer1", {})
-                all_rules = data.get("layer3_rules", [])
-                if not layer1:
-                    return self._error(400, "BAD_REQUEST", "No layer1 DSP data in audio intelligence file")
-
-                section_start = body.get("sectionStart")
-                section_end = body.get("sectionEnd")
-
-                # If section range provided, only reapply rules for that section
-                if section_start is not None and section_end is not None:
-                    section_rules = [r for r in all_rules if r.get("_group_start") == section_start and r.get("_group_end") == section_end]
-                    _log(f"reapply-rules: targeted {len(section_rules)} rules for {section_start}s-{section_end}s")
-
-                    from scenecraft.audio_intelligence import apply_rules as _apply
-                    new_events = _apply(layer1, section_rules)
-
-                    # Splice: remove old events in this range, add new ones
-                    old_events = data.get("layer3_events", [])
-                    kept = [e for e in old_events if not (section_start <= e["time"] <= section_end)]
-                    merged = sorted(kept + new_events, key=lambda e: e["time"])
-                    data["layer3_events"] = merged
-
-                    with open(ai_path, "w") as f:
-                        _json.dump(data, f, indent=2)
-
-                    _log(f"  Section: {len(new_events)} new events, {len(merged)} total")
-                    return self._json_response({"success": True, "eventCount": len(merged)})
-
-                # Full reapply in background thread
-                from scenecraft.ws_server import job_manager
-                job_id = job_manager.create_job("reapply_rules", total=1, meta={"project": m.group(1)})
-                rules = all_rules
-
-                def _run():
-                    try:
-                        from scenecraft.audio_intelligence import apply_rules as _apply
-                        _log(f"[job {job_id}] Applying {len(rules)} rules...")
-                        events = _apply(layer1, rules)
-                        import json as _j
-                        with open(ai_path) as f:
-                            fresh = _j.load(f)
-                        fresh["layer3_events"] = events
-                        with open(ai_path, "w") as f:
-                            _j.dump(fresh, f, indent=2)
-                        _log(f"[job {job_id}] Generated {len(events)} events")
-                        job_manager.complete_job(job_id, {"eventCount": len(events)})
-                    except Exception as e:
-                        _log(f"[job {job_id}] FAILED: {e}")
-                        job_manager.fail_job(job_id, str(e))
-
-                import threading
-                threading.Thread(target=_run, daemon=True).start()
-                return self._json_response({"success": True, "jobId": job_id, "ruleCount": len(rules)})
+                self._read_json_body()
+                return self._json_response({"success": True, "eventCount": 0})
 
             # POST /api/projects/:name/generate-keyframe-variations
             m = re.match(r"^/api/projects/([^/]+)/generate-keyframe-variations$", path)
@@ -4669,7 +4582,8 @@ def make_handler(work_dir: Path):
             duration = body.get("duration")  # optional: 4, 6, or 8 seconds
             use_next_tr_frame = body.get("useNextTransitionFrame", False)  # use first frame of next transition's video as end frame
             no_end_frame = body.get("noEndFrame", False)  # generate from start image only, no end frame conditioning
-            _log(f"[generate-transition-candidates] tr={tr_id} count={count} duration={duration} useNextTrFrame={use_next_tr_frame} noEndFrame={no_end_frame} (body keys: {list(body.keys())})")
+            generate_audio = body.get("generateAudio", False)  # whether Veo should generate audio
+            _log(f"[generate-transition-candidates] tr={tr_id} count={count} duration={duration} useNextTrFrame={use_next_tr_frame} noEndFrame={no_end_frame} generateAudio={generate_audio} (body keys: {list(body.keys())})")
             if not tr_id:
                 return self._error(400, "BAD_REQUEST", "Missing 'transitionId'")
 
@@ -4811,6 +4725,7 @@ def make_handler(work_dir: Path):
                                     prompt=prompt,
                                     output_path=j["output"],
                                     duration_seconds=int(slot_duration),
+                                    generate_audio=generate_audio,
                                     on_status=lambda msg: job_manager.update_progress(job_id, completed_count[0], msg),
                                 )
                             else:
@@ -4820,6 +4735,7 @@ def make_handler(work_dir: Path):
                                     prompt=prompt,
                                     output_path=j["output"],
                                     duration_seconds=int(slot_duration),
+                                    generate_audio=generate_audio,
                                     on_status=lambda msg: job_manager.update_progress(job_id, completed_count[0], msg),
                                 )
                             completed_count[0] += 1
@@ -4838,6 +4754,7 @@ def make_handler(work_dir: Path):
                                         client.generate_video_from_image(
                                             image_path=j["start"], prompt=prompt,
                                             output_path=j["output"], duration_seconds=int(slot_duration),
+                                            generate_audio=generate_audio,
                                             on_status=lambda msg: job_manager.update_progress(job_id, completed_count[0], msg),
                                         )
                                     else:
@@ -4845,6 +4762,7 @@ def make_handler(work_dir: Path):
                                             start_frame_path=j["start"], end_frame_path=j["end"],
                                             prompt=prompt, output_path=j["output"],
                                             duration_seconds=int(slot_duration),
+                                            generate_audio=generate_audio,
                                             on_status=lambda msg: job_manager.update_progress(job_id, completed_count[0], msg),
                                         )
                                     completed_count[0] += 1
@@ -4925,108 +4843,43 @@ def make_handler(work_dir: Path):
             except Exception as e:
                 self._error(500, "INTERNAL_ERROR", str(e))
 
-        def _handle_get_audio_intelligence(self, project_name: str):
-            """GET /api/projects/:name/audio-intelligence — return processed beat events from audio intelligence file."""
-            _log(f"get-audio-intelligence: {project_name}")
-            project_dir = work_dir / project_name
-
-            # Determine which file to use
-            import yaml as pyyaml
-            settings_path = project_dir / "settings.yaml"
-            ai_file = None
-            if settings_path.exists():
-                with open(settings_path) as f:
-                    s = pyyaml.safe_load(f) or {}
-                ai_file = s.get("audio_intelligence_file")
-
-            # Auto-detect latest if not configured
-            if not ai_file:
-                candidates = sorted(project_dir.glob("audio_intelligence*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-                if candidates:
-                    ai_file = candidates[0].name
-
-            if not ai_file or not (project_dir / ai_file).exists():
-                # Fallback: return empty (frontend falls back to beats.json)
-                return self._json_response({"activeFile": None, "events": [], "sections": [], "rules": []})
-
-            try:
-                import json as _json
-                with open(project_dir / ai_file) as f:
-                    data = _json.load(f)
-
-                events = data.get("layer3_events", [])
-                sections = data.get("layer2", [])
-                rules = data.get("layer3_rules", [])
-
-                # List available files
-                available = sorted([f.name for f in project_dir.glob("audio_intelligence*.json")], reverse=True)
-
-                # Extract onsets-only from layer1 for client-side rule preview (~1.5MB)
-                layer1 = data.get("layer1", {})
-                onsets = {}
-                for stem, bands in layer1.items():
-                    onsets[stem] = {}
-                    for band, bdata in bands.items():
-                        onsets[stem][band] = bdata.get("onsets", [])
-
-                self._json_response({
-                    "activeFile": ai_file,
-                    "availableFiles": available,
-                    "events": events,
-                    "sections": sections,
-                    "rules": rules,
-                    "ruleCount": len(rules),
-                    "onsets": onsets,
-                })
-            except Exception as e:
-                self._error(500, "INTERNAL_ERROR", str(e))
-
         def _handle_get_settings(self, project_name: str):
-            """GET /api/projects/:name/settings — read project settings from settings.yaml."""
+            """GET /api/projects/:name/settings — read project settings from settings.json."""
             _log(f"get-settings: {project_name}")
-            import yaml as pyyaml
-            settings_path = work_dir / project_name / "settings.yaml"
+            settings_path = work_dir / project_name / "settings.json"
             defaults = {
                 "preview_quality": 50,
-                "audio_intelligence_file": None,
                 "render_preview_fps": 24,
             }
             if settings_path.exists():
                 with open(settings_path) as f:
-                    saved = pyyaml.safe_load(f) or {}
+                    saved = json.load(f)
                 defaults.update(saved)
 
-            # Also list available audio intelligence files
-            project_dir = work_dir / project_name
-            ai_files = sorted([
-                f.name for f in project_dir.glob("audio_intelligence*.json")
-            ], reverse=True)
-
-            self._json_response({**defaults, "available_audio_intelligence_files": ai_files})
+            self._json_response(defaults)
 
         def _handle_update_settings(self, project_name: str):
-            """POST /api/projects/:name/settings — update project settings in settings.yaml."""
+            """POST /api/projects/:name/settings — update project settings."""
             body = self._read_json_body()
             if body is None:
                 return
 
             _log(f"update-settings: settings updated")
-            import yaml as pyyaml
-            settings_path = work_dir / project_name / "settings.yaml"
+            settings_path = work_dir / project_name / "settings.json"
 
             existing = {}
             if settings_path.exists():
                 with open(settings_path) as f:
-                    existing = pyyaml.safe_load(f) or {}
+                    existing = json.load(f)
 
             # Only allow known fields
-            allowed = {"preview_quality", "audio_intelligence_file", "render_preview_fps"}
+            allowed = {"preview_quality", "render_preview_fps"}
             for key in allowed:
                 if key in body:
                     existing[key] = body[key]
 
             with open(settings_path, "w") as f:
-                pyyaml.dump(existing, f, default_flow_style=False, allow_unicode=True)
+                json.dump(existing, f, indent=2)
 
             self._json_response({"success": True, **existing})
 
@@ -6307,7 +6160,7 @@ def make_handler(work_dir: Path):
     return SceneCraftHandler
 
 
-def run_server(host: str = "0.0.0.0", port: int = 8890, work_dir: str | None = None):
+def run_server(host: str = "0.0.0.0", port: int = 8890, work_dir: str | None = None, no_auth: bool = False):
     """Start the SceneCraft REST API server."""
     if work_dir:
         wd = Path(work_dir)
@@ -6319,7 +6172,7 @@ def run_server(host: str = "0.0.0.0", port: int = 8890, work_dir: str | None = N
         print("Run 'scenecraft server' to configure, or specify --work-dir.", file=sys.stderr)
         raise SystemExit(1)
 
-    handler = make_handler(wd)
+    handler = make_handler(wd, no_auth=no_auth)
     class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True
 
@@ -6330,7 +6183,7 @@ def run_server(host: str = "0.0.0.0", port: int = 8890, work_dir: str | None = N
     from scenecraft.ws_server import start_ws_server, FolderWatcher
     import scenecraft.ws_server as _ws_mod
     _ws_mod.folder_watcher = FolderWatcher(wd)
-    start_ws_server(host, ws_port)
+    start_ws_server(host, ws_port, work_dir=wd)
 
     # Folder watches are lazy — activated when frontend opens a project and calls watch-folder,
     # NOT restored on server boot. This avoids inotify overhead for projects not being viewed.
