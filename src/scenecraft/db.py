@@ -42,9 +42,16 @@ _conn_lock = threading.Lock()
 
 _migrated_dbs: set[str] = set()  # tracks which DBs have been migrated this process
 
-def get_db(project_dir: Path) -> sqlite3.Connection:
-    """Get or create a SQLite connection for a project directory."""
-    db_path = str(project_dir / "project.db")
+def get_db(project_dir: Path, db_path: Path | str | None = None) -> sqlite3.Connection:
+    """Get or create a SQLite connection for a project directory.
+
+    If `db_path` is provided, use that path directly (for session working copies).
+    Otherwise, use the default `project_dir/project.db`.
+    """
+    if db_path is not None:
+        db_path = str(db_path)
+    else:
+        db_path = str(project_dir / "project.db")
     thread_key = f"{db_path}:{threading.current_thread().ident}"
 
     with _conn_lock:
@@ -62,9 +69,12 @@ def get_db(project_dir: Path) -> sqlite3.Connection:
         return _connections[thread_key]
 
 
-def close_db(project_dir: Path):
-    """Close all connections for a project."""
-    db_path = str(project_dir / "project.db")
+def close_db(project_dir: Path, db_path: Path | str | None = None):
+    """Close all connections for a project (or a specific session DB path)."""
+    if db_path is not None:
+        db_path = str(db_path)
+    else:
+        db_path = str(project_dir / "project.db")
     with _conn_lock:
         to_remove = [k for k in _connections if k.startswith(db_path)]
         for k in to_remove:
@@ -187,6 +197,17 @@ def _ensure_schema(conn: sqlite3.Connection):
             z_order INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_tr_effects ON transition_effects(transition_id);
+
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL DEFAULT 'local',
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            images TEXT,
+            tool_calls TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_user ON chat_messages(user_id, created_at);
 
         CREATE TABLE IF NOT EXISTS audio_tracks (
             id TEXT PRIMARY KEY,
@@ -354,6 +375,15 @@ def _ensure_schema(conn: sqlite3.Connection):
             conn.execute("INSERT OR IGNORE INTO tracks (id, name, z_order, blend_mode, base_opacity, enabled) VALUES ('track_1', 'Track 1', 0, 'normal', 1.0, 1)")
     except Exception:
         pass  # another thread may have inserted it
+
+    # Add ingredients, negative_prompt, seed columns to transitions
+    tr_cols5 = {row[1] for row in conn.execute("PRAGMA table_info(transitions)").fetchall()}
+    if "ingredients" not in tr_cols5:
+        conn.execute("ALTER TABLE transitions ADD COLUMN ingredients TEXT NOT NULL DEFAULT '[]'")
+    if "negative_prompt" not in tr_cols5:
+        conn.execute("ALTER TABLE transitions ADD COLUMN negative_prompt TEXT NOT NULL DEFAULT ''")
+    if "seed" not in tr_cols5:
+        conn.execute("ALTER TABLE transitions ADD COLUMN seed INTEGER")
 
     # Add last_modified_by column for attribution
     for table in ("keyframes", "transitions", "effects", "tracks"):
@@ -557,6 +587,9 @@ def _row_to_transition(row: sqlite3.Row) -> dict:
         "deleted_at": row["deleted_at"],
         "include_section_desc": bool(row["include_section_desc"]) if "include_section_desc" in row.keys() else True,
         "hidden": bool(row["hidden"]) if "hidden" in row.keys() else False,
+        "ingredients": json.loads(row["ingredients"]) if "ingredients" in row.keys() and row["ingredients"] else [],
+        "negativePrompt": row["negative_prompt"] if "negative_prompt" in row.keys() else "",
+        "seed": row["seed"] if "seed" in row.keys() else None,
     }
 
 
@@ -665,6 +698,8 @@ def update_transition(project_dir: Path, tr_id: str, **fields):
             val = json.dumps(val) if isinstance(val, list) else val
         elif key == "chroma_key":
             val = json.dumps(val) if isinstance(val, (dict, list)) else val
+        elif key == "ingredients":
+            val = json.dumps(val) if isinstance(val, list) else val
         sets.append(f"{col} = ?")
         values.append(val)
     if not sets:

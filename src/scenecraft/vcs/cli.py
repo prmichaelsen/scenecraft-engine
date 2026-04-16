@@ -17,6 +17,7 @@ from .bootstrap import (
     list_org_members,
 )
 from .auth import generate_token
+from .sessions import list_sessions, prune_sessions
 
 
 def _require_root() -> Path:
@@ -141,3 +142,32 @@ def user_list():
         return
     for u in users:
         click.echo(f"  {u['username']}  role={u['role']}  created={u['created_at']}")
+
+
+# ── Session commands ─────────────────────────────────────────────
+
+@vcs_group.group("session")
+def session_group():
+    """Manage editing sessions."""
+    pass
+
+
+@session_group.command("list")
+def session_list():
+    """List all active sessions."""
+    root = _require_root()
+    sessions = list_sessions(root)
+    if not sessions:
+        click.echo("No active sessions.")
+        return
+    for s in sessions:
+        click.echo(f"  {s['id']}  {s['username']}  {s['org']}/{s['project']}  branch={s['branch']}  last_active={s['last_active']}")
+
+
+@session_group.command("prune")
+@click.option("--days", default=7, type=int, help="Remove sessions inactive for more than N days (default: 7)")
+def session_prune(days: int):
+    """Remove stale sessions and their working copy files."""
+    root = _require_root()
+    count = prune_sessions(root, max_age_days=days)
+    click.echo(f"Pruned {count} stale session(s).")

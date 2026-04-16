@@ -258,6 +258,11 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             if m:
                 return self._handle_get_settings(m.group(1))
 
+            # GET /api/projects/:name/ingredients
+            m = re.match(r"^/api/projects/([^/]+)/ingredients$", path)
+            if m:
+                return self._handle_get_ingredients(m.group(1))
+
             # GET /api/projects/:name/bench
             m = re.match(r"^/api/projects/([^/]+)/bench$", path)
             if m:
@@ -1627,6 +1632,26 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             m = re.match(r"^/api/projects/([^/]+)/generate-transition-candidates$", path)
             if m:
                 return self._handle_generate_transition_candidates(m.group(1))
+
+            # POST /api/projects/:name/ingredients/promote
+            m = re.match(r"^/api/projects/([^/]+)/ingredients/promote$", path)
+            if m:
+                return self._handle_promote_ingredient(m.group(1))
+
+            # POST /api/projects/:name/ingredients/remove
+            m = re.match(r"^/api/projects/([^/]+)/ingredients/remove$", path)
+            if m:
+                return self._handle_remove_ingredient(m.group(1))
+
+            # POST /api/projects/:name/ingredients/update
+            m = re.match(r"^/api/projects/([^/]+)/ingredients/update$", path)
+            if m:
+                return self._handle_update_ingredient(m.group(1))
+
+            # POST /api/projects/:name/extend-video
+            m = re.match(r"^/api/projects/([^/]+)/extend-video$", path)
+            if m:
+                return self._handle_extend_video(m.group(1))
 
             # POST /api/projects/:name/update-meta
             m = re.match(r"^/api/projects/([^/]+)/update-meta$", path)
@@ -4030,6 +4055,9 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     return self._error(404, "NOT_FOUND", f"Transition {tr_id} not found")
 
                 include_section_desc = body.get("includeSectionDesc")
+                negative_prompt = body.get("negativePrompt")
+                seed = body.get("seed")
+                ingredients = body.get("ingredients")
                 updates = {}
                 if action is not None:
                     updates["action"] = action
@@ -4037,12 +4065,254 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     updates["use_global_prompt"] = use_global
                 if include_section_desc is not None:
                     updates["include_section_desc"] = include_section_desc
+                if negative_prompt is not None:
+                    updates["negative_prompt"] = negative_prompt
+                if "seed" in body:
+                    updates["seed"] = seed
+                if ingredients is not None:
+                    updates["ingredients"] = ingredients
                 if updates:
                     update_transition(project_dir, tr_id, **updates)
 
                 self._json_response({"success": True})
             except Exception as e:
                 self._error(500, "INTERNAL_ERROR", str(e))
+
+        # ── Ingredients endpoints ──────────────────────────────────────
+
+        def _handle_get_ingredients(self, project_name: str):
+            """GET /api/projects/:name/ingredients — list all ingredient images."""
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+            try:
+                ingredients_file = project_dir / "ingredients.json"
+                if ingredients_file.exists():
+                    import json as _json
+                    data = _json.loads(ingredients_file.read_text())
+                    self._json_response({"ingredients": data.get("ingredients", [])})
+                else:
+                    self._json_response({"ingredients": []})
+            except Exception as e:
+                self._error(500, "INTERNAL_ERROR", str(e))
+
+        def _handle_promote_ingredient(self, project_name: str):
+            """POST /api/projects/:name/ingredients/promote — copy an image into ingredients dir."""
+            body = self._read_json_body()
+            if body is None:
+                return
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+            try:
+                import json as _json, shutil, uuid
+                from datetime import datetime, timezone
+
+                source_type = body.get("sourceType", "keyframe")
+                source_path = body.get("sourcePath", "")
+                label = body.get("label", "")
+
+                src = project_dir / source_path
+                if not src.exists():
+                    return self._error(404, "NOT_FOUND", f"Source not found: {source_path}")
+
+                ing_dir = project_dir / "ingredients"
+                ing_dir.mkdir(parents=True, exist_ok=True)
+
+                ing_id = f"ing_{uuid.uuid4().hex[:8]}"
+                ext = src.suffix or ".png"
+                dest = ing_dir / f"{ing_id}{ext}"
+                shutil.copy2(str(src), str(dest))
+
+                ingredient = {
+                    "id": ing_id,
+                    "path": f"ingredients/{ing_id}{ext}",
+                    "label": label or src.stem,
+                    "addedAt": datetime.now(timezone.utc).isoformat(),
+                    "sourceType": source_type,
+                    "sourceRef": source_path,
+                }
+
+                # Update manifest
+                manifest_path = project_dir / "ingredients.json"
+                if manifest_path.exists():
+                    manifest = _json.loads(manifest_path.read_text())
+                else:
+                    manifest = {"ingredients": []}
+                manifest["ingredients"].append(ingredient)
+                manifest_path.write_text(_json.dumps(manifest, indent=2))
+
+                _log(f"[ingredients] promoted {source_path} -> {ingredient['path']}")
+                self._json_response({"success": True, "ingredient": ingredient})
+            except Exception as e:
+                self._error(500, "INTERNAL_ERROR", str(e))
+
+        def _handle_remove_ingredient(self, project_name: str):
+            """POST /api/projects/:name/ingredients/remove — delete an ingredient."""
+            body = self._read_json_body()
+            if body is None:
+                return
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+            try:
+                import json as _json
+                ing_id = body.get("ingredientId", "")
+                if not ing_id:
+                    return self._error(400, "BAD_REQUEST", "Missing ingredientId")
+
+                manifest_path = project_dir / "ingredients.json"
+                if not manifest_path.exists():
+                    return self._error(404, "NOT_FOUND", "No ingredients manifest")
+
+                manifest = _json.loads(manifest_path.read_text())
+                ingredient = next((i for i in manifest["ingredients"] if i["id"] == ing_id), None)
+                if not ingredient:
+                    return self._error(404, "NOT_FOUND", f"Ingredient {ing_id} not found")
+
+                # Remove file
+                ing_file = project_dir / ingredient["path"]
+                if ing_file.exists():
+                    ing_file.unlink()
+
+                # Remove from manifest
+                manifest["ingredients"] = [i for i in manifest["ingredients"] if i["id"] != ing_id]
+                manifest_path.write_text(_json.dumps(manifest, indent=2))
+
+                _log(f"[ingredients] removed {ing_id}")
+                self._json_response({"success": True})
+            except Exception as e:
+                self._error(500, "INTERNAL_ERROR", str(e))
+
+        def _handle_update_ingredient(self, project_name: str):
+            """POST /api/projects/:name/ingredients/update — update ingredient metadata."""
+            body = self._read_json_body()
+            if body is None:
+                return
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+            try:
+                import json as _json
+                ing_id = body.get("ingredientId", "")
+                if not ing_id:
+                    return self._error(400, "BAD_REQUEST", "Missing ingredientId")
+
+                manifest_path = project_dir / "ingredients.json"
+                if not manifest_path.exists():
+                    return self._error(404, "NOT_FOUND", "No ingredients manifest")
+
+                manifest = _json.loads(manifest_path.read_text())
+                ingredient = next((i for i in manifest["ingredients"] if i["id"] == ing_id), None)
+                if not ingredient:
+                    return self._error(404, "NOT_FOUND", f"Ingredient {ing_id} not found")
+
+                if "label" in body:
+                    ingredient["label"] = body["label"]
+
+                manifest_path.write_text(_json.dumps(manifest, indent=2))
+                self._json_response({"success": True})
+            except Exception as e:
+                self._error(500, "INTERNAL_ERROR", str(e))
+
+        # ── Video extension endpoint ──────────────────────────────────
+
+        def _handle_extend_video(self, project_name: str):
+            """POST /api/projects/:name/extend-video — extend an existing video clip using Veo."""
+            body = self._read_json_body()
+            if body is None:
+                return
+
+            tr_id = body.get("transitionId")
+            video_path = body.get("videoPath")
+            if not tr_id or not video_path:
+                return self._error(400, "BAD_REQUEST", "Missing transitionId or videoPath")
+
+            project_dir = work_dir / project_name
+
+            from scenecraft.db import get_transition, get_meta
+            tr = get_transition(project_dir, tr_id)
+            if not tr:
+                return self._error(404, "NOT_FOUND", f"Transition {tr_id} not found")
+
+            video_file = project_dir / video_path
+            if not video_file.exists():
+                return self._error(404, "NOT_FOUND", f"Video not found: {video_path}")
+
+            meta = get_meta(project_dir)
+            motion_prompt = meta.get("motionPrompt") or meta.get("motion_prompt") or ""
+            action = tr.get("action") or "Continue the video smoothly"
+            use_global = tr.get("use_global_prompt", True)
+            if use_global and motion_prompt:
+                prompt = f"{action}. Camera and motion style: {motion_prompt}"
+            else:
+                prompt = action
+
+            from scenecraft.ws_server import job_manager
+            job_id = job_manager.create_job("extend_video", total=1, meta={"transitionId": tr_id, "project": project_name})
+
+            vid_backend = _get_video_backend(project_dir)
+
+            def _run():
+                try:
+                    from scenecraft.render.google_video import GoogleVideoClient
+                    from pathlib import Path as _Path
+                    import subprocess as _sp
+
+                    client = GoogleVideoClient(vertex=True)
+                    job_manager.update_progress(job_id, 0, "Extracting last frame...")
+
+                    # Extract last frame from existing video
+                    last_frame = project_dir / "transition_candidates" / tr_id / f"_extend_last_frame.png"
+                    last_frame.parent.mkdir(parents=True, exist_ok=True)
+                    _sp.run(["ffmpeg", "-y", "-sseof", "-0.1", "-i", str(video_file), "-vframes", "1", "-q:v", "2", str(last_frame)],
+                            capture_output=True, timeout=10)
+                    if not last_frame.exists():
+                        job_manager.fail_job(job_id, "Failed to extract last frame from video")
+                        return
+
+                    # Generate extension from last frame
+                    slot_dir = project_dir / "transition_candidates" / tr_id / "slot_0"
+                    slot_dir.mkdir(parents=True, exist_ok=True)
+                    existing = sorted(slot_dir.glob("v*.mp4"))
+                    next_v = len(existing) + 1
+                    output = str(slot_dir / f"v{next_v}.mp4")
+
+                    job_manager.update_progress(job_id, 0, "Extending video with Veo...")
+                    client.generate_video_from_image(
+                        image_path=str(last_frame),
+                        prompt=prompt,
+                        output_path=output,
+                        duration_seconds=8,
+                        generate_audio=False,
+                        on_status=lambda msg: job_manager.update_progress(job_id, 0, msg),
+                    )
+
+                    # Collect all candidates for result
+                    candidates = {}
+                    tr_cand_dir = project_dir / "transition_candidates" / tr_id
+                    if tr_cand_dir.exists():
+                        for sd in sorted(tr_cand_dir.iterdir()):
+                            if sd.is_dir():
+                                videos = sorted([
+                                    f"transition_candidates/{tr_id}/{sd.name}/{f.name}"
+                                    for f in sd.glob("v*.mp4")
+                                ])
+                                candidates[sd.name] = videos
+
+                    job_manager.complete_job(job_id, {"transitionId": tr_id, "candidates": candidates})
+                    # Clean up temp frame
+                    if last_frame.exists():
+                        last_frame.unlink()
+                except Exception as e:
+                    _log(f"[extend-video] FAILED: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    job_manager.fail_job(job_id, str(e))
+
+            import threading
+            threading.Thread(target=_run, daemon=True).start()
+            self._json_response({"jobId": job_id, "transitionId": tr_id})
 
         def _handle_update_transition_remap(self, project_name: str):
             """POST /api/projects/:name/update-transition-remap — update a transition's remap/duration."""
@@ -4583,7 +4853,10 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             use_next_tr_frame = body.get("useNextTransitionFrame", False)  # use first frame of next transition's video as end frame
             no_end_frame = body.get("noEndFrame", False)  # generate from start image only, no end frame conditioning
             generate_audio = body.get("generateAudio", False)  # whether Veo should generate audio
-            _log(f"[generate-transition-candidates] tr={tr_id} count={count} duration={duration} useNextTrFrame={use_next_tr_frame} noEndFrame={no_end_frame} generateAudio={generate_audio} (body keys: {list(body.keys())})")
+            req_ingredients = body.get("ingredients")  # optional list of ingredient paths for Veo reference images
+            req_negative_prompt = body.get("negativePrompt")  # optional negative prompt
+            req_seed = body.get("seed")  # optional uint32 seed
+            _log(f"[generate-transition-candidates] tr={tr_id} count={count} duration={duration} useNextTrFrame={use_next_tr_frame} noEndFrame={no_end_frame} generateAudio={generate_audio} ingredients={len(req_ingredients) if req_ingredients else 0} negPrompt={bool(req_negative_prompt)} seed={req_seed} (body keys: {list(body.keys())})")
             if not tr_id:
                 return self._error(400, "BAD_REQUEST", "Missing 'transitionId'")
 
@@ -4664,7 +4937,22 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             else:
                 slot_duration = min(max_seconds, tr_duration / n_slots) if tr_duration > 0 else max_seconds
 
-            _log(f"  veo: {tr_id} {from_kf_id}→{to_kf_id} prompt={prompt[:60]!r} dur={slot_duration}s count={count} existing={existing_count}")
+            # Resolve ingredient paths — prefer request body, fall back to transition record
+            ingredient_paths_raw = req_ingredients if req_ingredients else tr.get("ingredients", [])
+            ingredient_paths = [str(project_dir / p) for p in ingredient_paths_raw if p] if ingredient_paths_raw else None
+            # Filter out non-existent ingredient files
+            if ingredient_paths:
+                from pathlib import Path as _P
+                ingredient_paths = [p for p in ingredient_paths if _P(p).exists()]
+                if not ingredient_paths:
+                    ingredient_paths = None
+
+            # Negative prompt — prefer request body, fall back to transition record
+            negative_prompt = req_negative_prompt if req_negative_prompt else tr.get("negativePrompt", "") or None
+            # Seed — prefer request body, fall back to transition record
+            veo_seed = req_seed if req_seed is not None else tr.get("seed")
+
+            _log(f"  veo: {tr_id} {from_kf_id}→{to_kf_id} prompt={prompt[:60]!r} dur={slot_duration}s count={count} existing={existing_count} ingredients={len(ingredient_paths) if ingredient_paths else 0} negPrompt={bool(negative_prompt)} seed={veo_seed}")
 
             from scenecraft.ws_server import job_manager
             job_id = job_manager.create_job("transition_candidates", total=count, meta={"transitionId": tr_id, "project": project_name})
@@ -4726,6 +5014,9 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                                     output_path=j["output"],
                                     duration_seconds=int(slot_duration),
                                     generate_audio=generate_audio,
+                                    ingredients=ingredient_paths,
+                                    negative_prompt=negative_prompt,
+                                    seed=veo_seed,
                                     on_status=lambda msg: job_manager.update_progress(job_id, completed_count[0], msg),
                                 )
                             else:
@@ -4736,6 +5027,9 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                                     output_path=j["output"],
                                     duration_seconds=int(slot_duration),
                                     generate_audio=generate_audio,
+                                    ingredients=ingredient_paths,
+                                    negative_prompt=negative_prompt,
+                                    seed=veo_seed,
                                     on_status=lambda msg: job_manager.update_progress(job_id, completed_count[0], msg),
                                 )
                             completed_count[0] += 1
@@ -4755,6 +5049,9 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                                             image_path=j["start"], prompt=prompt,
                                             output_path=j["output"], duration_seconds=int(slot_duration),
                                             generate_audio=generate_audio,
+                                            ingredients=ingredient_paths,
+                                            negative_prompt=negative_prompt,
+                                            seed=veo_seed,
                                             on_status=lambda msg: job_manager.update_progress(job_id, completed_count[0], msg),
                                         )
                                     else:
@@ -4763,6 +5060,9 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                                             prompt=prompt, output_path=j["output"],
                                             duration_seconds=int(slot_duration),
                                             generate_audio=generate_audio,
+                                            ingredients=ingredient_paths,
+                                            negative_prompt=negative_prompt,
+                                            seed=veo_seed,
                                             on_status=lambda msg: job_manager.update_progress(job_id, completed_count[0], msg),
                                         )
                                     completed_count[0] += 1
@@ -5650,6 +5950,48 @@ def make_handler(work_dir: Path, no_auth: bool = False):
 
         # ── Helpers ──────────────────────────────────────────────
 
+        def _get_session_db_path(self, project_name: str) -> Path | None:
+            """Return the session-specific working copy DB path, or None if no session routing.
+
+            When auth is enabled (_sc_root set and user authenticated), look up the
+            user's session for this project and return its working copy path.
+            If no session exists yet, return None (falls back to default project.db).
+            """
+            if _sc_root is None or not self._authenticated_user:
+                return None
+            try:
+                from scenecraft.vcs.sessions import get_session_for_user, touch_session
+                branch = self.headers.get("X-Scenecraft-Branch", "main")
+                # Best-effort org lookup — find any org the user is in that owns this project
+                org = self._find_user_org_for_project(project_name)
+                if org is None:
+                    return None
+                session = get_session_for_user(_sc_root, self._authenticated_user, org, project_name, branch)
+                if session is None:
+                    return None
+                touch_session(_sc_root, session["id"])
+                return Path(session["working_copy"])
+            except Exception:
+                return None
+
+        def _find_user_org_for_project(self, project_name: str) -> str | None:
+            """Find which org a user's project belongs to. Returns first match."""
+            if _sc_root is None or not self._authenticated_user:
+                return None
+            try:
+                from scenecraft.vcs.bootstrap import get_server_db
+                conn = get_server_db(_sc_root)
+                rows = conn.execute(
+                    "SELECT org FROM org_members WHERE username = ?", (self._authenticated_user,)
+                ).fetchall()
+                conn.close()
+                for row in rows:
+                    if (_sc_root / "orgs" / row["org"] / "projects" / project_name).is_dir():
+                        return row["org"]
+            except Exception:
+                pass
+            return None
+
         def _get_project_dir(self, project_name: str) -> Path | None:
             """Get project directory, auto-importing YAML to SQLite if needed."""
             project_dir = work_dir / project_name
@@ -5791,7 +6133,7 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             """Add CORS headers for cross-origin requests from the synthesizer."""
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Scenecraft-Branch")
 
         def _handle_get_section_settings(self, project_name: str):
             """GET /api/projects/:name/section-settings?section=label — get persisted settings for a section."""
