@@ -16,7 +16,7 @@ from .bootstrap import (
     list_users,
     list_org_members,
 )
-from .auth import generate_token
+from .auth import generate_token, create_login_code
 from .sessions import list_sessions, prune_sessions
 
 
@@ -53,15 +53,42 @@ def init(org: str, admin: str | None, root: str):
 @vcs_group.command()
 @click.option("--user", default=None, help="Username (default: current OS user)")
 @click.option("--expiry", default=24, type=int, help="Token expiry in hours (default: 24)")
-def token(user: str | None, expiry: int):
-    """Generate a JWT authentication token for the current user."""
+@click.option("--host", default="localhost:8890", help="Host:port for the browser login URL (default: localhost:8890 for SSH tunnel)")
+@click.option("--scheme", default="http", type=click.Choice(["http", "https"]), help="URL scheme (default: http)")
+@click.option("--open/--no-open", "open_browser", default=False, help="Attempt to open the URL in the local browser")
+@click.option("--raw", is_flag=True, default=False, help="Print just the JWT (no URL) — for scripts")
+def token(user: str | None, expiry: int, host: str, scheme: str, open_browser: bool, raw: bool):
+    """Generate a login URL for authenticating your browser session.
+
+    Default flow: generates a JWT, stores it against a one-time code, and prints
+    a URL you can open (or forward via SSH tunnel) to log in. The URL can only
+    be used once and expires after 5 minutes.
+
+    Use --raw to print just the JWT for scripting or manual Authorization headers.
+    """
     root = _require_root()
     try:
         tok = generate_token(root, username=user, expiry_hours=expiry)
-        click.echo(tok)
     except ValueError as e:
         click.echo(f"Error: {e}", err=True)
         raise SystemExit(1)
+
+    if raw:
+        click.echo(tok)
+        return
+
+    code = create_login_code(root, tok)
+    url = f"{scheme}://{host}/auth/login?code={code}"
+    click.echo(url)
+    click.echo("")
+    click.echo(f"Valid for 5 minutes. Open in your browser (use SSH port-forward if {host.split(':')[0]} is remote).")
+
+    if open_browser:
+        import webbrowser
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
 
 
 # ── Org commands ─────────────────────────────────────────────────

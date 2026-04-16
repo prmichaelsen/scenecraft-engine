@@ -15,6 +15,62 @@ from .bootstrap import get_server_db, find_root
 
 TOKEN_ALGORITHM = "HS256"
 TOKEN_EXPIRY_HOURS = 24
+LOGIN_CODE_TTL_SECONDS = 300  # 5 minutes
+
+COOKIE_NAME = "scenecraft_jwt"
+
+
+# ── Login code storage (one-time codes exchanged for cookie) ─────
+
+_LOGIN_CODES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS login_codes (
+    code TEXT PRIMARY KEY,
+    token TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+"""
+
+
+def _ensure_login_codes_table(sc_root: Path) -> sqlite3.Connection:
+    conn = get_server_db(sc_root)
+    conn.executescript(_LOGIN_CODES_SCHEMA)
+    conn.commit()
+    return conn
+
+
+def create_login_code(sc_root: Path, token: str) -> str:
+    """Store a JWT against a short-lived one-time login code. Returns the code."""
+    code = secrets.token_urlsafe(24)
+    expires_at = int((datetime.now(tz=timezone.utc) + timedelta(seconds=LOGIN_CODE_TTL_SECONDS)).timestamp())
+    conn = _ensure_login_codes_table(sc_root)
+    # Garbage-collect expired codes on every insert
+    now_ts = int(datetime.now(tz=timezone.utc).timestamp())
+    conn.execute("DELETE FROM login_codes WHERE expires_at < ?", (now_ts,))
+    conn.execute("INSERT INTO login_codes (code, token, expires_at) VALUES (?, ?, ?)", (code, token, expires_at))
+    conn.commit()
+    conn.close()
+    return code
+
+
+def consume_login_code(sc_root: Path, code: str) -> str | None:
+    """Exchange a login code for the JWT. Single-use — deletes on consumption.
+
+    Returns None if code is invalid, expired, or already used.
+    """
+    conn = _ensure_login_codes_table(sc_root)
+    now_ts = int(datetime.now(tz=timezone.utc).timestamp())
+    row = conn.execute(
+        "SELECT token, expires_at FROM login_codes WHERE code = ?", (code,)
+    ).fetchone()
+    if row is None:
+        conn.close()
+        return None
+    conn.execute("DELETE FROM login_codes WHERE code = ?", (code,))
+    conn.commit()
+    conn.close()
+    if row["expires_at"] < now_ts:
+        return None
+    return row["token"]
 
 
 def _get_secret(sc_root: Path) -> str:
@@ -83,3 +139,38 @@ def extract_bearer_token(authorization_header: str | None) -> str | None:
     if len(parts) == 2 and parts[0].lower() == "bearer":
         return parts[1].strip()
     return None
+
+
+def extract_cookie_token(cookie_header: str | None) -> str | None:
+    """Extract the scenecraft_jwt token from a Cookie header."""
+    if not cookie_header:
+        return None
+    for part in cookie_header.split(";"):
+        part = part.strip()
+        if "=" in part:
+            name, value = part.split("=", 1)
+            if name.strip() == COOKIE_NAME:
+                return value.strip()
+    return None
+
+
+def build_cookie_header(token: str, max_age_seconds: int = TOKEN_EXPIRY_HOURS * 3600, secure: bool = False) -> str:
+    """Build a Set-Cookie header value for the JWT.
+
+    Uses HttpOnly + SameSite=Lax. Path=/. Secure flag optional (enable behind HTTPS).
+    """
+    parts = [
+        f"{COOKIE_NAME}={token}",
+        "Path=/",
+        "HttpOnly",
+        "SameSite=Lax",
+        f"Max-Age={max_age_seconds}",
+    ]
+    if secure:
+        parts.append("Secure")
+    return "; ".join(parts)
+
+
+def build_clear_cookie_header() -> str:
+    """Build a Set-Cookie header that clears the auth cookie."""
+    return f"{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"

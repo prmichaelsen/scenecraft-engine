@@ -92,23 +92,46 @@ def make_handler(work_dir: Path, no_auth: bool = False):
         """REST API handler for SceneCraft pipeline operations."""
 
         _authenticated_user: str | None = None
+        _refreshed_cookie: str | None = None  # Set by _authenticate, emitted by response helpers
 
         def _authenticate(self) -> bool:
-            """Validate JWT from Authorization header. Returns True if auth passes or is not required."""
+            """Validate JWT from Authorization header or scenecraft_jwt cookie.
+
+            Returns True if auth passes or is not required. On success with a
+            cookie-based request, primes _refreshed_cookie for sliding expiration.
+            """
             if _sc_root is None:
                 return True  # No .scenecraft = auth disabled
-            auth_header = self.headers.get("Authorization")
-            if not auth_header:
-                self._error(401, "UNAUTHORIZED", "Missing Authorization header")
-                return False
-            from scenecraft.vcs.auth import extract_bearer_token, validate_token
-            token = extract_bearer_token(auth_header)
+            # Unauthenticated endpoints
+            path = self.path.split("?", 1)[0]
+            if path in ("/auth/login", "/auth/logout"):
+                return True
+
+            from scenecraft.vcs.auth import (
+                extract_bearer_token, extract_cookie_token, validate_token,
+                generate_token, build_cookie_header,
+            )
+
+            token = extract_bearer_token(self.headers.get("Authorization"))
+            from_cookie = False
             if not token:
-                self._error(401, "UNAUTHORIZED", "Invalid Authorization header format")
+                token = extract_cookie_token(self.headers.get("Cookie"))
+                from_cookie = token is not None
+
+            if not token:
+                self._error(401, "UNAUTHORIZED", "Not authenticated")
                 return False
+
             try:
                 payload = validate_token(_sc_root, token)
                 self._authenticated_user = payload.get("sub")
+                # Sliding expiration: mint a fresh token for cookie-based requests
+                if from_cookie:
+                    try:
+                        refreshed = generate_token(_sc_root, username=self._authenticated_user)
+                        self._refreshed_cookie = build_cookie_header(refreshed)
+                    except Exception:
+                        pass
                 return True
             except Exception:
                 self._error(401, "UNAUTHORIZED", "Invalid or expired token")
@@ -121,6 +144,10 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 return
             parsed = urlparse(self.path)
             path = unquote(parsed.path)
+
+            # GET /auth/login?code=<one-time-code> — exchange code for HttpOnly cookie, redirect
+            if path == "/auth/login":
+                return self._handle_auth_login(parsed.query)
 
             # GET /api/config
             if path == "/api/config":
@@ -465,6 +492,10 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 return
             parsed = urlparse(self.path)
             path = unquote(parsed.path)
+
+            # POST /auth/logout — clear the cookie
+            if path == "/auth/logout":
+                return self._handle_auth_logout()
 
             # Structural timeline mutations need a per-project lock to prevent
             # read-modify-write races (e.g., two concurrent deletes creating duplicate bridges).
@@ -1811,6 +1842,42 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     entries.append(info)
 
             self._json_response({"path": subpath or "", "entries": entries})
+
+        def _handle_auth_login(self, query_string: str):
+            """GET /auth/login?code=X — exchange a one-time code for an HttpOnly cookie, redirect home."""
+            if _sc_root is None:
+                return self._error(501, "AUTH_DISABLED", "Auth is not enabled on this server")
+            from urllib.parse import parse_qs
+            code = parse_qs(query_string).get("code", [""])[0]
+            if not code:
+                return self._error(400, "BAD_REQUEST", "Missing code")
+            from scenecraft.vcs.auth import consume_login_code, build_cookie_header
+            token = consume_login_code(_sc_root, code)
+            if not token:
+                return self._error(401, "INVALID_CODE", "Login code is invalid, expired, or already used")
+            # Where to redirect after login — default to "/" on the same host
+            cookie = build_cookie_header(token)
+            try:
+                self.send_response(303)
+                self.send_header("Location", "/")
+                self.send_header("Set-Cookie", cookie)
+                self._cors_headers()
+                self.end_headers()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def _handle_auth_logout(self):
+            """POST /auth/logout — clear the auth cookie."""
+            from scenecraft.vcs.auth import build_clear_cookie_header
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Set-Cookie", build_clear_cookie_header())
+                self._cors_headers()
+                self.end_headers()
+                self.wfile.write(b'{"ok":true}')
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         def _handle_list_projects(self):
             """GET /api/projects — list all projects in work dir."""
@@ -6120,6 +6187,8 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
                 self._cors_headers()
+                if self._refreshed_cookie:
+                    self.send_header("Set-Cookie", self._refreshed_cookie)
                 self.end_headers()
                 self.wfile.write(data)
             except (BrokenPipeError, ConnectionResetError):
@@ -6131,7 +6200,14 @@ def make_handler(work_dir: Path, no_auth: bool = False):
 
         def _cors_headers(self):
             """Add CORS headers for cross-origin requests from the synthesizer."""
-            self.send_header("Access-Control-Allow-Origin", "*")
+            # With credentials, Access-Control-Allow-Origin must echo the request origin (not *)
+            origin = self.headers.get("Origin")
+            if origin:
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Access-Control-Allow-Credentials", "true")
+                self.send_header("Vary", "Origin")
+            else:
+                self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Scenecraft-Branch")
 
