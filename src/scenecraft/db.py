@@ -198,6 +198,54 @@ def _ensure_schema(conn: sqlite3.Connection):
         );
         CREATE INDEX IF NOT EXISTS idx_tr_effects ON transition_effects(transition_id);
 
+        -- Candidate pool model (see design/local.candidate-pool-migration.md)
+        -- pool_segments is the authoritative record of every video file in pool/segments/.
+        -- Files are UUID-named on disk; original_filename / original_filepath preserve
+        -- user-facing provenance for imports. Label is editable; created_by is not.
+        CREATE TABLE IF NOT EXISTS pool_segments (
+            id TEXT PRIMARY KEY,
+            pool_path TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL,
+            created_by TEXT NOT NULL DEFAULT '',
+            original_filename TEXT,
+            original_filepath TEXT,
+            label TEXT NOT NULL DEFAULT '',
+            generation_params TEXT,
+            created_at TEXT NOT NULL,
+            duration_seconds REAL,
+            width INTEGER,
+            height INTEGER,
+            byte_size INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_pool_segments_kind ON pool_segments(kind);
+        CREATE INDEX IF NOT EXISTS idx_pool_segments_created_by ON pool_segments(created_by);
+
+        -- Normalized tag table (not a JSON column) — scales to 10k+ segments with
+        -- indexed queries and merge-friendly row-level semantics.
+        CREATE TABLE IF NOT EXISTS pool_segment_tags (
+            pool_segment_id TEXT NOT NULL REFERENCES pool_segments(id),
+            tag TEXT NOT NULL,
+            tagged_by TEXT NOT NULL DEFAULT '',
+            tagged_at TEXT NOT NULL,
+            PRIMARY KEY (pool_segment_id, tag)
+        );
+        CREATE INDEX IF NOT EXISTS idx_pool_segment_tags_tag ON pool_segment_tags(tag);
+        CREATE INDEX IF NOT EXISTS idx_pool_segment_tags_segment ON pool_segment_tags(pool_segment_id);
+
+        -- Junction mapping transitions to pool segments. Rank is derived from
+        -- added_at (ORDER BY added_at ASC) — no stored rank column.
+        CREATE TABLE IF NOT EXISTS tr_candidates (
+            transition_id TEXT NOT NULL,
+            slot INTEGER NOT NULL DEFAULT 0,
+            pool_segment_id TEXT NOT NULL REFERENCES pool_segments(id),
+            added_at TEXT NOT NULL,
+            source TEXT NOT NULL,
+            PRIMARY KEY (transition_id, slot, pool_segment_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tr_candidates_tr ON tr_candidates(transition_id);
+        CREATE INDEX IF NOT EXISTS idx_tr_candidates_segment ON tr_candidates(pool_segment_id);
+        CREATE INDEX IF NOT EXISTS idx_tr_candidates_order ON tr_candidates(transition_id, slot, added_at);
+
         CREATE TABLE IF NOT EXISTS chat_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT NOT NULL DEFAULT 'local',
@@ -390,6 +438,15 @@ def _ensure_schema(conn: sqlite3.Connection):
         cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if "last_modified_by" not in cols:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN last_modified_by TEXT NOT NULL DEFAULT ''")
+
+    # M7: Add trim_in, trim_out, source_video_duration to transitions
+    tr_cols6 = {row[1] for row in conn.execute("PRAGMA table_info(transitions)").fetchall()}
+    if "trim_in" not in tr_cols6:
+        conn.execute("ALTER TABLE transitions ADD COLUMN trim_in REAL NOT NULL DEFAULT 0")
+    if "trim_out" not in tr_cols6:
+        conn.execute("ALTER TABLE transitions ADD COLUMN trim_out REAL")
+    if "source_video_duration" not in tr_cols6:
+        conn.execute("ALTER TABLE transitions ADD COLUMN source_video_duration REAL")
 
     # ── Undo triggers (AFTER all migrations so PRAGMA table_info sees all columns) ──
     _undo_tracked_tables = ["keyframes", "transitions", "suppressions", "effects", "tracks", "transition_effects", "markers", "audio_tracks", "audio_clips"]
@@ -590,6 +647,9 @@ def _row_to_transition(row: sqlite3.Row) -> dict:
         "ingredients": json.loads(row["ingredients"]) if "ingredients" in row.keys() and row["ingredients"] else [],
         "negativePrompt": row["negative_prompt"] if "negative_prompt" in row.keys() else "",
         "seed": row["seed"] if "seed" in row.keys() else None,
+        "trim_in": row["trim_in"] if "trim_in" in row.keys() else 0.0,
+        "trim_out": row["trim_out"] if "trim_out" in row.keys() else None,
+        "source_video_duration": row["source_video_duration"] if "source_video_duration" in row.keys() else None,
     }
 
 
@@ -794,6 +854,57 @@ def get_transitions_involving(project_dir: Path, kf_id: str) -> list[dict]:
     return [_row_to_transition(r) for r in rows]
 
 
+def _probe_video_duration(video_path: Path) -> float | None:
+    """Return duration (seconds) for a video via ffprobe, or None on failure."""
+    import subprocess as _sp
+    try:
+        p = _sp.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", str(video_path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        s = (p.stdout or "").strip()
+        return float(s) if s else None
+    except (ValueError, FileNotFoundError, _sp.TimeoutExpired):
+        return None
+
+
+def backfill_transition_trim(project_dir: Path, *, verbose: bool = False) -> dict:
+    """Probe selected videos and initialize trim_in/trim_out/source_video_duration.
+
+    Idempotent: rows where source_video_duration IS NOT NULL are skipped.
+    Returns {"probed": N, "skipped": N, "missing": N}.
+    """
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        "SELECT id, source_video_duration FROM transitions WHERE deleted_at IS NULL"
+    ).fetchall()
+    probed = skipped = missing = 0
+    for row in rows:
+        tr_id = row["id"]
+        if row["source_video_duration"] is not None:
+            skipped += 1
+            continue
+        video_path = project_dir / "selected_transitions" / f"{tr_id}_slot_0.mp4"
+        if not video_path.exists():
+            missing += 1
+            continue
+        dur = _probe_video_duration(video_path)
+        if dur is None or dur <= 0:
+            missing += 1
+            continue
+        _retry_on_locked(lambda: (
+            conn.execute(
+                "UPDATE transitions SET source_video_duration = ?, trim_in = 0, trim_out = ? WHERE id = ?",
+                (dur, dur, tr_id),
+            ),
+            conn.commit(),
+        ))
+        probed += 1
+        if verbose:
+            print(f"[backfill] {tr_id}: source={dur:.2f}s, trim=[0, {dur:.2f}]")
+    return {"probed": probed, "skipped": skipped, "missing": missing}
+
+
 # ── Effects / Suppressions ──────────────────────────────────────────
 
 def get_effects(project_dir: Path) -> list[dict]:
@@ -924,6 +1035,253 @@ def get_bench_item(project_dir: Path, bench_id: str) -> dict | None:
         "sourcePath": row["source_path"], "label": row["label"],
         "addedAt": row["added_at"],
     }
+
+
+# ── Candidate pool operations ──────────────────────────────────────
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _row_to_pool_segment(row) -> dict:
+    return {
+        "id": row["id"],
+        "poolPath": row["pool_path"],
+        "kind": row["kind"],
+        "createdBy": row["created_by"],
+        "originalFilename": row["original_filename"],
+        "originalFilepath": row["original_filepath"],
+        "label": row["label"],
+        "generationParams": json.loads(row["generation_params"]) if row["generation_params"] else None,
+        "createdAt": row["created_at"],
+        "durationSeconds": row["duration_seconds"],
+        "width": row["width"],
+        "height": row["height"],
+        "byteSize": row["byte_size"],
+    }
+
+
+def add_pool_segment(
+    project_dir: Path,
+    *,
+    kind: str,
+    created_by: str,
+    pool_path: str,
+    original_filename: str | None = None,
+    original_filepath: str | None = None,
+    label: str = "",
+    generation_params: dict | None = None,
+    duration_seconds: float | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    byte_size: int | None = None,
+) -> str:
+    """Insert a pool_segments row. Returns the generated UUID id."""
+    assert kind in ("generated", "imported"), f"bad kind: {kind}"
+    seg_id = uuid.uuid4().hex
+    conn = get_db(project_dir)
+    conn.execute(
+        """INSERT INTO pool_segments
+           (id, pool_path, kind, created_by, original_filename, original_filepath,
+            label, generation_params, created_at, duration_seconds, width, height, byte_size)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (seg_id, pool_path, kind, created_by, original_filename, original_filepath,
+         label, json.dumps(generation_params) if generation_params else None,
+         _now_iso(), duration_seconds, width, height, byte_size),
+    )
+    conn.commit()
+    return seg_id
+
+
+def get_pool_segment(project_dir: Path, seg_id: str) -> dict | None:
+    conn = get_db(project_dir)
+    row = conn.execute("SELECT * FROM pool_segments WHERE id = ?", (seg_id,)).fetchone()
+    return _row_to_pool_segment(row) if row else None
+
+
+def list_pool_segments(project_dir: Path, kind: str | None = None) -> list[dict]:
+    conn = get_db(project_dir)
+    if kind:
+        rows = conn.execute(
+            "SELECT * FROM pool_segments WHERE kind = ? ORDER BY created_at DESC", (kind,)
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM pool_segments ORDER BY created_at DESC").fetchall()
+    return [_row_to_pool_segment(r) for r in rows]
+
+
+def update_pool_segment_label(project_dir: Path, seg_id: str, label: str) -> None:
+    conn = get_db(project_dir)
+    conn.execute("UPDATE pool_segments SET label = ? WHERE id = ?", (label, seg_id))
+    conn.commit()
+
+
+def delete_pool_segment(project_dir: Path, seg_id: str) -> None:
+    """Hard-delete. Caller is responsible for verifying no tr_candidates references exist
+    and for deleting the on-disk file."""
+    conn = get_db(project_dir)
+    conn.execute("DELETE FROM pool_segment_tags WHERE pool_segment_id = ?", (seg_id,))
+    conn.execute("DELETE FROM pool_segments WHERE id = ?", (seg_id,))
+    conn.commit()
+
+
+# ── Pool segment tags ─────────────────────────────────────────────
+
+def add_pool_segment_tag(project_dir: Path, seg_id: str, tag: str, tagged_by: str) -> None:
+    """Idempotent — same (seg, tag) is a no-op."""
+    conn = get_db(project_dir)
+    conn.execute(
+        "INSERT OR IGNORE INTO pool_segment_tags (pool_segment_id, tag, tagged_by, tagged_at) VALUES (?, ?, ?, ?)",
+        (seg_id, tag, tagged_by, _now_iso()),
+    )
+    conn.commit()
+
+
+def remove_pool_segment_tag(project_dir: Path, seg_id: str, tag: str) -> None:
+    conn = get_db(project_dir)
+    conn.execute(
+        "DELETE FROM pool_segment_tags WHERE pool_segment_id = ? AND tag = ?",
+        (seg_id, tag),
+    )
+    conn.commit()
+
+
+def get_pool_segment_tags(project_dir: Path, seg_id: str) -> list[dict]:
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        "SELECT tag, tagged_by, tagged_at FROM pool_segment_tags WHERE pool_segment_id = ? ORDER BY tagged_at",
+        (seg_id,),
+    ).fetchall()
+    return [{"tag": r["tag"], "taggedBy": r["tagged_by"], "taggedAt": r["tagged_at"]} for r in rows]
+
+
+def list_all_tags(project_dir: Path) -> list[dict]:
+    """Returns distinct tags in use with their usage counts."""
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        "SELECT tag, COUNT(*) as count FROM pool_segment_tags GROUP BY tag ORDER BY count DESC"
+    ).fetchall()
+    return [{"tag": r["tag"], "count": r["count"]} for r in rows]
+
+
+def find_segments_by_tag(project_dir: Path, tag: str) -> list[dict]:
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        """SELECT ps.* FROM pool_segments ps
+           JOIN pool_segment_tags pst ON pst.pool_segment_id = ps.id
+           WHERE pst.tag = ?
+           ORDER BY ps.created_at DESC""",
+        (tag,),
+    ).fetchall()
+    return [_row_to_pool_segment(r) for r in rows]
+
+
+# ── Transition → candidate junction ────────────────────────────────
+
+def add_tr_candidate(
+    project_dir: Path,
+    *,
+    transition_id: str,
+    slot: int,
+    pool_segment_id: str,
+    source: str,
+    added_at: str | None = None,
+) -> None:
+    """Insert a junction row. If added_at is None, uses now(). Idempotent by PK."""
+    assert source in ("generated", "imported", "split-inherit", "cross-tr-copy"), f"bad source: {source}"
+    conn = get_db(project_dir)
+    conn.execute(
+        """INSERT OR IGNORE INTO tr_candidates
+           (transition_id, slot, pool_segment_id, added_at, source)
+           VALUES (?, ?, ?, ?, ?)""",
+        (transition_id, slot, pool_segment_id, added_at or _now_iso(), source),
+    )
+    conn.commit()
+
+
+def remove_tr_candidate(project_dir: Path, transition_id: str, slot: int, pool_segment_id: str) -> None:
+    conn = get_db(project_dir)
+    conn.execute(
+        "DELETE FROM tr_candidates WHERE transition_id = ? AND slot = ? AND pool_segment_id = ?",
+        (transition_id, slot, pool_segment_id),
+    )
+    conn.commit()
+
+
+def get_tr_candidates(project_dir: Path, transition_id: str, slot: int = 0) -> list[dict]:
+    """Return candidate rows for (tr, slot) joined with pool_segments, ordered by added_at.
+
+    This is the ordered list that drives the v1/v2/v3 UI — callers can enumerate
+    with a 1-based index to derive the display rank.
+    """
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        """SELECT tc.added_at, tc.source,
+                  ps.*
+           FROM tr_candidates tc
+           JOIN pool_segments ps ON ps.id = tc.pool_segment_id
+           WHERE tc.transition_id = ? AND tc.slot = ?
+           ORDER BY tc.added_at ASC""",
+        (transition_id, slot),
+    ).fetchall()
+    result = []
+    for row in rows:
+        seg = _row_to_pool_segment(row)
+        seg["addedAt"] = row["added_at"]
+        seg["junctionSource"] = row["source"]
+        result.append(seg)
+    return result
+
+
+def clone_tr_candidates(
+    project_dir: Path,
+    *,
+    source_transition_id: str,
+    target_transition_id: str,
+    new_source: str = "split-inherit",
+) -> int:
+    """Clone all junction rows from source tr to target tr, preserving slot and added_at.
+
+    Returns the count of rows cloned. Used for split + duplicate operations.
+    """
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        "SELECT slot, pool_segment_id, added_at FROM tr_candidates WHERE transition_id = ?",
+        (source_transition_id,),
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            """INSERT OR IGNORE INTO tr_candidates
+               (transition_id, slot, pool_segment_id, added_at, source)
+               VALUES (?, ?, ?, ?, ?)""",
+            (target_transition_id, row["slot"], row["pool_segment_id"], row["added_at"], new_source),
+        )
+    conn.commit()
+    return len(rows)
+
+
+def count_tr_candidate_refs(project_dir: Path, pool_segment_id: str) -> int:
+    """Count how many junction rows reference this pool segment. Used for GC preview."""
+    conn = get_db(project_dir)
+    row = conn.execute(
+        "SELECT COUNT(*) as n FROM tr_candidates WHERE pool_segment_id = ?", (pool_segment_id,),
+    ).fetchone()
+    return row["n"] if row else 0
+
+
+def find_gc_candidates(project_dir: Path) -> list[dict]:
+    """Find pool_segments rows with kind='generated' that no junction row references.
+
+    kind='imported' is never garbage-collected (user assets stay in the pool).
+    """
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        """SELECT ps.* FROM pool_segments ps
+           LEFT JOIN tr_candidates tc ON tc.pool_segment_id = ps.id
+           WHERE ps.kind = 'generated' AND tc.pool_segment_id IS NULL""",
+    ).fetchall()
+    return [_row_to_pool_segment(r) for r in rows]
 
 
 # ── Track operations ───────────────────────────────────────────────
