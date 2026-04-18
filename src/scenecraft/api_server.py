@@ -1935,7 +1935,11 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             for kf in db_get_keyframes(project_dir):
                 kf_id = kf["id"]
                 img_path = project_dir / "selected_keyframes" / f"{kf_id}.png"
-                has_selected = img_path.exists()
+                # DB-only truthiness — `selected` column is the source of truth.
+                # File is a cached artifact; log a warning if DB says present but file missing.
+                has_selected = kf.get("selected") is not None
+                if has_selected and not img_path.exists():
+                    _log(f"⚠ keyframe {kf_id} has selected={kf.get('selected')} but file missing: {img_path}")
 
                 candidates_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{kf_id}"
                 candidate_files = []
@@ -1982,32 +1986,45 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             from scenecraft.db import get_all_transition_effects
             all_tr_effects = get_all_transition_effects(project_dir)
             transitions = []
-            tr_candidates_root = project_dir / "transition_candidates"
+            from scenecraft.db import get_tr_candidates as _db_get_tr_cands
             for tr in db_get_transitions(project_dir):
                 tr_id = tr.get("id", "")
-                # Scan disk for video candidates per slot
+                # Read video candidates per slot from the junction table (pool model).
+                # Order by added_at — that's the v1/v2/v3 display order. Include pool_segment_id
+                # so the frontend can refer to candidates by stable id instead of rank.
                 slot_candidates = {}
-                tr_dir = tr_candidates_root / tr_id
-                if tr_dir.exists():
-                    for slot_dir in sorted(tr_dir.iterdir()):
-                        if slot_dir.is_dir():
-                            videos = sorted([
-                                f"transition_candidates/{tr_id}/{slot_dir.name}/{f.name}"
-                                for f in slot_dir.glob("v*.mp4")
-                            ], key=lambda p: int(p.rsplit("v", 1)[-1].split(".")[0]))
-                            if videos:
-                                slot_candidates[slot_dir.name] = videos
-
-                # Check for selected transition videos
-                selected_tr_dir = project_dir / "selected_transitions"
-                has_selected_videos = []
+                slot_candidate_details = {}
                 for slot_idx in range(tr.get("slots", 1)):
-                    sel_path = selected_tr_dir / f"{tr_id}_slot_{slot_idx}.mp4"
-                    has_selected_videos.append(sel_path.exists())
+                    cands = _db_get_tr_cands(project_dir, tr_id, slot_idx)
+                    if cands:
+                        slot_candidates[f"slot_{slot_idx}"] = [c["poolPath"] for c in cands]
+                        slot_candidate_details[f"slot_{slot_idx}"] = [
+                            {
+                                "id": c["id"],
+                                "poolPath": c["poolPath"],
+                                "kind": c["kind"],
+                                "label": c.get("label") or "",
+                                "createdBy": c.get("createdBy") or "",
+                                "durationSeconds": c.get("durationSeconds"),
+                                "addedAt": c.get("addedAt"),
+                            }
+                            for c in cands
+                        ]
 
-                # selected: from DB it's already flattened; wrap back to list for API compat
+                # DB-only truthiness for transition videos: `selected` column is the source of truth.
+                # File is a cached artifact; warn on mismatch rather than silently reporting "no video".
+                selected_tr_dir = project_dir / "selected_transitions"
                 sel = tr.get("selected")
                 selected_list = sel if isinstance(sel, list) else [sel]
+                has_selected_videos = []
+                for slot_idx in range(tr.get("slots", 1)):
+                    slot_selected = selected_list[slot_idx] if slot_idx < len(selected_list) else None
+                    has_selected = slot_selected is not None
+                    has_selected_videos.append(has_selected)
+                    if has_selected:
+                        sel_path = selected_tr_dir / f"{tr_id}_slot_{slot_idx}.mp4"
+                        if not sel_path.exists():
+                            _log(f"⚠ transition {tr_id} slot_{slot_idx} has selected={slot_selected} but file missing: {sel_path}")
 
                 # Scan for slot keyframe candidates (intermediate keyframe images for multi-slot transitions)
                 slot_kf_candidates = {}
@@ -2075,9 +2092,13 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     "isAdjustment": tr.get("is_adjustment", False),
                     "hidden": tr.get("hidden", False),
                     "candidates": slot_candidates,
+                    "candidateDetails": slot_candidate_details,
                     "hasSelectedVideos": has_selected_videos,
                     "selected": selected_list,
                     "remap": tr.get("remap", {"method": "linear", "target_duration": 0}),
+                    "trimIn": tr.get("trim_in") or 0,
+                    "trimOut": tr.get("trim_out"),
+                    "sourceVideoDuration": tr.get("source_video_duration"),
                     "slotKeyframeCandidates": slot_kf_candidates,
                     "selectedSlotKeyframes": selected_slot_kfs,
                     "slotActions": tr.get("slot_actions", []),
@@ -2195,10 +2216,25 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             _log(f"select-transitions: {len(selections)} selections")
             try:
                 import shutil
-                from scenecraft.db import update_transition
+                import subprocess as _sp
+                from scenecraft.db import update_transition, get_transition
                 selected_dir = project_dir / "selected_transitions"
                 selected_dir.mkdir(parents=True, exist_ok=True)
                 tr_candidates_root = project_dir / "transition_candidates"
+
+                # Track trim adjustments for the response
+                trim_updates = {}
+
+                def _probe_duration(path: Path) -> float | None:
+                    try:
+                        r = _sp.run(
+                            ["ffprobe", "-v", "error", "-show_entries",
+                             "format=duration", "-of", "csv=p=0", str(path)],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        return float(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+                    except Exception:
+                        return None
 
                 for key, variant in selections.items():
                     if "_slot_" in key:
@@ -2221,7 +2257,33 @@ def make_handler(work_dir: Path, no_auth: bool = False):
 
                     update_transition(project_dir, tr_id, selected=variant)
 
-                self._json_response({"success": True, "applied": len(selections)})
+                    # Variant selection hook (slot_0 only — multi-slot trim is future work):
+                    # Probe the new selected video, update source_video_duration, and clamp trim.
+                    if slot_idx == 0 and variant is not None:
+                        sel_path = selected_dir / f"{tr_id}_slot_0.mp4"
+                        if sel_path.exists():
+                            new_src_dur = _probe_duration(sel_path)
+                            if new_src_dur is not None and new_src_dur > 0:
+                                tr_row = get_transition(project_dir, tr_id) or {}
+                                trim_in = tr_row.get("trim_in") or 0
+                                trim_out = tr_row.get("trim_out")
+                                clamped_trim_out = min(trim_out, new_src_dur) if trim_out is not None else new_src_dur
+                                clamped_trim_in = min(trim_in, max(0, new_src_dur - 0.1))
+                                update_transition(
+                                    project_dir, tr_id,
+                                    source_video_duration=new_src_dur,
+                                    trim_in=clamped_trim_in,
+                                    trim_out=clamped_trim_out,
+                                )
+                                trim_updates[tr_id] = {
+                                    "sourceVideoDuration": new_src_dur,
+                                    "trimIn": clamped_trim_in,
+                                    "trimOut": clamped_trim_out,
+                                    "clamped": (trim_out is not None and trim_out > new_src_dur) or trim_in > (new_src_dur - 0.1),
+                                }
+                                _log(f"  {tr_id}: source={new_src_dur:.2f}s trim=[{clamped_trim_in:.2f}, {clamped_trim_out:.2f}]")
+
+                self._json_response({"success": True, "applied": len(selections), "trimUpdates": trim_updates})
             except Exception as e:
                 self._error(500, "INTERNAL_ERROR", str(e))
 
@@ -2336,6 +2398,9 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     "to": tr.get("to", ""),
                     "durationSeconds": tr.get("duration_seconds", 0),
                     "slots": tr.get("slots", 1),
+                    "trimIn": tr.get("trim_in") or 0,
+                    "trimOut": tr.get("trim_out"),
+                    "sourceVideoDuration": tr.get("source_video_duration"),
                 })
 
             self._json_response({"bin": bin_entries, "transitionBin": transition_bin})
@@ -3550,20 +3615,31 @@ def make_handler(work_dir: Path, no_auth: bool = False):
 
                     timeline_dur = tr_to_time - tr_from_time
                     progress = (time_sec - tr_from_time) / timeline_dur if timeline_dur > 0 else 0
-                    # Probe actual video duration — DB duration_seconds is the
-                    # timeline span, not the file length (Veo clamps to 4-8s).
+                    # Probe actual video duration as a fallback when source_video_duration
+                    # is not cached in the DB.
                     probe = sp.run(
                         ["ffprobe", "-v", "error", "-show_entries",
                          "format=duration", "-of", "csv=p=0", str(video_path)],
                         capture_output=True, text=True, timeout=5,
                     )
                     probe_dur = probe.stdout.strip() if probe.returncode == 0 else ""
-                    video_dur = float(probe_dur) if probe_dur else active_tr.get("duration_seconds", timeline_dur)
-                    video_time = progress * video_dur
-                    # Clamp to at least 1 frame from the end (avoid seeking past last decodable frame)
-                    max_seek = max(0, video_dur - 0.1)
+                    probe_dur_f = float(probe_dur) if probe_dur else None
+                    # Clip model: use trim_in/trim_out from the transition. Fall back to
+                    # cached source_video_duration, then to ffprobe.
+                    trim_in = active_tr.get("trim_in") or 0
+                    trim_out = active_tr.get("trim_out")
+                    source_dur = active_tr.get("source_video_duration") or probe_dur_f
+                    if trim_out is None:
+                        trim_out = source_dur
+                    if trim_out is None:
+                        # Last resort — legacy pre-migration path
+                        trim_out = active_tr.get("duration_seconds", timeline_dur)
+                    video_dur = float(trim_out) if trim_out else timeline_dur
+                    video_time = float(trim_in) + (progress * (float(trim_out) - float(trim_in)))
+                    # Clamp to at least 1 frame from the end of the trimmed span
+                    max_seek = max(0, float(trim_out) - 0.1)
                     video_time = min(video_time, max_seek)
-                    _log(f"  probe_dur={probe_dur} video_dur={video_dur:.3f} progress={progress:.3f} video_time={video_time:.3f} (clamped to max {max_seek:.3f})")
+                    _log(f"  trim_in={trim_in} trim_out={trim_out} source_dur={source_dur} progress={progress:.3f} video_time={video_time:.3f} (clamped to max {max_seek:.3f})")
                     _log(f"  ffmpeg: -ss {video_time:.3f} from {video_path.name} -> {snap_path}")
 
                     result = sp.run(
@@ -3787,6 +3863,14 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 split_progress = (split_time - from_time) / (to_time - from_time)
                 dur1 = round(split_time - from_time, 2)
                 dur2 = round(to_time - split_time, 2)
+
+                # Clip-model trim math: where in the source does the split fall?
+                # source_offset_at_t = trim_in + split_progress * (trim_out - trim_in)
+                orig_trim_in = tr.get("trim_in") or 0
+                orig_trim_out = tr.get("trim_out")
+                orig_src_dur = tr.get("source_video_duration")
+                orig_span = (orig_trim_out - orig_trim_in) if (orig_trim_out is not None) else None
+                split_source_offset = (orig_trim_in + split_progress * orig_span) if orig_span else None
 
                 # Inherit track_id from the original transition
                 tr_track = tr.get("track_id", "track_1")
@@ -4981,18 +5065,14 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             if not no_end_frame and not _Path(end_img).exists():
                 return self._error(400, "BAD_REQUEST", f"End keyframe image not found: {to_kf_id}")
 
-            # Count existing candidates
-            tr_candidates_dir = project_dir / "transition_candidates" / tr_id
+            # Count existing candidates via junction table (pool model)
+            from scenecraft.db import get_tr_candidates as _db_get_tr_cands
             existing_count = 0
-            if tr_candidates_dir.exists():
-                if slot_index is not None:
-                    slot_dir = tr_candidates_dir / f"slot_{slot_index}"
-                    if slot_dir.exists():
-                        existing_count = _next_variant(slot_dir, ".mp4") - 1
-                else:
-                    for sd in tr_candidates_dir.iterdir():
-                        if sd.is_dir():
-                            existing_count = max(existing_count, len(list(sd.glob("v*.mp4"))))
+            if slot_index is not None:
+                existing_count = len(_db_get_tr_cands(project_dir, tr_id, slot_index))
+            else:
+                for si in range(n_slots):
+                    existing_count = max(existing_count, len(_db_get_tr_cands(project_dir, tr_id, si)))
 
             use_global = tr.get("use_global_prompt", True)
             if use_global and motion_prompt:
@@ -5041,13 +5121,16 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                         client = GoogleVideoClient(vertex=True)
                     job_manager.update_progress(job_id, 0, f"Starting video generation ({vid_backend})...")
 
-                    # Build jobs for each slot + variant
+                    # Build jobs for each slot + variant. Output files go directly to
+                    # the pool; junction rows are inserted after successful generation.
+                    import uuid as _uuid
+                    pool_segs_dir = project_dir / "pool" / "segments"
+                    pool_segs_dir.mkdir(parents=True, exist_ok=True)
+
                     gen_jobs = []
                     for si in range(n_slots):
                         if slot_index is not None and si != slot_index:
                             continue
-                        slot_dir = project_dir / "transition_candidates" / tr_id / f"slot_{si}"
-                        slot_dir.mkdir(parents=True, exist_ok=True)
 
                         # For multi-slot, use slot keyframes if available
                         s_img = start_img if si == 0 else str(project_dir / "selected_slot_keyframes" / f"{tr_id}_slot_{si - 1}.png")
@@ -5057,12 +5140,18 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                         if not _Path(e_img).exists():
                             e_img = end_img
 
-                        slot_existing = _next_variant(slot_dir, ".mp4") - 1
-                        for v in range(slot_existing + 1, slot_existing + count + 1):
-                            output = str(slot_dir / f"v{v}.mp4")
-                            if _Path(output).exists():
-                                continue
-                            gen_jobs.append({"slot": si, "variant": v, "start": s_img, "end": e_img, "output": output})
+                        for _ in range(count):
+                            seg_uuid = _uuid.uuid4().hex
+                            pool_name = f"cand_{seg_uuid}.mp4"
+                            output = str(pool_segs_dir / pool_name)
+                            gen_jobs.append({
+                                "slot": si,
+                                "start": s_img,
+                                "end": e_img,
+                                "output": output,
+                                "seg_uuid": seg_uuid,
+                                "pool_path": f"pool/segments/{pool_name}",
+                            })
 
                     if not gen_jobs:
                         job_manager.complete_job(job_id, {"transitionId": tr_id, "candidates": {}})
@@ -5071,6 +5160,78 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     _log(f"[job {job_id}] Generating {len(gen_jobs)} Veo clips for {tr_id}...")
                     completed_count = [0]
                     rejected = []
+
+                    # Snapshot of inputs captured at request time — preserved verbatim as
+                    # pool_segments.generation_params for each successful candidate.
+                    gen_params_template = {
+                        "provider": vid_backend.split("/")[0] if "/" in vid_backend else vid_backend,
+                        "model": vid_backend.split("/")[1] if "/" in vid_backend else None,
+                        "prompt": prompt,
+                        "negative_prompt": negative_prompt,
+                        "seed": veo_seed,
+                        "ingredients": {
+                            "from_keyframe_id": from_kf_id,
+                            "to_keyframe_id": to_kf_id,
+                            "motion_prompt": motion_prompt if use_global else "",
+                            "action": action,
+                            "ingredient_paths": ingredient_paths_raw if ingredient_paths_raw else [],
+                        },
+                        "params": {
+                            "duration_target": slot_duration,
+                            "generate_audio": generate_audio,
+                            "no_end_frame": no_end_frame,
+                            "use_next_tr_frame": use_next_tr_frame,
+                        },
+                    }
+
+                    auth_user = getattr(self, "_authenticated_user", None) or "local"
+
+                    def _record_candidate(j):
+                        """After a successful generation: probe, insert pool_segments,
+                        insert tr_candidates junction row."""
+                        try:
+                            output = _Path(j["output"])
+                            if not output.exists():
+                                _log(f"    ⚠ expected output missing: {output}")
+                                return
+                            # Probe duration
+                            import subprocess as _sp
+                            dur = None
+                            try:
+                                r = _sp.run(
+                                    ["ffprobe", "-v", "error", "-show_entries",
+                                     "format=duration", "-of", "csv=p=0", str(output)],
+                                    capture_output=True, text=True, timeout=5,
+                                )
+                                if r.returncode == 0 and r.stdout.strip():
+                                    dur = float(r.stdout.strip())
+                            except Exception:
+                                pass
+                            byte_size = output.stat().st_size
+
+                            from scenecraft.db import (
+                                add_pool_segment as _add_seg,
+                                add_tr_candidate as _add_tc,
+                            )
+                            # Use the pre-assigned UUID so the file name and DB id match
+                            conn = get_db_conn = None  # placeholder; add_pool_segment generates its own id
+                            # Pre-generated UUID is in j["seg_uuid"] — we need a variant that accepts it.
+                            # Since add_pool_segment generates internally, insert directly here to keep ids aligned.
+                            from scenecraft.db import get_db as _get_db, _now_iso
+                            _conn = _get_db(project_dir)
+                            _conn.execute(
+                                """INSERT INTO pool_segments
+                                   (id, pool_path, kind, created_by, original_filename, original_filepath,
+                                    label, generation_params, created_at, duration_seconds, width, height, byte_size)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (j["seg_uuid"], j["pool_path"], "generated", auth_user, None, None,
+                                 "", json.dumps(gen_params_template), _now_iso(), dur, None, None, byte_size),
+                            )
+                            _conn.commit()
+                            _add_tc(project_dir, transition_id=tr_id, slot=j["slot"],
+                                    pool_segment_id=j["seg_uuid"], source="generated")
+                        except Exception as e:
+                            _log(f"    ⚠ failed to record pool candidate for {j.get('pool_path')}: {e}")
 
                     def _gen(j):
                         try:
@@ -5100,7 +5261,8 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                                     on_status=lambda msg: job_manager.update_progress(job_id, completed_count[0], msg),
                                 )
                             completed_count[0] += 1
-                            _log(f"    {tr_id} slot_{j['slot']} v{j['variant']} done")
+                            _record_candidate(j)
+                            _log(f"    {tr_id} slot_{j['slot']} {j['seg_uuid'][:8]} done")
                         except PromptRejectedError as e:
                             # Retry prompt rejections up to 5 times (content filters can be flaky)
                             max_rejection_retries = 5
@@ -5133,7 +5295,8 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                                             on_status=lambda msg: job_manager.update_progress(job_id, completed_count[0], msg),
                                         )
                                     completed_count[0] += 1
-                                    _log(f"    {tr_id} slot_{j['slot']} v{j['variant']} succeeded on retry {retry_i + 1}")
+                                    _record_candidate(j)
+                                    _log(f"    {tr_id} slot_{j['slot']} {j['seg_uuid'][:8]} succeeded on retry {retry_i + 1}")
                                     succeeded = True
                                     break
                                 except PromptRejectedError:
@@ -5145,7 +5308,7 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                                 rejected.append(tr_id)
                                 job_manager.update_progress(job_id, completed_count[0], f"⚠ {tr_id}: prompt rejected after {max_rejection_retries} attempts")
                         except Exception as e:
-                            _log(f"    ⚠ {tr_id} slot_{j['slot']} v{j['variant']} FAILED: {e}")
+                            _log(f"    ⚠ {tr_id} slot_{j['slot']} {j.get('seg_uuid', '?')[:8]} FAILED: {e}")
 
                     with ThreadPoolExecutor(max_workers=min(len(gen_jobs), 4)) as pool:
                         futures = [pool.submit(_gen, j) for j in gen_jobs]
@@ -5155,17 +5318,13 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                             except Exception:
                                 pass
 
-                    # Collect results
+                    # Collect results from the junction table (source of truth)
+                    from scenecraft.db import get_tr_candidates as _db_get_tc
                     candidates = {}
-                    tr_cand_dir = project_dir / "transition_candidates" / tr_id
-                    if tr_cand_dir.exists():
-                        for sd in sorted(tr_cand_dir.iterdir()):
-                            if sd.is_dir():
-                                videos = sorted([
-                                    f"transition_candidates/{tr_id}/{sd.name}/{f.name}"
-                                    for f in sd.glob("v*.mp4")
-                                ])
-                                candidates[sd.name] = videos
+                    for si in range(n_slots):
+                        cands = _db_get_tc(project_dir, tr_id, si)
+                        if cands:
+                            candidates[f"slot_{si}"] = [c["poolPath"] for c in cands]
 
                     result = {"transitionId": tr_id, "candidates": candidates}
                     if rejected:
