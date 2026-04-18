@@ -2197,9 +2197,13 @@ def make_handler(work_dir: Path, no_auth: bool = False):
         def _handle_select_transitions(self, project_name: str):
             """POST /api/projects/:name/select-transitions — apply transition video selections.
 
-            Body: { "selections": { "tr_001_slot_0": 2, "tr_005": 1 } }
+            Body: { "selections": { "tr_001_slot_0": "<pool_segment_uuid>", "tr_005": "<uuid>" } }
             Keys are "tr_NNN_slot_N" or "tr_NNN" (shorthand for slot_0).
-            Values are 1-based variant indices.
+            Values are pool_segment_ids (stable UUIDs), or null to deselect.
+
+            Legacy callers that send integer ranks are accepted for a transition period:
+            the integer is resolved against the tr's candidate list (ORDER BY added_at)
+            into a pool_segment_id. New clients should send the id directly.
             """
             body = self._read_json_body()
             if body is None:
@@ -2217,10 +2221,14 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             try:
                 import shutil
                 import subprocess as _sp
-                from scenecraft.db import update_transition, get_transition
+                from scenecraft.db import (
+                    update_transition,
+                    get_transition,
+                    get_pool_segment,
+                    get_tr_candidates as _db_get_tc,
+                )
                 selected_dir = project_dir / "selected_transitions"
                 selected_dir.mkdir(parents=True, exist_ok=True)
-                tr_candidates_root = project_dir / "transition_candidates"
 
                 # Track trim adjustments for the response
                 trim_updates = {}
@@ -2236,52 +2244,101 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     except Exception:
                         return None
 
-                for key, variant in selections.items():
+                def _resolve_to_segment_id(tr_id: str, slot_idx: int, value) -> str | None:
+                    """Accept either a pool_segment_id UUID string, an int rank (legacy),
+                    or None (deselect). Returns a pool_segment_id or None."""
+                    if value is None:
+                        return None
+                    if isinstance(value, int):
+                        # Legacy rank — resolve via ordered junction list
+                        cands = _db_get_tc(project_dir, tr_id, slot_idx)
+                        if 1 <= value <= len(cands):
+                            return cands[value - 1]["id"]
+                        _log(f"  ⚠ {tr_id} slot_{slot_idx}: legacy rank {value} out of range ({len(cands)} candidates)")
+                        return None
+                    return str(value)
+
+                # Group by tr_id so we merge slot updates into a single selected array write.
+                by_tr: dict[str, dict[int, str | None]] = {}
+                for key, value in selections.items():
                     if "_slot_" in key:
                         tr_id, slot_part = key.rsplit("_slot_", 1)
                         slot_idx = int(slot_part)
                     else:
                         tr_id = key
                         slot_idx = 0
+                    seg_id = _resolve_to_segment_id(tr_id, slot_idx, value)
+                    by_tr.setdefault(tr_id, {})[slot_idx] = seg_id
 
-                    if variant is not None:
-                        source = tr_candidates_root / tr_id / f"slot_{slot_idx}" / f"v{variant}.mp4"
+                for tr_id, slot_updates in by_tr.items():
+                    tr_row = get_transition(project_dir, tr_id) or {}
+                    n_slots = tr_row.get("slots", 1)
+
+                    # Apply file copies / deselects per slot
+                    for slot_idx, seg_id in slot_updates.items():
                         dest = selected_dir / f"{tr_id}_slot_{slot_idx}.mp4"
-                        if source.exists():
-                            shutil.copy2(str(source), str(dest))
+                        if seg_id is not None:
+                            seg = get_pool_segment(project_dir, seg_id)
+                            if not seg:
+                                _log(f"  ⚠ pool_segment not found: {seg_id}")
+                                continue
+                            source = project_dir / seg["poolPath"]
+                            if source.exists():
+                                shutil.copy2(str(source), str(dest))
+                            else:
+                                _log(f"  ⚠ pool segment file missing: {source}")
+                        else:
+                            if dest.exists():
+                                dest.unlink()
+
+                    # Build the merged selected[] array preserving unchanged slots
+                    existing_selected = tr_row.get("selected")
+                    if isinstance(existing_selected, list):
+                        current = list(existing_selected)
+                    elif existing_selected is None or existing_selected == []:
+                        current = [None] * n_slots
                     else:
-                        # Deselect — remove the selected video
-                        dest = selected_dir / f"{tr_id}_slot_{slot_idx}.mp4"
-                        if dest.exists():
-                            dest.unlink()
+                        # Single scalar (legacy shape) — promote to 1-element list
+                        current = [existing_selected]
+                    # Pad to n_slots
+                    while len(current) < n_slots:
+                        current.append(None)
+                    for slot_idx, seg_id in slot_updates.items():
+                        if slot_idx < len(current):
+                            current[slot_idx] = seg_id
+                    # transitions.selected holds pool_segment_id (TEXT) per slot
+                    update_transition(project_dir, tr_id, selected=current)
 
-                    update_transition(project_dir, tr_id, selected=variant)
-
-                    # Variant selection hook (slot_0 only — multi-slot trim is future work):
-                    # Probe the new selected video, update source_video_duration, and clamp trim.
-                    if slot_idx == 0 and variant is not None:
+                    # Variant selection hook (slot_0 only): update source_video_duration
+                    # and clamp trim to new source length.
+                    slot_0_seg_id = slot_updates.get(0)
+                    if slot_0_seg_id is not None:
                         sel_path = selected_dir / f"{tr_id}_slot_0.mp4"
-                        if sel_path.exists():
+                        new_src_dur = None
+                        # Prefer the cached duration on pool_segments to avoid ffprobe
+                        seg_full = get_pool_segment(project_dir, slot_0_seg_id)
+                        if seg_full and seg_full.get("durationSeconds"):
+                            new_src_dur = seg_full["durationSeconds"]
+                        elif sel_path.exists():
                             new_src_dur = _probe_duration(sel_path)
-                            if new_src_dur is not None and new_src_dur > 0:
-                                tr_row = get_transition(project_dir, tr_id) or {}
-                                trim_in = tr_row.get("trim_in") or 0
-                                trim_out = tr_row.get("trim_out")
-                                clamped_trim_out = min(trim_out, new_src_dur) if trim_out is not None else new_src_dur
-                                clamped_trim_in = min(trim_in, max(0, new_src_dur - 0.1))
-                                update_transition(
-                                    project_dir, tr_id,
-                                    source_video_duration=new_src_dur,
-                                    trim_in=clamped_trim_in,
-                                    trim_out=clamped_trim_out,
-                                )
-                                trim_updates[tr_id] = {
-                                    "sourceVideoDuration": new_src_dur,
-                                    "trimIn": clamped_trim_in,
-                                    "trimOut": clamped_trim_out,
-                                    "clamped": (trim_out is not None and trim_out > new_src_dur) or trim_in > (new_src_dur - 0.1),
-                                }
-                                _log(f"  {tr_id}: source={new_src_dur:.2f}s trim=[{clamped_trim_in:.2f}, {clamped_trim_out:.2f}]")
+                        if new_src_dur is not None and new_src_dur > 0:
+                            trim_in = tr_row.get("trim_in") or 0
+                            trim_out = tr_row.get("trim_out")
+                            clamped_trim_out = min(trim_out, new_src_dur) if trim_out is not None else new_src_dur
+                            clamped_trim_in = min(trim_in, max(0, new_src_dur - 0.1))
+                            update_transition(
+                                project_dir, tr_id,
+                                source_video_duration=new_src_dur,
+                                trim_in=clamped_trim_in,
+                                trim_out=clamped_trim_out,
+                            )
+                            trim_updates[tr_id] = {
+                                "sourceVideoDuration": new_src_dur,
+                                "trimIn": clamped_trim_in,
+                                "trimOut": clamped_trim_out,
+                                "clamped": (trim_out is not None and trim_out > new_src_dur) or trim_in > (new_src_dur - 0.1),
+                            }
+                            _log(f"  {tr_id}: source={new_src_dur:.2f}s trim=[{clamped_trim_in:.2f}, {clamped_trim_out:.2f}]")
 
                 self._json_response({"success": True, "applied": len(selections), "trimUpdates": trim_updates})
             except Exception as e:

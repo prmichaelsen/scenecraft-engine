@@ -332,6 +332,45 @@ def test_delete_pool_segment_also_removes_tags(project):
 
 # ── Cross-branch merge behavior (simulation) ──────────────────────
 
+def test_multi_slot_selection_merges(project):
+    """Updating slot_1 must not overwrite slot_0's selection and vice versa.
+
+    Simulates what select-transitions does when merging slot updates into the
+    transitions.selected array.
+    """
+    import json
+    from scenecraft.db import get_db, add_transition, update_transition, get_transition
+
+    s0 = add_pool_segment(project, kind="generated", created_by="a",
+                          pool_path="pool/segments/c0.mp4")
+    s1 = add_pool_segment(project, kind="generated", created_by="a",
+                          pool_path="pool/segments/c1.mp4")
+
+    add_transition(project, {
+        "id": "tr_multi", "from": "kf_a", "to": "kf_b",
+        "duration_seconds": 4.0, "slots": 2, "action": "", "use_global_prompt": 1,
+        "selected": [None, None], "remap": {"method": "linear", "target_duration": 4.0},
+    })
+
+    # Apply slot_0 first
+    tr = get_transition(project, "tr_multi") or {}
+    current = tr.get("selected") if isinstance(tr.get("selected"), list) else [None, None]
+    current[0] = s0
+    update_transition(project, "tr_multi", selected=current)
+
+    # Apply slot_1 — must preserve slot_0
+    tr = get_transition(project, "tr_multi")
+    current = tr["selected"] if isinstance(tr["selected"], list) else [None, None]
+    while len(current) < 2:
+        current.append(None)
+    current[1] = s1
+    update_transition(project, "tr_multi", selected=current)
+
+    # Verify both slots retained
+    tr = get_transition(project, "tr_multi")
+    assert tr["selected"] == [s0, s1]
+
+
 def test_append_only_generation_is_merge_safe(project):
     """Two users on two branches generate candidates for the same tr.
 
