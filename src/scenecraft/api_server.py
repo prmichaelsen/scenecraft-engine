@@ -2216,6 +2216,9 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                                 "createdBy": c.get("createdBy") or "",
                                 "durationSeconds": c.get("durationSeconds"),
                                 "addedAt": c.get("addedAt"),
+                                # Include generation_params so the frontend can offer
+                                # a "reuse settings" affordance on generated candidates
+                                "generationParams": c.get("generationParams"),
                             }
                             for c in cands
                         ]
