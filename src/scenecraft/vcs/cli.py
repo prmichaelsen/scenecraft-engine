@@ -1,4 +1,9 @@
-"""CLI commands for scenecraft VCS — init, org, user management."""
+"""Top-level CLI commands for scenecraft — init, token, org/user/session management.
+
+These commands are registered directly on the main scenecraft CLI group (not nested
+under a 'vcs' subcommand) because authentication and session management are part of
+the core server flow, not a version-control-only concern.
+"""
 
 from __future__ import annotations
 
@@ -28,17 +33,13 @@ def _require_root() -> Path:
     return root
 
 
-@click.group("vcs")
-def vcs_group():
-    """Version control commands — init, org, user management."""
-    pass
+# ── init ─────────────────────────────────────────────────────────
 
-
-@vcs_group.command()
+@click.command("init")
 @click.option("--org", default="default", help="Name of the initial org (default: 'default')")
 @click.option("--admin", default=None, help="Admin username (default: current OS user)")
 @click.option("--root", default=".", type=click.Path(), help="Root directory (default: cwd)")
-def init(org: str, admin: str | None, root: str):
+def init_cmd(org: str, admin: str | None, root: str):
     """Initialize a new .scenecraft directory with an org and admin user."""
     try:
         sc = init_root(Path(root), org_name=org, admin_username=admin)
@@ -50,22 +51,39 @@ def init(org: str, admin: str | None, root: str):
         raise SystemExit(1)
 
 
-@vcs_group.command()
+# ── token ────────────────────────────────────────────────────────
+
+def _detect_primary_ip() -> str:
+    """Best-effort detection of this machine's primary LAN/WAN IP."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return "localhost"
+    finally:
+        s.close()
+
+
+@click.command("token")
 @click.option("--user", default=None, help="Username (default: current OS user)")
 @click.option("--expiry", default=24, type=int, help="Token expiry in hours (default: 24)")
-@click.option("--host", default="localhost:8890", help="Host:port for the browser login URL (default: localhost:8890 for SSH tunnel)")
+@click.option("--host", default=None, help="Host:port for the browser login URL (default: this machine's IP + :8890)")
 @click.option("--scheme", default="http", type=click.Choice(["http", "https"]), help="URL scheme (default: http)")
 @click.option("--open/--no-open", "open_browser", default=False, help="Attempt to open the URL in the local browser")
 @click.option("--raw", is_flag=True, default=False, help="Print just the JWT (no URL) — for scripts")
-def token(user: str | None, expiry: int, host: str, scheme: str, open_browser: bool, raw: bool):
+def token_cmd(user: str | None, expiry: int, host: str | None, scheme: str, open_browser: bool, raw: bool):
     """Generate a login URL for authenticating your browser session.
 
     Default flow: generates a JWT, stores it against a one-time code, and prints
-    a URL you can open (or forward via SSH tunnel) to log in. The URL can only
-    be used once and expires after 5 minutes.
+    a URL you can open to log in. The URL can only be used once and expires
+    after 5 minutes.
 
     Use --raw to print just the JWT for scripting or manual Authorization headers.
     """
+    if host is None:
+        host = f"{_detect_primary_ip()}:8890"
     root = _require_root()
     try:
         tok = generate_token(root, username=user, expiry_hours=expiry)
@@ -91,9 +109,9 @@ def token(user: str | None, expiry: int, host: str, scheme: str, open_browser: b
             pass
 
 
-# ── Org commands ─────────────────────────────────────────────────
+# ── org ──────────────────────────────────────────────────────────
 
-@vcs_group.group("org")
+@click.group("org")
 def org_group():
     """Manage organizations."""
     pass
@@ -133,9 +151,9 @@ def org_members(name: str):
         click.echo(f"  {m['username']}  role={m['role']}  joined={m['joined_at']}")
 
 
-# ── User commands ────────────────────────────────────────────────
+# ── user ─────────────────────────────────────────────────────────
 
-@vcs_group.group("user")
+@click.group("user")
 def user_group():
     """Manage users."""
     pass
@@ -171,9 +189,9 @@ def user_list():
         click.echo(f"  {u['username']}  role={u['role']}  created={u['created_at']}")
 
 
-# ── Session commands ─────────────────────────────────────────────
+# ── session ──────────────────────────────────────────────────────
 
-@vcs_group.group("session")
+@click.group("session")
 def session_group():
     """Manage editing sessions."""
     pass
@@ -198,3 +216,14 @@ def session_prune(days: int):
     root = _require_root()
     count = prune_sessions(root, max_age_days=days)
     click.echo(f"Pruned {count} stale session(s).")
+
+
+# ── Registration helper (called from scenecraft.cli:main) ────────
+
+def register_commands(main_group: click.Group) -> None:
+    """Register all top-level server commands on the main scenecraft CLI."""
+    main_group.add_command(init_cmd)
+    main_group.add_command(token_cmd)
+    main_group.add_command(org_group)
+    main_group.add_command(user_group)
+    main_group.add_command(session_group)
