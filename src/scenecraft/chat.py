@@ -142,6 +142,10 @@ Tools available:
   • assign_keyframe_image — mark a candidate variant (v{N}.png) as selected.
   • assign_pool_video — mark a pool_segment as selected for a transition slot (the
     segment must already be a candidate via tr_candidates).
+  • checkpoint(name?) — create a non-destructive restore point (snapshots project.db).
+    Call this BEFORE a batch of risky edits.
+  • list_checkpoints — inspect available checkpoint filenames + names + timestamps.
+  • restore_checkpoint(filename) — roll back to a checkpoint (destructive, user-confirmed).
   • delete_keyframe, delete_transition — soft-delete one item (asks to confirm).
   • batch_delete_keyframes, batch_delete_transitions — soft-delete many in ONE
     confirmation and ONE undo group. Prefer these over looping single-deletes.
@@ -466,6 +470,56 @@ UPDATE_TRANSITION_TOOL: dict = {
     },
 }
 
+CHECKPOINT_TOOL: dict = {
+    "name": "checkpoint",
+    "description": (
+        "Create a named restore point by snapshotting project.db. Non-destructive; "
+        "shows up in the Checkpoints panel. Call this before a risky batch of edits "
+        "so the user can restore if something goes wrong."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Optional human-readable label. Defaults to the timestamp.",
+            },
+        },
+    },
+}
+
+RESTORE_CHECKPOINT_TOOL: dict = {
+    "name": "restore_checkpoint",
+    "description": (
+        "Replace the current project database with a checkpoint snapshot. DESTRUCTIVE — "
+        "all changes since that checkpoint will be lost. Inspect checkpoints.yaml via "
+        "sql_query on the filesystem (or ask the user to pick from the Checkpoints "
+        "panel) to find the filename first. Requires user confirmation."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "filename": {
+                "type": "string",
+                "description": "Checkpoint filename, e.g. 'project.db.checkpoint-20260418_140530'.",
+            },
+        },
+        "required": ["filename"],
+    },
+}
+
+LIST_CHECKPOINTS_TOOL: dict = {
+    "name": "list_checkpoints",
+    "description": (
+        "List all checkpoints for the current project. Reads checkpoints.yaml and "
+        "filesystem. Returns filename, name, created, and size_bytes for each entry."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {},
+    },
+}
+
 SPLIT_TRANSITION_TOOL: dict = {
     "name": "split_transition",
     "description": (
@@ -585,6 +639,9 @@ TOOLS: list[dict] = [
     SPLIT_TRANSITION_TOOL,
     ASSIGN_KEYFRAME_IMAGE_TOOL,
     ASSIGN_POOL_VIDEO_TOOL,
+    CHECKPOINT_TOOL,
+    LIST_CHECKPOINTS_TOOL,
+    RESTORE_CHECKPOINT_TOOL,
     GENERATE_KEYFRAME_CANDIDATES_TOOL,
     GENERATE_TRANSITION_CANDIDATES_TOOL,
 ]
@@ -631,6 +688,7 @@ def _format_tool_input_summary(tool_name: str, tool_input: dict, project_dir: Pa
         "delete_keyframe", "delete_transition",
         "batch_delete_keyframes", "batch_delete_transitions",
         "generate_keyframe_candidates", "generate_transition_candidates",
+        "restore_checkpoint",
     }:
         try:
             return _format_destructive_summary(tool_name, input_dict, project_dir)
@@ -758,6 +816,37 @@ def _format_destructive_summary(tool_name: str, input_dict: dict, project_dir: P
         )
         items.append(f"~{est_cost_usd:.2f} USD · ~{total * 45}-{total * 180}s")
         return f"Generate {total} video candidates for {tr_id}?", items
+
+    if tool_name == "restore_checkpoint":
+        from scenecraft.db import get_checkpoint as _db_get_checkpoint, get_db
+        filename = input_dict.get("filename", "")
+        entry = _db_get_checkpoint(project_dir, filename)
+        file_path = project_dir / filename
+        items: list[str] = []
+        if entry:
+            label = entry.get("name") or "(unnamed)"
+            created = entry.get("created_at", "?")
+            items.append(f"{filename}")
+            items.append(f"name: {label}")
+            items.append(f"created: {created}")
+        elif file_path.exists():
+            items.append(f"{filename}")
+            items.append("metadata: not recorded in checkpoints table")
+        else:
+            return f"Restore checkpoint {filename}?", [f"{filename} (NOT FOUND)"]
+
+        try:
+            conn = get_db(project_dir)
+            checkpoint_ts = entry.get("created_at") if entry else None
+            if checkpoint_ts:
+                since = conn.execute(
+                    "SELECT COUNT(*) FROM undo_groups WHERE timestamp > ?", (checkpoint_ts,)
+                ).fetchone()[0]
+                if since > 0:
+                    items.append(f"⚠ {since} undo groups will be lost")
+        except Exception:
+            pass
+        return f"Restore {filename}? (DESTRUCTIVE)", items
 
     # Unreachable — caller gates on tool_name
     return f"Confirm `{tool_name}`?", []
@@ -1090,6 +1179,88 @@ def _exec_update_transition(project_dir: Path, input_data: dict) -> dict:
         "transition_id": tr_id,
         "updated_fields": sorted(fields.keys()),
         "old_values": old_values,
+    }
+
+
+def _exec_checkpoint(project_dir: Path, input_data: dict) -> dict:
+    import sqlite3 as _sqlite3
+    from scenecraft.db import add_checkpoint
+
+    db_path = project_dir / "project.db"
+    if not db_path.exists():
+        return {"error": "no project.db in this project"}
+
+    name = input_data.get("name") or ""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"project.db.checkpoint-{ts}"
+    dst = project_dir / filename
+
+    # Online SQLite backup (safe under WAL)
+    src_conn = _sqlite3.connect(str(db_path))
+    dst_conn = _sqlite3.connect(str(dst))
+    try:
+        src_conn.backup(dst_conn)
+    finally:
+        dst_conn.close()
+        src_conn.close()
+
+    created_iso = datetime.now().astimezone().isoformat()
+    add_checkpoint(project_dir, filename, name=name, created_at=created_iso)
+
+    return {
+        "filename": filename,
+        "name": name,
+        "created_at": created_iso,
+        "size_bytes": dst.stat().st_size,
+    }
+
+
+def _exec_list_checkpoints(project_dir: Path, input_data: dict) -> dict:
+    from scenecraft.db import list_checkpoints as _db_list_checkpoints
+
+    meta_by_file = {c["filename"]: c for c in _db_list_checkpoints(project_dir)}
+    checkpoints = []
+    for f in sorted(project_dir.glob("project.db.checkpoint-*"), reverse=True):
+        stat = f.stat()
+        meta = meta_by_file.get(f.name, {})
+        checkpoints.append({
+            "filename": f.name,
+            "name": meta.get("name", ""),
+            "created_at": meta.get("created_at"),
+            "size_bytes": stat.st_size,
+        })
+    return {"checkpoints": checkpoints, "count": len(checkpoints)}
+
+
+def _exec_restore_checkpoint(project_dir: Path, input_data: dict) -> dict:
+    import sqlite3 as _sqlite3
+    from scenecraft.db import close_db
+
+    filename = input_data.get("filename") or ""
+    if not filename or not isinstance(filename, str):
+        return {"error": "missing filename"}
+    if not filename.startswith("project.db.checkpoint-"):
+        return {"error": f"not a valid checkpoint filename: {filename}"}
+
+    checkpoint_path = project_dir / filename
+    if not checkpoint_path.exists():
+        return {"error": f"checkpoint not found: {filename}"}
+
+    db_path = project_dir / "project.db"
+    # Close pooled connections before overwriting
+    close_db(project_dir)
+
+    src_conn = _sqlite3.connect(str(checkpoint_path))
+    dst_conn = _sqlite3.connect(str(db_path))
+    try:
+        src_conn.backup(dst_conn)
+    finally:
+        dst_conn.close()
+        src_conn.close()
+
+    return {
+        "restored_from": filename,
+        "restored_at": datetime.now().isoformat(),
     }
 
 
@@ -1532,6 +1703,15 @@ async def _execute_tool(
         return result, "error" in result
     if name == "assign_pool_video":
         result = _exec_assign_pool_video(project_dir, input_data)
+        return result, "error" in result
+    if name == "checkpoint":
+        result = _exec_checkpoint(project_dir, input_data)
+        return result, "error" in result
+    if name == "list_checkpoints":
+        result = _exec_list_checkpoints(project_dir, input_data)
+        return result, "error" in result
+    if name == "restore_checkpoint":
+        result = _exec_restore_checkpoint(project_dir, input_data)
         return result, "error" in result
     if name == "generate_keyframe_candidates":
         from scenecraft.chat_generation import start_keyframe_generation

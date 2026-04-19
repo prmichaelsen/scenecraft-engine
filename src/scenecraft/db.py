@@ -297,6 +297,12 @@ def _ensure_schema(conn: sqlite3.Connection):
             notes TEXT NOT NULL DEFAULT '',
             sort_order INTEGER NOT NULL DEFAULT 0
         );
+
+        CREATE TABLE IF NOT EXISTS checkpoints (
+            filename TEXT PRIMARY KEY,
+            name TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
     """)
 
     # ── Undo system ──
@@ -1657,6 +1663,46 @@ def export_to_yaml(project_dir: Path):
     }
     with open(project_dir / "timeline.yaml", "w") as f:
         yaml.dump(timeline, f, default_flow_style=False, allow_unicode=True, sort_keys=False, width=1000)
+
+
+# ── Checkpoints ────────────────────────────────────────────────────
+
+
+def add_checkpoint(project_dir: Path, filename: str, name: str = "", created_at: str | None = None) -> dict:
+    """Record a checkpoint's metadata. Idempotent on filename."""
+    conn = get_db(project_dir)
+    ts = created_at or _now_iso()
+    conn.execute(
+        "INSERT OR REPLACE INTO checkpoints (filename, name, created_at) VALUES (?, ?, ?)",
+        (filename, name, ts),
+    )
+    conn.commit()
+    return {"filename": filename, "name": name, "created_at": ts}
+
+
+def get_checkpoint(project_dir: Path, filename: str) -> dict | None:
+    conn = get_db(project_dir)
+    row = conn.execute(
+        "SELECT filename, name, created_at FROM checkpoints WHERE filename = ?", (filename,)
+    ).fetchone()
+    if not row:
+        return None
+    return {"filename": row[0], "name": row[1], "created_at": row[2]}
+
+
+def list_checkpoints(project_dir: Path) -> list[dict]:
+    """Return checkpoint metadata rows ordered newest-first."""
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        "SELECT filename, name, created_at FROM checkpoints ORDER BY created_at DESC"
+    ).fetchall()
+    return [{"filename": r[0], "name": r[1], "created_at": r[2]} for r in rows]
+
+
+def remove_checkpoint(project_dir: Path, filename: str) -> None:
+    conn = get_db(project_dir)
+    conn.execute("DELETE FROM checkpoints WHERE filename = ?", (filename,))
+    conn.commit()
 
 
 # ── Undo / Redo operations ────────────────────────────────────────

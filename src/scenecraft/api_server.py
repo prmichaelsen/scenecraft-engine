@@ -266,22 +266,38 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
                 from datetime import datetime as _dt
-                import yaml as _yaml
-                # Load manifest for names
-                manifest_path = project_dir / "checkpoints.yaml"
-                name_map = {}
-                if manifest_path.exists():
-                    with open(manifest_path) as _mf:
-                        for entry in (_yaml.safe_load(_mf) or []):
-                            if isinstance(entry, dict):
-                                name_map[entry.get("filename", "")] = entry.get("name", "")
+                from scenecraft.db import list_checkpoints as _db_list_checkpoints, add_checkpoint as _db_add_checkpoint
+                meta_by_file = {c["filename"]: c for c in _db_list_checkpoints(project_dir)}
+                # One-shot migration: pull any checkpoints.yaml entries into the DB
+                # (legacy yaml is being retired; see memory: No YAML in scenecraft)
+                legacy_manifest = project_dir / "checkpoints.yaml"
+                if legacy_manifest.exists():
+                    try:
+                        import yaml as _yaml
+                        with open(legacy_manifest) as _mf:
+                            for entry in (_yaml.safe_load(_mf) or []):
+                                if not isinstance(entry, dict):
+                                    continue
+                                fn = entry.get("filename", "")
+                                if fn and fn not in meta_by_file:
+                                    _db_add_checkpoint(
+                                        project_dir,
+                                        fn,
+                                        name=entry.get("name", ""),
+                                        created_at=entry.get("created") or _dt.now().astimezone().isoformat(),
+                                    )
+                        meta_by_file = {c["filename"]: c for c in _db_list_checkpoints(project_dir)}
+                    except Exception as _e:
+                        _log(f"checkpoints.yaml migration skipped: {_e}")
+
                 checkpoints = []
                 for f in sorted(project_dir.glob("project.db.checkpoint-*"), reverse=True):
                     stat = f.stat()
+                    meta = meta_by_file.get(f.name, {})
                     checkpoints.append({
                         "filename": f.name,
-                        "name": name_map.get(f.name, ""),
-                        "created": _dt.fromtimestamp(stat.st_mtime).isoformat(),
+                        "name": meta.get("name", ""),
+                        "created": meta.get("created_at") or _dt.fromtimestamp(stat.st_mtime).isoformat(),
                         "size_bytes": stat.st_size,
                     })
                 return self._json_response({"checkpoints": checkpoints, "active": "project.db"})
@@ -640,6 +656,12 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             if m:
                 return self._handle_update_timestamp(m.group(1))
 
+            # POST /api/projects/:name/update-transition-trim — atomic trim + kf-timestamp
+            # update for clip-boundary drag. See design/local.clip-trim-and-snap.md.
+            m = re.match(r"^/api/projects/([^/]+)/update-transition-trim$", path)
+            if m:
+                return self._handle_update_transition_trim(m.group(1))
+
             # POST /api/projects/:name/update-prompt
             m = re.match(r"^/api/projects/([^/]+)/update-prompt$", path)
             if m:
@@ -854,16 +876,14 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 finally:
                     dst_conn.close()
                     src_conn.close()
-                # Save metadata to checkpoints.yaml
-                import yaml as _yaml
-                manifest_path = project_dir / "checkpoints.yaml"
-                manifest = []
-                if manifest_path.exists():
-                    with open(manifest_path) as _mf:
-                        manifest = _yaml.safe_load(_mf) or []
-                manifest.append({"filename": filename, "name": name or "", "created": datetime.now().isoformat()})
-                with open(manifest_path, "w") as _mf:
-                    _yaml.dump(manifest, _mf, default_flow_style=False)
+                # Persist metadata to the checkpoints table (see memory: No YAML in scenecraft)
+                from scenecraft.db import add_checkpoint as _db_add_checkpoint
+                _db_add_checkpoint(
+                    project_dir,
+                    filename,
+                    name=name or "",
+                    created_at=datetime.now().astimezone().isoformat(),
+                )
 
                 _log(f"checkpoint: {m.group(1)} -> {filename}{' (' + name + ')' if name else ''}")
                 return self._json_response({"success": True, "filename": filename, "name": name})
@@ -908,6 +928,8 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 if not filename.startswith("project.db.checkpoint-") or not checkpoint_path.exists():
                     return self._error(404, "NOT_FOUND", f"Checkpoint not found: {filename}")
                 checkpoint_path.unlink()
+                from scenecraft.db import remove_checkpoint as _db_remove_checkpoint
+                _db_remove_checkpoint(project_dir, filename)
                 _log(f"checkpoint deleted: {m.group(1)} / {filename}")
                 return self._json_response({"success": True})
 
@@ -2601,6 +2623,99 @@ def make_handler(work_dir: Path, no_auth: bool = False):
 
                 self._json_response({"success": True, "keyframeId": kf_id, "newTimestamp": new_timestamp})
             except Exception as e:
+                self._error(500, "INTERNAL_ERROR", str(e))
+
+        def _handle_update_transition_trim(self, project_name: str):
+            """POST /api/projects/:name/update-transition-trim — atomic trim + boundary move.
+
+            Body: {
+              "transitionId": "tr_xxx",
+              "trimIn": 0.0,           # optional — only if changing left edge
+              "trimOut": 5.2,          # optional — only if changing right edge
+              "fromKfTimestamp": "0:02.00",  # optional — new from_kf time when left edge moves
+              "toKfTimestamp":   "0:07.20",  # optional — new to_kf time when right edge moves
+            }
+
+            Single DB transaction so the trim + keyframe-timestamp + adjacent-tr duration
+            updates all land together (prevents timeline inconsistency between renders).
+            """
+            body = self._read_json_body()
+            if body is None:
+                return
+            tr_id = body.get("transitionId")
+            if not tr_id:
+                return self._error(400, "BAD_REQUEST", "Missing 'transitionId'")
+
+            trim_in = body.get("trimIn")
+            trim_out = body.get("trimOut")
+            from_ts = body.get("fromKfTimestamp")
+            to_ts = body.get("toKfTimestamp")
+
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+
+            try:
+                from scenecraft.db import (
+                    undo_begin as _ub, get_transition, update_transition,
+                    update_keyframe, get_keyframe, get_transitions as _get_trs,
+                )
+                _ub(project_dir, f"Trim drag on {tr_id}")
+
+                def parse_ts(ts):
+                    parts = str(ts).split(":")
+                    if len(parts) == 2:
+                        return int(parts[0]) * 60 + float(parts[1])
+                    return float(ts) if isinstance(ts, (int, float)) else 0
+
+                tr = get_transition(project_dir, tr_id)
+                if not tr:
+                    return self._error(404, "NOT_FOUND", f"Transition not found: {tr_id}")
+
+                # Update trim values on the transition
+                trim_updates: dict = {}
+                if trim_in is not None:
+                    trim_updates["trim_in"] = float(trim_in)
+                if trim_out is not None:
+                    trim_updates["trim_out"] = float(trim_out)
+                if trim_updates:
+                    update_transition(project_dir, tr_id, **trim_updates)
+
+                # Update keyframe timestamps if provided. Cascades to adjacent trs'
+                # duration_seconds same as the single-kf update path.
+                kf_updates: list[tuple[str, str]] = []  # (kf_id, new_timestamp)
+                if from_ts is not None and tr.get("from"):
+                    kf_updates.append((tr["from"], from_ts))
+                if to_ts is not None and tr.get("to"):
+                    kf_updates.append((tr["to"], to_ts))
+
+                all_trs = _get_trs(project_dir) if kf_updates else []
+                for kf_id, new_ts in kf_updates:
+                    update_keyframe(project_dir, kf_id, timestamp=new_ts)
+                    new_time = parse_ts(new_ts)
+                    # Cascade to adjacent transitions' duration_seconds
+                    for adj in all_trs:
+                        if adj["from"] == kf_id or adj["to"] == kf_id:
+                            other_id = adj["to"] if adj["from"] == kf_id else adj["from"]
+                            other_kf = get_keyframe(project_dir, other_id)
+                            if other_kf:
+                                other_time = parse_ts(other_kf["timestamp"])
+                                dur = round(abs(new_time - other_time), 2)
+                                update_transition(project_dir, adj["id"], duration_seconds=dur)
+
+                _log(
+                    f"update-transition-trim: {tr_id} "
+                    f"trim=[{trim_in},{trim_out}] kfts=[{from_ts},{to_ts}]"
+                )
+                self._json_response({
+                    "success": True,
+                    "transitionId": tr_id,
+                    "trimIn": trim_updates.get("trim_in"),
+                    "trimOut": trim_updates.get("trim_out"),
+                })
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
                 self._error(500, "INTERNAL_ERROR", str(e))
 
         def _handle_update_prompt(self, project_name: str):
