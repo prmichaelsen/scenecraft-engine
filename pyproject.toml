@@ -15,7 +15,6 @@ dependencies = [
     "click>=8.0.0",
     "moviepy>=2.0.0",
     "Pillow>=10.0.0",
-    "ruamel.yaml>=0.18.0",
     "python-dotenv>=1.0.0",
 ]
 

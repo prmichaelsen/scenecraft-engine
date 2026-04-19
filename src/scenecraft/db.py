@@ -1567,163 +1567,6 @@ def validate_timeline(project_dir: Path) -> list[str]:
     return warnings
 
 
-# ── YAML Import / Export ────────────────────────────────────────────
-
-def import_from_yaml(project_dir: Path):
-    """Import project data from YAML files into SQLite."""
-    from scenecraft.project import load_project
-
-    data = load_project(project_dir)
-    if data.get("_format") == "empty":
-        return
-
-    conn = get_db(project_dir)
-
-    # Clear existing data
-    conn.execute("DELETE FROM keyframes")
-    conn.execute("DELETE FROM transitions")
-    conn.execute("DELETE FROM meta")
-    conn.execute("DELETE FROM effects")
-    conn.execute("DELETE FROM suppressions")
-
-    # Meta
-    meta = data.get("meta", {})
-    for key, value in meta.items():
-        if key.startswith("_"):
-            continue
-        conn.execute(
-            "INSERT INTO meta (key, value) VALUES (?, ?)",
-            (key, json.dumps(value) if not isinstance(value, str) else value),
-        )
-
-    # Keyframes (active)
-    for kf in data.get("keyframes", []):
-        conn.execute(
-            """INSERT INTO keyframes (id, timestamp, section, source, prompt, selected, candidates, context)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (kf["id"], kf.get("timestamp", "0:00"), kf.get("section", ""), kf.get("source", ""),
-             kf.get("prompt", ""), kf.get("selected"), json.dumps(kf.get("candidates", [])),
-             json.dumps(kf.get("context")) if kf.get("context") else None),
-        )
-
-    # Binned keyframes
-    for kf in data.get("bin", []):
-        conn.execute(
-            """INSERT INTO keyframes (id, timestamp, section, source, prompt, selected, candidates, context, deleted_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (kf["id"], kf.get("timestamp", "0:00"), kf.get("section", ""), kf.get("source", ""),
-             kf.get("prompt", ""), kf.get("selected"), json.dumps(kf.get("candidates", [])),
-             json.dumps(kf.get("context")) if kf.get("context") else None, kf.get("deleted_at", "")),
-        )
-
-    # Transitions (active)
-    for tr in data.get("transitions", []):
-        selected = tr.get("selected")
-        if isinstance(selected, (int, str)) and selected is not None:
-            selected = [selected]
-        elif selected is None:
-            selected = [None]
-        conn.execute(
-            """INSERT INTO transitions (id, from_kf, to_kf, duration_seconds, slots, action, use_global_prompt, selected, remap)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (tr["id"], tr.get("from", ""), tr.get("to", ""), tr.get("duration_seconds", 0),
-             tr.get("slots", 1), tr.get("action", ""), int(tr.get("use_global_prompt", False)),
-             json.dumps(selected), json.dumps(tr.get("remap", {"method": "linear", "target_duration": 0}))),
-        )
-
-    # Binned transitions
-    for tr in data.get("transition_bin", []):
-        selected = tr.get("selected")
-        if isinstance(selected, (int, str)) and selected is not None:
-            selected = [selected]
-        elif selected is None:
-            selected = [None]
-        conn.execute(
-            """INSERT INTO transitions (id, from_kf, to_kf, duration_seconds, slots, action, use_global_prompt, selected, remap, deleted_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (tr["id"], tr.get("from", ""), tr.get("to", ""), tr.get("duration_seconds", 0),
-             tr.get("slots", 1), tr.get("action", ""), int(tr.get("use_global_prompt", False)),
-             json.dumps(selected), json.dumps(tr.get("remap", {"method": "linear", "target_duration": 0})),
-             tr.get("deleted_at", "")),
-        )
-
-    # Watched folders as meta
-    wf = data.get("watched_folders", [])
-    if wf:
-        conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)", ("watched_folders", json.dumps(wf)))
-
-    # Import effects from beats.yaml
-    import yaml
-    effects_path = project_dir / "beats.yaml"
-    if effects_path.exists():
-        with open(effects_path) as f:
-            effects_data = yaml.safe_load(f) or {}
-        for fx in effects_data.get("effects", []):
-            conn.execute(
-                "INSERT INTO effects (id, type, time, intensity, duration) VALUES (?, ?, ?, ?, ?)",
-                (fx["id"], fx.get("type", "pulse"), fx.get("time", 0), fx.get("intensity", 0.8), fx.get("duration", 0.2)),
-            )
-        for sup in effects_data.get("suppressions", []):
-            conn.execute(
-                "INSERT INTO suppressions (id, from_time, to_time, effect_types) VALUES (?, ?, ?, ?)",
-                (sup["id"], sup.get("from", 0), sup.get("to", 0),
-                 json.dumps(sup.get("effectTypes")) if sup.get("effectTypes") else None),
-            )
-
-    conn.commit()
-
-
-def export_to_yaml(project_dir: Path):
-    """Export SQLite data back to YAML files (split format)."""
-    import yaml
-
-    meta = get_meta(project_dir)
-    keyframes = get_keyframes(project_dir)
-    binned_kfs = get_binned_keyframes(project_dir)
-    transitions = get_transitions(project_dir)
-    binned_trs = get_binned_transitions(project_dir)
-
-    # Strip internal fields from meta
-    clean_meta = {k: v for k, v in meta.items() if not k.startswith("_") and k != "watched_folders"}
-    watched = meta.get("watched_folders", [])
-    if isinstance(watched, str):
-        watched = json.loads(watched)
-
-    # project.yaml
-    project_data = {"meta": clean_meta, "watched_folders": watched}
-    with open(project_dir / "project.yaml", "w") as f:
-        yaml.dump(project_data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-
-    # Strip deleted_at from active items, convert back to YAML-friendly format
-    def kf_to_yaml(kf):
-        d = dict(kf)
-        d.pop("deleted_at", None)
-        return d
-
-    def tr_to_yaml(tr):
-        d = dict(tr)
-        d.pop("deleted_at", None)
-        # Restore YAML key names
-        d["from"] = d.pop("from_kf", d.pop("from", ""))
-        d["to"] = d.pop("to_kf", d.pop("to", ""))
-        return d
-
-    # timeline.yaml
-    timeline = {
-        "active_timeline": "default",
-        "timelines": {
-            "default": {
-                "keyframes": [kf_to_yaml(kf) for kf in keyframes],
-                "transitions": [tr_to_yaml(tr) for tr in transitions],
-                "bin": [kf_to_yaml(kf) for kf in binned_kfs],
-                "transition_bin": [tr_to_yaml(tr) for tr in binned_trs],
-            }
-        }
-    }
-    with open(project_dir / "timeline.yaml", "w") as f:
-        yaml.dump(timeline, f, default_flow_style=False, allow_unicode=True, sort_keys=False, width=1000)
-
-
 # ── Checkpoints ────────────────────────────────────────────────────
 
 
@@ -1905,36 +1748,8 @@ def _row_to_section(row: sqlite3.Row) -> dict:
     }
 
 
-def _migrate_sections_from_yaml(conn: sqlite3.Connection, project_dir: Path):
-    """One-time migration: import sections from narrative.yaml into DB."""
-    yaml_path = project_dir / "narrative.yaml"
-    if yaml_path.exists():
-        import yaml
-        with open(yaml_path) as f:
-            data = yaml.safe_load(f) or {}
-        sections = data.get("sections", [])
-        for i, sec in enumerate(sections):
-            conn.execute(
-                """INSERT OR IGNORE INTO sections (id, label, start, "end", mood, energy, instruments, motifs, events, visual_direction, notes, sort_order)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (sec.get("id", f"section_{i}"), sec.get("label", ""),
-                 sec.get("start", "0:00"), sec.get("end"),
-                 sec.get("mood", ""), sec.get("energy", ""),
-                 json.dumps(sec.get("instruments", [])),
-                 json.dumps(sec.get("motifs", [])),
-                 json.dumps(sec.get("events", [])),
-                 sec.get("visual_direction", ""),
-                 sec.get("notes", ""), i),
-            )
-    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('sections_migrated', '1')")
-    conn.commit()
-
-
 def get_sections(project_dir: Path) -> list[dict]:
     conn = get_db(project_dir)
-    row = conn.execute("SELECT value FROM meta WHERE key = 'sections_migrated'").fetchone()
-    if not row:
-        _migrate_sections_from_yaml(conn, project_dir)
     rows = conn.execute('SELECT * FROM sections ORDER BY sort_order').fetchall()
     return [_row_to_section(r) for r in rows]
 
@@ -1955,8 +1770,6 @@ def set_sections(project_dir: Path, sections: list[dict]):
              sec.get("visual_direction", ""),
              sec.get("notes", ""), i),
         )
-    # Mark migrated so get_sections doesn't re-check yaml
-    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('sections_migrated', '1')")
     conn.commit()
 
 

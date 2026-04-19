@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import time
-import yaml
 from pathlib import Path
 from datetime import datetime
 
 
-METRICS_FILE = ".metrics.yaml"
+METRICS_FILE = ".metrics.json"
 
 
 def _metrics_path(work_dir: str) -> Path:
@@ -20,7 +20,7 @@ def load_metrics(work_dir: str) -> dict:
     p = _metrics_path(work_dir)
     if p.exists():
         with open(p) as f:
-            return yaml.safe_load(f) or {}
+            return json.load(f)
     return {}
 
 
@@ -29,7 +29,7 @@ def save_metrics(work_dir: str, metrics: dict) -> None:
     p = _metrics_path(work_dir)
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "w") as f:
-        yaml.dump(metrics, f, default_flow_style=False, sort_keys=False)
+        json.dump(metrics, f, indent=2)
 
 
 def record_step(

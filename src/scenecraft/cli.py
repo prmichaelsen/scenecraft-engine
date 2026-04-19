@@ -1430,7 +1430,6 @@ def audio_intelligence(video_file: str, work_dir: str, output: str | None,
 @click.option("--work-dir", default=".scenecraft_work", type=str, help="Work directory")
 @click.option("--fps", default=None, type=float, help="Video frame rate")
 @click.option("--sr", default=22050, type=int, help="Sample rate")
-@click.option("--sections-yaml", default=None, type=click.Path(exists=True), help="Manual sections.yaml for per-section rule generation")
 def audio_intelligence_multimodel(
     video_file: str, auto_separate: bool,
     vocals: str | None, kick: str | None, snare: str | None, hh: str | None,
@@ -1438,7 +1437,6 @@ def audio_intelligence_multimodel(
     bass: str | None, guitar: str | None, piano: str | None, other: str | None,
     output: str | None, descriptions: str | None, creative_direction: str | None,
     vocal_bleed_threshold: float, work_dir: str, fps: float | None, sr: int,
-    sections_yaml: str | None,
 ):
     """Run multi-model audio intelligence pipeline (InstVoc + DrumSep + Demucs 6s).
 
@@ -1514,13 +1512,6 @@ def audio_intelligence_multimodel(
 
     out_path = output or str(work.root / "audio_intelligence_multimodel.json")
 
-    # Auto-detect sections.yaml in work dir if not specified
-    if not sections_yaml:
-        auto_sections = work.root / "sections.yaml"
-        if auto_sections.exists():
-            sections_yaml = str(auto_sections)
-            _log(f"  Auto-detected sections.yaml: {auto_sections}")
-
     result = run_audio_intelligence_multimodel(
         vocals_path=vocals,
         drumsep_paths=drumsep_paths,
@@ -1533,7 +1524,6 @@ def audio_intelligence_multimodel(
         sensitivity={k: 1.0 for k in ['zoom_pulse','zoom_bounce','shake_x','shake_y','flash','hard_cut','contrast_pop','glow_swell']},
         vocal_bleed_threshold=vocal_bleed_threshold,
         fps=video_fps,
-        sections_yaml=sections_yaml,
     )
 
     _log(f"  {len(result['layer3_events'])} effect events generated")
@@ -1551,7 +1541,7 @@ def audio_intelligence_multimodel(
 @click.option("--remote/--local", default=False, help="Run effects on Vast.ai GPU (NVENC encoding, much faster)")
 @click.option("--hard-cuts/--no-hard-cuts", default=False, help="Enable hard_cut effect (blinding brightness spikes, off by default)")
 @click.option("--preview/--no-preview", default=False, help="Half resolution + ultrafast encode for quick previews (~4x faster)")
-@click.option("--config", default=None, type=click.Path(exists=True), help="SceneCraft project config YAML (settings, offsets, etc.)")
+@click.option("--config", default=None, type=click.Path(exists=True), help="Effect config JSON (settings, offsets, vocal_bleed_threshold)")
 def effects(video_file: str, beats: str | None, ai_events: str | None, output: str | None,
             glow: bool, fps: float | None, plan: str | None, time_offset: float, remote: bool,
             hard_cuts: bool, preview: bool, config: str | None):
@@ -1564,18 +1554,16 @@ def effects(video_file: str, beats: str | None, ai_events: str | None, output: s
     Add --remote to run on Vast.ai GPU for ~10x faster encoding.
 
     Examples:
-        scenecraft effects video.mp4 --ai-events ai.json --config scenecraft.yaml
+        scenecraft effects video.mp4 --ai-events ai.json --config effects.json
         scenecraft effects video.mp4 --beats beats.json
     """
-    # Load config if provided
+    # Load config if provided (JSON only — YAML support removed)
     effect_offsets = None
     config_bleed_threshold = None
     if config:
-        import yaml as pyyaml
         with open(config) as f:
-            cfg = pyyaml.safe_load(f)
+            cfg = json.load(f)
         settings = cfg.get("settings", {})
-        # Config overrides CLI defaults (but explicit CLI flags still win)
         if not hard_cuts and settings.get("hard_cuts"):
             hard_cuts = True
         if not preview and settings.get("preview"):
@@ -2183,152 +2171,13 @@ def _get_ai_plan(beat_map: dict, user_prompt: str | None, audio_descriptions: li
         raise click.ClickException(f"AI effect plan failed: {e}")
 
 
-# ── Narrative Keyframe Pipeline ────────────────────────────────────
+# ── Narrative render CLI ──────────────────────────────────────────
 
 
 @main.group()
 def narrative():
-    """Narrative keyframe pipeline — YAML-driven keyframe + Veo transition generation."""
+    """Narrative rendering (use the web frontend for authoring)."""
     pass
-
-
-@narrative.command()
-@click.argument("yaml_path", type=click.Path(exists=True))
-@click.option("--vertex/--no-vertex", default=False, help="Use Vertex AI vs AI Studio")
-@click.option("--segments", default=None, help="Filter keyframes: kf_001,kf_005-kf_010")
-@click.option("--candidates", "n_candidates", default=None, type=int, help="Override candidates per slot")
-@click.option("--dry-run", is_flag=True, help="Validate YAML and print stats only")
-@click.option("--replicate", "use_replicate", is_flag=True, help="Use Replicate API instead of Google AI Studio/Vertex")
-@click.option("--regen", default=None, help="Regen targets: 'kf_005/v1,v2;kf_007/v2' or 'kf_005;kf_007' (all variants)")
-def keyframes(yaml_path, vertex, segments, n_candidates, dry_run, use_replicate, regen):
-    """Generate keyframe candidates from narrative YAML."""
-    from scenecraft.render.narrative import load_narrative, narrative_stats, generate_keyframe_candidates
-
-    data = load_narrative(yaml_path)
-    stats = narrative_stats(data)
-    click.echo(f"Narrative: {data['meta']['title']}")
-    click.echo(f"  Keyframes: {stats['keyframes']} ({stats['keyframes_with_candidates']} with candidates, {stats['keyframes_selected']} selected, {stats['existing_keyframes']} existing)")
-    click.echo(f"  Transitions: {stats['transitions']} ({stats['total_slots']} total slots, {stats['existing_transitions']} existing)")
-    click.echo(f"  Multi-slot transitions: {stats['multi_slot_transitions']} ({stats['intermediate_keyframes_needed']} intermediate keyframes needed)")
-
-    if dry_run:
-        return
-
-    seg_filter = _parse_kf_filter(segments) if segments else None
-
-    # Parse --regen: "kf_005/v1,v2;kf_007/v2" -> {kf_005: {v1, v2}, kf_007: {v2}}
-    # or "kf_005;kf_007" -> {kf_005: set(), kf_007: set()} (all variants)
-    regen_map = None
-    if regen is not None:
-        regen_map = {}
-        for part in regen.split(";"):
-            part = part.strip()
-            if not part:
-                continue
-            if "/" in part:
-                kf_id, variants = part.split("/", 1)
-                regen_map[kf_id.strip()] = {v.strip() for v in variants.split(",")}
-            else:
-                regen_map[part] = set()  # empty = all variants
-
-    generate_keyframe_candidates(yaml_path, vertex=vertex, candidates_per_slot=n_candidates, segment_filter=seg_filter, use_replicate=use_replicate, regen=regen_map)
-
-
-@narrative.command(name="select-keyframes")
-@click.argument("yaml_path", type=click.Path(exists=True))
-@click.argument("selections", nargs=-1, required=True)
-def select_keyframes_cmd(yaml_path, selections):
-    """Apply keyframe selections. E.g.: kf_001:v2 kf_005:v3"""
-    from scenecraft.render.narrative import apply_keyframe_selection
-
-    parsed = {}
-    for sel in selections:
-        parts = sel.split(":")
-        if len(parts) != 2:
-            raise click.ClickException(f"Invalid selection format: {sel} (expected kf_id:vN)")
-        kf_id = parts[0]
-        variant = int(parts[1].lstrip("v"))
-        parsed[kf_id] = variant
-
-    apply_keyframe_selection(yaml_path, parsed)
-
-
-@narrative.command(name="resolve-existing")
-@click.argument("yaml_path", type=click.Path(exists=True))
-def resolve_existing_cmd(yaml_path):
-    """Extract boundary frames from existing transition segments into selected_keyframes/."""
-    from scenecraft.render.narrative import resolve_existing_boundary_frames
-    resolve_existing_boundary_frames(yaml_path)
-
-
-@narrative.command()
-@click.argument("yaml_path", type=click.Path(exists=True))
-def actions(yaml_path):
-    """Generate LLM transition actions for empty transitions."""
-    from scenecraft.render.narrative import generate_transition_actions
-    generate_transition_actions(yaml_path)
-
-
-@narrative.command(name="slot-keyframes")
-@click.argument("yaml_path", type=click.Path(exists=True))
-@click.option("--vertex/--no-vertex", default=False)
-@click.option("--candidates", "n_candidates", default=None, type=int)
-@click.option("--replicate", "use_replicate", is_flag=True, help="Use Replicate API")
-def slot_keyframes_cmd(yaml_path, vertex, n_candidates, use_replicate):
-    """Generate intermediate keyframe candidates for multi-slot transitions."""
-    from scenecraft.render.narrative import generate_slot_keyframe_candidates
-    generate_slot_keyframe_candidates(yaml_path, vertex=vertex, candidates_per_slot=n_candidates, use_replicate=use_replicate)
-
-
-@narrative.command(name="select-slot-keyframes")
-@click.argument("yaml_path", type=click.Path(exists=True))
-@click.argument("selections", nargs=-1, required=True)
-def select_slot_keyframes_cmd(yaml_path, selections):
-    """Apply slot keyframe selections. E.g.: tr_041_slot_0:v2"""
-    from scenecraft.render.narrative import apply_slot_keyframe_selection
-
-    parsed = {}
-    for sel in selections:
-        parts = sel.split(":")
-        if len(parts) != 2:
-            raise click.ClickException(f"Invalid selection format: {sel}")
-        slot_key = parts[0]
-        variant = int(parts[1].lstrip("v"))
-        parsed[slot_key] = variant
-
-    apply_slot_keyframe_selection(yaml_path, parsed)
-
-
-@narrative.command()
-@click.argument("yaml_path", type=click.Path(exists=True))
-@click.option("--vertex/--no-vertex", default=False)
-@click.option("--segments", default=None, help="Filter transitions: tr_001,tr_005-tr_010")
-@click.option("--candidates", "n_candidates", default=None, type=int)
-def transitions(yaml_path, vertex, segments, n_candidates):
-    """Generate Veo transition video candidates."""
-    from scenecraft.render.narrative import generate_transition_candidates
-
-    seg_filter = _parse_kf_filter(segments) if segments else None
-    generate_transition_candidates(yaml_path, vertex=vertex, candidates_per_slot=n_candidates, segment_filter=seg_filter)
-
-
-@narrative.command(name="select-transitions")
-@click.argument("yaml_path", type=click.Path(exists=True))
-@click.argument("selections", nargs=-1, required=True)
-def select_transitions_cmd(yaml_path, selections):
-    """Apply transition selections. E.g.: tr_001:v2 tr_005_slot_0:v3"""
-    from scenecraft.render.narrative import apply_transition_selection
-
-    parsed = {}
-    for sel in selections:
-        parts = sel.split(":")
-        if len(parts) != 2:
-            raise click.ClickException(f"Invalid selection format: {sel}")
-        key = parts[0]
-        variant = int(parts[1].lstrip("v"))
-        parsed[key] = variant
-
-    apply_transition_selection(yaml_path, parsed)
 
 
 @narrative.command()
@@ -2362,11 +2211,11 @@ def crossfade_cmd(video_file: str, output: str | None, crossfade_frames: int,
     import subprocess
     from pathlib import Path
     from scenecraft.render.workdir import WorkDir
-    from scenecraft.project import load_project
+    from scenecraft.db import load_project_data
     from scenecraft.render.crossfade import concat_with_crossfade
 
     work = WorkDir(video_file, base_dir=work_dir)
-    data = load_project(work.root)
+    data = load_project_data(work.root)
 
     if not output:
         output = str(work.root / "crossfade_output.mp4")

@@ -92,14 +92,6 @@ def load_narrative(project_dir: str | Path) -> dict:
     return load_project_data(path)
 
 
-def save_narrative(data: dict, yaml_path: str | None = None) -> None:  # noqa: ARG001
-    """Deprecated no-op — all writes go directly to project.db via the
-    generation functions' DB helpers. Kept for backward compatibility with
-    callers inside this module; safe to remove once those are refactored.
-    """
-    return None
-
-
 def narrative_stats(data: dict) -> dict:
     """Return summary stats for a loaded narrative."""
     keyframes = data["keyframes"]
@@ -450,7 +442,6 @@ def generate_keyframe_candidates(
 
     if not jobs:
         _log("All keyframe candidates already generated.")
-        save_narrative(data, yaml_path)
         return
 
     # When 4 or fewer keyframes targeted, parallelize candidates within each keyframe
@@ -547,7 +538,6 @@ def generate_keyframe_candidates(
                     _log(f"  FAILED: {e}")
 
     # Save updated YAML
-    save_narrative(data, yaml_path)
     _log("Keyframe candidate generation complete.")
 
 
@@ -580,8 +570,6 @@ def apply_keyframe_selection(yaml_path: str, selections: dict[str, int]) -> None
         shutil.copy2(str(source), str(dest))
         kf["selected"] = variant
         _log(f"  {kf_id}: selected v{variant} -> {dest}")
-
-    save_narrative(data, yaml_path)
     _log("Keyframe selections applied.")
 
 
@@ -681,8 +669,6 @@ def generate_transition_actions(yaml_path: str) -> None:
         action = response.content[0].text.strip()
         tr["action"] = action
         _log(f"    Action: {action[:80]}...")
-
-    save_narrative(data, yaml_path)
     _log("Transition action generation complete.")
 
 
@@ -825,8 +811,6 @@ def generate_slot_keyframe_candidates(
             slot_labels = [f"slot {i}" for i in range(n_intermediates)]
             make_slot_grid(all_slot_images, grid_path, f"{tr['id']} — {n_intermediates} intermediate keyframes", slot_labels)
             _log(f"    Combined grid: {grid_path}")
-
-    save_narrative(data, yaml_path)
     _log("Slot keyframe candidate generation complete.")
 
 
@@ -864,8 +848,6 @@ def apply_slot_keyframe_selection(yaml_path: str, selections: dict[str, int]) ->
                 if "selected_slot_keyframes" not in tr or not isinstance(tr.get("selected_slot_keyframes"), dict):
                     tr["selected_slot_keyframes"] = {}
                 tr["selected_slot_keyframes"][slot_key] = variant
-
-    save_narrative(data, yaml_path)
     _log("Slot keyframe selections applied.")
 
 
@@ -1058,8 +1040,6 @@ def apply_transition_selection(yaml_path: str, selections: dict[str, int]) -> No
             if not isinstance(tr.get("selected"), list) or len(tr["selected"]) != n_slots:
                 tr["selected"] = [None] * n_slots
             tr["selected"][slot_idx] = variant
-
-    save_narrative(data, yaml_path)
     _log("Transition selections applied.")
 
 

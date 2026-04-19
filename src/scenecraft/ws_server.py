@@ -318,30 +318,21 @@ class FolderWatcher:
                         self._import_files(project, folder, [name])
 
     def _import_files(self, project: str, folder: Path, filenames: list[str]):
-        """Import new files into the project bin."""
+        """Import new files into the project bin (soft-deleted rows flagged as bin)."""
+        import re as _re
         import shutil
         from datetime import datetime, timezone
-        from scenecraft.project import load_project, save_project
+
+        from scenecraft.db import add_keyframe, add_transition, get_keyframes, get_transitions
 
         project_dir = self._work_dir / project
-        if not project_dir.is_dir():
+        if not (project_dir / "project.db").exists():
             return
 
-        parsed = load_project(project_dir)
-        if parsed.get("_format") == "empty":
-            return
-
-        keyframes = parsed.get("keyframes", [])
-        kf_bin = parsed.get("bin", [])
-        tr_bin = parsed.get("transition_bin", [])
-        transitions = parsed.get("transitions", [])
-
-        import re as _re
-        all_kf_ids = [kf.get("id", "") for kf in keyframes + kf_bin]
-        max_kf = max((int(m.group(1)) for kid in all_kf_ids if (m := _re.match(r'kf_(\d+)', kid))), default=0)
-
-        all_tr_ids = [tr.get("id", "") for tr in transitions + tr_bin]
-        max_tr = max((int(m.group(1)) for tid in all_tr_ids if (m := _re.match(r'tr_(\d+)', tid))), default=0)
+        kfs = get_keyframes(project_dir, include_deleted=True)
+        trs = get_transitions(project_dir, include_deleted=True)
+        max_kf = max((int(m.group(1)) for kid in (kf.get("id", "") for kf in kfs) if (m := _re.match(r'kf_(\d+)', kid))), default=0)
+        max_tr = max((int(m.group(1)) for tid in (tr.get("id", "") for tr in trs) if (m := _re.match(r'tr_(\d+)', tid))), default=0)
 
         now = datetime.now(timezone.utc).isoformat()
         selected_kf_dir = project_dir / "selected_keyframes"
@@ -361,7 +352,7 @@ class FolderWatcher:
                 kf_id = f"kf_{max_kf:03d}"
                 dest = selected_kf_dir / f"{kf_id}.png"
                 shutil.copy2(str(f), str(dest))
-                kf_bin.append({
+                add_keyframe(project_dir, {
                     "id": kf_id,
                     "timestamp": "0:00",
                     "section": "",
@@ -370,7 +361,7 @@ class FolderWatcher:
                     "context": None,
                     "candidates": [],
                     "selected": 1,
-                    "deleted_at": now,
+                    "deleted_at": now,  # bin entry — soft-deleted means "in bin"
                 })
                 imported_kf.append(kf_id)
 
@@ -379,7 +370,7 @@ class FolderWatcher:
                 tr_id = f"tr_{max_tr:03d}"
                 dest = selected_tr_dir / f"{tr_id}_slot_0{ext}"
                 shutil.copy2(str(f), str(dest))
-                tr_bin.append({
+                add_transition(project_dir, {
                     "id": tr_id,
                     "from": "",
                     "to": "",
@@ -395,11 +386,6 @@ class FolderWatcher:
 
         if not imported_kf and not imported_tr:
             return
-
-        parsed["bin"] = kf_bin
-        parsed["transition_bin"] = tr_bin
-
-        save_project(parsed, project_dir)
 
         summary = f"{len(imported_kf)} keyframe(s), {len(imported_tr)} transition(s)"
         _log(f"Auto-imported from watched folder: {summary}")

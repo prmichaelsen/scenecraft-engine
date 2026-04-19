@@ -492,9 +492,9 @@ RESTORE_CHECKPOINT_TOOL: dict = {
     "name": "restore_checkpoint",
     "description": (
         "Replace the current project database with a checkpoint snapshot. DESTRUCTIVE — "
-        "all changes since that checkpoint will be lost. Inspect checkpoints.yaml via "
-        "sql_query on the filesystem (or ask the user to pick from the Checkpoints "
-        "panel) to find the filename first. Requires user confirmation."
+        "all changes since that checkpoint will be lost. Inspect the checkpoints "
+        "table via sql_query (or ask the user to pick from the Checkpoints panel) "
+        "to find the filename first. Requires user confirmation."
     ),
     "input_schema": {
         "type": "object",
@@ -511,8 +511,8 @@ RESTORE_CHECKPOINT_TOOL: dict = {
 LIST_CHECKPOINTS_TOOL: dict = {
     "name": "list_checkpoints",
     "description": (
-        "List all checkpoints for the current project. Reads checkpoints.yaml and "
-        "filesystem. Returns filename, name, created, and size_bytes for each entry."
+        "List all checkpoints for the current project. Returns filename, name, "
+        "created, and size_bytes for each entry."
     ),
     "input_schema": {
         "type": "object",

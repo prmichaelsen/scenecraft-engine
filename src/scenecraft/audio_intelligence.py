@@ -1631,117 +1631,6 @@ def extract_layer3_rules_chunked(
     return all_rules, all_events
 
 
-def load_sections_yaml(path: str) -> list[dict]:
-    """Load manual section groups from sections.yaml.
-
-    Returns list of {name, start, end, beat_sections, notes}.
-    """
-    import yaml
-    with open(path) as f:
-        data = yaml.safe_load(f)
-    groups = data.get("groups", [])
-
-    result = []
-    for g in groups:
-        # Parse time strings like "8:07" to seconds
-        def _parse_time(ts):
-            parts = str(ts).split(":")
-            if len(parts) == 2:
-                return int(parts[0]) * 60 + float(parts[1])
-            return float(ts)
-
-        start = _parse_time(g["start"])
-        end = _parse_time(g["end"])
-        beat_range = g.get("beat_sections", [0, 0])
-
-        result.append({
-            "name": g.get("name", ""),
-            "start_time": start,
-            "end_time": end,
-            "beat_section_start": beat_range[0] if isinstance(beat_range, list) else 0,
-            "beat_section_end": beat_range[1] if isinstance(beat_range, list) else 0,
-            "notes": g.get("notes", ""),
-        })
-
-    return result
-
-
-def extract_layer3_rules_from_sections_yaml(
-    layer1_data: dict,
-    layer2_data: list[dict],
-    sections_yaml_path: str,
-    creative_direction: str | None = None,
-    sensitivity: dict[str, float] | None = None,
-    vocal_bleed_threshold: float = 0.25,
-    bleed_exempt_stems: set[str] | None = None,
-    disabled_effects: set[str] | None = None,
-) -> tuple[list[dict], list[dict]]:
-    """Generate per-section rules using manual sections.yaml groupings.
-
-    Each group in sections.yaml gets its own Claude call with the group's
-    audio descriptions as context. No tailored energy guidance — Claude
-    reads the descriptions and decides.
-    """
-    groups = load_sections_yaml(sections_yaml_path)
-    _log(f"  Layer 3 (sections.yaml mode): {len(groups)} manual groups")
-    for g in groups:
-        _log(f"    {g['start_time']:.0f}s - {g['end_time']:.0f}s: {g['name']}")
-
-    all_rules = []
-    all_events = []
-
-    for i, group in enumerate(groups):
-        start = group["start_time"]
-        end = group["end_time"]
-        dur = end - start
-        name = group["name"]
-
-        # Gather descriptions that fall within this group's time range
-        group_descs = [
-            d for d in layer2_data
-            if d.get("start_time", 0) < end and d.get("end_time", 0) > start
-        ]
-        desc_summary = "\n\n".join(
-            f"[{d['start_time']:.0f}s-{d['end_time']:.0f}s] {d['description'][:300]}"
-            for d in group_descs[:5]
-        ) if group_descs else group.get("notes", "")
-
-        chunk_direction = f"Section: \"{name}\" ({start:.0f}s to {end:.0f}s, {dur:.0f}s)"
-        chunk_direction += f"\n\nAudio descriptions:\n{desc_summary}"
-        if creative_direction:
-            chunk_direction = f"{creative_direction}\n\n{chunk_direction}"
-
-        _log(f"  Group {i+1}/{len(groups)}: {name} ({start:.0f}s-{end:.0f}s, {dur:.0f}s)")
-
-        rules = extract_layer3_rules(
-            layer1_data, layer2_data,
-            time_offset=start,
-            time_limit=dur,
-            creative_direction=chunk_direction,
-            sensitivity=sensitivity,
-            disabled_effects=disabled_effects,
-        )
-
-        for rule in rules:
-            rule["_group_name"] = name
-            rule["_group_start"] = start
-            rule["_group_end"] = end
-
-        exempt = bleed_exempt_stems or set()
-        chunk_events = apply_rules_in_range(
-            layer1_data, rules, start, end,
-            vocal_bleed_threshold=vocal_bleed_threshold,
-        )
-        _log(f"    → {len(rules)} rules, {len(chunk_events)} events")
-
-        all_rules.extend(rules)
-        all_events.extend(chunk_events)
-
-    all_events.sort(key=lambda e: e["time"])
-    _log(f"  Total: {len(all_rules)} rules, {len(all_events)} events across {len(groups)} groups")
-    return all_rules, all_events
-
-
 # ─── Full Pipeline ──────────────────────────────────────────────────────────
 
 def run_audio_intelligence(
@@ -1853,7 +1742,6 @@ def run_audio_intelligence_multimodel(
     vocal_bleed_threshold: float = 0.25,
     fps: float = 24.0,
     stats_mode: bool = False,
-    sections_yaml: str | None = None,
 ) -> dict:
     """Run the 3-layer pipeline using multi-model stems.
 
@@ -1872,8 +1760,6 @@ def run_audio_intelligence_multimodel(
         vocal_bleed_threshold: Confidence ratio threshold.
         fps: Video frame rate.
         stats_mode: Use stats-only Claude prompt.
-        sections_yaml: Path to sections.yaml for manual chunking. If provided, generates
-            per-section rules using the manual groupings instead of one global ruleset.
     """
     _log("=== Multi-Model Audio Intelligence Pipeline ===")
 
@@ -1886,28 +1772,17 @@ def run_audio_intelligence_multimodel(
     # Layer 3: Claude rules + apply
     exempt = set(drumsep_paths.keys()) | set(melodic_paths.keys())
 
-    if sections_yaml and Path(sections_yaml).exists():
-        _log(f"  Using sections.yaml for per-section rules: {sections_yaml}")
-        rules, layer3 = extract_layer3_rules_from_sections_yaml(
-            layer1, layer2,
-            sections_yaml_path=sections_yaml,
-            creative_direction=creative_direction,
-            sensitivity=sensitivity,
-            vocal_bleed_threshold=vocal_bleed_threshold,
-            bleed_exempt_stems=exempt,
-        )
-    else:
-        duration = librosa.get_duration(path=audio_path, sr=sr)
-        rules = extract_layer3_rules(
-            layer1, layer2,
-            time_offset=0.0,
-            time_limit=duration,
-            creative_direction=creative_direction,
-            sensitivity=sensitivity,
-            stats_mode=stats_mode,
-        )
-        _log(f"  Bleed-exempt stems (from instrumental): {exempt}")
-        layer3 = apply_rules(layer1, rules, vocal_bleed_threshold=vocal_bleed_threshold, bleed_exempt_stems=exempt)
+    duration = librosa.get_duration(path=audio_path, sr=sr)
+    rules = extract_layer3_rules(
+        layer1, layer2,
+        time_offset=0.0,
+        time_limit=duration,
+        creative_direction=creative_direction,
+        sensitivity=sensitivity,
+        stats_mode=stats_mode,
+    )
+    _log(f"  Bleed-exempt stems (from instrumental): {exempt}")
+    layer3 = apply_rules(layer1, rules, vocal_bleed_threshold=vocal_bleed_threshold, bleed_exempt_stems=exempt)
 
     result = {
         "layer1_summary": {
