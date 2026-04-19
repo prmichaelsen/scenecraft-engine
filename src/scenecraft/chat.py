@@ -129,8 +129,13 @@ Keyframes: {kf_count} | Transitions: {tr_count} | Tracks: {track_count}
 Tools available:
   • sql_query — read-only SELECT against project.db (use for counts, filters, schema
     inspection, ad-hoc analysis). Default 100 rows; pass `limit` for more.
-  • update_keyframe_prompt — change a keyframe's prompt text.
-  • update_keyframe_timestamp — move a keyframe on the timeline.
+  • add_keyframe — insert a new keyframe at a timestamp with a prompt.
+  • update_keyframe — generic: update any subset of fields (prompt, timestamp, label,
+    track, section, blend_mode, opacity, …) in one undo group.
+  • update_transition — generic: update duration, action, slots, label, tags, remap,
+    blend_mode, opacity, seed, negative_prompt, flags, etc.
+  • update_keyframe_prompt / update_keyframe_timestamp — narrow variants if only
+    that one field is changing.
   • update_curve — replace a transition's color/opacity curve points.
   • update_transform_curve — replace a transition's transform X/Y/Z curve points.
   • delete_keyframe, delete_transition — soft-delete one item (asks to confirm).
@@ -372,6 +377,91 @@ GENERATE_KEYFRAME_CANDIDATES_TOOL: dict = {
     },
 }
 
+ADD_KEYFRAME_TOOL: dict = {
+    "name": "add_keyframe",
+    "description": (
+        "Insert a new keyframe on the timeline. Auto-generated ID. Wrapped in an "
+        "undo group. Returns the new keyframe_id so you can immediately assign an "
+        "image or generate candidates."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "timestamp": {"type": "string", "description": "Position on the timeline: 'm:ss', 'mm:ss.fff', or seconds as a string."},
+            "prompt": {"type": "string", "description": "Prompt text for image generation."},
+            "track_id": {"type": "string", "description": "Optional; defaults to 'track_1'."},
+            "section": {"type": "string", "description": "Optional narrative section label."},
+            "label": {"type": "string", "description": "Optional display label."},
+            "label_color": {"type": "string", "description": "Optional hex color like '#ff8800'."},
+        },
+        "required": ["timestamp", "prompt"],
+    },
+}
+
+UPDATE_KEYFRAME_TOOL: dict = {
+    "name": "update_keyframe",
+    "description": (
+        "Update any subset of a keyframe's fields in one call. Pass only the fields "
+        "you want to change. Wrapped in an undo group. For narrow cases use "
+        "update_keyframe_prompt or update_keyframe_timestamp."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "keyframe_id": {"type": "string"},
+            "timestamp": {"type": "string"},
+            "prompt": {"type": "string"},
+            "track_id": {"type": "string"},
+            "section": {"type": "string"},
+            "label": {"type": "string"},
+            "label_color": {"type": "string", "description": "Hex color like '#ff8800'."},
+            "blend_mode": {"type": "string", "description": "'normal', 'add', 'multiply', 'screen', 'overlay', etc."},
+            "opacity": {"type": "number", "minimum": 0, "maximum": 1},
+            "refinement_prompt": {"type": "string"},
+        },
+        "required": ["keyframe_id"],
+    },
+}
+
+UPDATE_TRANSITION_TOOL: dict = {
+    "name": "update_transition",
+    "description": (
+        "Update any subset of a transition's metadata fields. Does NOT handle color "
+        "or transform curves — use update_curve / update_transform_curve for those. "
+        "Wrapped in an undo group."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "transition_id": {"type": "string"},
+            "duration_seconds": {"type": "number", "minimum": 0},
+            "slots": {"type": "integer", "minimum": 1},
+            "action": {"type": "string", "description": "Motion/intent prompt, e.g. 'crossfade', 'cut', 'slow pan left'."},
+            "label": {"type": "string"},
+            "label_color": {"type": "string"},
+            "track_id": {"type": "string"},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "blend_mode": {"type": "string"},
+            "opacity": {"type": "number"},
+            "use_global_prompt": {"type": "boolean"},
+            "include_section_desc": {"type": "boolean"},
+            "hidden": {"type": "boolean"},
+            "is_adjustment": {"type": "boolean"},
+            "remap": {
+                "type": "object",
+                "description": "Playback remap config.",
+                "properties": {
+                    "method": {"type": "string", "enum": ["linear", "ease-in", "ease-out", "ease-in-out"]},
+                    "target_duration": {"type": "number"},
+                },
+            },
+            "negative_prompt": {"type": "string"},
+            "seed": {"type": "integer"},
+        },
+        "required": ["transition_id"],
+    },
+}
+
 GENERATE_TRANSITION_CANDIDATES_TOOL: dict = {
     "name": "generate_transition_candidates",
     "description": (
@@ -412,6 +502,9 @@ TOOLS: list[dict] = [
     DELETE_TRANSITION_TOOL,
     BATCH_DELETE_KEYFRAMES_TOOL,
     BATCH_DELETE_TRANSITIONS_TOOL,
+    ADD_KEYFRAME_TOOL,
+    UPDATE_KEYFRAME_TOOL,
+    UPDATE_TRANSITION_TOOL,
     GENERATE_KEYFRAME_CANDIDATES_TOOL,
     GENERATE_TRANSITION_CANDIDATES_TOOL,
 ]
@@ -812,6 +905,114 @@ def _exec_update_transform_curve(project_dir: Path, input_data: dict) -> dict:
     return {"transition_id": tr_id, "axis": axis, "point_count": len(points)}
 
 
+_UPDATE_KEYFRAME_FIELDS: tuple[str, ...] = (
+    "timestamp", "prompt", "track_id", "section", "label", "label_color",
+    "blend_mode", "opacity", "refinement_prompt",
+)
+
+_UPDATE_TRANSITION_FIELDS: tuple[str, ...] = (
+    "duration_seconds", "slots", "action", "label", "label_color", "track_id",
+    "tags", "blend_mode", "opacity", "use_global_prompt", "include_section_desc",
+    "hidden", "is_adjustment", "remap", "negative_prompt", "seed",
+)
+
+
+def _exec_add_keyframe(project_dir: Path, input_data: dict) -> dict:
+    from scenecraft.db import add_keyframe, next_keyframe_id, get_keyframe, undo_begin
+    timestamp = input_data.get("timestamp")
+    prompt = input_data.get("prompt")
+    if not timestamp or not isinstance(timestamp, str):
+        return {"error": "missing timestamp"}
+    if not isinstance(prompt, str):
+        return {"error": "prompt must be a string"}
+    track_id = input_data.get("track_id") or "track_1"
+    section = input_data.get("section") or ""
+    label = input_data.get("label") or ""
+    label_color = input_data.get("label_color") or ""
+
+    kf_id = next_keyframe_id(project_dir)
+    undo_begin(project_dir, f"Chat: add keyframe {kf_id} @ {timestamp}")
+    add_keyframe(project_dir, {
+        "id": kf_id,
+        "timestamp": timestamp,
+        "prompt": prompt,
+        "track_id": track_id,
+        "section": section,
+        "label": label,
+        "label_color": label_color,
+        "candidates": [],
+    })
+    created = get_keyframe(project_dir, kf_id) or {}
+    return {
+        "keyframe_id": kf_id,
+        "timestamp": created.get("timestamp", timestamp),
+        "prompt": created.get("prompt", prompt),
+        "track_id": created.get("track_id", track_id),
+        "section": created.get("section", section),
+        "label": created.get("label", label),
+    }
+
+
+def _exec_update_keyframe(project_dir: Path, input_data: dict) -> dict:
+    from scenecraft.db import get_keyframe, update_keyframe, undo_begin
+    kf_id = input_data.get("keyframe_id")
+    if not kf_id or not isinstance(kf_id, str):
+        return {"error": "missing keyframe_id"}
+    existing = get_keyframe(project_dir, kf_id)
+    if not existing:
+        return {"error": f"keyframe not found: {kf_id}"}
+
+    fields: dict[str, Any] = {}
+    old_values: dict[str, Any] = {}
+    for key in _UPDATE_KEYFRAME_FIELDS:
+        if key in input_data and input_data[key] is not None:
+            fields[key] = input_data[key]
+            old_values[key] = existing.get(key)
+
+    if not fields:
+        return {"error": "no updatable fields provided; see schema for allowed keys"}
+
+    undo_begin(project_dir, f"Chat: update keyframe {kf_id}")
+    update_keyframe(project_dir, kf_id, **fields)
+    return {
+        "keyframe_id": kf_id,
+        "updated_fields": sorted(fields.keys()),
+        "old_values": old_values,
+    }
+
+
+def _exec_update_transition(project_dir: Path, input_data: dict) -> dict:
+    from scenecraft.db import get_transition, update_transition, undo_begin
+    tr_id = input_data.get("transition_id")
+    if not tr_id or not isinstance(tr_id, str):
+        return {"error": "missing transition_id"}
+    existing = get_transition(project_dir, tr_id)
+    if not existing:
+        return {"error": f"transition not found: {tr_id}"}
+
+    fields: dict[str, Any] = {}
+    old_values: dict[str, Any] = {}
+    for key in _UPDATE_TRANSITION_FIELDS:
+        if key in input_data and input_data[key] is not None:
+            fields[key] = input_data[key]
+            # Map fields whose response key differs from storage key
+            if key == "negative_prompt":
+                old_values[key] = existing.get("negativePrompt")
+            else:
+                old_values[key] = existing.get(key)
+
+    if not fields:
+        return {"error": "no updatable fields provided; see schema for allowed keys"}
+
+    undo_begin(project_dir, f"Chat: update transition {tr_id}")
+    update_transition(project_dir, tr_id, **fields)
+    return {
+        "transition_id": tr_id,
+        "updated_fields": sorted(fields.keys()),
+        "old_values": old_values,
+    }
+
+
 def _exec_delete_keyframe(project_dir: Path, input_data: dict) -> dict:
     from scenecraft.db import get_keyframe, delete_keyframe, undo_begin
     kf_id = input_data.get("keyframe_id")
@@ -1010,6 +1211,15 @@ async def _execute_tool(
         return result, "error" in result
     if name == "batch_delete_transitions":
         result = _exec_batch_delete_transitions(project_dir, input_data)
+        return result, "error" in result
+    if name == "add_keyframe":
+        result = _exec_add_keyframe(project_dir, input_data)
+        return result, "error" in result
+    if name == "update_keyframe":
+        result = _exec_update_keyframe(project_dir, input_data)
+        return result, "error" in result
+    if name == "update_transition":
+        result = _exec_update_transition(project_dir, input_data)
         return result, "error" in result
     if name == "generate_keyframe_candidates":
         from scenecraft.chat_generation import start_keyframe_generation
