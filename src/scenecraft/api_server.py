@@ -309,6 +309,25 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             if m:
                 return self._json_response({"activeFile": None, "events": [], "sections": [], "rules": [], "ruleCount": 0, "onsets": {}})
 
+            # GET /api/projects/:name/render-frame?t=<seconds>[&quality=<1-100>]
+            m = re.match(r"^/api/projects/([^/]+)/render-frame$", path)
+            if m:
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None:
+                    return
+                from urllib.parse import parse_qs
+                qs = parse_qs(parsed.query)
+                try:
+                    t = float(qs.get("t", ["0"])[0])
+                except ValueError:
+                    return self._error(400, "BAD_REQUEST", "t must be a number")
+                try:
+                    quality = int(qs.get("quality", ["85"])[0])
+                except ValueError:
+                    quality = 85
+                quality = max(1, min(100, quality))
+                return self._handle_render_frame(project_dir, t, quality)
+
             # GET /api/projects/:name/descriptions
             m = re.match(r"^/api/projects/([^/]+)/descriptions$", path)
             if m:
@@ -3008,6 +3027,54 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 })
 
             self._json_response({"bin": bin_entries, "transitionBin": transition_bin})
+
+        def _handle_render_frame(self, project_dir, t: float, quality: int):
+            """GET /api/projects/:name/render-frame?t=X — render and return a single JPEG frame.
+
+            Uses the backend compositor (same code path as the final export render),
+            so the returned frame matches the final output pixel-for-pixel pre-encode.
+            """
+            try:
+                import cv2
+
+                from scenecraft.render.compositor import render_frame_at
+                from scenecraft.render.schedule import build_schedule
+            except ImportError as e:
+                return self._error(500, "INTERNAL_ERROR", f"Render dependencies not installed: {e}")
+
+            try:
+                schedule = build_schedule(project_dir)
+            except Exception as e:
+                return self._error(500, "INTERNAL_ERROR", f"build_schedule failed: {e}")
+
+            if schedule.duration_seconds <= 0 or not schedule.segments:
+                return self._error(404, "NO_CONTENT", "Project has no renderable content yet")
+
+            # Clamp t into the project's timeline
+            t = max(0.0, min(t, schedule.duration_seconds - 1.0 / schedule.fps))
+
+            try:
+                frame = render_frame_at(schedule, t, frame_cache={})
+            except Exception as e:
+                return self._error(500, "INTERNAL_ERROR", f"render_frame_at failed: {e}")
+
+            ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+            if not ok:
+                return self._error(500, "INTERNAL_ERROR", "JPEG encode failed")
+            data = bytes(buf)
+
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self._cors_headers()
+                if self._refreshed_cookie:
+                    self.send_header("Set-Cookie", self._refreshed_cookie)
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         def _handle_get_descriptions(self, project_name: str):
             """GET /api/projects/:name/descriptions — parse descriptions.md into structured sections."""
