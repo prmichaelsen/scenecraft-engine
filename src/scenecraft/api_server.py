@@ -1903,22 +1903,23 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             self._json_response({"path": subpath or "", "entries": entries})
 
         def _handle_auth_login(self, query_string: str):
-            """GET /auth/login?code=X — exchange a one-time code for an HttpOnly cookie, redirect home."""
+            """GET /auth/login?code=X[&redirect_uri=URL] — exchange code for cookie, then redirect."""
             if _sc_root is None:
                 return self._error(501, "AUTH_DISABLED", "Auth is not enabled on this server")
             from urllib.parse import parse_qs
-            code = parse_qs(query_string).get("code", [""])[0]
+            qs = parse_qs(query_string)
+            code = qs.get("code", [""])[0]
             if not code:
                 return self._error(400, "BAD_REQUEST", "Missing code")
             from scenecraft.vcs.auth import consume_login_code, build_cookie_header
             token = consume_login_code(_sc_root, code)
             if not token:
                 return self._error(401, "INVALID_CODE", "Login code is invalid, expired, or already used")
-            # Where to redirect after login — default to "/" on the same host
+            redirect_uri = qs.get("redirect_uri", ["/"])[0] or "/"
             cookie = build_cookie_header(token)
             try:
                 self.send_response(303)
-                self.send_header("Location", "/")
+                self.send_header("Location", redirect_uri)
                 self.send_header("Set-Cookie", cookie)
                 self._cors_headers()
                 self.end_headers()

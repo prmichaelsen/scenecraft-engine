@@ -441,40 +441,36 @@ def _format_destructive_summary(tool_name: str, input_dict: dict, project_dir: P
 
     if tool_name == "batch_delete_keyframes":
         ids = [s for s in (input_dict.get("keyframe_ids") or []) if isinstance(s, str)]
+        kfs = {kid: get_keyframe(project_dir, kid) for kid in ids}
+        valid_ids = [kid for kid in ids if kfs.get(kid)]
+        missing_ids = [kid for kid in ids if not kfs.get(kid)]
         items: list[str] = []
-        found = 0
-        missing: list[str] = []
-        for kid in ids[:12]:
-            kf = get_keyframe(project_dir, kid)
-            if kf:
-                items.append(_kf_line(kf))
-                found += 1
-            else:
-                missing.append(kid)
-        for m in missing[:6]:
+        for kid in valid_ids[:10]:
+            items.append(_kf_line(kfs[kid]))
+        if len(valid_ids) > 10:
+            items.append(f"… and {len(valid_ids) - 10} more")
+        for m in missing_ids[:4]:
             items.append(f"{m} (not found)")
-        if len(ids) > 12:
-            items.append(f"… and {len(ids) - 12} more")
-        msg = f"Delete {len(ids)} keyframes? ({found} valid, {len(missing)} missing)" if missing else f"Delete {len(ids)} keyframes?"
+        if len(missing_ids) > 4:
+            items.append(f"… and {len(missing_ids) - 4} more missing")
+        msg = f"Delete {len(ids)} keyframes? ({len(valid_ids)} valid, {len(missing_ids)} missing)" if missing_ids else f"Delete {len(ids)} keyframes?"
         return msg, items
 
     if tool_name == "batch_delete_transitions":
         ids = [s for s in (input_dict.get("transition_ids") or []) if isinstance(s, str)]
+        trs = {tid: get_transition(project_dir, tid) for tid in ids}
+        valid_ids = [tid for tid in ids if trs.get(tid)]
+        missing_ids = [tid for tid in ids if not trs.get(tid)]
         items = []
-        found = 0
-        missing = []
-        for tid in ids[:12]:
-            tr = get_transition(project_dir, tid)
-            if tr:
-                items.append(_tr_line(tr))
-                found += 1
-            else:
-                missing.append(tid)
-        for m in missing[:6]:
+        for tid in valid_ids[:10]:
+            items.append(_tr_line(trs[tid]))
+        if len(valid_ids) > 10:
+            items.append(f"… and {len(valid_ids) - 10} more")
+        for m in missing_ids[:4]:
             items.append(f"{m} (not found)")
-        if len(ids) > 12:
-            items.append(f"… and {len(ids) - 12} more")
-        msg = f"Delete {len(ids)} transitions? ({found} valid, {len(missing)} missing)" if missing else f"Delete {len(ids)} transitions?"
+        if len(missing_ids) > 4:
+            items.append(f"… and {len(missing_ids) - 4} more missing")
+        msg = f"Delete {len(ids)} transitions? ({len(valid_ids)} valid, {len(missing_ids)} missing)" if missing_ids else f"Delete {len(ids)} transitions?"
         return msg, items
 
     # Unreachable — caller gates on tool_name

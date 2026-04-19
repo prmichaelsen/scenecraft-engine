@@ -8,7 +8,8 @@
       "Bash(npx tsc *)",
       "Bash(/home/prmichaelsen/.acp/projects/scenecraft-engine/.venv/bin/scenecraft --help)",
       "Bash(/home/prmichaelsen/.acp/projects/scenecraft-engine/.venv/bin/scenecraft org *)",
-      "Bash(sqlite3 *)"
+      "Bash(sqlite3 *)",
+      "Bash(/home/prmichaelsen/.acp/projects/scenecraft-engine/.venv/bin/scenecraft token *)"
     ]
   }
 }

@@ -79,9 +79,10 @@ def _detect_primary_ip() -> str:
 @click.option("--expiry", default=24, type=int, help="Token expiry in hours (default: 24)")
 @click.option("--host", default=None, help="Host:port for the browser login URL (default: this machine's IP + :8890)")
 @click.option("--scheme", default="http", type=click.Choice(["http", "https"]), help="URL scheme (default: http)")
+@click.option("--redirect-uri", default=None, help="Where to redirect after login (e.g. the frontend URL)")
 @click.option("--open/--no-open", "open_browser", default=False, help="Attempt to open the URL in the local browser")
 @click.option("--raw", is_flag=True, default=False, help="Print just the JWT (no URL) — for scripts")
-def token_cmd(user: str | None, expiry: int, host: str | None, scheme: str, open_browser: bool, raw: bool):
+def token_cmd(user: str | None, expiry: int, host: str | None, scheme: str, redirect_uri: str | None, open_browser: bool, raw: bool):
     """Generate a login URL for authenticating your browser session.
 
     Default flow: generates a JWT, stores it against a one-time code, and prints
@@ -105,6 +106,9 @@ def token_cmd(user: str | None, expiry: int, host: str | None, scheme: str, open
 
     code = create_login_code(root, tok)
     url = f"{scheme}://{host}/auth/login?code={code}"
+    if redirect_uri:
+        from urllib.parse import quote
+        url += f"&redirect_uri={quote(redirect_uri, safe='')}"
     click.echo(url)
     click.echo("")
     click.echo(f"Valid for 5 minutes. Open in your browser (use SSH port-forward if {host.split(':')[0]} is remote).")
