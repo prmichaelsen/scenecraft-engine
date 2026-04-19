@@ -423,28 +423,30 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 if "?" in self.path:
                     qs = dict(p.split("=", 1) for p in self.path.split("?", 1)[1].split("&") if "=" in p)
                     limit = int(qs.get("limit", "100"))
-                tr_cand_root = project_dir / "transition_candidates"
+                # Pool model: list all generated video candidates across all trs
+                # by joining tr_candidates with pool_segments, ordered by added_at.
+                from scenecraft.db import get_db as _get_db
                 candidates = []
-                if tr_cand_root.is_dir():
-                    tr_dirs = sorted(
-                        [d for d in tr_cand_root.iterdir() if d.is_dir()],
-                        key=lambda p: p.stat().st_mtime, reverse=True
-                    )
-                    for tr_dir in tr_dirs:
-                        if len(candidates) >= limit: break
-                        tr_id = tr_dir.name
-                        for slot_dir in sorted(tr_dir.iterdir()):
-                            if not slot_dir.is_dir(): continue
-                            for f in sorted(slot_dir.glob("v*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True):
-                                if len(candidates) >= limit: break
-                                vnum = int(f.stem.replace("v", ""))
-                                candidates.append({
-                                    "transitionId": tr_id,
-                                    "slot": slot_dir.name,
-                                    "variant": vnum,
-                                    "path": f"transition_candidates/{tr_id}/{slot_dir.name}/{f.name}",
-                                    "size": f.stat().st_size,
-                                })
+                conn = _get_db(project_dir)
+                rows = conn.execute(
+                    """SELECT tc.transition_id, tc.slot, tc.added_at,
+                              ps.id, ps.pool_path, ps.byte_size, ps.duration_seconds
+                       FROM tr_candidates tc
+                       JOIN pool_segments ps ON ps.id = tc.pool_segment_id
+                       ORDER BY tc.added_at DESC
+                       LIMIT ?""",
+                    (limit,),
+                ).fetchall()
+                for row in rows:
+                    candidates.append({
+                        "transitionId": row["transition_id"],
+                        "slot": f"slot_{row['slot']}",
+                        "poolSegmentId": row["id"],
+                        "path": row["pool_path"],
+                        "size": row["byte_size"],
+                        "durationSeconds": row["duration_seconds"],
+                        "addedAt": row["added_at"],
+                    })
                 return self._json_response({"candidates": candidates})
 
             # GET /api/projects/:name/markers
@@ -1359,17 +1361,10 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     dst_sel = project_dir / "selected_transitions" / f"{target_id}_slot_0.mp4"
                     dst_sel.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(str(src_sel), str(dst_sel))
-                src_cands = project_dir / "transition_candidates" / source_id
-                if src_cands.is_dir():
-                    dst_cands = project_dir / "transition_candidates" / target_id
-                    dst_cands.mkdir(parents=True, exist_ok=True)
-                    for slot_dir in src_cands.iterdir():
-                        if slot_dir.is_dir():
-                            dst_slot = dst_cands / slot_dir.name
-                            dst_slot.mkdir(parents=True, exist_ok=True)
-                            for f in slot_dir.iterdir():
-                                if not (dst_slot / f.name).exists():
-                                    shutil.copy2(str(f), str(dst_slot / f.name))
+                # Pool model: clone junction rows (no file copies for candidates)
+                from scenecraft.db import clone_tr_candidates as _clone_tc
+                _clone_tc(project_dir, source_transition_id=source_id,
+                          target_transition_id=target_id, new_source="cross-tr-copy")
                 from scenecraft.db import get_transition, update_transition
                 src_tr = get_transition(project_dir, source_id)
                 if src_tr:
@@ -3352,25 +3347,19 @@ def make_handler(work_dir: Path, no_auth: bool = False):
 
                         # Copy selected video from old spanning transition
                         if old_tr:
+                            # Pool model: clone junction rows (no file copies).
+                            from scenecraft.db import clone_tr_candidates as _clone_tc, update_transition
+                            _clone_tc(project_dir, source_transition_id=old_tr["id"],
+                                      target_transition_id=tr1_id, new_source="cross-tr-copy")
+
+                            # Refresh selected cache from original so render paths work
                             old_sel = project_dir / "selected_transitions" / f"{old_tr['id']}_slot_0.mp4"
                             if old_sel.exists():
                                 new_sel = project_dir / "selected_transitions" / f"{tr1_id}_slot_0.mp4"
                                 new_sel.parent.mkdir(parents=True, exist_ok=True)
                                 shutil.copy2(str(old_sel), str(new_sel))
-                                from scenecraft.db import update_transition
-                                update_transition(project_dir, tr1_id, selected=[1])
-
-                            # Copy transition candidates
-                            old_cand = project_dir / "transition_candidates" / old_tr["id"]
-                            if old_cand.is_dir():
-                                new_cand = project_dir / "transition_candidates" / tr1_id
-                                new_cand.mkdir(parents=True, exist_ok=True)
-                                for slot_dir in old_cand.iterdir():
-                                    if slot_dir.is_dir():
-                                        dst_slot = new_cand / slot_dir.name
-                                        dst_slot.mkdir(parents=True, exist_ok=True)
-                                        for f in slot_dir.iterdir():
-                                            shutil.copy2(str(f), str(dst_slot / f.name))
+                                # Inherit the same pool_segment_id as the original
+                                update_transition(project_dir, tr1_id, selected=old_tr.get("selected"))
 
                             # Copy transition effects
                             from scenecraft.db import get_transition_effects, add_transition_effect
@@ -3391,25 +3380,17 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                         }
                         db_add_tr(project_dir, tr2_data)
 
-                        # Copy video + candidates to second transition too
+                        # Pool model: clone junction rows and refresh the selected cache.
                         if old_tr:
+                            from scenecraft.db import clone_tr_candidates as _clone_tc, update_transition
+                            _clone_tc(project_dir, source_transition_id=old_tr["id"],
+                                      target_transition_id=tr2_id, new_source="cross-tr-copy")
+
                             old_sel = project_dir / "selected_transitions" / f"{old_tr['id']}_slot_0.mp4"
                             if old_sel.exists():
                                 new_sel = project_dir / "selected_transitions" / f"{tr2_id}_slot_0.mp4"
                                 shutil.copy2(str(old_sel), str(new_sel))
-                                from scenecraft.db import update_transition
-                                update_transition(project_dir, tr2_id, selected=[1])
-
-                            old_cand = project_dir / "transition_candidates" / old_tr["id"]
-                            if old_cand.is_dir():
-                                new_cand = project_dir / "transition_candidates" / tr2_id
-                                new_cand.mkdir(parents=True, exist_ok=True)
-                                for slot_dir in old_cand.iterdir():
-                                    if slot_dir.is_dir():
-                                        dst_slot = new_cand / slot_dir.name
-                                        dst_slot.mkdir(parents=True, exist_ok=True)
-                                        for f in slot_dir.iterdir():
-                                            shutil.copy2(str(f), str(dst_slot / f.name))
+                                update_transition(project_dir, tr2_id, selected=old_tr.get("selected"))
 
                             from scenecraft.db import get_transition_effects, add_transition_effect
                             for fx in get_transition_effects(project_dir, old_tr["id"]):
@@ -3560,19 +3541,15 @@ def make_handler(work_dir: Path, no_auth: bool = False):
 
                     new_tr_id = next_transition_id(project_dir)
 
-                    # Copy transition video candidates
-                    src_cand = project_dir / "transition_candidates" / src_tr["id"]
-                    if src_cand.is_dir():
-                        dst_cand = project_dir / "transition_candidates" / new_tr_id
-                        dst_cand.mkdir(parents=True, exist_ok=True)
-                        for slot_dir in src_cand.iterdir():
-                            if slot_dir.is_dir():
-                                dst_slot = dst_cand / slot_dir.name
-                                dst_slot.mkdir(parents=True, exist_ok=True)
-                                for f in slot_dir.iterdir():
-                                    shutil.copy2(str(f), str(dst_slot / f.name))
+                    # Pool model: clone junction rows so the duplicate sees the
+                    # same candidates without copying any files. Both transitions
+                    # reference the same pool_segments.
+                    from scenecraft.db import clone_tr_candidates as _clone_tc
+                    _clone_tc(project_dir, source_transition_id=src_tr["id"],
+                              target_transition_id=new_tr_id, new_source="cross-tr-copy")
 
-                    # Copy selected transition video
+                    # Refresh the selected-video cache for the duplicate (still
+                    # used by render paths for fast reads).
                     src_sel = project_dir / "selected_transitions" / f"{src_tr['id']}_slot_0.mp4"
                     if src_sel.exists():
                         dst_sel = project_dir / "selected_transitions" / f"{new_tr_id}_slot_0.mp4"
@@ -3750,19 +3727,15 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                                         os.link(str(old_sel), str(new_sel))
                                     except OSError:
                                         shutil.copy2(str(old_sel), str(new_sel))
-                                    selected = 1
+                                    # Inherit the same pool_segment_id as the source
+                                    inh_tr_row = get_transition(project_dir, inherited_tr_id)
+                                    selected = inh_tr_row.get("selected") if inh_tr_row else None
                                     _log(f"[delete-kf] {kf_id}: inherited video from {inherited_tr_id}")
 
-                                # Copy candidates
-                                old_cand_dir = project_dir / "transition_candidates" / inherited_tr_id / "slot_0"
-                                if old_cand_dir.exists():
-                                    new_cand_dir = project_dir / "transition_candidates" / new_tr_id / "slot_0"
-                                    new_cand_dir.mkdir(parents=True, exist_ok=True)
-                                    for f in old_cand_dir.iterdir():
-                                        try:
-                                            os.link(str(f), str(new_cand_dir / f.name))
-                                        except OSError:
-                                            shutil.copy2(str(f), str(new_cand_dir / f.name))
+                                # Pool model: clone junction rows instead of file copies
+                                from scenecraft.db import clone_tr_candidates as _clone_tc
+                                _clone_tc(project_dir, source_transition_id=inherited_tr_id,
+                                          target_transition_id=new_tr_id, new_source="cross-tr-copy")
 
                                 # Copy transition effects
                                 from scenecraft.db import get_transition_effects, add_transition_effect
@@ -3888,17 +3861,13 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                                         os.link(str(old_sel), str(new_sel))
                                     except OSError:
                                         shutil.copy2(str(old_sel), str(new_sel))
-                                    selected = 1
+                                    # Inherit the same pool_segment_id
+                                    selected = inh_tr.get("selected")
 
-                                old_cand = project_dir / "transition_candidates" / inh_tr["id"] / "slot_0"
-                                if old_cand.exists():
-                                    new_cand = project_dir / "transition_candidates" / tr_id / "slot_0"
-                                    new_cand.mkdir(parents=True, exist_ok=True)
-                                    for f in old_cand.iterdir():
-                                        try:
-                                            os.link(str(f), str(new_cand / f.name))
-                                        except OSError:
-                                            shutil.copy2(str(f), str(new_cand / f.name))
+                                # Pool model: clone junction rows instead of file copies
+                                from scenecraft.db import clone_tr_candidates as _clone_tc
+                                _clone_tc(project_dir, source_transition_id=inh_tr["id"],
+                                          target_transition_id=tr_id, new_source="cross-tr-copy")
 
                                 for fx in get_transition_effects(project_dir, inh_tr["id"]):
                                     add_transition_effect(project_dir, tr_id, fx["type"], fx.get("params"))
@@ -4547,91 +4516,78 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 now = datetime.now(timezone.utc).isoformat()
                 db_del_tr(project_dir, tr_id, now)
 
-                # Create two new transitions
+                # Capture original selected pool_segment_id (slot 0) for both halves.
+                # Both tr1 and tr2 point at the same source file; trim_in/trim_out
+                # control what portion plays. This is a pure metadata split — no
+                # ffmpeg re-encoding, no file copying.
+                orig_selected = tr.get("selected")
+                if isinstance(orig_selected, list):
+                    orig_selected_seg_id = orig_selected[0] if orig_selected else None
+                elif isinstance(orig_selected, str):
+                    orig_selected_seg_id = orig_selected
+                else:
+                    orig_selected_seg_id = None
+
+                # Create two new transitions. Both inherit orig trim_in/out split at
+                # split_source_offset, source_video_duration, and selected variant.
                 tr1_id = next_transition_id(project_dir)
-                tr2_id = next_transition_id(project_dir)
-                # Temp: need tr1 committed before tr2 id generation works
                 db_add_tr(project_dir, {
                     "id": tr1_id, "from": tr["from"], "to": new_kf_id,
                     "duration_seconds": dur1, "slots": 1, "action": tr.get("action", ""),
-                    "use_global_prompt": tr.get("use_global_prompt", False), "selected": None,
+                    "use_global_prompt": tr.get("use_global_prompt", False),
+                    "selected": [orig_selected_seg_id] if orig_selected_seg_id else None,
                     "remap": {"method": "linear", "target_duration": dur1},
                     "track_id": tr_track,
+                    "trim_in": orig_trim_in,
+                    "trim_out": split_source_offset if split_source_offset is not None else orig_trim_out,
+                    "source_video_duration": orig_src_dur,
                 })
-                # Re-get next ID after tr1 is committed
                 tr2_id = next_transition_id(project_dir)
                 db_add_tr(project_dir, {
                     "id": tr2_id, "from": new_kf_id, "to": tr["to"],
                     "duration_seconds": dur2, "slots": 1, "action": tr.get("action", ""),
-                    "use_global_prompt": tr.get("use_global_prompt", False), "selected": None,
+                    "use_global_prompt": tr.get("use_global_prompt", False),
+                    "selected": [orig_selected_seg_id] if orig_selected_seg_id else None,
                     "remap": {"method": "linear", "target_duration": dur2},
                     "track_id": tr_track,
+                    "trim_in": split_source_offset if split_source_offset is not None else orig_trim_in,
+                    "trim_out": orig_trim_out,
+                    "source_video_duration": orig_src_dur,
                 })
 
-                _log(f"  Created {new_kf_id}, {tr1_id} ({dur1}s), {tr2_id} ({dur2}s)")
+                # Clone the junction rows so both halves see the same candidate
+                # list (and stay divergable — regenerating on one doesn't touch
+                # the other because new inserts go to their own tr_candidates rows).
+                from scenecraft.db import clone_tr_candidates as _clone_tc
+                n1 = _clone_tc(project_dir, source_transition_id=tr_id,
+                               target_transition_id=tr1_id, new_source="split-inherit")
+                n2 = _clone_tc(project_dir, source_transition_id=tr_id,
+                               target_transition_id=tr2_id, new_source="split-inherit")
+                _log(f"  Created {new_kf_id}, {tr1_id} ({dur1}s), {tr2_id} ({dur2}s); cloned {n1}/{n2} junction rows")
 
-                # If original had a selected video, extract keyframe frame synchronously
-                # then split video in background
+                # If there's a selected video, copy its cache so render paths work
+                # immediately, and extract the split-point keyframe image.
                 sel_video = project_dir / "selected_transitions" / f"{tr_id}_slot_0.mp4"
-                if sel_video.exists():
-                    # Probe duration and compute split point
-                    probe = sp.run(
-                        ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", str(sel_video)],
-                        capture_output=True, text=True,
-                    )
-                    video_dur = float(probe.stdout.strip()) if probe.stdout.strip() else (to_time - from_time)
-                    split_at = split_progress * video_dur
+                if sel_video.exists() and split_source_offset is not None:
+                    # Refresh the selected cache for both new trs
+                    sel_dir = project_dir / "selected_transitions"
+                    sel_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(sel_video), str(sel_dir / f"{tr1_id}_slot_0.mp4"))
+                    shutil.copy2(str(sel_video), str(sel_dir / f"{tr2_id}_slot_0.mp4"))
 
-                    # Extract frame at split point as new keyframe image (synchronous — fast)
+                    # Extract single frame at split_source_offset for the new kf's image.
                     sel_kf_dir = project_dir / "selected_keyframes"
                     sel_kf_dir.mkdir(parents=True, exist_ok=True)
-                    sp.run(["ffmpeg", "-y", "-ss", str(split_at), "-i", str(sel_video),
+                    sp.run(["ffmpeg", "-y", "-ss", f"{split_source_offset:.3f}", "-i", str(sel_video),
                             "-vframes", "1", "-q:v", "2",
                             str(sel_kf_dir / f"{new_kf_id}.png")], capture_output=True, timeout=10)
-                    _log(f"  Extracted keyframe frame at {split_at:.2f}s -> {new_kf_id}.png")
-                    # Add to candidates and mark as selected
-                    import time as _time
+                    _log(f"  Extracted keyframe frame at source_offset={split_source_offset:.2f}s -> {new_kf_id}.png")
                     cand_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{new_kf_id}"
                     cand_dir.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(str(sel_kf_dir / f"{new_kf_id}.png"), str(cand_dir / "v1.png"))
                     from scenecraft.db import update_keyframe as _upd_kf
                     _upd_kf(project_dir, new_kf_id, selected=1,
                             candidates=[f"keyframe_candidates/candidates/section_{new_kf_id}/v1.png"])
-
-                    def _split_video():
-                        try:
-                            # Split part 1 — re-encode for precise cut
-                            cand1_dir = project_dir / "transition_candidates" / tr1_id / "slot_0"
-                            cand1_dir.mkdir(parents=True, exist_ok=True)
-                            part1 = cand1_dir / "v1.mp4"
-                            sp.run(["ffmpeg", "-y", "-i", str(sel_video), "-t", str(split_at),
-                                    "-c:v", "libx264", "-crf", "18", "-preset", "fast",
-                                    "-c:a", "aac", "-b:a", "192k",
-                                    str(part1)], capture_output=True, timeout=60)
-                            sel1 = project_dir / "selected_transitions" / f"{tr1_id}_slot_0.mp4"
-                            shutil.copy2(str(part1), str(sel1))
-
-                            # Split part 2 — re-encode to get a clean cut (stream copy can't seek precisely)
-                            cand2_dir = project_dir / "transition_candidates" / tr2_id / "slot_0"
-                            cand2_dir.mkdir(parents=True, exist_ok=True)
-                            part2 = cand2_dir / "v1.mp4"
-                            sp.run(["ffmpeg", "-y", "-ss", str(split_at), "-i", str(sel_video),
-                                    "-c:v", "libx264", "-crf", "18", "-preset", "fast",
-                                    "-c:a", "aac", "-b:a", "192k",
-                                    str(part2)], capture_output=True, timeout=60)
-                            sel2 = project_dir / "selected_transitions" / f"{tr2_id}_slot_0.mp4"
-                            shutil.copy2(str(part2), str(sel2))
-
-                            # Update DB with selected variants
-                            from scenecraft.db import update_transition
-                            update_transition(project_dir, tr1_id, selected=1)
-                            update_transition(project_dir, tr2_id, selected=1)
-
-                            _log(f"  Video split complete: {tr1_id} + {tr2_id}")
-                        except Exception as e:
-                            _log(f"  Warning: video split failed: {e}")
-
-                    _split_video()  # synchronous — ensures files exist before response
 
                 self._json_response({
                     "success": True, "keyframeId": new_kf_id,
@@ -5073,21 +5029,22 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     client = GoogleVideoClient(vertex=True)
                     job_manager.update_progress(job_id, 0, "Extracting last frame...")
 
-                    # Extract last frame from existing video
-                    last_frame = project_dir / "transition_candidates" / tr_id / f"_extend_last_frame.png"
-                    last_frame.parent.mkdir(parents=True, exist_ok=True)
+                    # Extract last frame from existing video to a tmp file in the
+                    # pool dir (cleaned up after generation — not a persistent asset)
+                    import uuid as _uuid
+                    pool_segs = project_dir / "pool" / "segments"
+                    pool_segs.mkdir(parents=True, exist_ok=True)
+                    last_frame = pool_segs / f"_extend_last_frame_{tr_id}_{_uuid.uuid4().hex[:8]}.png"
                     _sp.run(["ffmpeg", "-y", "-sseof", "-0.1", "-i", str(video_file), "-vframes", "1", "-q:v", "2", str(last_frame)],
                             capture_output=True, timeout=10)
                     if not last_frame.exists():
                         job_manager.fail_job(job_id, "Failed to extract last frame from video")
                         return
 
-                    # Generate extension from last frame
-                    slot_dir = project_dir / "transition_candidates" / tr_id / "slot_0"
-                    slot_dir.mkdir(parents=True, exist_ok=True)
-                    existing = sorted(slot_dir.glob("v*.mp4"))
-                    next_v = len(existing) + 1
-                    output = str(slot_dir / f"v{next_v}.mp4")
+                    # Generate extension as a new pool segment
+                    seg_uuid = _uuid.uuid4().hex
+                    pool_name = f"cand_{seg_uuid}.mp4"
+                    output = str(pool_segs / pool_name)
 
                     job_manager.update_progress(job_id, 0, "Extending video with Veo...")
                     client.generate_video_from_image(
@@ -5099,17 +5056,39 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                         on_status=lambda msg: job_manager.update_progress(job_id, 0, msg),
                     )
 
-                    # Collect all candidates for result
+                    # Register in pool + link to transition as a candidate
+                    if _Path(output).exists():
+                        probe = _sp.run(
+                            ["ffprobe", "-v", "error", "-show_entries",
+                             "format=duration", "-of", "csv=p=0", output],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        dur = float(probe.stdout.strip()) if probe.returncode == 0 and probe.stdout.strip() else None
+                        byte_size = _Path(output).stat().st_size
+                        auth_user = getattr(self, "_authenticated_user", None) or "local"
+                        from scenecraft.db import get_db as _get_db, _now_iso, add_tr_candidate as _add_tc
+                        conn = _get_db(project_dir)
+                        conn.execute(
+                            """INSERT INTO pool_segments
+                               (id, pool_path, kind, created_by, original_filename, original_filepath,
+                                label, generation_params, created_at, duration_seconds, width, height, byte_size)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (seg_uuid, f"pool/segments/{pool_name}", "generated", auth_user,
+                             None, None, "",
+                             json.dumps({"provider": "google-veo", "prompt": prompt, "source": "extend"}),
+                             _now_iso(), dur, None, None, byte_size),
+                        )
+                        conn.commit()
+                        _add_tc(project_dir, transition_id=tr_id, slot=0,
+                                pool_segment_id=seg_uuid, source="generated")
+
+                    # Collect candidates via the junction table
+                    from scenecraft.db import get_tr_candidates as _db_get_tc
                     candidates = {}
-                    tr_cand_dir = project_dir / "transition_candidates" / tr_id
-                    if tr_cand_dir.exists():
-                        for sd in sorted(tr_cand_dir.iterdir()):
-                            if sd.is_dir():
-                                videos = sorted([
-                                    f"transition_candidates/{tr_id}/{sd.name}/{f.name}"
-                                    for f in sd.glob("v*.mp4")
-                                ])
-                                candidates[sd.name] = videos
+                    for si in range(1):  # slot 0 only — extend is single-slot
+                        cands = _db_get_tc(project_dir, tr_id, si)
+                        if cands:
+                            candidates[f"slot_{si}"] = [c["poolPath"] for c in cands]
 
                     job_manager.complete_job(job_id, {"transitionId": tr_id, "candidates": candidates})
                     # Clean up temp frame
