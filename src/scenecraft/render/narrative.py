@@ -1,4 +1,4 @@
-"""Narrative keyframe pipeline — YAML-driven keyframe generation and Veo transition pipeline."""
+"""Narrative keyframe pipeline — keyframe generation and Veo transition pipeline (DB-backed)."""
 
 from __future__ import annotations
 
@@ -10,8 +10,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-
-import yaml
 
 
 def _log(msg: str) -> None:
@@ -69,137 +67,37 @@ def _parse_timestamp(ts: str) -> float:
     return minutes * 60 + seconds + millis / (10 ** len(str(millis)))
 
 
-# ── YAML Loading & Validation ──────────────────────────────────────
+# ── Project data loading (DB-backed) ───────────────────────────────
 
 
-def load_narrative(yaml_path: str) -> dict:
-    """Load and validate a narrative YAML file (legacy or split format).
+def load_narrative(project_dir: str | Path) -> dict:
+    """Load project data for generation/render pipelines from project.db.
 
-    Returns the parsed dict with timestamps converted to seconds and
-    all paths resolved relative to the YAML file's parent directory.
+    Accepts either a project directory or a path to a file within it (legacy
+    callers pass yaml_path — the parent directory is used). Returns the same
+    shape historical callers expect:
+        { "meta": {...}, "keyframes": [...], "transitions": [...],
+          "_work_dir": str, "_project_dir": Path }
+
+    No YAML is read. The project's audio file is resolved via meta["audio"]
+    or a glob fallback inside the project directory.
     """
-    yaml_path = Path(yaml_path)
-    if not yaml_path.exists():
-        raise FileNotFoundError(f"Narrative YAML not found: {yaml_path}")
+    from scenecraft.db import load_project_data
 
-    # Split format: timeline.yaml exists alongside project.yaml + narrative.yaml
-    if yaml_path.name == "timeline.yaml" or (yaml_path.parent / "timeline.yaml").exists():
-        from scenecraft.project import load_project
-        data = load_project(yaml_path.parent)
-    else:
-        with open(yaml_path) as f:
-            data = yaml.safe_load(f)
-
-    # Validate top-level structure
-    for key in ("meta", "keyframes", "transitions"):
-        if key not in data:
-            raise ValueError(f"Missing required top-level key: {key}")
-
-    meta = data["meta"]
-    for key in ("title", "audio", "fps", "resolution", "candidates_per_slot", "transition_max_seconds"):
-        if key not in meta:
-            raise ValueError(f"Missing required meta key: {key}")
-
-    # Build keyframe index
-    kf_ids = set()
-    for kf in data["keyframes"]:
-        for key in ("id", "timestamp", "source", "prompt"):
-            if key not in kf:
-                raise ValueError(f"Keyframe missing required key: {key}")
-        if kf["id"] in kf_ids:
-            raise ValueError(f"Duplicate keyframe ID: {kf['id']}")
-        kf_ids.add(kf["id"])
-        # Parse timestamp to seconds
-        kf["_timestamp_seconds"] = _parse_timestamp(kf["timestamp"])
-
-    # Validate transitions (warn on orphaned references instead of failing)
-    valid_transitions = []
-    for tr in data["transitions"]:
-        for key in ("id", "from", "to", "duration_seconds", "slots"):
-            if key not in tr:
-                raise ValueError(f"Transition {tr.get('id', '?')} missing required key: {key}")
-        if tr["from"] not in kf_ids or tr["to"] not in kf_ids:
-            _log(f"  WARNING: Transition {tr['id']} references missing keyframe ({tr['from']} -> {tr['to']}), skipping")
-            continue
-        valid_transitions.append(tr)
-    data["transitions"] = valid_transitions
-
-    # Resolve paths relative to YAML parent
-    base_dir = yaml_path.parent
-    for kf in data["keyframes"]:
-        source = Path(kf["source"])
-        if not source.is_absolute():
-            kf["_source_resolved"] = str(base_dir / source)
-        else:
-            kf["_source_resolved"] = str(source)
-        # Resolve existing_keyframe if present
-        if kf.get("existing_keyframe"):
-            ekf = Path(kf["existing_keyframe"])
-            if not ekf.is_absolute():
-                kf["_existing_keyframe_resolved"] = str(base_dir / ekf)
-            else:
-                kf["_existing_keyframe_resolved"] = str(ekf)
-
-    # Resolve existing_segment paths on transitions
-    for tr in data["transitions"]:
-        if tr.get("existing_segment"):
-            segs = tr["existing_segment"]
-            if isinstance(segs, str):
-                segs = [segs]
-            resolved = []
-            for s in segs:
-                p = Path(s)
-                if not p.is_absolute():
-                    resolved.append(str(base_dir / p))
-                else:
-                    resolved.append(str(p))
-            tr["_existing_segment_resolved"] = resolved
-
-    audio = Path(meta["audio"])
-    if not audio.is_absolute():
-        meta["_audio_resolved"] = str(base_dir / audio)
-    else:
-        meta["_audio_resolved"] = str(audio)
-
-    data["_yaml_path"] = str(yaml_path)
-    data["_work_dir"] = str(yaml_path.parent)
-
-    return data
+    path = Path(project_dir)
+    if path.is_file():
+        path = path.parent
+    if not (path / "project.db").exists():
+        raise FileNotFoundError(f"No project.db in {path}")
+    return load_project_data(path)
 
 
-def save_narrative(data: dict, yaml_path: str | None = None) -> None:
-    """Write the narrative data back to YAML, stripping internal fields."""
-    # Split format: delegate to save_project
-    fmt = data.get("_format")
-    work_dir = data.get("_work_dir")
-    if fmt == "split" or (work_dir and (Path(work_dir) / "timeline.yaml").exists()):
-        from scenecraft.project import save_project
-        save_project(data, Path(work_dir))
-        return
-
-    yaml_path = yaml_path or data.get("_yaml_path")
-    if not yaml_path:
-        raise ValueError("No yaml_path provided and none stored in data")
-
-    # Deep copy and strip internal fields
-    import copy
-    out = copy.deepcopy(data)
-    for key in list(out.keys()):
-        if key.startswith("_"):
-            del out[key]
-    for kf in out.get("keyframes", []):
-        for key in list(kf.keys()):
-            if key.startswith("_"):
-                del kf[key]
-    for tr in out.get("transitions", []):
-        for key in list(tr.keys()):
-            if key.startswith("_"):
-                del tr[key]
-    if "_audio_resolved" in out.get("meta", {}):
-        del out["meta"]["_audio_resolved"]
-
-    with open(yaml_path, "w") as f:
-        yaml.dump(out, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+def save_narrative(data: dict, yaml_path: str | None = None) -> None:  # noqa: ARG001
+    """Deprecated no-op — all writes go directly to project.db via the
+    generation functions' DB helpers. Kept for backward compatibility with
+    callers inside this module; safe to remove once those are refactored.
+    """
+    return None
 
 
 def narrative_stats(data: dict) -> dict:
@@ -1329,1043 +1227,10 @@ def _blend_frames(base, overlay, mode: str = "normal", opacity: float = 1.0):
     return np.clip(result * 255, 0, 255).astype(np.uint8)
 
 
-def assemble_final(yaml_path: str, output_path: str, max_time: float | None = None, crossfade_frames: int | None = None) -> str:
-    """Time-remap selected transitions, concatenate, and mux audio.
-
-    Args:
-        max_time: Stop assembling after this timeline time (seconds). None = full track.
-        crossfade_frames: Number of frames for crossfade transitions. Default from settings.yaml or 8.
-    """
+def _mux_audio(tmp_path: str, output_path: str, audio_path: str, preview: bool) -> None:
+    """Re-encode the temp video, mux its audio track onto output_path, and delete the temp file."""
     import subprocess
 
-    # Export DB to YAML first so curve_points and other DB-only edits are included
-    yaml_dir = Path(yaml_path).parent
-    if (yaml_dir / "project.db").exists():
-        from scenecraft.db import export_to_yaml
-        export_to_yaml(yaml_dir)
-        _log("  Exported DB to YAML before assembly")
-
-    data = load_narrative(yaml_path)
-    work_dir = Path(data["_work_dir"])
-    meta = data["meta"]
-    selected_tr_dir = work_dir / "selected_transitions"
-    remapped_dir = work_dir / "remapped"
-    remapped_dir.mkdir(parents=True, exist_ok=True)
-
-    transitions = data["transitions"]
-    max_seconds = meta["transition_max_seconds"]
-
-    # Build keyframe timestamp lookup for computing timeline durations
-    kf_by_id = {kf["id"]: kf for kf in data["keyframes"]}
-
-    def _parse_ts(ts):
-        parts = str(ts).split(":")
-        if len(parts) == 2:
-            return int(parts[0]) * 60 + float(parts[1])
-        return 0.0
-
-    # Sort transitions by timeline order
-    transitions = sorted(transitions, key=lambda tr: _parse_ts(
-        kf_by_id.get(tr.get("from", ""), {}).get("timestamp", "99:99")
-    ))
-
-    # Collect clip info with timeline durations
-    clips_info = []
-    for tr in transitions:
-        n_slots = tr["slots"]
-        if n_slots == 0:
-            continue
-
-        from_kf = kf_by_id.get(tr.get("from", ""))
-        to_kf = kf_by_id.get(tr.get("to", ""))
-        if from_kf and to_kf:
-            timeline_duration = _parse_ts(to_kf["timestamp"]) - _parse_ts(from_kf["timestamp"])
-        else:
-            timeline_duration = tr["duration_seconds"]
-
-        if timeline_duration <= 0:
-            continue
-
-        selected = selected_tr_dir / f"{tr['id']}_slot_0.mp4"
-        if not selected.exists():
-            # Fallback: use from-keyframe image as a still frame
-            kf_image = work_dir / "selected_keyframes" / f"{tr.get('from', '')}.png"
-            if kf_image.exists():
-                _log(f"  {tr['id']}: no video, using keyframe image {kf_image.name}")
-                clips_info.append({
-                    "tr": tr,
-                    "selected": str(kf_image),
-                    "is_still": True,
-                    "from_ts": _parse_ts(from_kf["timestamp"]) if from_kf else 0,
-                    "to_ts": _parse_ts(to_kf["timestamp"]) if to_kf else 0,
-                    "timeline_dur": timeline_duration,
-                })
-            else:
-                _log(f"  WARNING: Missing {selected} (no keyframe fallback)")
-            continue
-
-        clips_info.append({
-            "tr": tr,
-            "selected": str(selected),
-            "is_still": False,
-            "from_ts": _parse_ts(from_kf["timestamp"]) if from_kf else 0,
-            "to_ts": _parse_ts(to_kf["timestamp"]) if to_kf else 0,
-            "timeline_dur": timeline_duration,
-        })
-
-    if not clips_info:
-        raise RuntimeError("No clips to assemble")
-
-    # Apply max_time filter
-    if max_time is not None:
-        clips_info = [ci for ci in clips_info if ci["from_ts"] < max_time]
-        # Clamp last clip's to_ts
-        if clips_info and clips_info[-1]["to_ts"] > max_time:
-            clips_info[-1]["to_ts"] = max_time
-            clips_info[-1]["timeline_dur"] = max_time - clips_info[-1]["from_ts"]
-        _log(f"  max_time={max_time:.1f}s → {len(clips_info)} clips")
-
-    n_clips = len(clips_info)
-    fps = 24.0
-    # Crossfade frames: CLI arg > settings.yaml > default 8
-    if crossfade_frames is None:
-        import yaml as _yaml
-        settings_path = work_dir / "settings.yaml"
-        if settings_path.exists():
-            with open(settings_path) as f:
-                _settings = _yaml.safe_load(f) or {}
-            crossfade_frames = _settings.get("crossfade_frames", 8)
-        else:
-            crossfade_frames = 8
-    XFADE_FRAMES = crossfade_frames
-    HALF = XFADE_FRAMES // 2
-
-    # Unified single-pass: remap + stitch + crossfade + effects in one frame loop
-    # No intermediate files — reads source clips directly, remaps inline matching frontend logic
-    import cv2
-    import numpy as np
-    import time as _time
-
-    # Load effect events if intel_path provided
-    intel_path = meta.get("_intel_path")
-    project_dir_str = str(work_dir)
-    effect_events = []
-    suppressions = []
-
-    # Try to find intel file automatically
-    if not intel_path:
-        candidates = sorted(work_dir.glob("audio_intelligence*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if candidates:
-            intel_path = str(candidates[0])
-
-    if intel_path:
-        import json as _json
-        with open(intel_path) as f:
-            intel_data = _json.load(f)
-        from scenecraft.render.effects_opencv import _apply_rules_client
-        onsets = {}
-        for stem, bands in intel_data.get("layer1", {}).items():
-            onsets[stem] = {}
-            for band, bdata in bands.items():
-                onsets[stem][band] = bdata.get("onsets", [])
-        rules = intel_data.get("layer3_rules", [])
-        layer1 = intel_data.get("layer1", {})
-        effect_events = _apply_rules_client(onsets, rules, layer1=layer1)
-        _log(f"Phase 2: Loaded {len(rules)} rules → {len(effect_events)} events")
-
-    # Load user effects and suppressions
-    if (work_dir / "project.db").exists():
-        from scenecraft.db import get_effects, get_suppressions
-        user_effects = get_effects(work_dir)
-        suppressions = get_suppressions(work_dir)
-        if user_effects:
-            for ufx in user_effects:
-                effect_events.append({
-                    "time": ufx["time"], "duration": ufx["duration"],
-                    "effect": ufx["type"], "intensity": ufx["intensity"],
-                    "sustain": 0, "stem_source": "user",
-                })
-            _log(f"  + {len(user_effects)} user effects, {len(suppressions)} suppressions")
-
-    effect_events.sort(key=lambda e: e["time"])
-
-    # Remove hard_cuts
-    effect_events = [e for e in effect_events if e.get("effect") != "hard_cut"]
-
-    def _effect_category(effect):
-        if effect in ("zoom_pulse", "zoom_bounce", "zoom"):
-            return "zoom"
-        if effect in ("shake_x", "shake_y", "shake"):
-            return "shake"
-        if effect in ("glow_swell", "glow"):
-            return "glow"
-        if effect in ("echo", "echo_pulse"):
-            return "echo"
-        if effect in ("contrast_pop",):
-            return "pulse"
-        return effect
-
-    def _is_suppressed(t, effect, is_layered=False):
-        category = _effect_category(effect)
-        for sup in suppressions:
-            if sup["from"] <= t <= sup["to"]:
-                if is_layered:
-                    layer_types = sup.get("layerEffectTypes")
-                    if not layer_types:
-                        continue
-                    if category in layer_types or effect in layer_types:
-                        return True
-                else:
-                    et = sup.get("effectTypes")
-                    if et is None:
-                        return True
-                    if category in et or effect in et:
-                        return True
-        return False
-
-    def _get_event_intensity(t, event):
-        event_time = event["time"]
-        duration = event.get("duration", 0.2)
-        sustain = event.get("sustain") or 0.0
-        intensity = event.get("intensity", 0.5)
-        dt = t - event_time
-        if dt < 0:
-            return 0.0
-        attack = min(0.04, duration * 0.2)
-        release = duration - attack
-        if sustain > 0:
-            if dt < attack:
-                return intensity * (dt / attack)
-            elif dt < attack + sustain:
-                return intensity
-            elif dt < attack + sustain + release:
-                return intensity * (1.0 - (dt - attack - sustain) / release)
-            return 0.0
-        else:
-            if dt < attack:
-                return intensity * (dt / attack)
-            elif dt < attack + release:
-                return intensity * (1.0 - (dt - attack) / release)
-            return 0.0
-
-    import math
-
-    def _apply_frame_effects(frame, t, w, h):
-        zoom_amount = 0.0
-        zoom_bounce_active = False
-        shake_x_val = 0
-        shake_y_val = 0
-        bright_alpha = 1.0
-        bright_beta = 0
-        contrast_amount = 0.0
-        glow_amount = 0.0
-
-        # Check zoom_bounce first
-        for event in effect_events:
-            et = event["time"]
-            max_dur = event.get("duration", 0.2) + (event.get("sustain") or 0.0) + 0.5
-            if et > t + 0.1:
-                break
-            if et + max_dur < t:
-                continue
-            if event["effect"] == "zoom_bounce" and _get_event_intensity(t, event) > 0.05:
-                zoom_bounce_active = True
-                break
-
-        for event in effect_events:
-            et = event["time"]
-            max_dur = event.get("duration", 0.2) + (event.get("sustain") or 0.0) + 0.5
-            if et > t + 0.1:
-                break
-            if et + max_dur < t:
-                continue
-            ei = _get_event_intensity(t, event)
-            if ei < 0.01:
-                continue
-            if _is_suppressed(et, event["effect"], event.get("is_layered", False)):
-                continue
-
-            effect = event["effect"]
-            if effect == "zoom_pulse":
-                if not zoom_bounce_active:
-                    zoom_amount = max(zoom_amount, 0.12 * ei)
-            elif effect == "zoom_bounce":
-                zoom_amount = max(zoom_amount, 0.20 * ei)
-            elif effect == "shake_x":
-                shake_x_val += int(8 * ei * math.sin(t * 47))
-            elif effect == "shake_y":
-                shake_y_val += int(5 * ei * math.cos(t * 53))
-            elif effect == "flash":
-                contrast_amount = max(contrast_amount, 0.4 * ei)
-            elif effect == "hard_cut":
-                bright_alpha = max(bright_alpha, 1.0 + 0.8 * ei)
-                bright_beta = max(bright_beta, int(50 * ei))
-            elif effect == "contrast_pop":
-                contrast_amount = max(contrast_amount, 0.4 * ei)
-            elif effect == "glow_swell":
-                glow_amount = max(glow_amount, 0.3 * ei)
-
-        if zoom_amount > 0.001:
-            zoom = 1.0 + zoom_amount
-            new_h, new_w = int(h * zoom), int(w * zoom)
-            zoomed = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            top = (new_h - h) // 2
-            left = (new_w - w) // 2
-            frame = zoomed[top:top+h, left:left+w]
-        if abs(shake_x_val) > 0 or abs(shake_y_val) > 0:
-            M = np.float32([[1, 0, shake_x_val], [0, 1, shake_y_val]])
-            frame = cv2.warpAffine(frame, M, (w, h), borderMode=cv2.BORDER_REFLECT)
-        if bright_alpha != 1.0 or bright_beta != 0:
-            frame = cv2.convertScaleAbs(frame, alpha=bright_alpha, beta=bright_beta)
-        if contrast_amount > 0.01:
-            contrast = 1.0 + contrast_amount
-            mean = np.mean(frame)
-            frame = cv2.convertScaleAbs(frame, alpha=contrast, beta=int(mean * (1 - contrast)))
-        if glow_amount > 0.01:
-            blurred = cv2.GaussianBlur(frame, (0, 0), 8)
-            frame = cv2.addWeighted(frame, 1.0 - glow_amount, blurred, glow_amount, 0)
-        return frame
-
-    # Build clip schedule with source paths (not remapped) for inline remap
-    def _evaluate_curve(curve_points, linear_progress):
-        """Match frontend evaluateCurve — linear interp between curve points."""
-        if not curve_points or len(curve_points) < 2:
-            return linear_progress
-        p = max(0.0, min(1.0, linear_progress))
-        if p <= curve_points[0][0]:
-            return curve_points[0][1]
-        if p >= curve_points[-1][0]:
-            return curve_points[-1][1]
-        lo, hi = 0, len(curve_points) - 1
-        while lo < hi - 1:
-            mid = (lo + hi) // 2
-            if curve_points[mid][0] <= p:
-                lo = mid
-            else:
-                hi = mid
-        x0, y0 = curve_points[lo]
-        x1, y1 = curve_points[hi]
-        if x1 == x0:
-            return y0
-        t_lerp = (p - x0) / (x1 - x0)
-        return y0 + t_lerp * (y1 - y0)
-
-    # Build timeline segments from track_1 transitions (DB if available, else YAML)
-    # Each segment: {from_ts, to_ts, source, is_still, remap_method, curve_points, effects}
-    # Sorted by from_ts, non-overlapping on the base track
-    segments = []
-    if (work_dir / "project.db").exists():
-        from scenecraft.db import get_transitions as db_get_trs_base, get_keyframes as db_get_kfs_base
-        db_trs = [tr for tr in db_get_trs_base(work_dir)
-                  if tr.get("track_id") == "track_1" and not tr.get("deleted_at")]
-        db_kfs = {kf["id"]: kf for kf in db_get_kfs_base(work_dir)
-                  if kf.get("track_id", "track_1") == "track_1" and not kf.get("deleted_at")}
-        for tr in db_trs:
-            from_kf = db_kfs.get(tr.get("from_id") or tr.get("from", ""))
-            to_kf = db_kfs.get(tr.get("to_id") or tr.get("to", ""))
-            if not from_kf or not to_kf:
-                continue
-            from_ts = _parse_ts(from_kf["timestamp"])
-            to_ts = _parse_ts(to_kf["timestamp"])
-            if to_ts <= from_ts:
-                continue
-            if max_time is not None and from_ts >= max_time:
-                continue
-            if max_time is not None and to_ts > max_time:
-                to_ts = max_time
-
-            tr_id = tr["id"]
-            selected = selected_tr_dir / f"{tr_id}_slot_0.mp4"
-            remap = {}
-            if tr.get("remap"):
-                remap = tr["remap"] if isinstance(tr["remap"], dict) else {}
-
-            # Get per-transition effects
-            try:
-                from scenecraft.db import get_transition_effects
-                tr_effects = get_transition_effects(work_dir, tr_id)
-            except Exception:
-                tr_effects = []
-
-            opacity_curve = tr.get("opacity_curve")
-            if isinstance(opacity_curve, str):
-                import json as _json2
-                try:
-                    opacity_curve = _json2.loads(opacity_curve)
-                except Exception:
-                    opacity_curve = None
-
-            # Color grading curves
-            def _parse_curve(val):
-                if isinstance(val, str):
-                    try:
-                        return _json2.loads(val)
-                    except Exception:
-                        return None
-                return val
-
-            color_grading = {
-                "red_curve": _parse_curve(tr.get("red_curve")),
-                "green_curve": _parse_curve(tr.get("green_curve")),
-                "blue_curve": _parse_curve(tr.get("blue_curve")),
-                "black_curve": _parse_curve(tr.get("black_curve")),
-                "saturation_curve": _parse_curve(tr.get("saturation_curve")),
-                "hue_shift_curve": _parse_curve(tr.get("hue_shift_curve")),
-                "invert_curve": _parse_curve(tr.get("invert_curve")),
-                "brightness_curve": _parse_curve(tr.get("brightness_curve")),
-                "contrast_curve": _parse_curve(tr.get("contrast_curve")),
-                "exposure_curve": _parse_curve(tr.get("exposure_curve")),
-            }
-            has_grading = any(color_grading.values())
-
-            transform_data = {
-                "transform_x": tr.get("transform_x"),
-                "transform_y": tr.get("transform_y"),
-                "transform_x_curve": _parse_curve(tr.get("transform_x_curve")),
-                "transform_y_curve": _parse_curve(tr.get("transform_y_curve")),
-                "transform_z_curve": _parse_curve(tr.get("transform_z_curve")),
-                "anchor_x": tr.get("anchor_x"),
-                "anchor_y": tr.get("anchor_y"),
-                "is_adjustment": tr.get("is_adjustment", False),
-            }
-            has_transform = any(transform_data.get(k) for k in ("transform_x", "transform_y", "transform_x_curve", "transform_y_curve", "transform_z_curve"))
-
-            if selected.exists():
-                segments.append({
-                    "from_ts": from_ts, "to_ts": to_ts,
-                    "source": str(selected), "is_still": False,
-                    "remap_method": remap.get("method", "linear"),
-                    "curve_points": remap.get("curve_points"),
-                    "effects": tr_effects,
-                    "opacity_curve": opacity_curve,
-                    **({k: v for k, v in color_grading.items() if v} if has_grading else {}),
-                    **(transform_data if has_transform else {}),
-                })
-            else:
-                kf_image = work_dir / "selected_keyframes" / f"{tr.get('from_id') or tr.get('from', '')}.png"
-                if kf_image.exists():
-                    segments.append({
-                        "from_ts": from_ts, "to_ts": to_ts,
-                        "source": str(kf_image), "is_still": True,
-                        "remap_method": "linear", "curve_points": None,
-                        "effects": tr_effects,
-                        "opacity_curve": opacity_curve,
-                        **({k: v for k, v in color_grading.items() if v} if has_grading else {}),
-                        **(transform_data if has_transform else {}),
-                    })
-    else:
-        # Fallback to YAML-based clips_info
-        for ci in clips_info:
-            remap = ci["tr"].get("remap", {})
-            segments.append({
-                "from_ts": ci["from_ts"], "to_ts": ci["to_ts"],
-                "source": ci["selected"], "is_still": ci.get("is_still", False),
-                "remap_method": remap.get("method", "linear"),
-                "curve_points": remap.get("curve_points"),
-                "effects": [],
-            })
-
-    # Sort by from_ts and deduplicate overlaps (keep longest)
-    segments.sort(key=lambda s: (s["from_ts"], -(s["to_ts"] - s["from_ts"])))
-    deduped = []
-    for seg in segments:
-        if deduped and seg["from_ts"] < deduped[-1]["to_ts"]:
-            # Overlap — keep the one that's already there (it's longer due to sort)
-            continue
-        deduped.append(seg)
-    segments = deduped
-    _log(f"  {len(segments)} base track segments (deduped from DB)")
-
-    # Pre-load source frames for each segment
-    # Determine output resolution from first video segment
-    w, h = 1920, 1080
-    for seg in segments:
-        if not seg["is_still"]:
-            cap0 = cv2.VideoCapture(seg["source"])
-            w = int(cap0.get(cv2.CAP_PROP_FRAME_WIDTH))
-            h = int(cap0.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            cap0.release()
-            break
-
-    # Load overlay tracks from DB for multi-track compositing
-    overlay_tracks = []
-    if (work_dir / "project.db").exists():
-        from scenecraft.db import get_tracks, get_keyframes as db_get_kfs, get_transitions as db_get_trs
-        tracks = get_tracks(work_dir)
-        # Sort by zOrder ascending — track_1 (zOrder 0) is base, higher zOrder overlays on top
-        tracks.sort(key=lambda t: t.get("z_order", 0))
-        all_db_kfs = db_get_kfs(work_dir)
-        all_db_trs = db_get_trs(work_dir)
-
-        for track in tracks[1:]:  # skip first track (base, already handled by clip_schedule)
-            if not track.get("enabled", True):
-                continue
-            tid = track["id"]
-            blend_mode = track.get("blend_mode", "normal")
-            opacity = track.get("base_opacity", 1.0)
-            tkfs = sorted(
-                [kf for kf in all_db_kfs if kf.get("track_id") == tid and not kf.get("deleted_at")],
-                key=lambda k: _parse_ts(k["timestamp"])
-            )
-            ttrs = [tr for tr in all_db_trs if tr.get("track_id") == tid and not tr.get("deleted_at")]
-
-            # Pre-load overlay clips: for each transition, load video frames; for keyframes, load still
-            overlay_clips = []
-            for tr in ttrs:
-                if tr.get("hidden"):
-                    continue
-                from_kf = next((k for k in tkfs if k["id"] == tr["from"]), None)
-                to_kf = next((k for k in tkfs if k["id"] == tr["to"]), None)
-                if not from_kf or not to_kf:
-                    continue
-                ft = _parse_ts(from_kf["timestamp"])
-                tt = _parse_ts(to_kf["timestamp"])
-                sel = tr.get("selected")
-                video_path = work_dir / "selected_transitions" / f"{tr['id']}_slot_0.mp4"
-                tr_opacity = tr.get("opacity")
-                tr_opacity_curve = tr.get("opacity_curve")
-                tr_blend = tr.get("blend_mode") or blend_mode
-                from scenecraft.db import get_transition_effects
-                tr_effects = get_transition_effects(work_dir, tr["id"])
-                clip_data = {
-                    "from_ts": ft, "to_ts": tt, "opacity": tr_opacity, "opacity_curve": tr_opacity_curve, "blend_mode": tr_blend, "effects": tr_effects,
-                    "red_curve": tr.get("red_curve"), "green_curve": tr.get("green_curve"), "blue_curve": tr.get("blue_curve"),
-                    "black_curve": tr.get("black_curve"), "saturation_curve": tr.get("saturation_curve"),
-                    "hue_shift_curve": tr.get("hue_shift_curve"), "invert_curve": tr.get("invert_curve"),
-                    "brightness_curve": tr.get("brightness_curve"), "contrast_curve": tr.get("contrast_curve"), "exposure_curve": tr.get("exposure_curve"),
-                    "is_adjustment": tr.get("is_adjustment", False),
-                    "mask_center_x": tr.get("mask_center_x"), "mask_center_y": tr.get("mask_center_y"),
-                    "mask_radius": tr.get("mask_radius"), "mask_feather": tr.get("mask_feather"),
-                    "transform_x": tr.get("transform_x"), "transform_y": tr.get("transform_y"),
-                    "transform_x_curve": tr.get("transform_x_curve"), "transform_y_curve": tr.get("transform_y_curve"), "transform_z_curve": tr.get("transform_z_curve"),
-                    "remap_method": tr.get("remap", {}).get("method", "linear") if isinstance(tr.get("remap"), dict) else "linear",
-                    "curve_points": tr.get("remap", {}).get("curve_points") if isinstance(tr.get("remap"), dict) else None,
-                }
-                if sel and sel not in (0, "null") and video_path.exists():
-                    clip_data.update({"video": str(video_path), "still": None})
-                    overlay_clips.append(clip_data)
-                else:
-                    kf_img = work_dir / "selected_keyframes" / f"{tr['from']}.png"
-                    if kf_img.exists():
-                        clip_data.update({"video": None, "still": str(kf_img)})
-                        overlay_clips.append(clip_data)
-
-            # Also add keyframes that have no outgoing transition (hold stills)
-            tr_from_ids = {tr["from"] for tr in ttrs}
-            for kf in tkfs:
-                if kf["id"] not in tr_from_ids:
-                    kf_img = work_dir / "selected_keyframes" / f"{kf['id']}.png"
-                    if kf_img.exists():
-                        kft = _parse_ts(kf["timestamp"])
-                        # Hold until next keyframe or end
-                        next_kf = next((k for k in tkfs if _parse_ts(k["timestamp"]) > kft), None)
-                        end_t = _parse_ts(next_kf["timestamp"]) if next_kf else kft + 1.0
-                        overlay_clips.append({"from_ts": kft, "to_ts": end_t, "video": None, "still": str(kf_img)})
-
-            if overlay_clips:
-                overlay_tracks.append({"blend_mode": blend_mode, "opacity": opacity, "clips": overlay_clips})
-                _log(f"  Overlay track {tid}: {len(overlay_clips)} clips, blend={blend_mode}, opacity={opacity}")
-
-    def _apply_color_grading(frame, clip, progress):
-        """Apply per-clip color curves (red, green, blue, black, saturation, hue_shift, invert) to a frame."""
-        import numpy as np
-        f = frame.astype(np.float32) / 255.0
-
-        # RGB channel multipliers
-        for ch, curve_key in enumerate(("blue_curve", "green_curve", "red_curve")):  # OpenCV is BGR
-            curve = clip.get(curve_key)
-            if curve:
-                f[:, :, ch] *= _evaluate_curve(curve, progress)
-
-        # Black fade
-        black_curve = clip.get("black_curve")
-        if black_curve:
-            f *= (1.0 - _evaluate_curve(black_curve, progress))
-
-        # Saturation
-        sat_curve = clip.get("saturation_curve")
-        if sat_curve:
-            sat = _evaluate_curve(sat_curve, progress)
-            if abs(sat - 1.0) > 0.001:
-                gray = np.mean(f, axis=2, keepdims=True)
-                f = gray + sat * (f - gray)
-
-        # Hue shift
-        hue_curve = clip.get("hue_shift_curve")
-        if hue_curve:
-            shift = _evaluate_curve(hue_curve, progress)
-            if shift > 0.001:
-                hsv = cv2.cvtColor(np.clip(f, 0, 1).astype(np.float32), cv2.COLOR_BGR2HSV)
-                hsv[:, :, 0] = (hsv[:, :, 0] / 360.0 + shift) % 1.0 * 360.0
-                f = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-
-        # Invert (from curve or effect)
-        inv = 0.0
-        inv_curve = clip.get("invert_curve")
-        if inv_curve:
-            inv = _evaluate_curve(inv_curve, progress)
-        if clip.get("_effect_invert"):
-            inv = max(inv, clip["_effect_invert"])
-        if inv > 0.001:
-            f = f * (1.0 - inv) + (1.0 - f) * inv
-
-        # Brightness (offset)
-        bright_curve = clip.get("brightness_curve")
-        if bright_curve:
-            bright = _evaluate_curve(bright_curve, progress)
-            if abs(bright) > 0.001:
-                f += bright
-
-        # Contrast (scale around 0.5)
-        con_curve = clip.get("contrast_curve")
-        if con_curve:
-            con = _evaluate_curve(con_curve, progress)
-            if abs(con - 1.0) > 0.001:
-                f = (f - 0.5) * con + 0.5
-
-        # Exposure (2^stops)
-        exp_curve = clip.get("exposure_curve")
-        if exp_curve:
-            exp_val = _evaluate_curve(exp_curve, progress)
-            if abs(exp_val) > 0.001:
-                f *= (2.0 ** exp_val)
-
-        return np.clip(f * 255, 0, 255).astype(np.uint8)
-
-    def _read_overlay_frame(oclip, progress, ow, oh):
-        """Read a frame from an overlay clip at the given progress (0-1), with remap support."""
-        # Apply time remap (curve or linear)
-        p = progress
-        if oclip.get("remap_method") == "curve" and oclip.get("curve_points"):
-            p = _evaluate_curve(oclip["curve_points"], p)
-
-        frame = None
-        if oclip.get("video"):
-            if "_cap" not in oclip:
-                oclip["_cap"] = cv2.VideoCapture(oclip["video"])
-                oclip["_nframes"] = int(oclip["_cap"].get(cv2.CAP_PROP_FRAME_COUNT))
-            cap = oclip["_cap"]
-            n = oclip["_nframes"]
-            if n > 0:
-                idx = min(int(p * n), n - 1)
-                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                ret, f = cap.read()
-                if ret:
-                    frame = cv2.resize(f, (ow, oh), interpolation=cv2.INTER_LINEAR)
-        elif oclip.get("still"):
-            if "_img" not in oclip:
-                oclip["_img"] = cv2.imread(oclip["still"])
-                if oclip["_img"] is not None:
-                    oclip["_img"] = cv2.resize(oclip["_img"], (ow, oh), interpolation=cv2.INTER_LINEAR)
-            frame = oclip["_img"]
-        return frame
-
-    # Transform + mask helpers (defined once, used by overlay compositor)
-    def _apply_transform(img, clip_data, progress=0):
-        import numpy as np
-        tx_curve = clip_data.get("transform_x_curve")
-        ty_curve = clip_data.get("transform_y_curve")
-        tz_curve = clip_data.get("transform_z_curve")
-        tx = _evaluate_curve(tx_curve, progress) if tx_curve else (clip_data.get("transform_x") or 0)
-        ty = _evaluate_curve(ty_curve, progress) if ty_curve else (clip_data.get("transform_y") or 0)
-        scale = _evaluate_curve(tz_curve, progress) if tz_curve else 1.0
-        anchor_x = clip_data.get("anchor_x") or 0.5
-        anchor_y = clip_data.get("anchor_y") or 0.5
-        h, w = img.shape[:2]
-        if abs(scale - 1.0) > 0.001:
-            # Scale centered on anchor point
-            ax, ay = int(anchor_x * w), int(anchor_y * h)
-            new_w, new_h = int(w * scale), int(h * scale)
-            if new_w > 0 and new_h > 0:
-                scaled = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-                # Offset so anchor stays in place
-                x0 = int(anchor_x * new_w) - ax
-                y0 = int(anchor_y * new_h) - ay
-                if scale > 1.0:
-                    img = scaled[y0:y0+h, x0:x0+w]
-                else:
-                    result = np.zeros_like(img)
-                    paste_x = max(0, -x0)
-                    paste_y = max(0, -y0)
-                    src_x = max(0, x0)
-                    src_y = max(0, y0)
-                    copy_w = min(new_w - src_x, w - paste_x)
-                    copy_h = min(new_h - src_y, h - paste_y)
-                    if copy_w > 0 and copy_h > 0:
-                        result[paste_y:paste_y+copy_h, paste_x:paste_x+copy_w] = scaled[src_y:src_y+copy_h, src_x:src_x+copy_w]
-                    img = result
-        is_adjustment = clip_data.get("is_adjustment", False)
-        if tx or ty:
-            dx = int(tx * w)
-            dy = int((-ty if not is_adjustment else ty) * h)
-            M = np.float32([[1, 0, dx], [0, 1, dy]])
-            img = cv2.warpAffine(img, M, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
-        return img
-
-    def _apply_radial_mask(img, clip_data):
-        mask_r = clip_data.get("mask_radius")
-        if mask_r is not None and mask_r < 1.0:
-            import numpy as np
-            h, w = img.shape[:2]
-            cx = clip_data.get("mask_center_x", 0.5) * w
-            cy = clip_data.get("mask_center_y", 0.5) * h
-            feather = clip_data.get("mask_feather", 0.0)
-            diag = (w**2 + h**2) ** 0.5
-            Y, X = np.ogrid[:h, :w]
-            dist = np.sqrt((X - cx)**2 + (Y - cy)**2) / diag
-            inner = mask_r * (1.0 - feather)
-            mask = np.clip(1.0 - (dist - inner) / max(mask_r - inner, 0.001), 0, 1).astype(np.float32)
-            mask = mask[:, :, np.newaxis]
-            img = (img.astype(np.float32) * mask).astype(np.uint8)
-        return img
-
-    def _process_overlay_clip(oclip, t, progress, ow, oh):
-        """Read + fully process an overlay clip frame: source read → color grading → transform → mask.
-        Returns (frame, opacity, blend_mode) or (None, ...) if no frame."""
-        frame = _read_overlay_frame(oclip, progress, ow, oh)
-        if frame is None:
-            return None, 0, "normal"
-
-        # Clip opacity
-        opacity = 1.0
-        if oclip.get("opacity_curve"):
-            opacity = _evaluate_curve(oclip["opacity_curve"], progress)
-        elif oclip.get("opacity") is not None:
-            opacity = oclip["opacity"]
-
-        blend = oclip.get("blend_mode") or "normal"
-
-        # Effects (strobe, invert)
-        clip_invert = 0.0
-        for efx in oclip.get("effects", []):
-            if not efx.get("enabled", True):
-                continue
-            if efx["type"] == "strobe":
-                period = efx["params"].get("period", 1.0 / efx["params"].get("frequency", 8))
-                duty = efx["params"].get("duty", 0.5)
-                elapsed = t - oclip["from_ts"]
-                if (elapsed / period) % 1 > duty:
-                    opacity = 0
-            elif efx["type"] == "invert":
-                clip_invert = efx["params"].get("amount", 1.0)
-        if clip_invert > 0 and not oclip.get("invert_curve"):
-            oclip["_effect_invert"] = clip_invert
-
-        # Color grading
-        has_curves = any(oclip.get(k) for k in ("red_curve", "green_curve", "blue_curve", "black_curve", "saturation_curve", "hue_shift_curve", "invert_curve", "brightness_curve", "contrast_curve", "exposure_curve"))
-        if has_curves:
-            frame = _apply_color_grading(frame, oclip, progress)
-
-        frame = _apply_transform(frame, oclip, progress)
-        frame = _apply_radial_mask(frame, oclip)
-        return frame, opacity, blend
-
-    # Sort overlay clips by from_ts for crossfade boundary detection
-    for otrack in overlay_tracks:
-        otrack["clips"].sort(key=lambda c: c["from_ts"])
-
-    # Per-track state for crossfade: last processed frame + clip index
-    _overlay_prev = {}  # track_idx -> {"clip_idx": int, "frame": ndarray}
-
-    def _composite_overlays(base_frame, t, ow, oh):
-        """Composite overlay tracks onto base frame at timeline time t, with crossfade at clip boundaries."""
-        result = base_frame
-        for ti, otrack in enumerate(overlay_tracks):
-            track_opacity = otrack["opacity"]
-            track_blend = otrack["blend_mode"]
-            clips = otrack["clips"]
-
-            # Find active clip
-            active_idx = -1
-            matched_clip = None
-            raw_progress = 0.0
-            progress = 0.0
-            for ci, oclip in enumerate(clips):
-                if oclip["from_ts"] <= t < oclip["to_ts"]:
-                    active_idx = ci
-                    matched_clip = oclip
-                    clip_dur = oclip["to_ts"] - oclip["from_ts"]
-                    raw_progress = (t - oclip["from_ts"]) / clip_dur if clip_dur > 0 else 0
-
-                    # Progress extension for crossfade zones (same as base track)
-                    seg_frames = round(clip_dur * fps)
-                    eff_xfade_ov = min(XFADE_FRAMES, max(2, seg_frames // 4))
-                    eff_half_xfade_ov = (eff_xfade_ov / 2) / fps
-                    ext = min(eff_half_xfade_ov / clip_dur, 0.2) if clip_dur > 0 else 0
-                    progress = ext + raw_progress * (1.0 - 2 * ext)
-                    progress = max(0.0, min(0.999, progress))
-                    break
-
-            if matched_clip is None:
-                _overlay_prev.pop(ti, None)
-                continue
-
-            if matched_clip.get("is_adjustment"):
-                result = _apply_color_grading(result, matched_clip, raw_progress)
-                result = _apply_radial_mask(result, matched_clip)
-                continue
-
-            # Process current clip frame (using extended progress)
-            frame, effect_opacity, effect_blend = _process_overlay_clip(matched_clip, t, progress, ow, oh)
-            if frame is None:
-                continue
-
-            # Resolve final opacity: effect opacity (includes strobe) * track default
-            clip_blend = effect_blend if matched_clip.get("blend_mode") else track_blend
-            clip_opacity = effect_opacity
-            if clip_opacity >= 1.0 and matched_clip.get("opacity") is None and not matched_clip.get("opacity_curve"):
-                clip_opacity = track_opacity
-
-            # Crossfade at clip boundaries
-            prev_state = _overlay_prev.get(ti)
-            clip_dur = matched_clip["to_ts"] - matched_clip["from_ts"]
-            seg_frames = round(clip_dur * fps)
-            eff_xfade = min(XFADE_FRAMES, max(2, seg_frames // 4))
-            eff_half_xfade_s = (eff_xfade / 2) / fps
-
-            # Start of clip: blend with previous clip's frame at time t
-            if active_idx > 0 and (t - matched_clip["from_ts"]) < eff_half_xfade_s:
-                prev_clip = clips[active_idx - 1]
-                if abs(prev_clip["to_ts"] - matched_clip["from_ts"]) < 0.1:
-                    prev_dur = prev_clip["to_ts"] - prev_clip["from_ts"]
-                    prev_raw = (t - prev_clip["from_ts"]) / prev_dur if prev_dur > 0 else 0
-                    prev_seg_frames = round(prev_dur * fps)
-                    prev_eff_xfade = min(XFADE_FRAMES, max(2, prev_seg_frames // 4))
-                    prev_eff_half = (prev_eff_xfade / 2) / fps
-                    prev_ext = min(prev_eff_half / prev_dur, 0.2) if prev_dur > 0 else 0
-                    prev_progress = prev_ext + min(prev_raw, 1.0) * (1.0 - 2 * prev_ext)
-                    prev_progress = max(0.0, min(0.999, prev_progress))
-                    prev_frame, _, _ = _process_overlay_clip(prev_clip, t, prev_progress, ow, oh)
-                    if prev_frame is not None:
-                        blend_t = (t - matched_clip["from_ts"]) / eff_half_xfade_s
-                        alpha = 0.5 + blend_t * 0.5
-                        frame = cv2.addWeighted(prev_frame, 1.0 - alpha, frame, alpha, 0)
-
-            # End of clip: read next clip's frame at time t and start blending
-            if active_idx < len(clips) - 1 and (matched_clip["to_ts"] - t) < eff_half_xfade_s:
-                next_clip = clips[active_idx + 1]
-                if abs(next_clip["from_ts"] - matched_clip["to_ts"]) < 0.1:
-                    # Compute next clip's progress at time t with extension (matching base track)
-                    next_dur = next_clip["to_ts"] - next_clip["from_ts"]
-                    next_raw = (t - next_clip["from_ts"]) / next_dur if next_dur > 0 else 0
-                    next_seg_frames = round(next_dur * fps)
-                    next_eff_xfade = min(XFADE_FRAMES, max(2, next_seg_frames // 4))
-                    next_eff_half = (next_eff_xfade / 2) / fps
-                    next_ext = min(next_eff_half / next_dur, 0.2) if next_dur > 0 else 0
-                    next_progress = next_ext + max(0, next_raw) * (1.0 - 2 * next_ext)
-                    next_progress = max(0.0, min(0.999, next_progress))
-                    next_frame, _, _ = _process_overlay_clip(next_clip, t, next_progress, ow, oh)
-                    if next_frame is not None:
-                        blend_t = (matched_clip["to_ts"] - t) / eff_half_xfade_s
-                        alpha = 0.5 + blend_t * 0.5
-                        frame = cv2.addWeighted(frame, alpha, next_frame, 1.0 - alpha, 0)
-
-            # Store for next frame's crossfade
-            _overlay_prev[ti] = {"clip_idx": active_idx, "frame": frame.copy()}
-
-            result = _blend_frames(result, frame, clip_blend, clip_opacity)
-
-            # Release handles for passed clips
-            for oclip in clips:
-                if oclip["to_ts"] < t - 1.0 and "_cap" in oclip:
-                    oclip["_cap"].release()
-                    del oclip["_cap"]
-                if oclip["to_ts"] < t - 1.0 and "_img" in oclip:
-                    del oclip["_img"]
-        return result
-
-    preview = output_path.endswith("_preview.mp4")
-    if preview:
-        w, h = w // 2, h // 2
-
-    # Lazy-load segment source frames — only load when needed, cache current segment
-    for seg in segments:
-        if seg["is_still"]:
-            img = cv2.imread(seg["source"])
-            if img is not None:
-                img = cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)
-            seg["_frames"] = [img] if img is not None else []
-            seg["_n"] = len(seg["_frames"])
-        else:
-            # Get frame count without loading frames
-            cap = cv2.VideoCapture(seg["source"])
-            seg["_n"] = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            cap.release()
-            seg["_frames"] = None  # loaded on demand
-            seg["_loaded"] = False
-
-    _loaded_segs = set()  # track which segments are loaded
-
-    def _ensure_loaded(seg_idx):
-        """Load segment frames into memory, evicting old segments (keep max 3 for crossfade)."""
-        seg = segments[seg_idx]
-        if seg.get("_loaded") or seg["is_still"]:
-            return
-        # Evict segments far from current (keep neighbors for crossfade)
-        keep = {seg_idx, seg_idx - 1, seg_idx + 1}
-        for old_idx in list(_loaded_segs):
-            if old_idx not in keep and 0 <= old_idx < len(segments):
-                old = segments[old_idx]
-                if not old["is_still"]:
-                    old["_frames"] = None
-                    old["_loaded"] = False
-                    _loaded_segs.discard(old_idx)
-        # Load this segment
-        cap = cv2.VideoCapture(seg["source"])
-        frames = []
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            fh, fw = frame.shape[:2]
-            if fw != w or fh != h:
-                frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA if preview else cv2.INTER_LINEAR)
-            elif preview:
-                frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
-            frames.append(frame)
-        cap.release()
-        seg["_frames"] = frames
-        seg["_n"] = len(frames)
-        seg["_loaded"] = True
-        _loaded_segs.add(seg_idx)
-
-    # Compute total output duration and frames
-    end_time = segments[-1]["to_ts"] if segments else 0
-    total_output_frames = round(end_time * fps)
-    _log(f"Phase 2: Per-frame render — {total_output_frames} frames ({end_time:.2f}s), {w}x{h} @ {fps}fps")
-    _log(f"  {len(segments)} segments, {XFADE_FRAMES}-frame crossfade, {len(effect_events)} effect events")
-
-    tmp_path = output_path + ".tmp.mp4"
-    out = cv2.VideoWriter(tmp_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-
-    start_time = _time.time()
-    xfade_dur = XFADE_FRAMES / fps
-    half_xfade = xfade_dur / 2
-
-    # Binary search helper
-    def _find_segment(t):
-        """Find segment index active at time t."""
-        lo, hi = 0, len(segments) - 1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if segments[mid]["to_ts"] <= t:
-                lo = mid + 1
-            elif segments[mid]["from_ts"] > t:
-                hi = mid - 1
-            else:
-                return mid
-        return -1
-
-    def _get_frame_at(seg_idx, progress):
-        """Get source frame from segment at given progress (0-1), with remap."""
-        seg = segments[seg_idx]
-        _ensure_loaded(seg_idx)
-        use_curve = seg["remap_method"] == "curve" and seg.get("curve_points")
-        p = progress
-        if use_curve:
-            p = _evaluate_curve(seg["curve_points"], p)
-        n = seg["_n"]
-        if n == 0:
-            return np.zeros((h, w, 3), dtype=np.uint8)
-        idx = min(int(p * n), n - 1)
-        return seg["_frames"][idx]
-
-    black_frame = np.zeros((h, w, 3), dtype=np.uint8)
-
-    for frame_num in range(total_output_frames):
-        t = frame_num / fps
-        seg_idx = _find_segment(t)
-
-        if seg_idx < 0:
-            # No segment covers this time — black frame
-            frame = black_frame.copy()
-        else:
-            seg = segments[seg_idx]
-            seg_dur = seg["to_ts"] - seg["from_ts"]
-
-            # Adaptive crossfade: scale down for short segments (max 25% of segment)
-            seg_frames = round(seg_dur * fps)
-            eff_xfade = min(XFADE_FRAMES, max(2, seg_frames // 4))
-            eff_half_xfade = (eff_xfade / 2) / fps
-
-            # Expand progress range to include crossfade extensions
-            ext = min(eff_half_xfade / seg_dur, 0.2) if seg_dur > 0 else 0
-            raw_progress = (t - seg["from_ts"]) / seg_dur if seg_dur > 0 else 0
-            progress = ext + raw_progress * (1.0 - 2 * ext)
-            progress = max(0.0, min(0.999, progress))
-            frame = _get_frame_at(seg_idx, progress)
-
-            # Crossfade at segment boundaries
-            if seg_idx > 0 and (t - seg["from_ts"]) < eff_half_xfade:
-                prev_seg = segments[seg_idx - 1]
-                if prev_seg["to_ts"] == seg["from_ts"] and prev_seg["_n"] > 0:
-                    blend_t = (t - seg["from_ts"]) / eff_half_xfade
-                    alpha = 0.5 + blend_t * 0.5
-                    prev_dur = prev_seg["to_ts"] - prev_seg["from_ts"]
-                    prev_ext = min(eff_half_xfade / prev_dur, 0.2) if prev_dur > 0 else 0
-                    prev_raw = (t - prev_seg["from_ts"]) / prev_dur if prev_dur > 0 else 0
-                    prev_progress = prev_ext + prev_raw * (1.0 - 2 * prev_ext)
-                    prev_progress = max(0.0, min(0.999, prev_progress))
-                    prev_frame = _get_frame_at(seg_idx - 1, prev_progress)
-                    frame = cv2.addWeighted(prev_frame, 1.0 - alpha, frame, alpha, 0)
-
-            if seg_idx < len(segments) - 1 and (seg["to_ts"] - t) < eff_half_xfade:
-                next_seg = segments[seg_idx + 1]
-                if next_seg["from_ts"] == seg["to_ts"] and next_seg["_n"] > 0:
-                    blend_t = (seg["to_ts"] - t) / eff_half_xfade
-                    alpha = 0.5 + blend_t * 0.5
-                    next_dur = next_seg["to_ts"] - next_seg["from_ts"]
-                    next_ext = min(eff_half_xfade / next_dur, 0.2) if next_dur > 0 else 0
-                    next_raw = (t - next_seg["from_ts"]) / next_dur if next_dur > 0 else 0
-                    next_progress = next_ext + next_raw * (1.0 - 2 * next_ext)
-                    next_progress = max(0.0, min(0.999, next_progress))
-                    next_frame = _get_frame_at(seg_idx + 1, next_progress)
-                    frame = cv2.addWeighted(frame, alpha, next_frame, 1.0 - alpha, 0)
-
-            # Base track opacity curve (fade to/from black)
-            if seg.get("opacity_curve"):
-                opacity = _evaluate_curve(seg["opacity_curve"], raw_progress)
-                opacity = max(0.0, min(1.0, opacity))
-                if opacity < 0.999:
-                    frame = cv2.convertScaleAbs(frame, alpha=opacity, beta=0)
-
-            # Color grading (saturation, RGB curves, etc.)
-            has_curves = any(seg.get(k) for k in ("red_curve", "green_curve", "blue_curve", "black_curve", "saturation_curve", "hue_shift_curve", "invert_curve", "brightness_curve", "contrast_curve", "exposure_curve"))
-            if has_curves:
-                frame = _apply_color_grading(frame, seg, raw_progress)
-
-            # Per-transition effects (strobe etc.)
-            for efx in seg.get("effects", []):
-                if not efx.get("enabled", True):
-                    continue
-                if efx["type"] == "strobe":
-                    freq = efx["params"].get("frequency", 8)
-                    duty = efx["params"].get("duty", 0.5)
-                    if (progress * freq) % 1 > duty:
-                        frame = np.zeros_like(frame)
-
-            # Base track transform (X/Y/Z)
-            if any(seg.get(k) for k in ("transform_x", "transform_y", "transform_x_curve", "transform_y_curve", "transform_z_curve")):
-                frame = _apply_transform(frame, seg, raw_progress)
-
-        # Composite overlays first, then apply beat-synced effects to the final frame
-        frame = _composite_overlays(frame, t, w, h)
-        frame = _apply_frame_effects(frame, t, w, h)
-        out.write(frame)
-
-        if (frame_num + 1) % 1000 == 0 or frame_num == total_output_frames - 1:
-            elapsed = _time.time() - start_time
-            fps_actual = (frame_num + 1) / elapsed if elapsed > 0 else 0
-            eta = (total_output_frames - frame_num - 1) / fps_actual / 60 if fps_actual > 0 else 0
-            _log(f"  [{frame_num+1}/{total_output_frames}] {fps_actual:.0f} fps, ETA {eta:.1f}m")
-
-    out.release()
-    elapsed = _time.time() - start_time
-    _log(f"  Render done in {elapsed:.0f}s ({total_output_frames / elapsed:.0f} fps)")
-    _log(f"  Output: {total_output_frames} frames ({total_output_frames / fps:.2f}s)")
-
-    # Re-encode + mux audio
-    audio_path = meta["_audio_resolved"]
     _log(f"Phase 3: Re-encoding + muxing audio from {audio_path}...")
 
     if preview:
@@ -2386,6 +1251,71 @@ def assemble_final(yaml_path: str, output_path: str, max_time: float | None = No
     Path(tmp_path).unlink(missing_ok=True)
 
     _log(f"Final output: {output_path}")
+
+
+def assemble_final(project_dir: str | Path, output_path: str, max_time: float | None = None, crossfade_frames: int | None = None) -> str:
+    """Time-remap selected transitions, concatenate, and mux audio.
+
+    Thin coordinator: builds a Schedule, renders every frame, muxes audio.
+
+    Args:
+        project_dir: Project directory (contains project.db + media files).
+        max_time: Stop assembling after this timeline time (seconds). None = full track.
+        crossfade_frames: Number of frames for crossfade transitions. Default from meta.crossfade_frames or 8.
+    """
+    import time as _time
+
+    import cv2
+
+    from scenecraft.render.compositor import render_frame_at
+    from scenecraft.render.schedule import build_schedule
+
+    preview = output_path.endswith("_preview.mp4")
+    schedule = build_schedule(
+        project_dir,
+        max_time=max_time,
+        crossfade_frames=crossfade_frames,
+        preview=preview,
+    )
+
+    total_output_frames = round(schedule.duration_seconds * schedule.fps)
+    _log(
+        f"Phase 2: Per-frame render — {total_output_frames} frames "
+        f"({schedule.duration_seconds:.2f}s), {schedule.width}x{schedule.height} @ {schedule.fps}fps"
+    )
+    _log(
+        f"  {len(schedule.segments)} segments, "
+        f"{schedule.crossfade_frames}-frame crossfade, "
+        f"{len(schedule.effect_events)} effect events"
+    )
+
+    tmp_path = output_path + ".tmp.mp4"
+    out = cv2.VideoWriter(
+        tmp_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        schedule.fps,
+        (schedule.width, schedule.height),
+    )
+
+    frame_cache: dict = {}
+    start_time = _time.time()
+    for frame_num in range(total_output_frames):
+        t = frame_num / schedule.fps
+        frame = render_frame_at(schedule, t, frame_cache=frame_cache)
+        out.write(frame)
+
+        if (frame_num + 1) % 1000 == 0 or frame_num == total_output_frames - 1:
+            elapsed = _time.time() - start_time
+            fps_actual = (frame_num + 1) / elapsed if elapsed > 0 else 0
+            eta = (total_output_frames - frame_num - 1) / fps_actual / 60 if fps_actual > 0 else 0
+            _log(f"  [{frame_num+1}/{total_output_frames}] {fps_actual:.0f} fps, ETA {eta:.1f}m")
+
+    out.release()
+    elapsed = _time.time() - start_time
+    _log(f"  Render done in {elapsed:.0f}s ({total_output_frames / elapsed:.0f} fps)")
+    _log(f"  Output: {total_output_frames} frames ({total_output_frames / schedule.fps:.2f}s)")
+
+    _mux_audio(tmp_path, output_path, schedule.audio_path, preview=schedule.preview)
     return output_path
 
 

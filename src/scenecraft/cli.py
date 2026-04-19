@@ -2332,12 +2332,12 @@ def select_transitions_cmd(yaml_path, selections):
 
 
 @narrative.command()
-@click.argument("yaml_path", type=click.Path(exists=True))
+@click.argument("project_dir", type=click.Path(exists=True, file_okay=False))
 @click.option("--output", "-o", default="narrative_output.mp4", help="Output video path")
-def assemble(yaml_path, output):
+def assemble(project_dir, output):
     """Time-remap, concatenate, and mux audio into final video."""
     from scenecraft.render.narrative import assemble_final
-    assemble_final(yaml_path, output)
+    assemble_final(project_dir, output)
 
 
 @main.command(name="crossfade")

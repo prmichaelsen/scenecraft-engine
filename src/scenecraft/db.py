@@ -515,6 +515,65 @@ def set_meta_bulk(project_dir: Path, meta: dict):
     conn.commit()
 
 
+def _resolve_audio_path(project_dir: Path, meta: dict) -> str | None:
+    """Find the project's audio file.
+
+    Checks meta['audio'] first (absolute path or project-relative),
+    otherwise globs the project dir for common audio extensions.
+    Returns None if no audio is found.
+    """
+    raw = meta.get("audio")
+    if raw:
+        p = Path(raw)
+        if not p.is_absolute():
+            p = project_dir / p
+        if p.exists():
+            return str(p)
+    for ext in ("wav", "mp3", "flac", "m4a", "ogg"):
+        for f in project_dir.glob(f"*.{ext}"):
+            return str(f)
+    return None
+
+
+def load_project_data(project_dir: Path) -> dict:
+    """Load all project data the renderer + generation pipeline need, from SQLite.
+
+    Returns a dict shaped like the old load_narrative() result so callers can
+    migrate without chasing down every field access. Key fields:
+        - meta: dict (includes _audio_resolved, _work_dir)
+        - keyframes: list[dict] (active only, with _timestamp_seconds)
+        - transitions: list[dict] (active only)
+        - _work_dir: str
+        - _project_dir: Path
+    """
+    meta = get_meta(project_dir)
+    kfs = [kf for kf in get_keyframes(project_dir) if not kf.get("deleted_at")]
+    # Compute per-keyframe seconds for callers that rely on _timestamp_seconds
+    for kf in kfs:
+        ts = kf.get("timestamp", "0:00")
+        parts = str(ts).split(":")
+        if len(parts) == 2:
+            try:
+                kf["_timestamp_seconds"] = int(parts[0]) * 60 + float(parts[1])
+            except ValueError:
+                kf["_timestamp_seconds"] = 0.0
+        else:
+            kf["_timestamp_seconds"] = 0.0
+    trs = [tr for tr in get_transitions(project_dir) if not tr.get("deleted_at")]
+
+    audio = _resolve_audio_path(project_dir, meta)
+    if audio:
+        meta["_audio_resolved"] = audio
+
+    return {
+        "meta": meta,
+        "keyframes": kfs,
+        "transitions": trs,
+        "_work_dir": str(project_dir),
+        "_project_dir": project_dir,
+    }
+
+
 # ── Keyframe operations ─────────────────────────────────────────────
 
 def _row_to_keyframe(row: sqlite3.Row) -> dict:
