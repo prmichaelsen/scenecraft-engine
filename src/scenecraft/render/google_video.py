@@ -584,6 +584,9 @@ class GoogleVideoClient:
         model: str = "veo-3.0-generate-001",
         aspect_ratio: str = "16:9",
         ingredients: list[str] | None = None,
+        generate_audio: bool = False,
+        negative_prompt: str | None = None,
+        seed: int | None = None,
         on_status=None,
     ) -> str:
         """Generate a video clip from a reference image using Veo.
@@ -596,6 +599,7 @@ class GoogleVideoClient:
             model: Veo model name.
             aspect_ratio: Output aspect ratio.
             ingredients: Optional list of up to 3 character/object reference image paths.
+            generate_audio: Whether to generate audio along with the video.
 
         Returns:
             output_path
@@ -621,7 +625,10 @@ class GoogleVideoClient:
                 number_of_videos=1,
                 duration_seconds=8,
                 person_generation="allow_adult",
+                generate_audio=generate_audio,
                 **({"reference_images": ref_images} if ref_images else {}),
+                **({"negative_prompt": negative_prompt} if negative_prompt else {}),
+                **({"seed": seed} if seed is not None else {}),
             )
             return _retry_on_429(
                 self.client.models.generate_videos,
@@ -644,6 +651,9 @@ class GoogleVideoClient:
         duration_seconds: int = 2,
         model: str = "veo-3.0-generate-001",
         ingredients: list[str] | None = None,
+        generate_audio: bool = False,
+        negative_prompt: str | None = None,
+        seed: int | None = None,
         on_status=None,
     ) -> str:
         """Generate a transition clip between two frames using Veo.
@@ -657,6 +667,7 @@ class GoogleVideoClient:
             output_path: Where to save the transition clip.
             duration_seconds: Transition duration.
             model: Veo model name.
+            generate_audio: Whether to generate audio along with the video.
             ingredients: Optional list of up to 3 character/object reference image paths.
 
         Returns:
@@ -690,8 +701,11 @@ class GoogleVideoClient:
                 number_of_videos=1,
                 duration_seconds=veo_duration,
                 person_generation="allow_adult",
+                generate_audio=generate_audio,
                 last_frame=end_img,
                 **({"reference_images": ref_images} if ref_images else {}),
+                **({"negative_prompt": negative_prompt} if negative_prompt else {}),
+                **({"seed": seed} if seed is not None else {}),
             )
             return _retry_on_429(
                 self.client.models.generate_videos,

@@ -455,6 +455,19 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             if m:
                 return self._handle_get_pool(m.group(1))
 
+            # GET /api/projects/:name/pool/tags — list distinct tags with counts
+            m = re.match(r"^/api/projects/([^/]+)/pool/tags$", path)
+            if m:
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                from scenecraft.db import list_all_tags
+                return self._json_response({"tags": list_all_tags(project_dir)})
+
+            # GET /api/projects/:name/pool/gc-preview — list garbage-collectible segments
+            m = re.match(r"^/api/projects/([^/]+)/pool/gc-preview$", path)
+            if m:
+                return self._handle_pool_gc(m.group(1), dry_run=True)
+
             # GET /api/projects/:name/version/history (deprecated — git removed)
             m = re.match(r"^/api/projects/([^/]+)/version/history$", path)
             if m:
@@ -708,6 +721,33 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 shutil.copy2(str(src), str(dest))
                 _log(f"pool/add: {source_path} -> {dest.relative_to(project_dir)}")
                 return self._json_response({"success": True, "path": str(dest.relative_to(project_dir))})
+
+            # POST /api/projects/:name/pool/import — import a local file into the pool
+            # as a pool_segments row (kind='imported'). File is UUID-renamed on disk;
+            # original filename and full source path are preserved in DB metadata.
+            m = re.match(r"^/api/projects/([^/]+)/pool/import$", path)
+            if m:
+                return self._handle_pool_import(m.group(1))
+
+            # POST /api/projects/:name/pool/rename — update a pool segment's label
+            m = re.match(r"^/api/projects/([^/]+)/pool/rename$", path)
+            if m:
+                return self._handle_pool_rename(m.group(1))
+
+            # POST /api/projects/:name/pool/tag — tag a pool segment
+            m = re.match(r"^/api/projects/([^/]+)/pool/tag$", path)
+            if m:
+                return self._handle_pool_tag(m.group(1), add=True)
+
+            # POST /api/projects/:name/pool/untag — remove a tag
+            m = re.match(r"^/api/projects/([^/]+)/pool/untag$", path)
+            if m:
+                return self._handle_pool_tag(m.group(1), add=False)
+
+            # POST /api/projects/:name/pool/gc — garbage-collect unreferenced generated segments
+            m = re.match(r"^/api/projects/([^/]+)/pool/gc$", path)
+            if m:
+                return self._handle_pool_gc(m.group(1), dry_run=False)
 
             # POST /api/projects/:name/assign-pool-video
             m = re.match(r"^/api/projects/([^/]+)/assign-pool-video$", path)
@@ -2501,17 +2541,29 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             self._json_response({"sections": sections})
 
         def _handle_get_pool(self, project_name: str):
-            """GET /api/projects/:name/pool — list pool assets (unassigned keyframe images and video segments)."""
+            """GET /api/projects/:name/pool — list pool assets.
+
+            Video segments are read from the `pool_segments` table (authoritative record
+            of every file in pool/segments/, with label/created_by/tags/original_filename).
+            Keyframe images still use a filesystem scan — image pool migration is future work.
+
+            Query params:
+              ?tag=<tag>   — filter segments to those tagged with <tag>
+              ?kind=generated|imported — filter by kind
+            """
             _log(f"get-pool: {project_name}")
             project_dir = work_dir / project_name
             pool_dir = project_dir / "pool"
-            if not pool_dir.is_dir():
-                return self._json_response({"keyframes": [], "segments": []})
 
-            kf_dir = pool_dir / "keyframes"
-            seg_dir = pool_dir / "segments"
+            # Parse query params
+            from urllib.parse import parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            tag_filter = qs.get("tag", [None])[0]
+            kind_filter = qs.get("kind", [None])[0]
 
+            # Keyframe images (filesystem scan — unchanged)
             keyframes = []
+            kf_dir = pool_dir / "keyframes"
             if kf_dir.is_dir():
                 for f in sorted(kf_dir.iterdir()):
                     if f.suffix.lower() in ('.png', '.jpg', '.jpeg', '.webp'):
@@ -2521,17 +2573,230 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                             "size": f.stat().st_size,
                         })
 
+            # Segments (from pool_segments table + tag joins)
             segments = []
-            if seg_dir.is_dir():
-                for f in sorted(seg_dir.iterdir()):
-                    if f.suffix.lower() in ('.mp4', '.webm', '.mov'):
-                        segments.append({
-                            "name": f.name,
-                            "path": f"pool/segments/{f.name}",
-                            "size": f.stat().st_size,
-                        })
+            if (project_dir / "project.db").exists():
+                from scenecraft.db import (
+                    list_pool_segments as _list_segs,
+                    find_segments_by_tag as _by_tag,
+                    get_pool_segment_tags as _get_tags,
+                )
+                if tag_filter:
+                    segs = _by_tag(project_dir, tag_filter)
+                    if kind_filter:
+                        segs = [s for s in segs if s["kind"] == kind_filter]
+                else:
+                    segs = _list_segs(project_dir, kind=kind_filter)
+                for s in segs:
+                    tag_rows = _get_tags(project_dir, s["id"])
+                    segments.append({
+                        "id": s["id"],
+                        "path": s["poolPath"],
+                        "kind": s["kind"],
+                        "label": s.get("label") or s.get("originalFilename") or "",
+                        "originalFilename": s.get("originalFilename"),
+                        "originalFilepath": s.get("originalFilepath"),
+                        "createdBy": s.get("createdBy") or "",
+                        "createdAt": s.get("createdAt"),
+                        "durationSeconds": s.get("durationSeconds"),
+                        "width": s.get("width"),
+                        "height": s.get("height"),
+                        "byteSize": s.get("byteSize"),
+                        "generationParams": s.get("generationParams"),
+                        "tags": [t["tag"] for t in tag_rows],
+                    })
 
             self._json_response({"keyframes": keyframes, "segments": segments})
+
+        # ── Pool segment mutation handlers ────────────────────────
+
+        def _handle_pool_import(self, project_name: str):
+            """POST /api/projects/:name/pool/import — bring a local file into the pool
+            as a pool_segments row (kind='imported').
+
+            Body: {
+              "sourcePath": "/abs/path/on/server" | "relative/path/in/project",
+              "label": "optional display name"   (defaults to basename)
+            }
+
+            The file is copied (not moved) to pool/segments/import_{uuid}.{ext}.
+            original_filename and original_filepath are preserved in DB metadata.
+            """
+            body = self._read_json_body()
+            if body is None:
+                return
+            src_arg = body.get("sourcePath") or body.get("filepath")
+            if not src_arg:
+                return self._error(400, "BAD_REQUEST", "Missing 'sourcePath'")
+            label = body.get("label", "")
+
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+
+            try:
+                import shutil
+                import subprocess as _sp
+                import uuid as _uuid
+
+                src = Path(src_arg)
+                if not src.is_absolute():
+                    src = project_dir / src_arg
+                if not src.exists():
+                    return self._error(404, "NOT_FOUND", f"Source not found: {src_arg}")
+
+                original_filename = src.name
+                original_filepath = str(src.resolve())
+                ext = src.suffix or ".mp4"
+                seg_uuid = _uuid.uuid4().hex
+                pool_name = f"import_{seg_uuid}{ext}"
+                pool_dir = project_dir / "pool" / "segments"
+                pool_dir.mkdir(parents=True, exist_ok=True)
+                dest = pool_dir / pool_name
+                shutil.copy2(str(src), str(dest))
+
+                # Probe
+                dur = None
+                try:
+                    r = _sp.run(
+                        ["ffprobe", "-v", "error", "-show_entries",
+                         "format=duration", "-of", "csv=p=0", str(dest)],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    if r.returncode == 0 and r.stdout.strip():
+                        dur = float(r.stdout.strip())
+                except Exception:
+                    pass
+                byte_size = dest.stat().st_size
+
+                # Insert directly with the matching UUID so filename and id align
+                from scenecraft.db import get_db as _get_db, _now_iso
+                auth_user = getattr(self, "_authenticated_user", None) or "local"
+                conn = _get_db(project_dir)
+                conn.execute(
+                    """INSERT INTO pool_segments
+                       (id, pool_path, kind, created_by, original_filename, original_filepath,
+                        label, generation_params, created_at, duration_seconds, width, height, byte_size)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (seg_uuid, f"pool/segments/{pool_name}", "imported", auth_user,
+                     original_filename, original_filepath,
+                     label or original_filename, None, _now_iso(), dur, None, None, byte_size),
+                )
+                conn.commit()
+
+                _log(f"pool/import: {original_filename} -> seg={seg_uuid[:8]} ({byte_size // 1024}KB, {dur}s)")
+                self._json_response({
+                    "success": True,
+                    "poolSegmentId": seg_uuid,
+                    "poolPath": f"pool/segments/{pool_name}",
+                    "originalFilename": original_filename,
+                    "originalFilepath": original_filepath,
+                    "durationSeconds": dur,
+                })
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self._error(500, "INTERNAL_ERROR", str(e))
+
+        def _handle_pool_rename(self, project_name: str):
+            """POST /api/projects/:name/pool/rename — change a pool segment's label.
+
+            Body: { "poolSegmentId": "<uuid>", "label": "new display name" }
+            """
+            body = self._read_json_body()
+            if body is None:
+                return
+            seg_id = body.get("poolSegmentId")
+            label = body.get("label", "")
+            if not seg_id:
+                return self._error(400, "BAD_REQUEST", "Missing 'poolSegmentId'")
+
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+
+            from scenecraft.db import get_pool_segment, update_pool_segment_label
+            if not get_pool_segment(project_dir, seg_id):
+                return self._error(404, "NOT_FOUND", f"Pool segment not found: {seg_id}")
+            update_pool_segment_label(project_dir, seg_id, label)
+            _log(f"pool/rename: {seg_id[:8]} -> {label!r}")
+            self._json_response({"success": True, "poolSegmentId": seg_id, "label": label})
+
+        def _handle_pool_tag(self, project_name: str, *, add: bool):
+            """POST /api/projects/:name/pool/tag or /pool/untag.
+
+            Body: { "poolSegmentId": "<uuid>", "tag": "keeper" }
+            """
+            body = self._read_json_body()
+            if body is None:
+                return
+            seg_id = body.get("poolSegmentId")
+            tag = body.get("tag", "").strip()
+            if not seg_id or not tag:
+                return self._error(400, "BAD_REQUEST", "Missing 'poolSegmentId' or 'tag'")
+
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+
+            from scenecraft.db import (
+                get_pool_segment, add_pool_segment_tag, remove_pool_segment_tag,
+            )
+            if not get_pool_segment(project_dir, seg_id):
+                return self._error(404, "NOT_FOUND", f"Pool segment not found: {seg_id}")
+            auth_user = getattr(self, "_authenticated_user", None) or "local"
+            if add:
+                add_pool_segment_tag(project_dir, seg_id, tag, tagged_by=auth_user)
+                _log(f"pool/tag: {seg_id[:8]} +{tag}")
+            else:
+                remove_pool_segment_tag(project_dir, seg_id, tag)
+                _log(f"pool/untag: {seg_id[:8]} -{tag}")
+            self._json_response({"success": True})
+
+        def _handle_pool_gc(self, project_name: str, *, dry_run: bool):
+            """Garbage-collect unreferenced generated segments.
+
+            dry_run=True: list what would be deleted; no changes.
+            dry_run=False: delete DB rows AND on-disk files.
+
+            Never touches kind='imported' segments — user assets are preserved.
+            """
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+
+            from scenecraft.db import find_gc_candidates, delete_pool_segment
+            orphans = find_gc_candidates(project_dir)
+
+            if dry_run:
+                return self._json_response({
+                    "wouldDelete": len(orphans),
+                    "segments": [
+                        {
+                            "id": o["id"],
+                            "poolPath": o["poolPath"],
+                            "label": o.get("label") or "",
+                            "byteSize": o.get("byteSize"),
+                            "createdAt": o.get("createdAt"),
+                        }
+                        for o in orphans
+                    ],
+                })
+
+            deleted = 0
+            freed_bytes = 0
+            for seg in orphans:
+                try:
+                    disk = project_dir / seg["poolPath"]
+                    if disk.exists():
+                        freed_bytes += disk.stat().st_size
+                        disk.unlink()
+                    delete_pool_segment(project_dir, seg["id"])
+                    deleted += 1
+                except Exception as e:
+                    _log(f"  ⚠ gc failed for {seg['id']}: {e}")
+            _log(f"pool/gc: deleted {deleted} segments, freed {freed_bytes // 1024}KB")
+            self._json_response({"success": True, "deleted": deleted, "freedBytes": freed_bytes})
 
         def _handle_add_keyframe(self, project_name: str):
             """POST /api/projects/:name/add-keyframe — create a new keyframe at a given timestamp."""
@@ -3499,17 +3764,27 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 self._error(500, "INTERNAL_ERROR", str(e))
 
         def _handle_assign_pool_video(self, project_name: str):
-            """POST /api/projects/:name/assign-pool-video — assign a pool video to an existing transition."""
+            """POST /api/projects/:name/assign-pool-video — attach a pool segment to a transition.
+
+            Body: { "transitionId": "tr_001", "poolSegmentId": "<uuid>" }
+                  — OR (legacy) { "transitionId": "tr_001", "poolPath": "pool/segments/..." }
+
+            No file copy: inserts a tr_candidates junction row pointing the transition
+            at the existing pool_segments row, and sets the transition's selected pointer
+            to the pool_segment_id. The selected-video cache (selected_transitions/) is
+            still refreshed so render paths work unchanged.
+            """
             body = self._read_json_body()
             if body is None:
                 return
 
             tr_id = body.get("transitionId")
-            pool_path = body.get("poolPath")
-            if not tr_id or not pool_path:
-                return self._error(400, "BAD_REQUEST", "Missing 'transitionId' or 'poolPath'")
+            seg_id = body.get("poolSegmentId")
+            pool_path = body.get("poolPath")  # legacy fallback
+            if not tr_id or not (seg_id or pool_path):
+                return self._error(400, "BAD_REQUEST", "Missing 'transitionId' and either 'poolSegmentId' or 'poolPath'")
 
-            _log(f"assign-pool-video: {project_name} {tr_id} <- {pool_path}")
+            _log(f"assign-pool-video: {project_name} {tr_id} <- seg={seg_id} path={pool_path}")
 
             project_dir = self._require_project_dir(project_name)
             if project_dir is None:
@@ -3517,28 +3792,71 @@ def make_handler(work_dir: Path, no_auth: bool = False):
 
             try:
                 import shutil
-                from scenecraft.db import get_transition, update_transition
-
-                source = project_dir / pool_path
-                if not source.exists():
-                    return self._error(404, "NOT_FOUND", f"Pool video not found: {pool_path}")
+                from scenecraft.db import (
+                    get_transition, update_transition,
+                    get_pool_segment, list_pool_segments,
+                    add_tr_candidate,
+                )
 
                 tr = get_transition(project_dir, tr_id)
                 if not tr:
                     return self._error(404, "NOT_FOUND", f"Transition {tr_id} not found")
 
-                # Copy as candidate v(N+1)
-                cand_dir = project_dir / "transition_candidates" / tr_id / "slot_0"
-                cand_dir.mkdir(parents=True, exist_ok=True)
-                existing = _next_variant(cand_dir, ".mp4") - 1
-                variant = existing + 1
-                shutil.copy2(str(source), str(cand_dir / f"v{variant}.mp4"))
+                # Resolve seg_id — prefer explicit id, fall back to pool_path lookup
+                if not seg_id and pool_path:
+                    for s in list_pool_segments(project_dir):
+                        if s["poolPath"] == pool_path:
+                            seg_id = s["id"]
+                            break
+                    if not seg_id:
+                        return self._error(404, "NOT_FOUND", f"No pool_segment for path: {pool_path}")
 
-                # Set as selected
+                seg = get_pool_segment(project_dir, seg_id)
+                if not seg:
+                    return self._error(404, "NOT_FOUND", f"Pool segment not found: {seg_id}")
+                source = project_dir / seg["poolPath"]
+                if not source.exists():
+                    return self._error(404, "NOT_FOUND", f"Pool segment file missing on disk: {seg['poolPath']}")
+
+                # Junction row (idempotent — same tr+slot+seg is a no-op)
+                junction_source = "imported" if seg["kind"] == "imported" else "cross-tr-copy"
+                add_tr_candidate(
+                    project_dir,
+                    transition_id=tr_id, slot=0,
+                    pool_segment_id=seg_id, source=junction_source,
+                )
+
+                # Refresh cached selected video (no re-encode — just a copy)
                 sel_dir = project_dir / "selected_transitions"
                 sel_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(str(source), str(sel_dir / f"{tr_id}_slot_0.mp4"))
-                update_transition(project_dir, tr_id, selected=variant)
+
+                # Update transitions.selected to pool_segment_id (slot 0)
+                existing_selected = tr.get("selected")
+                if isinstance(existing_selected, list):
+                    current = list(existing_selected)
+                elif existing_selected is None or existing_selected == []:
+                    current = [None] * tr.get("slots", 1)
+                else:
+                    current = [existing_selected]
+                while len(current) < tr.get("slots", 1):
+                    current.append(None)
+                current[0] = seg_id
+                update_transition(project_dir, tr_id, selected=current)
+
+                # Also update source_video_duration / trim clamping (same logic as select-transitions)
+                new_src_dur = seg.get("durationSeconds")
+                if new_src_dur and new_src_dur > 0:
+                    trim_in = tr.get("trim_in") or 0
+                    trim_out = tr.get("trim_out")
+                    clamped_trim_out = min(trim_out, new_src_dur) if trim_out is not None else new_src_dur
+                    clamped_trim_in = min(trim_in, max(0, new_src_dur - 0.1))
+                    update_transition(
+                        project_dir, tr_id,
+                        source_video_duration=new_src_dur,
+                        trim_in=clamped_trim_in,
+                        trim_out=clamped_trim_out,
+                    )
 
                 # Extract first frame as keyframe image (non-blocking)
                 import subprocess as sp
@@ -3559,7 +3877,6 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                                 kf_cand_dir.mkdir(parents=True, exist_ok=True)
                                 kf_v = _next_variant(kf_cand_dir, ".png")
                                 shutil.copy2(str(tmp_frame), str(kf_cand_dir / f"v{kf_v}.png"))
-                                # Set as selected keyframe image
                                 shutil.move(str(tmp_frame), str(sel_kf_dir / f"{from_kf_id}.png"))
                                 all_cands = sorted([
                                     f"keyframe_candidates/candidates/section_{from_kf_id}/{f.name}"
@@ -3571,8 +3888,12 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                             _log(f"  First frame extraction failed: {ex}")
                     threading.Thread(target=_extract, daemon=True).start()
 
-                _log(f"  Assigned v{variant} to {tr_id}")
-                self._json_response({"success": True, "transitionId": tr_id, "variant": variant})
+                _log(f"  Assigned seg={seg_id[:8]} to {tr_id}")
+                self._json_response({
+                    "success": True,
+                    "transitionId": tr_id,
+                    "poolSegmentId": seg_id,
+                })
             except Exception as e:
                 import traceback
                 traceback.print_exc()
