@@ -136,6 +136,14 @@ Tools available:
   • delete_keyframe, delete_transition — soft-delete one item (asks to confirm).
   • batch_delete_keyframes, batch_delete_transitions — soft-delete many in ONE
     confirmation and ONE undo group. Prefer these over looping single-deletes.
+  • generate_keyframe_candidates — run Imagen to create N new image candidates for a
+    keyframe. Slow + costs API credit. User must confirm.
+  • generate_transition_candidates — run Veo to create N new video candidates for a
+    transition (inherits ingredients/seed/prompt from the transition record; use
+    update_transition first if you want to tweak them). Slow + expensive.
+
+After generation completes, use `assign_keyframe_image` / `assign_pool_video` to
+pick one of the new candidates (coming in task-54).
 
 All mutations are wrapped in undo groups; the user can undo any change you make.
 Prefer sql_query to discover IDs/state before mutating. Do not fabricate IDs —
@@ -335,6 +343,65 @@ BATCH_DELETE_TRANSITIONS_TOOL: dict = {
     },
 }
 
+GENERATE_KEYFRAME_CANDIDATES_TOOL: dict = {
+    "name": "generate_keyframe_candidates",
+    "description": (
+        "Generate new image candidates for a keyframe using Imagen. Requires the "
+        "keyframe to already have a selected source image (user must pick one "
+        "from the bin first). Generation takes 20-60 seconds and consumes API "
+        "credit — requires user confirmation. Returns the updated candidates "
+        "list so you can then call `assign_keyframe_image` to pick one."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "keyframe_id": {"type": "string"},
+            "count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 8,
+                "default": 3,
+                "description": "Number of new candidates to generate. Default 3.",
+            },
+            "prompt_override": {
+                "type": "string",
+                "description": "Optional. Uses the keyframe's saved prompt if omitted.",
+            },
+        },
+        "required": ["keyframe_id"],
+    },
+}
+
+GENERATE_TRANSITION_CANDIDATES_TOOL: dict = {
+    "name": "generate_transition_candidates",
+    "description": (
+        "Generate new video candidates for a transition using Veo. Slow (1-3 minutes) "
+        "and expensive — requires user confirmation. Inherits ingredients, seed, "
+        "negative prompt, and action from the transition record. To change those, "
+        "call `update_transition` first, then generate. Returns new pool_segment IDs "
+        "so you can call `assign_pool_video` to pick one."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "transition_id": {"type": "string"},
+            "count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 4,
+                "default": 2,
+                "description": "Number of new candidates per slot.",
+            },
+            "slot": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Optional slot index. Omit to generate for every slot.",
+            },
+        },
+        "required": ["transition_id"],
+    },
+}
+
 TOOLS: list[dict] = [
     SQL_QUERY_TOOL,
     UPDATE_KEYFRAME_PROMPT_TOOL,
@@ -345,6 +412,8 @@ TOOLS: list[dict] = [
     DELETE_TRANSITION_TOOL,
     BATCH_DELETE_KEYFRAMES_TOOL,
     BATCH_DELETE_TRANSITIONS_TOOL,
+    GENERATE_KEYFRAME_CANDIDATES_TOOL,
+    GENERATE_TRANSITION_CANDIDATES_TOOL,
 ]
 
 
@@ -365,6 +434,9 @@ _DESTRUCTIVE_TOOL_PATTERNS: tuple[str, ...] = (
     "moderate",
     "restore_checkpoint",
     "batch_delete",
+    # Generation tools are not DB-destructive but cost real money and take time;
+    # gate them behind the same confirmation flow.
+    "generate_",
 )
 
 
@@ -385,6 +457,7 @@ def _format_tool_input_summary(tool_name: str, tool_input: dict, project_dir: Pa
     if project_dir is not None and tool_name in {
         "delete_keyframe", "delete_transition",
         "batch_delete_keyframes", "batch_delete_transitions",
+        "generate_keyframe_candidates", "generate_transition_candidates",
     }:
         try:
             return _format_destructive_summary(tool_name, input_dict, project_dir)
@@ -472,6 +545,46 @@ def _format_destructive_summary(tool_name: str, input_dict: dict, project_dir: P
             items.append(f"… and {len(missing_ids) - 4} more missing")
         msg = f"Delete {len(ids)} transitions? ({len(valid_ids)} valid, {len(missing_ids)} missing)" if missing_ids else f"Delete {len(ids)} transitions?"
         return msg, items
+
+    if tool_name == "generate_keyframe_candidates":
+        kf_id = input_dict.get("keyframe_id", "")
+        count = int(input_dict.get("count") or 3)
+        kf = get_keyframe(project_dir, kf_id)
+        if not kf:
+            return f"Generate {count} images for {kf_id}?", [f"{kf_id} (not found)"]
+        prompt = (input_dict.get("prompt_override") or kf.get("prompt") or "").strip()
+        prompt_preview = prompt[:80] + ("..." if len(prompt) > 80 else "")
+        est_cost_usd = count * 0.04  # Imagen ≈ $0.04/image
+        items = [
+            _kf_line(kf),
+            f"prompt: {prompt_preview}" if prompt else "prompt: (empty — will fail)",
+            f"~{est_cost_usd:.2f} USD · ~{count * 15}-{count * 30}s",
+        ]
+        return f"Generate {count} image candidates for {kf_id}?", items
+
+    if tool_name == "generate_transition_candidates":
+        from scenecraft.db import get_keyframe as _get_kf
+        tr_id = input_dict.get("transition_id", "")
+        count = int(input_dict.get("count") or 2)
+        slot = input_dict.get("slot")
+        tr = get_transition(project_dir, tr_id)
+        if not tr:
+            return f"Generate {count} videos for {tr_id}?", [f"{tr_id} (not found)"]
+        n_slots = int(tr.get("slots", 1))
+        target_slots = 1 if slot is not None else n_slots
+        total = count * target_slots
+        est_cost_usd = total * 0.50  # Veo ≈ $0.50/video
+        action = (tr.get("action") or "").strip()
+        action_preview = action[:80] + ("..." if len(action) > 80 else "")
+        items = [_tr_line(tr)]
+        if action:
+            items.append(f"prompt: {action_preview}")
+        items.append(
+            f"slots: {'#' + str(slot) if slot is not None else f'all {n_slots}'} · "
+            f"{count}/slot = {total} videos"
+        )
+        items.append(f"~{est_cost_usd:.2f} USD · ~{total * 45}-{total * 180}s")
+        return f"Generate {total} video candidates for {tr_id}?", items
 
     # Unreachable — caller gates on tool_name
     return f"Confirm `{tool_name}`?", []
@@ -799,8 +912,73 @@ def _exec_batch_delete_transitions(project_dir: Path, input_data: dict) -> dict:
     }
 
 
-def _execute_tool(project_dir: Path, name: str, input_data: dict) -> tuple[dict, bool]:
-    """Execute a tool. Returns (result_dict, is_error)."""
+async def _await_generation_job(
+    ws, tool_use_id: str, project_name: str, job_id: str, poll_interval: float = 0.5, timeout: float = 900
+) -> tuple[dict, bool]:
+    """Poll job_manager until terminal state; forward tool_progress events to the chat WS.
+
+    Returns (result_dict, is_error). Final result includes the job's completion payload.
+    On timeout, returns an error but does NOT cancel the underlying job — it keeps running.
+    """
+    import asyncio
+    from scenecraft.ws_server import job_manager
+
+    deadline = asyncio.get_event_loop().time() + timeout
+    last_completed = -1
+    last_detail = ""
+    while True:
+        if asyncio.get_event_loop().time() > deadline:
+            return {"error": f"generation job {job_id} did not finish within {timeout}s; it may still be running"}, True
+
+        job = job_manager.get_job(job_id)
+        if job is None:
+            return {"error": f"job {job_id} vanished"}, True
+
+        # Forward progress updates if the counter or detail changed
+        completed = getattr(job, "completed", 0) or 0
+        detail = getattr(job, "meta", {}).get("last_detail", "") or last_detail
+        # Job.meta doesn't store detail; use completed/total as proxy
+        total = getattr(job, "total", 0) or 0
+        if completed != last_completed:
+            pct = (completed / total) if total else 0.0
+            try:
+                await ws.send(json.dumps({
+                    "type": "tool_progress",
+                    "toolProgress": {
+                        "id": tool_use_id,
+                        "phase": "generating",
+                        "pct": pct,
+                        "message": f"{completed}/{total}" if total else str(completed),
+                    },
+                }))
+            except Exception:
+                pass
+            last_completed = completed
+
+        status = getattr(job, "status", "running")
+        if status == "completed":
+            return (getattr(job, "result", None) or {}), False
+        if status == "failed":
+            return {"error": getattr(job, "error", None) or "generation failed"}, True
+
+        await asyncio.sleep(poll_interval)
+
+
+async def _execute_tool(
+    project_dir: Path,
+    name: str,
+    input_data: dict,
+    *,
+    ws=None,
+    tool_use_id: str | None = None,
+    project_name: str | None = None,
+) -> tuple[dict, bool]:
+    """Execute a tool. Returns (result_dict, is_error).
+
+    Generation tools kick off a background job and await its completion,
+    forwarding tool_progress events over `ws`. All other tools are purely
+    synchronous DB operations.
+    """
     input_data = input_data or {}
     if name == "sql_query":
         sql = input_data.get("sql", "")
@@ -833,6 +1011,35 @@ def _execute_tool(project_dir: Path, name: str, input_data: dict) -> tuple[dict,
     if name == "batch_delete_transitions":
         result = _exec_batch_delete_transitions(project_dir, input_data)
         return result, "error" in result
+    if name == "generate_keyframe_candidates":
+        from scenecraft.chat_generation import start_keyframe_generation
+        kickoff = start_keyframe_generation(
+            project_dir,
+            project_name or "",
+            input_data.get("keyframe_id", ""),
+            int(input_data.get("count") or 3),
+            input_data.get("prompt_override"),
+        )
+        if "error" in kickoff:
+            return kickoff, True
+        if ws is None or tool_use_id is None:
+            return {"error": "generation tools require ws context (internal error)"}, True
+        return await _await_generation_job(ws, tool_use_id, project_name or "", kickoff["job_id"])
+    if name == "generate_transition_candidates":
+        from scenecraft.chat_generation import start_transition_generation
+        slot = input_data.get("slot")
+        kickoff = start_transition_generation(
+            project_dir,
+            project_name or "",
+            input_data.get("transition_id", ""),
+            int(input_data.get("count") or 2),
+            slot_index=(int(slot) if slot is not None else None),
+        )
+        if "error" in kickoff:
+            return kickoff, True
+        if ws is None or tool_use_id is None:
+            return {"error": "generation tools require ws context (internal error)"}, True
+        return await _await_generation_job(ws, tool_use_id, project_name or "", kickoff["job_id"])
     return {"error": f"unknown tool: {name}"}, True
 
 
@@ -1055,7 +1262,14 @@ async def _stream_response(ws: ServerConnection, project_dir: Path, project_name
                 if bridge and bridge.has_tool(tu["name"]):
                     result, is_error = await bridge.call_tool(tu["name"], tu["input"] or {})
                 else:
-                    result, is_error = _execute_tool(project_dir, tu["name"], tu["input"])
+                    result, is_error = await _execute_tool(
+                        project_dir,
+                        tu["name"],
+                        tu["input"],
+                        ws=ws,
+                        tool_use_id=tu["id"],
+                        project_name=project_name,
+                    )
                 dt_ms = int((time.monotonic() - t0) * 1000)
 
                 await ws.send(json.dumps({
