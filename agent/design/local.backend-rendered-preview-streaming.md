@@ -107,14 +107,49 @@ Fallback on render failure/timeout: show last-known-good frame.
 
 ## Implementation
 
-### Backend
+### File layout
 
-#### Refactor `narrative.py:assemble_final`
+New concerns get new files. `narrative.py` (currently 2000+ LOC) keeps only `assemble_final` and its helpers; everything else moves.
 
-**Target decomposition:**
+**Backend (Python):**
+```
+src/scenecraft/render/
+├── narrative.py          existing; slim down — keep assemble_final, ffmpeg_writer, mux_audio
+├── schedule.py           NEW — Schedule dataclass, build_schedule()
+├── compositor.py         NEW — render_frame_at() and its inner helpers (transform, blend, grading, effects application)
+├── frame_cache.py        NEW — FrameCache (L1 memory + L2 disk), invalidate()
+├── preview_worker.py     NEW — RenderWorker, RenderCoordinator, latest-wins queue
+└── preview_stream.py     NEW — PyAV H.264 encode loop, fMP4 fragmenter
+
+src/scenecraft/
+├── api_server.py         existing; add routes — routes call into preview_worker/frame_cache
+└── render_api.py         NEW — GET /render-frame handler, WS /preview-stream handler (split out of api_server.py for clarity)
+```
+
+**Frontend (TypeScript):**
+```
+src/components/editor/
+├── PreviewViewport.tsx         NEW — the <video>+<canvas> surface with z-index swap
+└── PreviewPanel.tsx            existing; swap WebGL canvas for <PreviewViewport>
+
+src/hooks/
+├── useMSEPlayback.ts           NEW — MediaSource + SourceBuffer + WS plumbing
+└── useLatestWinsRequest.ts     NEW — scrub request queue
+
+src/lib/
+└── preview-client.ts           NEW — fetchScrubFrame(), openPreviewStream()
+```
+
+**Deletions in the WebGL-removal PR:**
+- `src/components/editor/BeatEffectPreview.tsx` — WebGL shader + per-layer uniform management
+- Any WebGL-specific helpers it pulls in (shader source, framebuffer utils, texture loaders)
+
+### Refactor `narrative.py:assemble_final`
+
+**Target decomposition** (split across `schedule.py`, `compositor.py`, and the slimmed `narrative.py`):
 
 ```python
-# src/scenecraft/render/narrative.py
+# src/scenecraft/render/schedule.py
 
 @dataclass
 class Schedule:
@@ -129,8 +164,17 @@ class Schedule:
 def build_schedule(work_dir: Path, session_dir: Path | None = None) -> Schedule:
     """Build the per-session render schedule from DB + filesystem. Expensive; call once per session."""
 
+
+# src/scenecraft/render/compositor.py
+
 def render_frame_at(schedule: Schedule, t: float) -> np.ndarray:
     """Render a single composited BGR frame at time t. Pure function of (schedule, t)."""
+
+
+# src/scenecraft/render/narrative.py (slimmed)
+
+from scenecraft.render.schedule import build_schedule
+from scenecraft.render.compositor import render_frame_at
 
 def assemble_final(yaml_path: str, output_path: str, ...) -> str:
     """Full-timeline render. Now just: build_schedule + loop render_frame_at + mux audio."""
@@ -155,7 +199,7 @@ def test_render_frame_at_parity(project_fixture):
 
 Covers at minimum: base track, base+one overlay with a blend mode, adjustment layer, strobe effect on overlay, color grading with curves.
 
-#### Frame cache
+#### Frame cache (`src/scenecraft/render/frame_cache.py`)
 
 Two-tier, per-session:
 
@@ -167,7 +211,7 @@ Cache key: `(time_ms, project_version, params_hash)`
 - `project_version` bumped on any DB write via a monotonic counter in `meta`
 - `params_hash` covers track list, effect params, transform/color curves — derived from `Schedule`
 
-#### Fine-grained invalidation
+#### Fine-grained invalidation (`invalidate()` in `frame_cache.py`)
 
 Each API write endpoint calls `invalidate(session_dir, from_ts, to_ts)` with the affected time range:
 
@@ -183,9 +227,10 @@ Each API write endpoint calls `invalidate(session_dir, from_ts, to_ts)` with the
 
 L1 eviction is synchronous. L2 eviction is async.
 
-#### Per-session render worker
+#### Per-session render worker (`src/scenecraft/render/preview_worker.py`)
 
 ```python
+# imports from compositor.py, schedule.py, frame_cache.py, preview_stream.py
 class RenderWorker:
     """One per active session. Owns its Schedule and cache."""
     def __init__(self, session_dir: Path):
@@ -198,7 +243,7 @@ class RenderWorker:
         return encode_jpeg(frame, quality)
 
     def render_playback_fragment(self, from_t: float, duration: float) -> bytes:
-        # Render range, encode as fMP4 via PyAV
+        # Render range, encode as fMP4 via PyAV (delegates to preview_stream.py)
         ...
 
 class RenderCoordinator:
@@ -209,7 +254,20 @@ class RenderCoordinator:
 
 Spawned lazily on first request; torn down after 5 min idle.
 
-#### API endpoints
+#### MSE encoding (`src/scenecraft/render/preview_stream.py`)
+
+PyAV-based H.264 encoder wrapper. `RenderWorker.render_playback_fragment()` delegates here to keep the worker file small and the encoder testable in isolation.
+
+```python
+class FragmentEncoder:
+    def __init__(self, width: int, height: int, fps: float): ...
+    def encode_range(self, frames: Iterable[np.ndarray]) -> bytes:
+        """Encode a sequence of BGR frames → fMP4 bytes (init segment + media segment)."""
+```
+
+#### API endpoints (`src/scenecraft/render_api.py`)
+
+Separate file from `api_server.py` to keep the growing API server from blowing past 7000 LOC. `api_server.py` just registers the render routes.
 
 ```
 GET  /api/projects/:name/render-frame?t=<float>&quality=<0-100>
