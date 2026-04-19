@@ -138,6 +138,10 @@ Tools available:
     that one field is changing.
   • update_curve — replace a transition's color/opacity curve points.
   • update_transform_curve — replace a transition's transform X/Y/Z curve points.
+  • split_transition — divide a transition at a time point, inserting a new keyframe.
+  • assign_keyframe_image — mark a candidate variant (v{N}.png) as selected.
+  • assign_pool_video — mark a pool_segment as selected for a transition slot (the
+    segment must already be a candidate via tr_candidates).
   • delete_keyframe, delete_transition — soft-delete one item (asks to confirm).
   • batch_delete_keyframes, batch_delete_transitions — soft-delete many in ONE
     confirmation and ONE undo group. Prefer these over looping single-deletes.
@@ -462,6 +466,79 @@ UPDATE_TRANSITION_TOOL: dict = {
     },
 }
 
+SPLIT_TRANSITION_TOOL: dict = {
+    "name": "split_transition",
+    "description": (
+        "Divide a transition into two transitions at a time point. Creates a new "
+        "keyframe at the split, then updates the original transition to end at the "
+        "new keyframe and inserts a new transition going new_kf → original_to_kf. "
+        "The new transition inherits action/slots/track from the original. `at_time` "
+        "must fall strictly between the transition's from and to keyframe timestamps. "
+        "Wrapped in an undo group. tr_candidates are NOT copied; regenerate if needed."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "transition_id": {"type": "string"},
+            "at_time": {
+                "type": "string",
+                "description": "Absolute timeline time ('m:ss', 'mm:ss.fff', or seconds as a string) strictly between from_kf and to_kf.",
+            },
+            "new_keyframe_prompt": {
+                "type": "string",
+                "description": "Optional prompt for the inserted keyframe; defaults to empty.",
+            },
+        },
+        "required": ["transition_id", "at_time"],
+    },
+}
+
+ASSIGN_KEYFRAME_IMAGE_TOOL: dict = {
+    "name": "assign_keyframe_image",
+    "description": (
+        "Mark a candidate as the selected image for a keyframe. Pass `variant` (the "
+        "integer N in v{N}.png — inspect the keyframe's `candidates` list or run "
+        "sql_query to discover). Updates the keyframe's `selected` field. Wrapped "
+        "in an undo group."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "keyframe_id": {"type": "string"},
+            "variant": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "1-based variant number (N in v{N}.png).",
+            },
+        },
+        "required": ["keyframe_id", "variant"],
+    },
+}
+
+ASSIGN_POOL_VIDEO_TOOL: dict = {
+    "name": "assign_pool_video",
+    "description": (
+        "Mark a pool_segment as the selected video for a transition slot. The "
+        "(transition_id, slot, pool_segment_id) triple must already exist in "
+        "tr_candidates (i.e. the segment was generated or imported for that slot). "
+        "Updates the transition's `selected` list. Wrapped in an undo group."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "transition_id": {"type": "string"},
+            "pool_segment_id": {"type": "string"},
+            "slot": {
+                "type": "integer",
+                "minimum": 0,
+                "default": 0,
+                "description": "Slot index within the transition. Default 0.",
+            },
+        },
+        "required": ["transition_id", "pool_segment_id"],
+    },
+}
+
 GENERATE_TRANSITION_CANDIDATES_TOOL: dict = {
     "name": "generate_transition_candidates",
     "description": (
@@ -505,6 +582,9 @@ TOOLS: list[dict] = [
     ADD_KEYFRAME_TOOL,
     UPDATE_KEYFRAME_TOOL,
     UPDATE_TRANSITION_TOOL,
+    SPLIT_TRANSITION_TOOL,
+    ASSIGN_KEYFRAME_IMAGE_TOOL,
+    ASSIGN_POOL_VIDEO_TOOL,
     GENERATE_KEYFRAME_CANDIDATES_TOOL,
     GENERATE_TRANSITION_CANDIDATES_TOOL,
 ]
@@ -1013,6 +1093,229 @@ def _exec_update_transition(project_dir: Path, input_data: dict) -> dict:
     }
 
 
+def _parse_ts_seconds(ts: Any) -> float | None:
+    """Parse a timestamp string into seconds. Returns None on malformed input."""
+    if ts is None:
+        return None
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    s = str(ts).strip()
+    if not s:
+        return None
+    try:
+        if ":" in s:
+            parts = s.split(":")
+            if len(parts) == 2:
+                return int(parts[0]) * 60 + float(parts[1])
+            if len(parts) == 3:
+                return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+            return None
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _exec_split_transition(project_dir: Path, input_data: dict) -> dict:
+    from scenecraft.db import (
+        get_transition, get_keyframe, add_keyframe, add_transition,
+        update_transition, next_keyframe_id, next_transition_id, undo_begin,
+    )
+
+    tr_id = input_data.get("transition_id")
+    at_time = input_data.get("at_time")
+    new_prompt = input_data.get("new_keyframe_prompt") or ""
+
+    if not tr_id or not isinstance(tr_id, str):
+        return {"error": "missing transition_id"}
+
+    tr = get_transition(project_dir, tr_id)
+    if not tr:
+        return {"error": f"transition not found: {tr_id}"}
+    if tr.get("deleted_at"):
+        return {"error": f"transition {tr_id} is deleted; restore it first"}
+
+    from_kf_id = tr.get("from")
+    to_kf_id = tr.get("to")
+    from_kf = get_keyframe(project_dir, from_kf_id) if from_kf_id else None
+    to_kf = get_keyframe(project_dir, to_kf_id) if to_kf_id else None
+    if not from_kf or not to_kf:
+        return {"error": f"transition {tr_id} has missing endpoints (from={from_kf_id}, to={to_kf_id})"}
+
+    at_sec = _parse_ts_seconds(at_time)
+    from_sec = _parse_ts_seconds(from_kf.get("timestamp"))
+    to_sec = _parse_ts_seconds(to_kf.get("timestamp"))
+    if at_sec is None:
+        return {"error": f"invalid at_time: {at_time!r}"}
+    if from_sec is None or to_sec is None:
+        return {"error": "could not parse endpoint timestamps"}
+    if not (from_sec < at_sec < to_sec):
+        return {
+            "error": f"at_time {at_time} ({at_sec}s) must be strictly between from_kf ({from_sec}s) and to_kf ({to_sec}s)"
+        }
+
+    # Format at_sec as m:ss.fff for timeline display
+    mins = int(at_sec // 60)
+    secs = at_sec - mins * 60
+    new_timestamp = f"{mins}:{secs:06.3f}"
+
+    new_kf_id = next_keyframe_id(project_dir)
+    new_tr_id = next_transition_id(project_dir)
+
+    undo_begin(project_dir, f"Chat: split {tr_id} at {new_timestamp}")
+
+    add_keyframe(project_dir, {
+        "id": new_kf_id,
+        "timestamp": new_timestamp,
+        "prompt": new_prompt,
+        "track_id": tr.get("track_id", "track_1"),
+        "section": "",
+        "label": "",
+        "candidates": [],
+    })
+
+    # Duration for each half, preserving total duration
+    total_dur = float(tr.get("duration_seconds") or (to_sec - from_sec))
+    first_dur = at_sec - from_sec
+    second_dur = to_sec - at_sec
+    # If the caller had a smaller total_dur than the natural span, scale proportionally
+    if total_dur > 0 and abs(total_dur - (to_sec - from_sec)) > 0.001:
+        scale = total_dur / (to_sec - from_sec)
+        first_dur *= scale
+        second_dur *= scale
+
+    add_transition(project_dir, {
+        "id": new_tr_id,
+        "from": new_kf_id,
+        "to": to_kf_id,
+        "duration_seconds": second_dur,
+        "slots": tr.get("slots", 1),
+        "action": tr.get("action", ""),
+        "use_global_prompt": int(bool(tr.get("use_global_prompt", True))),
+        "include_section_desc": int(bool(tr.get("include_section_desc", True))),
+        "track_id": tr.get("track_id", "track_1"),
+    })
+
+    update_transition(project_dir, tr_id, to=new_kf_id, duration_seconds=first_dur)
+
+    return {
+        "original_transition_id": tr_id,
+        "new_keyframe_id": new_kf_id,
+        "new_transition_id": new_tr_id,
+        "split_at": new_timestamp,
+        "first_duration_seconds": round(first_dur, 3),
+        "second_duration_seconds": round(second_dur, 3),
+    }
+
+
+def _exec_assign_keyframe_image(project_dir: Path, input_data: dict) -> dict:
+    from scenecraft.db import get_keyframe, update_keyframe, undo_begin
+    kf_id = input_data.get("keyframe_id")
+    variant = input_data.get("variant")
+    if not kf_id or not isinstance(kf_id, str):
+        return {"error": "missing keyframe_id"}
+    try:
+        variant = int(variant)
+    except (TypeError, ValueError):
+        return {"error": "variant must be an integer"}
+    if variant < 1:
+        return {"error": "variant must be >= 1"}
+
+    kf = get_keyframe(project_dir, kf_id)
+    if not kf:
+        return {"error": f"keyframe not found: {kf_id}"}
+
+    candidates = kf.get("candidates") or []
+    # Derive valid variant numbers from candidate paths like ".../v3.png"
+    import re as _re
+    available: list[int] = []
+    for p in candidates:
+        m = _re.search(r"v(\d+)\.\w+$", str(p))
+        if m:
+            available.append(int(m.group(1)))
+
+    if variant not in available:
+        return {
+            "error": f"variant {variant} is not among this keyframe's candidates",
+            "available_variants": sorted(available),
+        }
+
+    previous = kf.get("selected")
+    undo_begin(project_dir, f"Chat: assign image v{variant} to {kf_id}")
+    update_keyframe(project_dir, kf_id, selected=variant)
+
+    return {
+        "keyframe_id": kf_id,
+        "selected_variant": variant,
+        "previous_variant": previous,
+        "candidate_path": next((c for c in candidates if f"v{variant}." in str(c)), None),
+    }
+
+
+def _exec_assign_pool_video(project_dir: Path, input_data: dict) -> dict:
+    from scenecraft.db import (
+        get_transition, get_pool_segment, update_transition, get_tr_candidates, undo_begin,
+    )
+
+    tr_id = input_data.get("transition_id")
+    pool_seg_id = input_data.get("pool_segment_id")
+    slot = input_data.get("slot", 0)
+
+    if not tr_id or not isinstance(tr_id, str):
+        return {"error": "missing transition_id"}
+    if not pool_seg_id or not isinstance(pool_seg_id, str):
+        return {"error": "missing pool_segment_id"}
+    try:
+        slot = int(slot)
+    except (TypeError, ValueError):
+        return {"error": "slot must be an integer"}
+    if slot < 0:
+        return {"error": "slot must be >= 0"}
+
+    tr = get_transition(project_dir, tr_id)
+    if not tr:
+        return {"error": f"transition not found: {tr_id}"}
+
+    n_slots = int(tr.get("slots", 1))
+    if slot >= n_slots:
+        return {"error": f"slot {slot} out of range (transition has {n_slots} slots)"}
+
+    seg = get_pool_segment(project_dir, pool_seg_id)
+    if not seg:
+        return {"error": f"pool_segment not found: {pool_seg_id}"}
+
+    slot_cands = get_tr_candidates(project_dir, tr_id, slot)
+    # get_tr_candidates returns joined pool_segment dicts; pool_segment id is keyed "id"
+    cand_ids = [c.get("id") for c in slot_cands if c.get("id")]
+    if pool_seg_id not in cand_ids:
+        return {
+            "error": f"pool_segment {pool_seg_id} is not a candidate for slot {slot}",
+            "available_candidates": cand_ids,
+        }
+
+    # Build / update the selected list (length == slots, entries are pool_segment_id or None)
+    raw_selected = tr.get("selected")
+    if raw_selected is None:
+        selected_list: list = [None] * n_slots
+    elif isinstance(raw_selected, list):
+        selected_list = list(raw_selected) + [None] * max(0, n_slots - len(raw_selected))
+    else:
+        # Legacy: single scalar — expand
+        selected_list = [raw_selected] + [None] * (n_slots - 1)
+
+    previous = selected_list[slot]
+    selected_list[slot] = pool_seg_id
+
+    undo_begin(project_dir, f"Chat: assign video for {tr_id} slot {slot}")
+    update_transition(project_dir, tr_id, selected=selected_list)
+
+    return {
+        "transition_id": tr_id,
+        "slot": slot,
+        "pool_segment_id": pool_seg_id,
+        "previous_pool_segment_id": previous,
+    }
+
+
 def _exec_delete_keyframe(project_dir: Path, input_data: dict) -> dict:
     from scenecraft.db import get_keyframe, delete_keyframe, undo_begin
     kf_id = input_data.get("keyframe_id")
@@ -1220,6 +1523,15 @@ async def _execute_tool(
         return result, "error" in result
     if name == "update_transition":
         result = _exec_update_transition(project_dir, input_data)
+        return result, "error" in result
+    if name == "split_transition":
+        result = _exec_split_transition(project_dir, input_data)
+        return result, "error" in result
+    if name == "assign_keyframe_image":
+        result = _exec_assign_keyframe_image(project_dir, input_data)
+        return result, "error" in result
+    if name == "assign_pool_video":
+        result = _exec_assign_pool_video(project_dir, input_data)
         return result, "error" in result
     if name == "generate_keyframe_candidates":
         from scenecraft.chat_generation import start_keyframe_generation
