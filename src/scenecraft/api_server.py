@@ -309,6 +309,11 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             if m:
                 return self._json_response({"activeFile": None, "events": [], "sections": [], "rules": [], "ruleCount": 0, "onsets": {}})
 
+            # GET /api/render-cache/stats — global frame cache hit/miss stats
+            if path == "/api/render-cache/stats":
+                from scenecraft.render.frame_cache import global_cache
+                return self._json_response(global_cache.stats())
+
             # GET /api/projects/:name/render-frame?t=<seconds>[&quality=<1-100>]
             m = re.match(r"^/api/projects/([^/]+)/render-frame$", path)
             if m:
@@ -3033,46 +3038,54 @@ def make_handler(work_dir: Path, no_auth: bool = False):
 
             Uses the backend compositor (same code path as the final export render),
             so the returned frame matches the final output pixel-for-pixel pre-encode.
+            Hits a process-global in-memory LRU cache keyed on (project, db mtime, t, quality).
+            Any DB write bumps mtime → cache miss for affected project automatically.
             """
             try:
                 import cv2
 
                 from scenecraft.render.compositor import render_frame_at
+                from scenecraft.render.frame_cache import global_cache
                 from scenecraft.render.schedule import build_schedule
             except ImportError as e:
                 return self._error(500, "INTERNAL_ERROR", f"Render dependencies not installed: {e}")
 
-            try:
-                schedule = build_schedule(project_dir)
-            except Exception as e:
-                return self._error(500, "INTERNAL_ERROR", f"build_schedule failed: {e}")
+            cached_jpeg = global_cache.get(project_dir, t, quality)
+            cache_status = "HIT" if cached_jpeg is not None else "MISS"
 
-            if schedule.duration_seconds <= 0 or not schedule.segments:
-                return self._error(404, "NO_CONTENT", "Project has no renderable content yet")
+            if cached_jpeg is None:
+                try:
+                    schedule = build_schedule(project_dir)
+                except Exception as e:
+                    return self._error(500, "INTERNAL_ERROR", f"build_schedule failed: {e}")
 
-            # Clamp t into the project's timeline
-            t = max(0.0, min(t, schedule.duration_seconds - 1.0 / schedule.fps))
+                if schedule.duration_seconds <= 0 or not schedule.segments:
+                    return self._error(404, "NO_CONTENT", "Project has no renderable content yet")
 
-            try:
-                frame = render_frame_at(schedule, t, frame_cache={})
-            except Exception as e:
-                return self._error(500, "INTERNAL_ERROR", f"render_frame_at failed: {e}")
+                t = max(0.0, min(t, schedule.duration_seconds - 1.0 / schedule.fps))
 
-            ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-            if not ok:
-                return self._error(500, "INTERNAL_ERROR", "JPEG encode failed")
-            data = bytes(buf)
+                try:
+                    frame = render_frame_at(schedule, t, frame_cache={})
+                except Exception as e:
+                    return self._error(500, "INTERNAL_ERROR", f"render_frame_at failed: {e}")
+
+                ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+                if not ok:
+                    return self._error(500, "INTERNAL_ERROR", "JPEG encode failed")
+                cached_jpeg = bytes(buf)
+                global_cache.put(project_dir, t, quality, cached_jpeg)
 
             try:
                 self.send_response(200)
                 self.send_header("Content-Type", "image/jpeg")
-                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Length", str(len(cached_jpeg)))
                 self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Scenecraft-Cache", cache_status)
                 self._cors_headers()
                 if self._refreshed_cookie:
                     self.send_header("Set-Cookie", self._refreshed_cookie)
                 self.end_headers()
-                self.wfile.write(data)
+                self.wfile.write(cached_jpeg)
             except (BrokenPipeError, ConnectionResetError):
                 pass
 

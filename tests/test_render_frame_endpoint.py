@@ -135,6 +135,39 @@ def test_render_frame_unknown_project_404(project_env):
     assert exc_info.value.code == 404
 
 
+def test_render_frame_is_cached(project_env):
+    """Second request for the same (t, quality) hits the cache."""
+    from scenecraft.render.frame_cache import global_cache
+    global_cache.clear()
+
+    url = f"{project_env['base_url']}/api/projects/{project_env['project_name']}/render-frame?t=0.25"
+    first = _get(url)
+    first_body = first.read()
+    assert first.headers.get("X-Scenecraft-Cache") == "MISS"
+
+    second = _get(url)
+    second_body = second.read()
+    assert second.headers.get("X-Scenecraft-Cache") == "HIT"
+    # Identical bytes from cache
+    assert first_body == second_body
+
+
+def test_cache_invalidates_on_db_write(project_env):
+    """Writing to project.db bumps mtime → cache key changes → re-render."""
+    from scenecraft.db import set_meta
+    from scenecraft.render.frame_cache import global_cache
+    global_cache.clear()
+
+    url = f"{project_env['base_url']}/api/projects/{project_env['project_name']}/render-frame?t=0.25"
+    _get(url).read()
+    assert _get(url).headers.get("X-Scenecraft-Cache") == "HIT"
+
+    # Any DB write bumps mtime and invalidates
+    import time; time.sleep(0.01)  # ensure mtime changes
+    set_meta(project_env["project_dir"], "motion_prompt", "new prompt")
+    assert _get(url).headers.get("X-Scenecraft-Cache") == "MISS"
+
+
 def test_render_frame_empty_project_returns_no_content(project_env):
     """A project with no transitions yet can't be rendered — return a clear 404."""
     work_dir = project_env["project_dir"].parent
