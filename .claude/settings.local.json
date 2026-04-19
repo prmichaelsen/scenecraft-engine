@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(python3.12 -m venv /home/prmichaelsen/.acp/projects/scenecraft-engine/.venv)",
+      "Bash(/home/prmichaelsen/.acp/projects/scenecraft-engine/.venv/bin/pip install:*)",
+      "Bash(/home/prmichaelsen/.acp/projects/scenecraft-engine/.venv/bin/python3:*)",
+      "Bash(npx tsc *)",
+      "Bash(/home/prmichaelsen/.acp/projects/scenecraft-engine/.venv/bin/scenecraft --help)",
+      "Bash(/home/prmichaelsen/.acp/projects/scenecraft-engine/.venv/bin/scenecraft org *)",
+      "Bash(sqlite3 *)"
+    ]
+  }
+}

@@ -26,6 +26,14 @@ from .sessions import list_sessions, prune_sessions
 
 
 def _require_root() -> Path:
+    # Prefer the VCS root derived from the configured projects_dir — this is
+    # the same root the server uses, so CLI and server always agree.
+    from scenecraft.config import get_projects_dir
+    pd = get_projects_dir()
+    if pd is not None:
+        candidate = find_root(pd)
+        if candidate is not None:
+            return candidate
     root = find_root()
     if root is None:
         click.echo("Error: not inside a .scenecraft directory. Run 'scenecraft init' first.", err=True)

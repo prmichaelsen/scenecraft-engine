@@ -21,6 +21,7 @@ dependencies = [
 [project.optional-dependencies]
 ai = [
     "anthropic>=0.30.0",
+    "mcp>=1.0.0",
 ]
 google = [
     "google-genai>=1.0.0",

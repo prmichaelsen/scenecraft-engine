@@ -114,6 +114,22 @@ job_manager = JobManager()
 
 
 async def _handle_connection(ws: ServerConnection):
+    # Route chat connections to the chat handler
+    path = ws.request.path if ws.request else ""
+    if path.startswith("/ws/chat/"):
+        project_name = path.split("/ws/chat/", 1)[1].split("?")[0]
+        from urllib.parse import unquote
+        project_name = unquote(project_name)
+        if _work_dir and project_name:
+            project_dir = _work_dir / project_name
+            if project_dir.is_dir():
+                from scenecraft.chat import handle_chat_connection
+                await handle_chat_connection(ws, project_dir, project_name)
+                return
+        await ws.send(json.dumps({"type": "error", "error": f"Project not found: {project_name}"}))
+        return
+
+    # Default: job progress handler
     job_manager.register_connection(ws)
     _log(f"Client connected ({len(job_manager._connections)} total)")
     try:
@@ -148,6 +164,9 @@ async def _handle_connection(ws: ServerConnection):
     finally:
         job_manager.unregister_connection(ws)
         _log(f"Client disconnected ({len(job_manager._connections)} total)")
+
+
+_work_dir: Path | None = None
 
 
 async def _run_ws_server(host: str, port: int):
@@ -397,8 +416,11 @@ class FolderWatcher:
 folder_watcher: FolderWatcher | None = None
 
 
-def start_ws_server(host: str = "0.0.0.0", port: int = 8891):
+def start_ws_server(host: str = "0.0.0.0", port: int = 8891, work_dir: Path | None = None):
     """Start the WebSocket server in a background thread."""
+    global _work_dir
+    _work_dir = work_dir
+
     def _run():
         asyncio.run(_run_ws_server(host, port))
 

@@ -28,9 +28,9 @@ def main():
     pass
 
 
-# Register VCS subcommands
-from scenecraft.vcs.cli import vcs_group  # noqa: E402
-main.add_command(vcs_group)
+# Register top-level server commands (init, token, org, user, session)
+from scenecraft.vcs.cli import register_commands  # noqa: E402
+register_commands(main)
 
 
 @main.command()
@@ -1285,7 +1285,8 @@ def destroy_gpu(destroy_all: bool):
 @click.option("--port", default=8890, type=int, help="Server port (default: 8890)")
 @click.option("--host", default="0.0.0.0", type=str, help="Bind address (default: 0.0.0.0)")
 @click.option("--work-dir", default=None, type=str, help="Work directory (overrides config)")
-def server(port: int, host: str, work_dir: str | None):
+@click.option("--no-auth", is_flag=True, default=False, help="Disable JWT authentication")
+def server(port: int, host: str, work_dir: str | None, no_auth: bool):
     """Start SceneCraft REST API server for the synthesizer frontend."""
     from scenecraft.config import resolve_work_dir, set_projects_dir
 
@@ -1303,7 +1304,7 @@ def server(port: int, host: str, work_dir: str | None):
         wd.mkdir(parents=True, exist_ok=True)
 
     from scenecraft.api_server import run_server
-    run_server(host, port, work_dir=str(wd))
+    run_server(host, port, work_dir=str(wd), no_auth=no_auth)
 
 
 @main.command(name="audio-intelligence")

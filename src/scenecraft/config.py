@@ -1,13 +1,20 @@
-"""SceneCraft configuration — persistent settings stored at ~/.scenecraft/config.json."""
+"""SceneCraft configuration — persistent settings stored at $XDG_CONFIG_HOME/scenecraft/config.json."""
 
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 
-CONFIG_DIR = Path.home() / ".scenecraft"
+def _config_home() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    return Path(xdg) if xdg else Path.home() / ".config"
+
+
+CONFIG_DIR = _config_home() / "scenecraft"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+_LEGACY_CONFIG_FILE = Path.home() / ".scenecraft" / "config.json"
 
 
 def _ensure_config_dir():
@@ -15,11 +22,21 @@ def _ensure_config_dir():
 
 
 def load_config() -> dict:
-    """Load config from disk. Returns empty dict if no config exists."""
-    if not CONFIG_FILE.exists():
-        return {}
-    with open(CONFIG_FILE) as f:
-        return json.load(f)
+    """Load config from disk. Returns empty dict if no config exists.
+
+    Falls back to the legacy ~/.scenecraft/config.json location and migrates it.
+    """
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    if _LEGACY_CONFIG_FILE.exists():
+        with open(_LEGACY_CONFIG_FILE) as f:
+            data = json.load(f)
+        _ensure_config_dir()
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+        return data
+    return {}
 
 
 def save_config(config: dict):

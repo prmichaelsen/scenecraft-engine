@@ -104,7 +104,7 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 return True  # No .scenecraft = auth disabled
             # Unauthenticated endpoints
             path = self.path.split("?", 1)[0]
-            if path in ("/auth/login", "/auth/logout"):
+            if path in ("/auth/login", "/auth/logout", "/oauth/callback"):
                 return True
 
             from scenecraft.vcs.auth import (
@@ -148,6 +148,20 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             # GET /auth/login?code=<one-time-code> — exchange code for HttpOnly cookie, redirect
             if path == "/auth/login":
                 return self._handle_auth_login(parsed.query)
+
+            # GET /oauth/callback?code=...&state=... — OAuth authorization-code callback
+            if path == "/oauth/callback":
+                return self._handle_oauth_callback(parsed.query)
+
+            # GET /api/oauth/<service>/authorize — start an OAuth flow, return auth URL
+            m = re.match(r"^/api/oauth/([^/]+)/authorize$", path)
+            if m:
+                return self._handle_oauth_authorize(m.group(1))
+
+            # GET /api/oauth/<service>/status — is this user connected to the service?
+            m = re.match(r"^/api/oauth/([^/]+)/status$", path)
+            if m:
+                return self._handle_oauth_status(m.group(1))
 
             # GET /api/config
             if path == "/api/config":
@@ -509,6 +523,11 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             # POST /auth/logout — clear the cookie
             if path == "/auth/logout":
                 return self._handle_auth_logout()
+
+            # POST /api/oauth/<service>/disconnect — delete stored tokens
+            _m = re.match(r"^/api/oauth/([^/]+)/disconnect$", path)
+            if _m:
+                return self._handle_oauth_disconnect(_m.group(1))
 
             # Structural timeline mutations need a per-project lock to prevent
             # read-modify-write races (e.g., two concurrent deletes creating duplicate bridges).
@@ -1916,6 +1935,153 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 self._cors_headers()
                 self.end_headers()
                 self.wfile.write(b'{"ok":true}')
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def _handle_oauth_authorize(self, service: str):
+            """GET /api/oauth/<service>/authorize — start an OAuth flow.
+
+            Returns JSON: { url: <consent-url>, state: <token> }
+            Frontend opens `url` in a popup/new tab; the /oauth/callback handler
+            completes the flow server-side when the user authorizes.
+            """
+            from scenecraft.oauth_client import (
+                SERVICES, generate_pkce_pair, create_pending_state, build_authorize_url,
+            )
+            if service not in SERVICES:
+                return self._error(404, "UNKNOWN_SERVICE", f"No OAuth service: {service}")
+            user_id = getattr(self, "_authenticated_user", None) or "local"
+            verifier, challenge = generate_pkce_pair()
+            state = create_pending_state(user_id=user_id, service=service, code_verifier=verifier)
+            url = build_authorize_url(service, state, challenge)
+            _log(f"oauth-authorize: user={user_id} service={service}")
+            return self._json_response({"url": url, "state": state})
+
+        def _handle_oauth_callback(self, query_string: str):
+            """GET /oauth/callback?code=...&state=... — finish the OAuth flow.
+
+            Called by the browser after the user authorizes at agentbase.me.
+            Exchanges the code for tokens, persists them, renders an HTML page
+            that notifies the opener window and closes itself.
+            """
+            from urllib.parse import parse_qs
+            from scenecraft.oauth_client import (
+                consume_pending_state, exchange_code_for_tokens, save_tokens, TokenExchangeError,
+            )
+            qs = parse_qs(query_string)
+            code = qs.get("code", [""])[0]
+            state = qs.get("state", [""])[0]
+            err = qs.get("error", [""])[0]
+            err_desc = qs.get("error_description", [""])[0]
+
+            if err:
+                return self._send_callback_html(success=False, message=err_desc or err)
+            if not code or not state:
+                return self._send_callback_html(success=False, message="Missing code or state")
+
+            pending = consume_pending_state(state)
+            if not pending:
+                return self._send_callback_html(success=False, message="Invalid or expired state")
+
+            try:
+                result = exchange_code_for_tokens(code, pending["code_verifier"])
+            except TokenExchangeError as e:
+                msg = e.body.get("error_description") or e.body.get("error") or "Token exchange failed"
+                _log(f"oauth-callback: exchange failed: {msg}")
+                return self._send_callback_html(success=False, message=msg)
+
+            save_tokens(
+                user_id=pending["user_id"],
+                service=pending["service"],
+                access_token=result["access_token"],
+                refresh_token=result.get("refresh_token"),
+                expires_in=int(result.get("expires_in", 3600)),
+            )
+            _log(f"oauth-callback: stored tokens for {pending['user_id']}/{pending['service']}")
+            return self._send_callback_html(success=True, message=f"Connected {pending['service']}", service=pending["service"])
+
+        def _handle_oauth_status(self, service: str):
+            """GET /api/oauth/<service>/status — connection state for this user/service."""
+            from scenecraft.oauth_client import SERVICES, load_tokens
+            if service not in SERVICES:
+                return self._error(404, "UNKNOWN_SERVICE", f"No OAuth service: {service}")
+            user_id = getattr(self, "_authenticated_user", None) or "local"
+            tokens = load_tokens(user_id, service)
+            if tokens is None:
+                return self._json_response({"connected": False})
+            return self._json_response({
+                "connected": True,
+                "expires_at": tokens.expires_at.isoformat(),
+                "has_refresh_token": bool(tokens.refresh_token),
+                "created_at": tokens.created_at.isoformat(),
+                "updated_at": tokens.updated_at.isoformat(),
+            })
+
+        def _handle_oauth_disconnect(self, service: str):
+            """POST /api/oauth/<service>/disconnect — delete stored tokens."""
+            from scenecraft.oauth_client import SERVICES, delete_tokens
+            if service not in SERVICES:
+                return self._error(404, "UNKNOWN_SERVICE", f"No OAuth service: {service}")
+            user_id = getattr(self, "_authenticated_user", None) or "local"
+            deleted = delete_tokens(user_id, service)
+            _log(f"oauth-disconnect: user={user_id} service={service} deleted={deleted}")
+            return self._json_response({"disconnected": deleted})
+
+        def _send_callback_html(self, *, success: bool, message: str, service: str | None = None):
+            """Render a minimal HTML page shown in the popup after the OAuth callback."""
+            status_color = "#10b981" if success else "#ef4444"
+            title = "Connected" if success else "Connection Failed"
+            icon = "✓" if success else "✗"
+            # Escape for inline HTML/JS
+            import html as _html
+            safe_msg = _html.escape(message or "")
+            safe_service = _html.escape(service or "")
+            body = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>{title}</title>
+  <style>
+    body {{ font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0;
+            display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
+    .card {{ text-align: center; padding: 2rem 3rem; background: #1e293b; border-radius: 12px;
+             border: 1px solid #334155; max-width: 420px; }}
+    .icon {{ font-size: 3rem; color: {status_color}; line-height: 1; margin-bottom: 0.5rem; }}
+    h1 {{ font-size: 1.25rem; margin: 0 0 0.5rem 0; }}
+    p {{ color: #94a3b8; margin: 0; font-size: 0.9rem; line-height: 1.4; }}
+    .hint {{ margin-top: 1rem; font-size: 0.8rem; color: #64748b; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">{icon}</div>
+    <h1>{title}</h1>
+    <p>{safe_msg}</p>
+    <p class="hint">This window will close automatically.</p>
+  </div>
+  <script>
+    try {{
+      if (window.opener) {{
+        window.opener.postMessage({{
+          type: 'scenecraft-oauth-callback',
+          success: {str(success).lower()},
+          service: {json.dumps(safe_service)},
+          message: {json.dumps(safe_msg)},
+        }}, '*');
+      }}
+    }} catch (e) {{}}
+    setTimeout(() => {{ try {{ window.close(); }} catch (e) {{}} }}, 1500);
+  </script>
+</body>
+</html>"""
+            data = body.encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self._cors_headers()
+                self.end_headers()
+                self.wfile.write(data)
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
