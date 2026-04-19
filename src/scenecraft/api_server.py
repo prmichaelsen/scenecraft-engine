@@ -748,6 +748,13 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             if m:
                 return self._handle_pool_import(m.group(1))
 
+            # POST /api/projects/:name/pool/upload — browser file upload (multipart)
+            # that becomes a pool_segments row (kind='imported'). Used by drag-drop
+            # and file-picker flows in the frontend.
+            m = re.match(r"^/api/projects/([^/]+)/pool/upload$", path)
+            if m:
+                return self._handle_pool_upload(m.group(1))
+
             # POST /api/projects/:name/pool/rename — update a pool segment's label
             m = re.match(r"^/api/projects/([^/]+)/pool/rename$", path)
             if m:
@@ -2858,6 +2865,114 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     "poolPath": f"pool/segments/{pool_name}",
                     "originalFilename": original_filename,
                     "originalFilepath": original_filepath,
+                    "durationSeconds": dur,
+                })
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self._error(500, "INTERNAL_ERROR", str(e))
+
+        def _handle_pool_upload(self, project_name: str):
+            """POST /api/projects/:name/pool/upload — multipart file upload into the pool.
+
+            Form fields:
+              file:  the binary file (required)
+              label: user-facing display name (optional — defaults to original filename)
+              originalFilepath: original absolute path on the client's machine (optional;
+                                browsers may provide webkitRelativePath or full name)
+
+            Creates a pool_segments row with kind='imported'. File on disk is UUID-renamed
+            to import_{uuid}.{ext}; original_filename and original_filepath are preserved
+            in DB metadata.
+            """
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+
+            try:
+                content_type = self.headers.get('Content-Type', '')
+                if 'multipart/form-data' not in content_type:
+                    return self._error(400, "BAD_REQUEST", "Expected multipart/form-data")
+
+                content_length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(content_length)
+
+                boundary = content_type.split('boundary=')[-1].encode()
+                parts = body.split(b'--' + boundary)
+                file_data = None
+                file_name = None
+                label = ''
+                original_filepath = ''
+
+                for part in parts:
+                    if b'Content-Disposition' not in part:
+                        continue
+                    header_end = part.find(b'\r\n\r\n')
+                    if header_end < 0:
+                        continue
+                    header = part[:header_end].decode('utf-8', errors='replace')
+                    payload = part[header_end + 4:]
+                    if payload.endswith(b'\r\n'):
+                        payload = payload[:-2]
+
+                    if 'name="file"' in header:
+                        file_data = payload
+                        for h in header.split('\r\n'):
+                            if 'filename=' in h:
+                                file_name = h.split('filename=')[-1].strip('"').strip("'")
+                    elif 'name="label"' in header:
+                        label = payload.decode('utf-8', errors='replace').strip()
+                    elif 'name="originalFilepath"' in header:
+                        original_filepath = payload.decode('utf-8', errors='replace').strip()
+
+                if not file_data or not file_name:
+                    return self._error(400, "BAD_REQUEST", "Missing file upload")
+
+                import uuid as _uuid
+                import subprocess as _sp
+                ext = Path(file_name).suffix or ".mp4"
+                seg_uuid = _uuid.uuid4().hex
+                pool_name = f"import_{seg_uuid}{ext}"
+                pool_dir = project_dir / "pool" / "segments"
+                pool_dir.mkdir(parents=True, exist_ok=True)
+                dest = pool_dir / pool_name
+                dest.write_bytes(file_data)
+
+                # Probe
+                dur = None
+                try:
+                    r = _sp.run(
+                        ["ffprobe", "-v", "error", "-show_entries",
+                         "format=duration", "-of", "csv=p=0", str(dest)],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    if r.returncode == 0 and r.stdout.strip():
+                        dur = float(r.stdout.strip())
+                except Exception:
+                    pass
+                byte_size = dest.stat().st_size
+
+                from scenecraft.db import get_db as _get_db, _now_iso
+                auth_user = getattr(self, "_authenticated_user", None) or "local"
+                conn = _get_db(project_dir)
+                conn.execute(
+                    """INSERT INTO pool_segments
+                       (id, pool_path, kind, created_by, original_filename, original_filepath,
+                        label, generation_params, created_at, duration_seconds, width, height, byte_size)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (seg_uuid, f"pool/segments/{pool_name}", "imported", auth_user,
+                     file_name, original_filepath or None,
+                     label or file_name, None, _now_iso(), dur, None, None, byte_size),
+                )
+                conn.commit()
+
+                _log(f"pool/upload: {file_name} -> seg={seg_uuid[:8]} ({byte_size // 1024}KB, {dur}s)")
+                self._json_response({
+                    "success": True,
+                    "poolSegmentId": seg_uuid,
+                    "poolPath": f"pool/segments/{pool_name}",
+                    "originalFilename": file_name,
+                    "originalFilepath": original_filepath or None,
                     "durationSeconds": dur,
                 })
             except Exception as e:
