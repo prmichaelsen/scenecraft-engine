@@ -218,11 +218,6 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             if m:
                 return self._handle_get_narrative(m.group(1))
 
-            # GET /api/projects/:name/timelines
-            m = re.match(r"^/api/projects/([^/]+)/timelines$", path)
-            if m:
-                return self._handle_get_timelines(m.group(1))
-
             # GET /api/projects/:name/workspace-views
             m = re.match(r"^/api/projects/([^/]+)/workspace-views$", path)
             if m:
@@ -266,29 +261,8 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 project_dir = self._require_project_dir(m.group(1))
                 if project_dir is None: return
                 from datetime import datetime as _dt
-                from scenecraft.db import list_checkpoints as _db_list_checkpoints, add_checkpoint as _db_add_checkpoint
+                from scenecraft.db import list_checkpoints as _db_list_checkpoints
                 meta_by_file = {c["filename"]: c for c in _db_list_checkpoints(project_dir)}
-                # One-shot migration: pull any checkpoints.yaml entries into the DB
-                # (legacy yaml is being retired; see memory: No YAML in scenecraft)
-                legacy_manifest = project_dir / "checkpoints.yaml"
-                if legacy_manifest.exists():
-                    try:
-                        import yaml as _yaml
-                        with open(legacy_manifest) as _mf:
-                            for entry in (_yaml.safe_load(_mf) or []):
-                                if not isinstance(entry, dict):
-                                    continue
-                                fn = entry.get("filename", "")
-                                if fn and fn not in meta_by_file:
-                                    _db_add_checkpoint(
-                                        project_dir,
-                                        fn,
-                                        name=entry.get("name", ""),
-                                        created_at=entry.get("created") or _dt.now().astimezone().isoformat(),
-                                    )
-                        meta_by_file = {c["filename"]: c for c in _db_list_checkpoints(project_dir)}
-                    except Exception as _e:
-                        _log(f"checkpoints.yaml migration skipped: {_e}")
 
                 checkpoints = []
                 for f in sorted(project_dir.glob("project.db.checkpoint-*"), reverse=True):
@@ -661,6 +635,13 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             m = re.match(r"^/api/projects/([^/]+)/update-transition-trim$", path)
             if m:
                 return self._handle_update_transition_trim(m.group(1))
+
+            # POST /api/projects/:name/clip-trim-edge — design-correct l/r edge trim.
+            # Inserts gap (shrink) or advances neighbor trim (extend) so no tr is
+            # time-remapped. See design/local.clip-trim-and-snap.md.
+            m = re.match(r"^/api/projects/([^/]+)/clip-trim-edge$", path)
+            if m:
+                return self._handle_clip_trim_edge(m.group(1))
 
             # POST /api/projects/:name/update-prompt
             m = re.match(r"^/api/projects/([^/]+)/update-prompt$", path)
@@ -1802,21 +1783,6 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             if m:
                 return self._handle_update_narrative(m.group(1))
 
-            # POST /api/projects/:name/timeline/switch
-            m = re.match(r"^/api/projects/([^/]+)/timeline/switch$", path)
-            if m:
-                return self._handle_timeline_switch(m.group(1))
-
-            # POST /api/projects/:name/timeline/import
-            m = re.match(r"^/api/projects/([^/]+)/timeline/import$", path)
-            if m:
-                return self._handle_timeline_import(m.group(1))
-
-            # POST /api/projects/:name/timeline/create
-            m = re.match(r"^/api/projects/([^/]+)/timeline/create$", path)
-            if m:
-                return self._handle_timeline_create(m.group(1))
-
             # POST /api/projects/:name/version/commit (deprecated — git removed, no-op)
             m = re.match(r"^/api/projects/([^/]+)/version/commit$", path)
             if m:
@@ -2121,14 +2087,12 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 filenames = [f.name for f in files]
                 has_audio = any(f.endswith((".wav", ".mp3")) for f in filenames)
                 has_video = any(f.endswith(".mp4") for f in filenames)
-                has_yaml = "narrative_keyframes.yaml" in filenames or "timeline.yaml" in filenames
                 has_beats = "beats.json" in filenames
 
                 projects.append({
                     "name": entry.name,
                     "hasAudio": has_audio,
                     "hasVideo": has_video,
-                    "hasYaml": has_yaml,
                     "hasBeats": has_beats,
                     "fileCount": len(files),
                     "modified": entry.stat().st_mtime * 1000,
@@ -2145,7 +2109,7 @@ def make_handler(work_dir: Path, no_auth: bool = False):
 
             from scenecraft.db import get_meta, get_keyframes as db_get_keyframes, get_transitions as db_get_transitions, get_tracks
 
-            # Check if DB exists (auto-import happens in _get_project_dir)
+            # Check if DB exists
             if not (project_dir / "project.db").exists():
                 return self._json_response({
                     "meta": {"title": project_name, "fps": 24, "resolution": [1920, 1080]},
@@ -2280,7 +2244,7 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                         # Check for selected slot keyframe
                         sel_path = selected_slot_kf_dir / f"{slot_key}.png"
                         if sel_path.exists():
-                            # Find which variant is selected from YAML
+                            # Find which variant is selected from the transition record
                             slot_kf_selected = tr.get("selected_slot_keyframes", {})
                             if isinstance(slot_kf_selected, dict):
                                 selected_slot_kfs[slot_key] = slot_kf_selected.get(slot_key)
@@ -2712,6 +2676,262 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     "transitionId": tr_id,
                     "trimIn": trim_updates.get("trim_in"),
                     "trimOut": trim_updates.get("trim_out"),
+                })
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self._error(500, "INTERNAL_ERROR", str(e))
+
+        def _handle_clip_trim_edge(self, project_name: str):
+            """POST /api/projects/:name/clip-trim-edge — l/r clip-edge trim.
+
+            Body: {
+              "transitionId": "tr_xxx",
+              "edge": "right" | "left",
+              "newBoundaryTimestamp": "0:07.00",
+              "newTrim": 5.5
+            }
+
+            Design-correct behavior (no time remap on any tr):
+              SHRINK (new boundary pulled inward): inserts a new kf at the new
+                boundary and an empty tr filling the gap to the original boundary.
+                The original boundary kf stays where it is, so the neighbor tr is
+                untouched.
+              EXTEND (new boundary pushed outward): moves the original boundary
+                kf to the new position AND advances the neighbor's trim (trim_in
+                for right edge, trim_out for left edge) proportionally to its
+                time-remap factor, so the neighbor's factor is preserved.
+            """
+            body = self._read_json_body()
+            if body is None:
+                return
+            tr_id = body.get("transitionId")
+            edge = body.get("edge")
+            new_ts = body.get("newBoundaryTimestamp")
+            new_trim = body.get("newTrim")
+            if not tr_id or edge not in ("right", "left") or new_ts is None or new_trim is None:
+                return self._error(400, "BAD_REQUEST", "Missing required fields")
+
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+
+            try:
+                from scenecraft.db import (
+                    undo_begin as _ub, get_transition, update_transition,
+                    update_keyframe, get_keyframe, get_transitions as _get_trs,
+                    add_keyframe, add_transition, next_keyframe_id, next_transition_id,
+                    delete_transition, delete_keyframe,
+                )
+                import datetime as _dt
+
+                def parse_ts(ts):
+                    parts = str(ts).split(":")
+                    if len(parts) == 2:
+                        return int(parts[0]) * 60 + float(parts[1])
+                    return float(ts) if isinstance(ts, (int, float)) else 0.0
+
+                def fmt_ts(seconds: float) -> str:
+                    s = max(0.0, seconds)
+                    m = int(s // 60)
+                    rem = s - m * 60
+                    return f"{m}:{rem:05.2f}"
+
+                tr = get_transition(project_dir, tr_id)
+                if not tr:
+                    return self._error(404, "NOT_FOUND", f"Transition not found: {tr_id}")
+
+                _ub(project_dir, f"Clip-trim {edge} drag on {tr_id}")
+
+                from_kf = get_keyframe(project_dir, tr.get("from"))
+                to_kf = get_keyframe(project_dir, tr.get("to"))
+                if not from_kf or not to_kf:
+                    return self._error(500, "INTERNAL_ERROR", "Missing boundary keyframes")
+
+                all_trs = _get_trs(project_dir)
+
+                new_boundary_time = parse_ts(new_ts)
+                new_trim = float(new_trim)
+
+                if edge == "right":
+                    old_boundary_kf = to_kf
+                    old_boundary_time = parse_ts(to_kf["timestamp"])
+                    neighbor = next(
+                        (t for t in all_trs if t.get("from") == old_boundary_kf["id"] and t["id"] != tr_id),
+                        None,
+                    )
+                else:
+                    old_boundary_kf = from_kf
+                    old_boundary_time = parse_ts(from_kf["timestamp"])
+                    neighbor = next(
+                        (t for t in all_trs if t.get("to") == old_boundary_kf["id"] and t["id"] != tr_id),
+                        None,
+                    )
+
+                delta = new_boundary_time - old_boundary_time
+                shrinking = (edge == "right" and delta < 0) or (edge == "left" and delta > 0)
+                extending = (edge == "right" and delta > 0) or (edge == "left" and delta < 0)
+
+                if abs(delta) < 0.001:
+                    # Pure trim change with no boundary move
+                    if edge == "right":
+                        update_transition(project_dir, tr_id, trim_out=new_trim)
+                    else:
+                        update_transition(project_dir, tr_id, trim_in=new_trim)
+                    self._json_response({"success": True, "transitionId": tr_id, "mode": "trim-only"})
+                    return
+
+                if shrinking:
+                    # Insert new boundary kf + empty tr filling the gap.
+                    # Original kf stays put, so the neighbor is unaffected.
+                    new_kf_id = next_keyframe_id(project_dir)
+                    track_id = old_boundary_kf.get("track_id", "track_1")
+                    add_keyframe(project_dir, {
+                        "id": new_kf_id,
+                        "timestamp": fmt_ts(new_boundary_time),
+                        "track_id": track_id,
+                        "selected": None,
+                        "candidates": [],
+                    })
+
+                    empty_tr_id = next_transition_id(project_dir)
+                    if edge == "right":
+                        # current tr shrinks: to = new_kf. Empty fills new_kf -> old_boundary.
+                        new_current_dur = round(abs(new_boundary_time - parse_ts(from_kf["timestamp"])), 2)
+                        empty_dur = round(abs(old_boundary_time - new_boundary_time), 2)
+                        add_transition(project_dir, {
+                            "id": empty_tr_id,
+                            "from": new_kf_id,
+                            "to": old_boundary_kf["id"],
+                            "duration_seconds": empty_dur,
+                            "selected": [None],
+                            "track_id": track_id,
+                        })
+                        update_transition(
+                            project_dir, tr_id,
+                            **{"to": new_kf_id, "trim_out": new_trim, "duration_seconds": new_current_dur},
+                        )
+                    else:
+                        # current tr shrinks from left: from = new_kf. Empty fills old_boundary -> new_kf.
+                        new_current_dur = round(abs(parse_ts(to_kf["timestamp"]) - new_boundary_time), 2)
+                        empty_dur = round(abs(new_boundary_time - old_boundary_time), 2)
+                        add_transition(project_dir, {
+                            "id": empty_tr_id,
+                            "from": old_boundary_kf["id"],
+                            "to": new_kf_id,
+                            "duration_seconds": empty_dur,
+                            "selected": [None],
+                            "track_id": track_id,
+                        })
+                        update_transition(
+                            project_dir, tr_id,
+                            **{"from": new_kf_id, "trim_in": new_trim, "duration_seconds": new_current_dur},
+                        )
+
+                    _log(f"clip-trim-edge SHRINK: {tr_id} edge={edge} delta={delta:.3f} "
+                         f"new_kf={new_kf_id} empty_tr={empty_tr_id}")
+                    self._json_response({
+                        "success": True, "mode": "shrink-gap-insert",
+                        "transitionId": tr_id, "newKfId": new_kf_id, "emptyTrId": empty_tr_id,
+                    })
+                    return
+
+                # extending
+                if neighbor is None:
+                    # No neighbor on this edge — just move boundary kf + update trim
+                    update_keyframe(project_dir, old_boundary_kf["id"], timestamp=fmt_ts(new_boundary_time))
+                    if edge == "right":
+                        new_dur = round(abs(new_boundary_time - parse_ts(from_kf["timestamp"])), 2)
+                        update_transition(project_dir, tr_id, trim_out=new_trim, duration_seconds=new_dur)
+                    else:
+                        new_dur = round(abs(parse_ts(to_kf["timestamp"]) - new_boundary_time), 2)
+                        update_transition(project_dir, tr_id, trim_in=new_trim, duration_seconds=new_dur)
+                    _log(f"clip-trim-edge EXTEND (no neighbor): {tr_id} edge={edge} delta={delta:.3f}")
+                    self._json_response({"success": True, "mode": "extend-no-neighbor", "transitionId": tr_id})
+                    return
+
+                # Extend into neighbor. Check if we'd fully consume it.
+                if edge == "right":
+                    neighbor_far_kf = get_keyframe(project_dir, neighbor.get("to"))
+                else:
+                    neighbor_far_kf = get_keyframe(project_dir, neighbor.get("from"))
+                neighbor_far_time = parse_ts(neighbor_far_kf["timestamp"]) if neighbor_far_kf else None
+                fully_consuming = (
+                    neighbor_far_time is not None and (
+                        (edge == "right" and new_boundary_time >= neighbor_far_time) or
+                        (edge == "left" and new_boundary_time <= neighbor_far_time)
+                    )
+                )
+
+                if fully_consuming:
+                    # Soft-delete the neighbor; repoint current tr's boundary to neighbor's far kf;
+                    # the original boundary kf becomes orphaned — soft-delete it too.
+                    now_iso = _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+                    delete_transition(project_dir, neighbor["id"], now_iso)
+                    delete_keyframe(project_dir, old_boundary_kf["id"], now_iso)
+                    if edge == "right":
+                        new_dur = round(abs(neighbor_far_time - parse_ts(from_kf["timestamp"])), 2)
+                        update_transition(
+                            project_dir, tr_id,
+                            **{"to": neighbor_far_kf["id"], "trim_out": new_trim, "duration_seconds": new_dur},
+                        )
+                    else:
+                        new_dur = round(abs(parse_ts(to_kf["timestamp"]) - neighbor_far_time), 2)
+                        update_transition(
+                            project_dir, tr_id,
+                            **{"from": neighbor_far_kf["id"], "trim_in": new_trim, "duration_seconds": new_dur},
+                        )
+                    _log(f"clip-trim-edge EXTEND CONSUME: {tr_id} consumed neighbor={neighbor['id']}")
+                    self._json_response({
+                        "success": True, "mode": "extend-consume",
+                        "transitionId": tr_id, "consumedNeighbor": neighbor["id"],
+                    })
+                    return
+
+                # Partial extend: move boundary kf, advance neighbor trim by delta×factor.
+                update_keyframe(project_dir, old_boundary_kf["id"], timestamp=fmt_ts(new_boundary_time))
+
+                neighbor_trim_in = neighbor.get("trim_in") or 0.0
+                neighbor_trim_out = neighbor.get("trim_out")
+                neighbor_src_dur = neighbor.get("source_video_duration")
+                if neighbor_trim_out is None:
+                    neighbor_trim_out = neighbor_src_dur if neighbor_src_dur is not None else 0.0
+
+                if edge == "right":
+                    # neighbor is the next tr; its from_kf is old_boundary_kf (now moved).
+                    # Old neighbor timeline_dur was (neighbor.to_time - old_boundary_time).
+                    # New neighbor timeline_dur is (neighbor.to_time - new_boundary_time).
+                    old_neighbor_dur = neighbor_far_time - old_boundary_time
+                    new_neighbor_dur = neighbor_far_time - new_boundary_time
+                    if old_neighbor_dur > 0:
+                        neighbor_factor = (neighbor_trim_out - neighbor_trim_in) / old_neighbor_dur
+                        new_neighbor_trim_in = neighbor_trim_in + (new_boundary_time - old_boundary_time) * neighbor_factor
+                        update_transition(
+                            project_dir, neighbor["id"],
+                            trim_in=new_neighbor_trim_in,
+                            duration_seconds=round(new_neighbor_dur, 2),
+                        )
+                    new_current_dur = round(abs(new_boundary_time - parse_ts(from_kf["timestamp"])), 2)
+                    update_transition(project_dir, tr_id, trim_out=new_trim, duration_seconds=new_current_dur)
+                else:
+                    # neighbor is the prev tr; its to_kf is old_boundary_kf (now moved).
+                    old_neighbor_dur = old_boundary_time - neighbor_far_time
+                    new_neighbor_dur = new_boundary_time - neighbor_far_time
+                    if old_neighbor_dur > 0:
+                        neighbor_factor = (neighbor_trim_out - neighbor_trim_in) / old_neighbor_dur
+                        new_neighbor_trim_out = neighbor_trim_out + (new_boundary_time - old_boundary_time) * neighbor_factor
+                        update_transition(
+                            project_dir, neighbor["id"],
+                            trim_out=new_neighbor_trim_out,
+                            duration_seconds=round(new_neighbor_dur, 2),
+                        )
+                    new_current_dur = round(abs(parse_ts(to_kf["timestamp"]) - new_boundary_time), 2)
+                    update_transition(project_dir, tr_id, trim_in=new_trim, duration_seconds=new_current_dur)
+
+                _log(f"clip-trim-edge EXTEND PARTIAL: {tr_id} edge={edge} delta={delta:.3f} neighbor={neighbor['id']}")
+                self._json_response({
+                    "success": True, "mode": "extend-partial",
+                    "transitionId": tr_id, "neighborId": neighbor["id"],
                 })
             except Exception as e:
                 import traceback
@@ -5508,8 +5728,8 @@ def make_handler(work_dir: Path, no_auth: bool = False):
 
             tr_id = body.get("transitionId")  # optional — generate for specific transition or all
 
-            yaml_path = self._require_yaml_path(project_name)
-            if yaml_path is None:
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
                 return
 
             _log(f"generate-slot-keyframe-candidates: tr_id={tr_id or 'all'}")
@@ -5519,7 +5739,7 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             def _run():
                 try:
                     from scenecraft.render.narrative import generate_slot_keyframe_candidates
-                    generate_slot_keyframe_candidates(str(yaml_path), vertex=False)
+                    generate_slot_keyframe_candidates(str(project_dir), vertex=False)
 
                     # Collect results
                     project_dir = work_dir / project_name
@@ -6628,309 +6848,6 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             result = get_sections(project_dir)
             self._json_response({"success": True, "sections": len(result)})
 
-        def _handle_get_timelines(self, project_name: str):
-            """GET /api/projects/:name/timelines — list available timelines."""
-            _log(f"get-timelines: {project_name}")
-            from scenecraft.project import get_timelines
-            project_dir = work_dir / project_name
-            if not project_dir.is_dir():
-                return self._error(404, "NOT_FOUND", f"Project not found: {project_name}")
-            try:
-                result = get_timelines(project_dir)
-                self._json_response(result)
-            except Exception as e:
-                self._error(500, "INTERNAL_ERROR", str(e))
-
-        def _handle_timeline_switch(self, project_name: str):
-            """POST /api/projects/:name/timeline/switch — switch active timeline."""
-            from scenecraft.project import switch_timeline
-            body = self._read_json_body()
-            if body is None:
-                return
-            name = body.get("name")
-            if not name:
-                return self._error(400, "BAD_REQUEST", "Missing 'name'")
-            project_dir = work_dir / project_name
-            if not project_dir.is_dir():
-                return self._error(404, "NOT_FOUND", f"Project not found: {project_name}")
-            try:
-                _log(f"timeline-switch: {name}")
-                switch_timeline(project_dir, name)
-                self._json_response({"success": True, "active": name})
-            except ValueError as e:
-                self._error(404, "NOT_FOUND", str(e))
-
-        def _handle_timeline_import(self, project_name: str):
-            """POST /api/projects/:name/timeline/import — import timeline from source."""
-            from scenecraft.project import import_timeline
-            body = self._read_json_body()
-            if body is None:
-                return
-            source_path = body.get("sourcePath")
-            timeline_name = body.get("timelineName")
-            if not source_path:
-                return self._error(400, "BAD_REQUEST", "Missing 'sourcePath'")
-            project_dir = work_dir / project_name
-            if not project_dir.is_dir():
-                return self._error(404, "NOT_FOUND", f"Project not found: {project_name}")
-            try:
-                _log(f"timeline-import: source={source_path}")
-                result = import_timeline(project_dir, source_path, timeline_name)
-                self._json_response({"success": True, **result})
-            except Exception as e:
-                self._error(500, "INTERNAL_ERROR", str(e))
-
-        def _handle_timeline_create(self, project_name: str):
-            """POST /api/projects/:name/timeline/create — create new timeline."""
-            from scenecraft.project import create_timeline
-            body = self._read_json_body()
-            if body is None:
-                return
-            name = body.get("name")
-            copy_from = body.get("copyFrom")
-            if not name:
-                return self._error(400, "BAD_REQUEST", "Missing 'name'")
-            project_dir = work_dir / project_name
-            if not project_dir.is_dir():
-                return self._error(404, "NOT_FOUND", f"Project not found: {project_name}")
-            try:
-                _log(f"timeline-create: {name}")
-                create_timeline(project_dir, name, copy_from)
-                self._json_response({"success": True, "name": name})
-            except ValueError as e:
-                self._error(400, "BAD_REQUEST", str(e))
-
-        # ── Git Version Handlers ─────────────────────────────────
-
-        # Git versioning removed — replaced by checkpoint-based backups.
-        # version/* endpoints return no-ops or 410 GONE above.
-
-        def _handle_version_history(self, project_name: str):
-            """GET /api/projects/:name/version/history — DEPRECATED (git removed)"""
-            _log(f"version-history: {project_name}")
-            import subprocess as sp
-            project_dir = work_dir / project_name
-            if not project_dir.is_dir():
-                return self._error(404, "NOT_FOUND", f"Project not found: {project_name}")
-
-            self._ensure_git_repo(project_dir)
-
-            # Parse limit from query
-            parsed = urlparse(self.path)
-            limit = 20
-            if parsed.query:
-                for param in parsed.query.split("&"):
-                    if param.startswith("limit="):
-                        try:
-                            limit = int(param[6:])
-                        except ValueError:
-                            pass
-
-            # Get log
-            log = sp.run(
-                ["git", "log", f"--max-count={limit}", "--format=%H|%h|%s|%aI"],
-                cwd=project_dir, capture_output=True, text=True,
-            )
-            commits = []
-            for line in log.stdout.strip().split("\n"):
-                if not line:
-                    continue
-                parts = line.split("|", 3)
-                if len(parts) >= 4:
-                    commits.append({
-                        "sha": parts[1],
-                        "fullSha": parts[0],
-                        "message": parts[2],
-                        "date": parts[3],
-                    })
-
-            # Get current branch
-            branch = sp.run(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                cwd=project_dir, capture_output=True, text=True,
-            )
-
-            # Get all branches
-            branches_result = sp.run(
-                ["git", "branch", "--list", "--format=%(refname:short)"],
-                cwd=project_dir, capture_output=True, text=True,
-            )
-            branches = [b.strip() for b in branches_result.stdout.strip().split("\n") if b.strip()]
-
-            self._json_response({
-                "commits": commits,
-                "branch": branch.stdout.strip(),
-                "branches": branches,
-            })
-
-        def _handle_version_checkout(self, project_name: str):
-            """POST /api/projects/:name/version/checkout — restore to commit as new commit."""
-            import subprocess as sp
-            body = self._read_json_body()
-            if body is None:
-                return
-            sha = body.get("sha")
-            if not sha:
-                return self._error(400, "BAD_REQUEST", "Missing 'sha'")
-
-            project_dir = work_dir / project_name
-            if not project_dir.is_dir():
-                return self._error(404, "NOT_FOUND", f"Project not found: {project_name}")
-
-            self._ensure_git_repo(project_dir)
-            _log(f"version-checkout: {sha}")
-
-            # Get original commit message
-            msg_result = sp.run(
-                ["git", "log", "-1", "--format=%s", sha],
-                cwd=project_dir, capture_output=True, text=True,
-            )
-            original_msg = msg_result.stdout.strip() if msg_result.returncode == 0 else "unknown"
-
-            # Restore files from that commit
-            result = sp.run(
-                ["git", "checkout", sha, "--", "."],
-                cwd=project_dir, capture_output=True, text=True,
-            )
-            if result.returncode != 0:
-                return self._error(500, "GIT_ERROR", result.stderr.strip())
-
-            # Commit the restoration as a new commit
-            sp.run(["git", "add", "-A"], cwd=project_dir, capture_output=True, check=True)
-            restore_msg = f"Restored to: {original_msg}"
-            sp.run(["git", "commit", "-m", restore_msg], cwd=project_dir, capture_output=True, text=True)
-
-            new_sha = sp.run(
-                ["git", "rev-parse", "--short", "HEAD"],
-                cwd=project_dir, capture_output=True, text=True,
-            )
-            self._json_response({"success": True, "sha": new_sha.stdout.strip(), "message": restore_msg})
-
-        def _handle_version_branch(self, project_name: str):
-            """POST /api/projects/:name/version/branch — create or switch branch."""
-            import subprocess as sp
-            body = self._read_json_body()
-            if body is None:
-                return
-            name = body.get("name")
-            create = body.get("create", False)
-            if not name:
-                return self._error(400, "BAD_REQUEST", "Missing 'name'")
-
-            project_dir = work_dir / project_name
-            if not project_dir.is_dir():
-                return self._error(404, "NOT_FOUND", f"Project not found: {project_name}")
-
-            self._ensure_git_repo(project_dir)
-            _log(f"version-branch: {name} create={create}")
-
-            if create:
-                result = sp.run(
-                    ["git", "checkout", "-b", name],
-                    cwd=project_dir, capture_output=True, text=True,
-                )
-            else:
-                result = sp.run(
-                    ["git", "checkout", name],
-                    cwd=project_dir, capture_output=True, text=True,
-                )
-
-            if result.returncode != 0:
-                return self._error(500, "GIT_ERROR", result.stderr.strip())
-
-            self._json_response({"success": True, "branch": name})
-
-        def _handle_version_diff(self, project_name: str):
-            """GET /api/projects/:name/version/diff — show uncommitted changes."""
-            _log(f"version-diff: {project_name}")
-            import subprocess as sp
-            project_dir = work_dir / project_name
-            if not project_dir.is_dir():
-                return self._error(404, "NOT_FOUND", f"Project not found: {project_name}")
-
-            self._ensure_git_repo(project_dir)
-
-            # Parse optional from/to query params
-            parsed = urlparse(self.path)
-            from_ref = None
-            to_ref = None
-            if parsed.query:
-                for param in parsed.query.split("&"):
-                    if param.startswith("from="):
-                        from_ref = unquote(param[5:])
-                    elif param.startswith("to="):
-                        to_ref = unquote(param[3:])
-
-            if from_ref and to_ref:
-                # Diff between two commits
-                result = sp.run(
-                    ["git", "diff", "--name-status", from_ref, to_ref],
-                    cwd=project_dir, capture_output=True, text=True,
-                )
-            else:
-                # Uncommitted changes
-                result = sp.run(
-                    ["git", "status", "--porcelain"],
-                    cwd=project_dir, capture_output=True, text=True,
-                )
-
-            files = []
-            for line in result.stdout.strip().split("\n"):
-                if not line:
-                    continue
-                if from_ref and to_ref:
-                    # git diff --name-status format: "M\tfile.txt"
-                    parts = line.split("\t", 1)
-                    status_map = {"M": "modified", "A": "added", "D": "deleted", "R": "renamed"}
-                    status = status_map.get(parts[0].strip(), parts[0].strip())
-                    filepath = parts[1] if len(parts) > 1 else ""
-                else:
-                    # git status --porcelain format: "XY file.txt"
-                    status_code = line[:2].strip()
-                    filepath = line[3:].strip()
-                    status_map = {"M": "modified", "A": "added", "D": "deleted", "??": "untracked", "R": "renamed"}
-                    status = status_map.get(status_code, status_code)
-
-                is_binary = any(filepath.endswith(ext) for ext in
-                                (".png", ".jpg", ".jpeg", ".mp4", ".wav", ".mp3", ".zip"))
-                files.append({"path": filepath, "status": status, "binary": is_binary})
-
-            self._json_response({"files": files, "hasChanges": len(files) > 0})
-
-        def _handle_version_delete_branch(self, project_name: str):
-            """POST /api/projects/:name/version/delete-branch"""
-            import subprocess as sp
-            body = self._read_json_body()
-            if body is None:
-                return
-            name = body.get("name")
-            if not name:
-                return self._error(400, "BAD_REQUEST", "Missing 'name'")
-
-            project_dir = work_dir / project_name
-            if not project_dir.is_dir():
-                return self._error(404, "NOT_FOUND", f"Project not found: {project_name}")
-
-            self._ensure_git_repo(project_dir)
-            _log(f"version-delete-branch: {name}")
-
-            # Check not current branch
-            current = sp.run(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                cwd=project_dir, capture_output=True, text=True,
-            )
-            if current.stdout.strip() == name:
-                return self._error(400, "BAD_REQUEST", f"Cannot delete current branch: {name}")
-
-            result = sp.run(
-                ["git", "branch", "-D", name],
-                cwd=project_dir, capture_output=True, text=True,
-            )
-            if result.returncode != 0:
-                return self._error(500, "GIT_ERROR", result.stderr.strip())
-
-            self._json_response({"success": True})
-
         # ── Helpers ──────────────────────────────────────────────
 
         def _get_session_db_path(self, project_name: str) -> Path | None:
@@ -6976,19 +6893,10 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             return None
 
         def _get_project_dir(self, project_name: str) -> Path | None:
-            """Get project directory, auto-importing YAML to SQLite if needed."""
+            """Get project directory."""
             project_dir = work_dir / project_name
             if not project_dir.is_dir():
                 return None
-            db_path = project_dir / "project.db"
-            if not db_path.exists():
-                # Auto-import from YAML on first access
-                yaml_exists = (project_dir / "timeline.yaml").exists() or (project_dir / "narrative_keyframes.yaml").exists()
-                if yaml_exists:
-                    from scenecraft.db import import_from_yaml
-                    _log(f"Auto-importing {project_name} from YAML to SQLite...")
-                    import_from_yaml(project_dir)
-                    _log(f"  Import complete")
             return project_dir
 
         def _require_project_dir(self, project_name: str) -> Path | None:
@@ -6998,89 +6906,6 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 self._error(404, "NOT_FOUND", f"Project not found: {project_name}")
                 return None
             return d
-
-        def _get_yaml_path(self, project_name: str) -> Path | None:
-            """Get the YAML path for a project — prefers timeline.yaml (split format), falls back to legacy."""
-            project_dir = work_dir / project_name
-            split = project_dir / "timeline.yaml"
-            if split.exists():
-                return split
-            legacy = project_dir / "narrative_keyframes.yaml"
-            if legacy.exists():
-                return legacy
-            return None
-
-        def _load_timeline_data(self, parsed: dict) -> dict:
-            """Extract the active timeline's data from either split or legacy format.
-            Returns a dict with 'keyframes', 'transitions', 'bin', 'transition_bin' keys.
-            Also sets '_split' flag and '_active' name if split format.
-            """
-            if "timelines" in parsed:
-                active = parsed.get("active_timeline", "default")
-                tl = parsed.get("timelines", {}).get(active, {})
-                return {
-                    "keyframes": tl.get("keyframes", []),
-                    "transitions": tl.get("transitions", []),
-                    "bin": tl.get("bin", []),
-                    "transition_bin": tl.get("transition_bin", []),
-                    "_split": True,
-                    "_active": active,
-                }
-            return {
-                "keyframes": parsed.get("keyframes", []),
-                "transitions": parsed.get("transitions", []),
-                "bin": parsed.get("bin", []),
-                "transition_bin": parsed.get("transition_bin", []),
-                "_split": False,
-            }
-
-        def _save_timeline_data(self, parsed: dict, tl_data: dict):
-            """Write timeline data back into the parsed YAML structure."""
-            if tl_data.get("_split"):
-                active = tl_data.get("_active", "default")
-                if "timelines" not in parsed:
-                    parsed["timelines"] = {}
-                parsed["timelines"][active] = {
-                    "keyframes": tl_data["keyframes"],
-                    "transitions": tl_data["transitions"],
-                    "bin": tl_data["bin"],
-                    "transition_bin": tl_data["transition_bin"],
-                }
-            else:
-                parsed["keyframes"] = tl_data["keyframes"]
-                parsed["transitions"] = tl_data["transitions"]
-                parsed["bin"] = tl_data["bin"]
-                parsed["transition_bin"] = tl_data["transition_bin"]
-
-        def _require_yaml_path(self, project_name: str) -> Path | None:
-            """Get YAML path or send 404 error. Returns None if error was sent."""
-            path = self._get_yaml_path(project_name)
-            if path is None:
-                self._error(404, "NOT_FOUND", "No narrative_keyframes.yaml found")
-                return None
-            return path
-
-        def _ruamel_load(self, yaml_path):
-            """Load YAML with ruamel for round-trip editing."""
-            from ruamel.yaml import YAML
-            ryaml = YAML()
-            ryaml.width = 1000
-            ryaml.preserve_quotes = True
-            with open(yaml_path) as f:
-                return ryaml, ryaml.load(f)
-
-        def _ruamel_save(self, ryaml, parsed, yaml_path):
-            """Save YAML with ruamel, preserving formatting."""
-            with open(yaml_path, "w") as f:
-                ryaml.dump(parsed, f)
-
-        def _has_project_yaml(self, project_name: str) -> bool:
-            """Check if a project has any YAML data (split or legacy)."""
-            project_dir = work_dir / project_name
-            return (
-                (project_dir / "narrative_keyframes.yaml").exists()
-                or (project_dir / "timeline.yaml").exists()
-            )
 
         def _read_json_body(self) -> dict | None:
             """Read and parse JSON body from request."""
