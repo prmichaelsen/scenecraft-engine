@@ -9,7 +9,9 @@
       "Bash(/home/prmichaelsen/.acp/projects/scenecraft-engine/.venv/bin/scenecraft --help)",
       "Bash(/home/prmichaelsen/.acp/projects/scenecraft-engine/.venv/bin/scenecraft org *)",
       "Bash(sqlite3 *)",
-      "Bash(/home/prmichaelsen/.acp/projects/scenecraft-engine/.venv/bin/scenecraft token *)"
+      "Bash(/home/prmichaelsen/.acp/projects/scenecraft-engine/.venv/bin/scenecraft token *)",
+      "Bash(.venv/bin/python3 -c \"import yaml\")",
+      "Bash(.venv/bin/python3 -c \"from ruamel import yaml; print\\(yaml\\)\")"
     ]
   }
 }
