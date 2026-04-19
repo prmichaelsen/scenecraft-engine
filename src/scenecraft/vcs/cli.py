@@ -25,7 +25,30 @@ from .auth import generate_token, create_login_code
 from .sessions import list_sessions, prune_sessions
 
 
-def _require_root() -> Path:
+def _require_root(explicit: str | None = None) -> Path:
+    """Resolve the .scenecraft root.
+
+    Precedence:
+      1. Explicit `--root` flag on the command (if set)
+      2. `SCENECRAFT_ROOT` env var (handled inside find_root)
+      3. Configured projects_dir (scenecraft.config) — the server's own root
+      4. Walk up from cwd looking for `.scenecraft/`
+    """
+    if explicit:
+        p = Path(explicit).expanduser().resolve()
+        if p.name == ".scenecraft" and p.is_dir():
+            return p
+        sub = p / ".scenecraft"
+        if sub.is_dir():
+            return sub
+        click.echo(f"Error: no .scenecraft directory at {explicit!r}", err=True)
+        raise SystemExit(1)
+
+    # find_root already checks SCENECRAFT_ROOT as step 1
+    env_root = find_root()
+    if env_root is not None and "SCENECRAFT_ROOT" in __import__("os").environ:
+        return env_root
+
     # Prefer the VCS root derived from the configured projects_dir — this is
     # the same root the server uses, so CLI and server always agree.
     from scenecraft.config import get_projects_dir
@@ -34,11 +57,27 @@ def _require_root() -> Path:
         candidate = find_root(pd)
         if candidate is not None:
             return candidate
-    root = find_root()
-    if root is None:
-        click.echo("Error: not inside a .scenecraft directory. Run 'scenecraft init' first.", err=True)
-        raise SystemExit(1)
-    return root
+
+    # Final fallback: cwd walk (find_root with no start)
+    if env_root is not None:
+        return env_root
+    click.echo(
+        "Error: not inside a .scenecraft directory. Run 'scenecraft init' first, "
+        "pass --root, or set SCENECRAFT_ROOT.",
+        err=True,
+    )
+    raise SystemExit(1)
+
+
+def _root_option():
+    """Attach this to any top-level command to give it a --root override."""
+    return click.option(
+        "--root",
+        "root_override",
+        default=None,
+        type=click.Path(),
+        help="Path to a .scenecraft dir or its parent. Overrides SCENECRAFT_ROOT and cwd-walk.",
+    )
 
 
 # ── init ─────────────────────────────────────────────────────────
@@ -82,7 +121,8 @@ def _detect_primary_ip() -> str:
 @click.option("--redirect-uri", default=None, help="Where to redirect after login (e.g. the frontend URL)")
 @click.option("--open/--no-open", "open_browser", default=False, help="Attempt to open the URL in the local browser")
 @click.option("--raw", is_flag=True, default=False, help="Print just the JWT (no URL) — for scripts")
-def token_cmd(user: str | None, expiry: int, host: str | None, scheme: str, redirect_uri: str | None, open_browser: bool, raw: bool):
+@_root_option()
+def token_cmd(user: str | None, expiry: int, host: str | None, scheme: str, redirect_uri: str | None, open_browser: bool, raw: bool, root_override: str | None):
     """Generate a login URL for authenticating your browser session.
 
     Default flow: generates a JWT, stores it against a one-time code, and prints
@@ -93,7 +133,7 @@ def token_cmd(user: str | None, expiry: int, host: str | None, scheme: str, redi
     """
     if host is None:
         host = f"{_detect_primary_ip()}:8890"
-    root = _require_root()
+    root = _require_root(root_override)
     try:
         tok = generate_token(root, username=user, expiry_hours=expiry)
     except ValueError as e:
@@ -131,17 +171,19 @@ def org_group():
 
 @org_group.command("create")
 @click.argument("name")
-def org_create(name: str):
+@_root_option()
+def org_create(name: str, root_override: str | None):
     """Create a new organization."""
-    root = _require_root()
+    root = _require_root(root_override)
     create_org(root, name)
     click.echo(f"Created org: {name}")
 
 
 @org_group.command("list")
-def org_list():
+@_root_option()
+def org_list(root_override: str | None):
     """List all organizations."""
-    root = _require_root()
+    root = _require_root(root_override)
     orgs = list_orgs(root)
     if not orgs:
         click.echo("No organizations found.")
@@ -152,9 +194,10 @@ def org_list():
 
 @org_group.command("members")
 @click.argument("name")
-def org_members(name: str):
+@_root_option()
+def org_members(name: str, root_override: str | None):
     """List members of an organization."""
-    root = _require_root()
+    root = _require_root(root_override)
     members = list_org_members(root, name)
     if not members:
         click.echo(f"No members in org '{name}'.")
@@ -176,9 +219,10 @@ def user_group():
 @click.option("--pubkey", default=None, type=click.Path(exists=True), help="Path to SSH public key file")
 @click.option("--role", default="editor", type=click.Choice(["admin", "editor", "viewer"]))
 @click.option("--org", default=None, help="Add user to this org after creation")
-def user_add(username: str, pubkey: str | None, role: str, org: str | None):
+@_root_option()
+def user_add(username: str, pubkey: str | None, role: str, org: str | None, root_override: str | None):
     """Register a new user."""
-    root = _require_root()
+    root = _require_root(root_override)
     pubkey_content = ""
     if pubkey:
         pubkey_content = Path(pubkey).read_text().strip()
@@ -190,9 +234,10 @@ def user_add(username: str, pubkey: str | None, role: str, org: str | None):
 
 
 @user_group.command("list")
-def user_list():
+@_root_option()
+def user_list(root_override: str | None):
     """List all registered users."""
-    root = _require_root()
+    root = _require_root(root_override)
     users = list_users(root)
     if not users:
         click.echo("No users found.")
@@ -210,9 +255,10 @@ def session_group():
 
 
 @session_group.command("list")
-def session_list():
+@_root_option()
+def session_list(root_override: str | None):
     """List all active sessions."""
-    root = _require_root()
+    root = _require_root(root_override)
     sessions = list_sessions(root)
     if not sessions:
         click.echo("No active sessions.")
@@ -223,9 +269,10 @@ def session_list():
 
 @session_group.command("prune")
 @click.option("--days", default=7, type=int, help="Remove sessions inactive for more than N days (default: 7)")
-def session_prune(days: int):
+@_root_option()
+def session_prune(days: int, root_override: str | None):
     """Remove stale sessions and their working copy files."""
-    root = _require_root()
+    root = _require_root(root_override)
     count = prune_sessions(root, max_age_days=days)
     click.echo(f"Pruned {count} stale session(s).")
 

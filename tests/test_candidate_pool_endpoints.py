@@ -113,6 +113,61 @@ def test_import_creates_pool_segments_row(server):
     assert copied.read_bytes() == src.read_bytes()
 
 
+def test_upload_multipart_creates_pool_segment(server):
+    """Browser-style multipart upload lands as a pool_segments row (kind='imported')."""
+    project = _make_project(server["work_dir"], "upl")
+
+    # Build a multipart/form-data body manually (urllib doesn't help here)
+    boundary = "----testboundary1234"
+    file_bytes = b"\x00" * 2048
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="file"; filename="my_clip.mp4"\r\n'
+        "Content-Type: video/mp4\r\n"
+        "\r\n"
+    ).encode() + file_bytes + (
+        f"\r\n--{boundary}\r\n"
+        'Content-Disposition: form-data; name="label"\r\n'
+        "\r\n"
+        "opening shot"
+        f"\r\n--{boundary}\r\n"
+        'Content-Disposition: form-data; name="originalFilepath"\r\n'
+        "\r\n"
+        "/home/user/Footage/my_clip.mp4"
+        f"\r\n--{boundary}--\r\n"
+    ).encode()
+
+    req = urllib.request.Request(
+        f"{server['base']}/api/projects/upl/pool/upload",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=5) as r:
+        resp = json.loads(r.read().decode())
+
+    assert resp["success"] is True
+    seg_id = resp["poolSegmentId"]
+    assert len(seg_id) == 32
+    assert resp["poolPath"].startswith("pool/segments/import_")
+    assert resp["poolPath"].endswith(".mp4")
+    assert resp["originalFilename"] == "my_clip.mp4"
+    assert resp["originalFilepath"] == "/home/user/Footage/my_clip.mp4"
+
+    # File landed on disk under the UUID name
+    dest = project / resp["poolPath"]
+    assert dest.exists()
+    assert dest.stat().st_size == 2048
+
+    # DB row surfaces in /pool listing with the right metadata
+    _, listing = _get(server["base"], "/api/projects/upl/pool")
+    seg = next(s for s in listing["segments"] if s["id"] == seg_id)
+    assert seg["kind"] == "imported"
+    assert seg["label"] == "opening shot"
+    assert seg["originalFilename"] == "my_clip.mp4"
+    assert seg["originalFilepath"] == "/home/user/Footage/my_clip.mp4"
+
+
 def test_import_missing_source(server):
     _make_project(server["work_dir"], "imp")
     status, resp = _post(server["base"], "/api/projects/imp/pool/import", {

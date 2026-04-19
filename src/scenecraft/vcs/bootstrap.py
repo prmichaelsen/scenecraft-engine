@@ -105,7 +105,28 @@ def get_user_db(user_dir: Path) -> sqlite3.Connection:
 # ── Bootstrap ────────────────────────────────────────────────────
 
 def find_root(start: Path | None = None) -> Path | None:
-    """Walk up from start (or cwd) looking for a .scenecraft directory."""
+    """Locate the .scenecraft directory that owns the current working context.
+
+    Resolution order:
+    1. `SCENECRAFT_ROOT` env var — if set and points at a real `.scenecraft/` (or its
+       parent), use it. Lets the user pin the server root without editing every call
+       site; also how the test suite scopes each pytest tmp_path.
+    2. Walk upward from `start` (or cwd) looking for a `.scenecraft/`.
+    """
+    import os as _os
+    env_root = _os.environ.get("SCENECRAFT_ROOT", "").strip()
+    if env_root:
+        candidate = Path(env_root)
+        # Accept either a path that IS the .scenecraft dir, or a parent containing one.
+        if candidate.is_dir():
+            if candidate.name == ".scenecraft":
+                return candidate
+            sub = candidate / ".scenecraft"
+            if sub.is_dir():
+                return sub
+        # Env var set but invalid — fall through to cwd walk rather than error, so
+        # deleting and re-init'ing still works.
+
     p = (start or Path.cwd()).resolve()
     while True:
         candidate = p / ".scenecraft"
