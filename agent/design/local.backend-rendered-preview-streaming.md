@@ -25,15 +25,19 @@ The WebGL preview fails in ways that can't be fixed incrementally:
 
 1. **Performance ceiling**: too many overlay tracks cause the shader to stutter or fail to compile. The shader's per-layer loop grows with track count and eventually exceeds driver limits or hits VRAM pressure.
 2. **Shader complexity is unmaintainable**: multi-layer + chroma key + strobe + blend modes + adjustment layers + color grading compose into a pipeline that's increasingly fragile to extend.
-3. **Specific compositing bugs**: strobe timing desyncs across overlay tracks; adjustment layers don't composite correctly in preview.
+3. **Specific compositing bugs in preview only** — all work correctly in the final backend render:
+   - Strobe timing desyncs across overlay tracks
+   - Adjustment layers don't composite correctly
+   - Chroma key spill suppression is broken
 4. **Duplication**: the backend export path already correctly handles all these features. Two compositors (one correct, one buggy) is worse than one.
 
-Pain points that are NOT drivers (per clarification-6):
-- Chroma spill behaves fine in both preview and render
-- Cross-browser works
-- Blend modes + brightness/contrast/exposure work
+Migrating the preview to the backend renderer **inherently fixes the preview-only bugs** (strobe, adjustment layers, chroma spill) because the preview starts using the same code path the final render already uses.
 
-The performance ceiling is the primary driver; compositor correctness for strobe/adjustment layers is secondary but real.
+Pain points that are NOT drivers (per clarification-6):
+- Cross-browser: works
+- Blend modes + brightness/contrast/exposure: no preview-vs-render divergence
+
+The performance ceiling is the primary driver; eliminating the preview-only compositing bugs is a major secondary benefit.
 
 ---
 
