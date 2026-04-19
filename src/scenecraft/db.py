@@ -470,6 +470,11 @@ def _ensure_schema(conn: sqlite3.Connection):
         val_exprs = " || ',' || ".join([f"quote(OLD.{col})" for col in col_names])
         conn.execute(f"CREATE TRIGGER {table}_delete_undo AFTER DELETE ON {table} WHEN (SELECT value FROM undo_state WHERE key='active') = 1 BEGIN INSERT INTO undo_log (undo_group, sql_text) SELECT value, 'INSERT INTO {table} ({col_list}) VALUES (' || {val_exprs} || ')' FROM undo_state WHERE key='current_group'; END;")
 
+    # Commit all DDL + seed inserts. Without this, the connection holds an open
+    # transaction that blocks writes from other threads (e.g., background workers,
+    # API request handlers on separate threads).
+    conn.commit()
+
 
 # ── Meta operations ─────────────────────────────────────────────────
 
