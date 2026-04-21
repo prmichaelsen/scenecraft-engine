@@ -422,7 +422,7 @@ milestones:
     completed: null
     estimated_weeks: 2.5
     tasks_total: 5
-    tasks_completed: 2
+    tasks_completed: 3
     tasks:
       - id: task-32
         title: Extract build_schedule + render_frame_at + parity tests
@@ -446,10 +446,10 @@ milestones:
       - id: task-34
         title: MSE playback — RenderWorker, PyAV encoder, /preview-stream WebSocket
         file: agent/tasks/milestone-11-backend-rendered-preview-streaming/task-34-mse-playback-streaming.md
-        status: not_started
+        status: completed
         estimated_hours: 32
-        started: null
-        completed_date: null
+        started: 2026-04-20T00:00:00Z
+        completed_date: 2026-04-20T00:00:00Z
         actual_hours: null
         dependencies:
           - task-32
