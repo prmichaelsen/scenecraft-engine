@@ -26,6 +26,29 @@ def _log(msg: str, level: str = "info"):
         pass
 
 
+_AUDIO_EXTS = frozenset({".wav", ".mp3", ".aac", ".m4a", ".flac", ".ogg", ".opus", ".aif", ".aiff"})
+_VIDEO_EXTS = frozenset({".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"})
+_IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff", ".avif"})
+
+
+def _classify_media_type(path: str) -> str:
+    """Classify a pool asset as 'audio' | 'video' | 'image' | 'other' from its extension.
+
+    Emitted alongside pool_segments so the frontend doesn't have to sniff paths
+    to decide which renderer to use (e.g. PoolAudioCard vs PoolVideoCard).
+    """
+    if not path:
+        return "other"
+    ext = Path(path).suffix.lower()
+    if ext in _AUDIO_EXTS:
+        return "audio"
+    if ext in _VIDEO_EXTS:
+        return "video"
+    if ext in _IMAGE_EXTS:
+        return "image"
+    return "other"
+
+
 def _next_variant(directory: Path, ext: str = ".png") -> int:
     """Find the next available variant number in a directory (max existing + 1)."""
     import re as _re
@@ -3862,6 +3885,7 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     segments.append({
                         "id": s["id"],
                         "path": s["poolPath"],
+                        "mediaType": _classify_media_type(s["poolPath"]),
                         "kind": s["kind"],
                         "label": s.get("label") or s.get("originalFilename") or "",
                         "originalFilename": s.get("originalFilename"),
