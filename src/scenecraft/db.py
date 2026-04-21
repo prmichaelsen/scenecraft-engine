@@ -301,6 +301,20 @@ def _ensure_schema(conn: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_acl_transition ON audio_clip_links(transition_id);
         CREATE INDEX IF NOT EXISTS idx_acl_audio_clip ON audio_clip_links(audio_clip_id);
 
+        -- Junction mapping audio_clips to pool_segments. Mirrors tr_candidates
+        -- but for audio: each clip can have N alternate sources (isolated stems,
+        -- regenerated TTS, plugin-processed variants), with one optionally
+        -- promoted to selected via audio_clips.selected.
+        CREATE TABLE IF NOT EXISTS audio_candidates (
+            audio_clip_id     TEXT NOT NULL REFERENCES audio_clips(id),
+            pool_segment_id   TEXT NOT NULL REFERENCES pool_segments(id),
+            added_at          TEXT NOT NULL,
+            source            TEXT NOT NULL,
+            PRIMARY KEY (audio_clip_id, pool_segment_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_audio_cand_clip ON audio_candidates(audio_clip_id);
+        CREATE INDEX IF NOT EXISTS idx_audio_cand_seg ON audio_candidates(pool_segment_id);
+
         CREATE TABLE IF NOT EXISTS sections (
             id TEXT PRIMARY KEY,
             label TEXT NOT NULL DEFAULT '',
@@ -471,6 +485,12 @@ def _ensure_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE transitions ADD COLUMN trim_out REAL")
     if "source_video_duration" not in tr_cols6:
         conn.execute("ALTER TABLE transitions ADD COLUMN source_video_duration REAL")
+
+    # M11: Add audio_clips.selected (FK to pool_segments.id) for the audio
+    # candidate junction. Nullable; NULL means "use source_path as-is".
+    ac_cols = {row[1] for row in conn.execute("PRAGMA table_info(audio_clips)").fetchall()}
+    if "selected" not in ac_cols:
+        conn.execute("ALTER TABLE audio_clips ADD COLUMN selected TEXT")
 
     # ── Undo triggers (AFTER all migrations so PRAGMA table_info sees all columns) ──
     _undo_tracked_tables = ["keyframes", "transitions", "suppressions", "effects", "tracks", "transition_effects", "markers", "audio_tracks", "audio_clips"]
@@ -1372,6 +1392,96 @@ def find_gc_candidates(project_dir: Path) -> list[dict]:
     return [_row_to_pool_segment(r) for r in rows]
 
 
+# ── Audio clip → candidate junction (M11) ──────────────────────────
+
+_AUDIO_CANDIDATE_SOURCES = ("generated", "imported", "chat_generation", "plugin")
+
+
+def add_audio_candidate(
+    project_dir: Path,
+    *,
+    audio_clip_id: str,
+    pool_segment_id: str,
+    source: str,
+    added_at: str | None = None,
+) -> None:
+    """Insert an audio_candidates junction row. Idempotent on (clip, segment) PK."""
+    assert source in _AUDIO_CANDIDATE_SOURCES, f"bad source: {source}"
+    conn = get_db(project_dir)
+    conn.execute(
+        """INSERT OR IGNORE INTO audio_candidates
+           (audio_clip_id, pool_segment_id, added_at, source)
+           VALUES (?, ?, ?, ?)""",
+        (audio_clip_id, pool_segment_id, added_at or _now_iso(), source),
+    )
+    conn.commit()
+
+
+def get_audio_candidates(project_dir: Path, audio_clip_id: str) -> list[dict]:
+    """Return candidate rows for an audio clip joined with pool_segments.
+
+    Newest first (ORDER BY added_at DESC). Each dict has the standard
+    pool_segment fields plus `addedAt` and `junctionSource`.
+    """
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        """SELECT ac.added_at, ac.source, ps.*
+           FROM audio_candidates ac
+           JOIN pool_segments ps ON ps.id = ac.pool_segment_id
+           WHERE ac.audio_clip_id = ?
+           ORDER BY ac.added_at DESC""",
+        (audio_clip_id,),
+    ).fetchall()
+    result = []
+    for row in rows:
+        seg = _row_to_pool_segment(row)
+        seg["addedAt"] = row["added_at"]
+        seg["junctionSource"] = row["source"]
+        result.append(seg)
+    return result
+
+
+def assign_audio_candidate(
+    project_dir: Path, audio_clip_id: str, pool_segment_id: str | None
+) -> None:
+    """Set audio_clips.selected. Pass None to revert to the original source file."""
+    conn = get_db(project_dir)
+    conn.execute(
+        "UPDATE audio_clips SET selected = ? WHERE id = ?",
+        (pool_segment_id, audio_clip_id),
+    )
+    conn.commit()
+
+
+def remove_audio_candidate(
+    project_dir: Path, audio_clip_id: str, pool_segment_id: str
+) -> None:
+    """Delete the junction row. If the removed segment was the selected one,
+    clear audio_clips.selected so playback falls back to source_path."""
+    conn = get_db(project_dir)
+    conn.execute(
+        "DELETE FROM audio_candidates WHERE audio_clip_id = ? AND pool_segment_id = ?",
+        (audio_clip_id, pool_segment_id),
+    )
+    conn.execute(
+        "UPDATE audio_clips SET selected = NULL WHERE id = ? AND selected = ?",
+        (audio_clip_id, pool_segment_id),
+    )
+    conn.commit()
+
+
+def get_audio_clip_effective_path(project_dir: Path, audio_clip: dict) -> str:
+    """Return the pool_segment's pool_path if a candidate is selected,
+    otherwise the clip's source_path. Used by playback/export to honor
+    the user's chosen variant transparently."""
+    selected = audio_clip.get("selected")
+    if selected:
+        seg = get_pool_segment(project_dir, selected)
+        if seg and seg.get("poolPath"):
+            return seg["poolPath"]
+    return audio_clip.get("source_path", "")
+
+
 # ── Track operations ───────────────────────────────────────────────
 
 def get_tracks(project_dir: Path) -> list[dict]:
@@ -1880,6 +1990,7 @@ def get_audio_clips(project_dir: Path, track_id: str | None = None) -> list[dict
         "volume_curve": json.loads(r["volume_curve"]) if r["volume_curve"] else [[0, 0], [1, 0]],
         "muted": bool(r["muted"]),
         "remap": json.loads(r["remap"]) if r["remap"] else {"method": "linear", "target_duration": 0},
+        "selected": r["selected"],
     } for r in rows]
 
 
