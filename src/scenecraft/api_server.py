@@ -1139,6 +1139,8 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             # POST /api/projects/:name/transitions/:tr_id/link-audio
             # M9 task-84: extract audio from the transition's selected video,
             # create audio_clips + audio_clip_links, route to the paired slot.
+            # Body: { "replace": false } — true to swap an existing link (use
+            # when the selected video changes, e.g. Veo completion).
             m = re.match(r"^/api/projects/([^/]+)/transitions/([^/]+)/link-audio$", path)
             if m:
                 project_dir = self._require_project_dir(m.group(1))
@@ -1146,9 +1148,9 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     return
                 tr_id = m.group(2)
                 body = self._read_json_body() or {}
-                force = bool(body.get("force", False))
+                replace = bool(body.get("replace", body.get("force", False)))
                 from scenecraft.audio.linking import link_audio_for_transition
-                result = link_audio_for_transition(project_dir, tr_id, force=force)
+                result = link_audio_for_transition(project_dir, tr_id, replace=replace)
                 status_code = 200 if result["status"] in ("linked", "exists", "skipped") else 500
                 return self._json_response(result, status=status_code)
 
@@ -2656,7 +2658,35 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                             }
                             _log(f"  {tr_id}: source={new_src_dur:.2f}s trim=[{clamped_trim_in:.2f}, {clamped_trim_out:.2f}]")
 
-                self._json_response({"success": True, "applied": len(selections), "trimUpdates": trim_updates})
+                # M9 task-92: auto-link audio for every slot_0 selection that
+                # landed (Veo completions, manual picks, candidate swaps all
+                # route through here). Failures are non-fatal — the selection
+                # succeeds even if audio extraction doesn't.
+                auto_link_results: list[dict] = []
+                try:
+                    from scenecraft.audio.linking import link_audio_for_transition
+                    for tr_id, slot_updates in by_tr.items():
+                        if 0 not in slot_updates:
+                            continue
+                        new_seg_id = slot_updates[0]
+                        # Replace the old linked clip iff slot_0 got a new video.
+                        # If slot_0 was deselected (seg_id is None), leave any existing
+                        # link alone — user can explicitly unlink if desired.
+                        if new_seg_id is None:
+                            continue
+                        link_result = link_audio_for_transition(project_dir, tr_id, replace=True)
+                        auto_link_results.append(link_result)
+                        _log(f"  auto-link {tr_id}: {link_result['status']} "
+                             f"{('reason=' + str(link_result.get('reason'))) if link_result.get('reason') else ''}".rstrip())
+                except Exception as e:
+                    _log(f"auto-link error (non-fatal): {e}")
+
+                self._json_response({
+                    "success": True,
+                    "applied": len(selections),
+                    "trimUpdates": trim_updates,
+                    "audioLinks": auto_link_results,
+                })
             except Exception as e:
                 self._error(500, "INTERNAL_ERROR", str(e))
 

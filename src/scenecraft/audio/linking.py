@@ -63,15 +63,19 @@ def _selected_video_path(project_dir: Path, transition_id: str, selected_json: s
 def link_audio_for_transition(
     project_dir: Path,
     transition_id: str,
-    force: bool = False,
+    replace: bool = False,
 ) -> dict:
     """Create a linked audio clip for the given transition.
 
     Args:
         project_dir: Project root containing project.db
         transition_id: Transition id to link audio for
-        force: If True, re-link even if a link already exists for this transition
-               (does NOT delete existing clips — creates an additional clip).
+        replace: If True, soft-delete any existing linked clips and drop
+                 their link rows before creating a new one. Use when the
+                 transition's selected video changes (e.g. Veo completes,
+                 user picks a different candidate). If the new video has no
+                 audio stream, the old links are still removed — the
+                 transition ends up unlinked.
 
     Returns a status dict: {
       "status": "linked" | "exists" | "skipped" | "error",
@@ -79,6 +83,7 @@ def link_audio_for_transition(
       "audio_clip_id": str | None,
       "audio_track_id": str | None,
       "audio_track_created": bool,
+      "replaced_clip_ids": list[str],
       "reason": str | None,
     }
     """
@@ -92,16 +97,25 @@ def link_audio_for_transition(
         "audio_clip_id": None,
         "audio_track_id": None,
         "audio_track_created": False,
+        "replaced_clip_ids": [],
         "reason": None,
     }
 
-    # Idempotency: skip if already linked (unless forced)
     existing_links = dbmod.get_audio_clip_links_for_transition(project_dir, transition_id)
-    if existing_links and not force:
+    if existing_links and not replace:
         result["status"] = "exists"
         result["audio_clip_id"] = existing_links[0]["audio_clip_id"]
         result["reason"] = "link already exists"
         return result
+
+    # Replace mode: soft-delete old clips + remove link rows before proceeding
+    if existing_links and replace:
+        old_clip_ids = [lk["audio_clip_id"] for lk in existing_links]
+        for clip_id in old_clip_ids:
+            dbmod.delete_audio_clip(project_dir, clip_id)
+        dbmod.remove_audio_clip_links_for_transition(project_dir, transition_id)
+        result["replaced_clip_ids"] = old_clip_ids
+        _log(f"replace: unlinked {len(old_clip_ids)} old clip(s) for {transition_id}")
 
     # Load the transition + its keyframes to get timeline span and video track
     tr = dbmod.get_transition(project_dir, transition_id)
