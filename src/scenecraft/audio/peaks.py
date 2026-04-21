@@ -74,7 +74,11 @@ def compute_peaks(
     if total_samples <= 0:
         return b""
 
-    # ffmpeg: seek to source_offset, decode `duration` seconds of mono s16le at 16kHz
+    # ffmpeg: seek to source_offset, decode `duration` seconds of mono s16le at 16kHz.
+    # Stream the output through a pipe and bucket it as we read, so memory stays
+    # bounded by one bucket's worth of samples rather than the full decode —
+    # important for multi-hour clips (a 2.5h file decodes to ~300 MB of s16 PCM
+    # which crashed subprocess.run with capture_output=True).
     cmd = [
         "ffmpeg", "-nostdin", "-loglevel", "error",
         "-ss", f"{source_offset:.6f}",
@@ -86,31 +90,63 @@ def compute_peaks(
         "-f", "s16le",
         "-",
     ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, timeout=60, check=False)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        raise RuntimeError(f"ffmpeg decode failed: {e}") from e
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg rc={result.returncode}: {result.stderr.decode('utf-8', errors='replace')[:300]}")
+    # Bucket size in samples: how many consecutive samples collapse into one peak.
+    # floor division matches the original reshape behaviour; we drop the trailing
+    # partial bucket the same way.
+    bucket_samples = max(1, total_samples // n_peaks)
+    bucket_bytes = bucket_samples * 2   # 2 bytes per int16 sample
+    peaks_out = np.zeros(n_peaks, dtype=np.float32)
 
-    # int16 → float32 in [-1, 1]
-    pcm = np.frombuffer(result.stdout, dtype=np.int16)
-    if pcm.size == 0:
-        data = np.zeros(n_peaks, dtype=np.float16).tobytes()
-    else:
-        samples = pcm.astype(np.float32) / 32768.0
-        # Window into n_peaks buckets, take absolute peak per bucket
-        if samples.size >= n_peaks:
-            # Trim to an even multiple so reshape works
-            usable = (samples.size // n_peaks) * n_peaks
-            trimmed = samples[:usable]
-            bucketed = np.abs(trimmed).reshape(n_peaks, -1)
-            peaks = bucketed.max(axis=1)
-        else:
-            # Fewer samples than buckets — pad with zeros
-            peaks = np.zeros(n_peaks, dtype=np.float32)
-            peaks[:samples.size] = np.abs(samples)
-        data = peaks.astype(np.float16).tobytes()
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError as e:
+        raise RuntimeError(f"ffmpeg not found: {e}") from e
+
+    try:
+        wrote_any = False
+        for i in range(n_peaks):
+            # Read exactly one bucket — retry until we have `bucket_bytes` or EOF
+            buf = b""
+            while len(buf) < bucket_bytes:
+                chunk = proc.stdout.read(bucket_bytes - len(buf))
+                if not chunk:
+                    break
+                buf += chunk
+            if not buf:
+                break
+            # Align to even byte count (should already be, but be defensive)
+            if len(buf) % 2:
+                buf = buf[:-1]
+            if not buf:
+                break
+            arr = np.frombuffer(buf, dtype=np.int16)
+            if arr.size:
+                peaks_out[i] = float(np.abs(arr.astype(np.float32) / 32768.0).max())
+                wrote_any = True
+        # Drain any remaining stdout (we intentionally ignore it — trailing bucket)
+        try:
+            proc.stdout.read()
+        except Exception:
+            pass
+        try:
+            rc = proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise RuntimeError("ffmpeg timed out during peak decode")
+        if rc != 0 and not wrote_any:
+            err = proc.stderr.read().decode("utf-8", errors="replace")[:300]
+            raise RuntimeError(f"ffmpeg rc={rc}: {err}")
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            proc.stderr.close()
+        except Exception:
+            pass
+
+    data = peaks_out.astype(np.float16).tobytes()
 
     if cache_file is not None:
         try:
