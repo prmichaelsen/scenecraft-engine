@@ -2186,6 +2186,10 @@ def get_audio_clips(project_dir: Path, track_id: str | None = None) -> list[dict
             # Derived fields (computed from linked transition at query time; not stored)
             "playback_rate": rate,
             "effective_source_offset": eff_off,
+            # M10 cross-type drag uses this so a linked clip isn't manually
+            # shifted when its transition is also moved — propagation via
+            # update_keyframe handles the linked-audio shift automatically.
+            "linked_transition_id": link_map.get(r["id"]),
         })
     return result
 
