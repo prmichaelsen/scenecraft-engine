@@ -224,11 +224,16 @@ class RenderWorker:
 
     def _render_loop(self) -> None:
         _log(f"render loop started for {self.project_dir.name}")
+        _tick = 0
         try:
             while not self._stop_flag.is_set():
+                _tick += 1
                 if not self._playing.is_set():
+                    if _tick % 20 == 1:
+                        _log(f"loop idle (not playing), tick={_tick}, playhead={self._playhead_t:.2f}, dur={self._schedule.duration_seconds:.2f}")
                     self._playing.wait(timeout=0.5)
                     continue
+                _log(f"loop active tick={_tick} playhead={self._playhead_t:.3f} dur={self._schedule.duration_seconds:.2f}")
                 if self._invalidated.is_set():
                     self._invalidated.clear()
                     try:
@@ -250,13 +255,14 @@ class RenderWorker:
 
                 # End-of-timeline?
                 if self._playhead_t >= self._schedule.duration_seconds - 1e-6:
-                    # Nothing left to render; idle.
+                    _log(f"loop: playhead {self._playhead_t:.2f} >= duration {self._schedule.duration_seconds:.2f} — idling")
                     self._playing.clear()
                     continue
 
                 # Render one fragment's worth of frames.
                 frames_to_render = self._frames_per_fragment
                 t0 = self._playhead_t
+                _log(f"rendering fragment: t0={t0:.3f} frames_to_render={frames_to_render}")
                 frames: list[np.ndarray] = []
                 black_count = 0
                 for i in range(frames_to_render):
@@ -288,16 +294,11 @@ class RenderWorker:
                         )
                     frames.append(frame)
 
-                    # Opportunistically warm the scrub cache.
-                    try:
-                        ok, buf = cv2.imencode(
-                            ".jpg", frame,
-                            [int(cv2.IMWRITE_JPEG_QUALITY), SCRUB_JPEG_QUALITY],
-                        )
-                        if ok:
-                            global_cache.put(self.project_dir, t, SCRUB_JPEG_QUALITY, bytes(buf))
-                    except Exception:
-                        pass
+                # (Previously: opportunistically warmed the scrub JPEG cache here
+                # via cv2.imencode per frame. That cost ~50-100ms per 1080p frame
+                # and was blocking the render thread — adding 2-4s per 2s fragment
+                # for no realtime-playback benefit. Removed. Scrub still works via
+                # its own HTTP path; the cache warms on actual scrub visits.)
 
                 if not frames:
                     self._playing.clear()
@@ -317,6 +318,9 @@ class RenderWorker:
                     except Exception as exc:
                         _log(f"encode_init failed: {exc}")
 
+                _log(f"encode_range: submitting {len(frames)} frames")
+                import time as _time
+                _t0 = _time.monotonic()
                 try:
                     segment = self._encoder.encode_range(frames)
                 except Exception as exc:
@@ -324,7 +328,7 @@ class RenderWorker:
                     _log(f"encode_range failed: {exc}\n{traceback.format_exc()}")
                     self._playing.clear()
                     continue
-                _log(f"fragment encoded: {len(segment)} bytes")
+                _log(f"fragment encoded: {len(segment)} bytes in {(_time.monotonic() - _t0):.2f}s")
 
                 # Backpressure: block if queue is full.
                 try:
