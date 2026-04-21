@@ -1,14 +1,16 @@
 """Frame cache for the scrub/playback renderer.
 
-L1 (in-memory) only for now. Keyed on the full project version (mtime of
-project.db + meta hash of render inputs), so any DB write invalidates the
-project's cache wholesale. Fine-grained range-based invalidation is a
-future optimization — see agent/design/local.backend-rendered-preview-streaming.md.
+L1 (in-memory) only for now. Keyed on `(project_dir, t_ms, quality)` —
+entries survive arbitrary DB writes. Callers (the mutating API endpoints)
+explicitly call `invalidate_range(project, t_start, t_end)` to drop
+entries whose time falls inside the range that the edit actually
+affects. Wholesale invalidation is still available via
+`invalidate_project` as an escape hatch for operations where computing a
+tight range would be error-prone (e.g., undo/redo).
 """
 
 from __future__ import annotations
 
-import os
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -16,8 +18,8 @@ from pathlib import Path
 from typing import Tuple
 
 
-# Cache key: (project_dir_str, db_mtime_ns, t_ms, quality)
-CacheKey = Tuple[str, int, int, int]
+# Cache key: (project_dir_str, t_ms, quality)
+CacheKey = Tuple[str, int, int]
 
 
 @dataclass
@@ -38,27 +40,13 @@ class FrameCache:
         self.hits = 0
         self.misses = 0
 
-    def _key(self, project_dir: Path, t: float, quality: int) -> CacheKey | None:
-        # SQLite WAL mode: the .db file's mtime only changes on checkpoint.
-        # Every write touches .db-wal instead. Use the max of both so any
-        # write is observed immediately.
-        mtimes: list[int] = []
-        for name in ("project.db", "project.db-wal"):
-            try:
-                mtimes.append(os.stat(project_dir / name).st_mtime_ns)
-            except FileNotFoundError:
-                continue
-        if not mtimes:
-            return None
-        mtime = max(mtimes)
+    def _key(self, project_dir: Path, t: float, quality: int) -> CacheKey:
         # Bucket t at millisecond precision — subframe-level determinism isn't
         # needed and would blow the cache on every mouse-pixel movement.
-        return (str(project_dir), mtime, int(round(t * 1000)), quality)
+        return (str(project_dir), int(round(t * 1000)), quality)
 
     def get(self, project_dir: Path, t: float, quality: int) -> bytes | None:
         key = self._key(project_dir, t, quality)
-        if key is None:
-            return None
         with self._lock:
             entry = self._store.get(key)
             if entry is None:
@@ -71,8 +59,6 @@ class FrameCache:
 
     def put(self, project_dir: Path, t: float, quality: int, jpeg: bytes) -> None:
         key = self._key(project_dir, t, quality)
-        if key is None:
-            return
         entry = _Entry(jpeg=jpeg, bytes_size=len(jpeg))
         with self._lock:
             if key in self._store:
@@ -99,6 +85,63 @@ class FrameCache:
         prefix = str(project_dir)
         with self._lock:
             to_drop = [k for k in self._store if k[0] == prefix]
+            for k in to_drop:
+                self._total_bytes -= self._store[k].bytes_size
+                del self._store[k]
+            return len(to_drop)
+
+    def invalidate_range(
+        self,
+        project_dir: Path,
+        t_start: float,
+        t_end: float,
+    ) -> int:
+        """Drop cache entries for `project_dir` whose time falls in [t_start, t_end].
+
+        Bounds are inclusive at both ends (seconds). `t_start > t_end`
+        returns 0 without raising. Returns count of entries evicted.
+        """
+        if t_end < t_start:
+            return 0
+        prefix = str(project_dir)
+        t_start_ms = int(round(t_start * 1000))
+        t_end_ms = int(round(t_end * 1000))
+        with self._lock:
+            to_drop = [
+                k for k in self._store
+                if k[0] == prefix and t_start_ms <= k[1] <= t_end_ms
+            ]
+            for k in to_drop:
+                self._total_bytes -= self._store[k].bytes_size
+                del self._store[k]
+            return len(to_drop)
+
+    def invalidate_ranges(
+        self,
+        project_dir: Path,
+        ranges: list[tuple[float, float]],
+    ) -> int:
+        """Invalidate multiple ranges in one locked pass. Returns total evicted."""
+        if not ranges:
+            return 0
+        prefix = str(project_dir)
+        ranges_ms = [
+            (int(round(a * 1000)), int(round(b * 1000)))
+            for a, b in ranges
+            if b >= a
+        ]
+        if not ranges_ms:
+            return 0
+        with self._lock:
+            to_drop = []
+            for k in self._store:
+                if k[0] != prefix:
+                    continue
+                t_ms = k[1]
+                for a, b in ranges_ms:
+                    if a <= t_ms <= b:
+                        to_drop.append(k)
+                        break
             for k in to_drop:
                 self._total_bytes -= self._store[k].bytes_size
                 del self._store[k]

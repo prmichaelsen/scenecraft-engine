@@ -2868,6 +2868,12 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 if not tr:
                     return self._error(404, "NOT_FOUND", f"Transition not found: {tr_id}")
 
+                # Capture OLD time range for cache invalidation.
+                old_from_kf = get_keyframe(project_dir, tr["from"]) if tr.get("from") else None
+                old_to_kf = get_keyframe(project_dir, tr["to"]) if tr.get("to") else None
+                old_from_t = parse_ts(old_from_kf["timestamp"]) if old_from_kf else 0.0
+                old_to_t = parse_ts(old_to_kf["timestamp"]) if old_to_kf else 0.0
+
                 # Update trim values on the transition
                 trim_updates: dict = {}
                 if trim_in is not None:
@@ -2898,6 +2904,20 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                                 other_time = parse_ts(other_kf["timestamp"])
                                 dur = round(abs(new_time - other_time), 2)
                                 update_transition(project_dir, adj["id"], duration_seconds=dur)
+
+                # Compute NEW time range; invalidate union of old and new spans
+                # so frames that are no-longer-this-transition AND frames that
+                # are now-this-transition both get recomputed.
+                new_from_t = parse_ts(from_ts) if from_ts is not None else old_from_t
+                new_to_t = parse_ts(to_ts) if to_ts is not None else old_to_t
+                from scenecraft.render.cache_invalidation import invalidate_frames_for_mutation
+                invalidate_frames_for_mutation(
+                    project_dir,
+                    ranges=[
+                        (min(old_from_t, old_to_t), max(old_from_t, old_to_t)),
+                        (min(new_from_t, new_to_t), max(new_from_t, new_to_t)),
+                    ],
+                )
 
                 _log(
                     f"update-transition-trim: {tr_id} "

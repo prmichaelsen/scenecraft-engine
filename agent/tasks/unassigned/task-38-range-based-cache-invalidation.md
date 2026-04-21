@@ -68,7 +68,9 @@ Audit every route in `src/scenecraft/api/` that mutates preview-relevant state. 
 | `POST /insert-pool-item` | landing transition's `[from, to]` |
 | `POST /keyframes` (add/update/delete) | adjacent transition(s)' time span (since keyframes bound transitions) |
 | `POST /batch-delete-keyframes` | union of affected transition ranges |
-| `POST /tracks/:id` (blend_mode, base_opacity, enabled toggle) | full track time range |
+| `POST /tracks/:id` — ANY setting change (blend_mode, base_opacity, enabled, mute, solo, z_order, color grading, transforms applied at track level) | full track's time-occupied range (union of all its transitions' `[from, to]`) |
+| Adjustment layer edits (transitions flagged `is_adjustment=true`) | `[from, to]` of the adjustment — same as normal transition edits, but note the adjustment layer's span affects ALL content rendered beneath it at that time range; the invalidation is correct because frames at those times change regardless of which layer owns them |
+| Adjustment layer move / trim | old_span ∪ new_span (same as normal transition move) |
 | `POST /undo`, `POST /redo` | conservative: use `invalidate_project` (or track per-op undo range; see design) |
 
 Each handler gets 2-5 added lines. A test per endpoint verifies the right range was invalidated (mock the cache).
