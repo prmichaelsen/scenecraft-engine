@@ -60,3 +60,5 @@ __pycache__/
 .pytest_cache/
 
 *-service.json
+# Claude Code agent worktrees (local only)
+.claude/worktrees/

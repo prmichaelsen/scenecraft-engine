@@ -11,7 +11,12 @@
       "Bash(sqlite3 *)",
       "Bash(/home/prmichaelsen/.acp/projects/scenecraft-engine/.venv/bin/scenecraft token *)",
       "Bash(.venv/bin/python3 -c \"import yaml\")",
-      "Bash(.venv/bin/python3 -c \"from ruamel import yaml; print\\(yaml\\)\")"
+      "Bash(.venv/bin/python3 -c \"from ruamel import yaml; print\\(yaml\\)\")",
+      "Bash(.venv/bin/python3 -m pytest tests/test_compositor_parity.py -v)",
+      "Bash(.venv/bin/pip list *)",
+      "Bash(.venv/bin/python3 -c \"import cv2; print\\(cv2.__version__\\)\")",
+      "Bash(.venv/bin/python3 *)",
+      "Bash(git merge worktree-agent-a99fdbe7 --no-ff -m 'merge: M11 task-34 — MSE playback \\(FragmentEncoder, RenderWorker, RenderCoordinator, /ws/preview-stream\\) *)"
     ]
   }
 }
