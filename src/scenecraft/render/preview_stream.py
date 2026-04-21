@@ -29,11 +29,14 @@ from typing import Iterable, Iterator
 
 import numpy as np
 
-# Tune + preset defaults chosen per task spec: ultrafast + zerolatency + crf 23.
-DEFAULT_PRESET = "ultrafast"
+# Preview-quality encoder defaults (not broadcast). `faster` + crf 28 + 2s
+# keyframe interval hits ~3-6 Mbps on 1080p24 content — roughly 5-8x smaller
+# than the earlier ultrafast+crf23+1s-GOP choice. Encode still comfortably
+# realtime on a single core. Reference: FFmpeg wiki Encode/H.264.
+DEFAULT_PRESET = "faster"
 DEFAULT_TUNE = "zerolatency"
-DEFAULT_CRF = 23
-DEFAULT_KEYFRAME_INTERVAL = 24  # one GOP per second at 24fps
+DEFAULT_CRF = 28
+DEFAULT_KEYFRAME_INTERVAL = 48  # 2s GOP at 24fps
 
 
 def _boxes(data: bytes) -> list[tuple[str, int, int]]:

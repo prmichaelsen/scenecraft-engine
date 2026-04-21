@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 # ── Module-level tuning knobs ────────────────────────────────────────────
 
 BUFFER_SECONDS = 10          # how far ahead of the playhead to pre-render
-FRAGMENT_SECONDS = 1.0       # one fMP4 media segment per second
+FRAGMENT_SECONDS = 2.0       # one fMP4 media segment per 2s — aligns with 2s GOP
 IDLE_TIMEOUT_S = 300         # tear down workers idle for this long
 SCRUB_JPEG_QUALITY = 85      # JPEG quality used when opportunistically warming the scrub cache
 
@@ -73,10 +73,15 @@ class RenderWorker:
         if queue_capacity is None:
             queue_capacity = max(1, math.ceil(BUFFER_SECONDS / FRAGMENT_SECONDS))
         self._queue: queue.Queue[bytes] = queue.Queue(maxsize=queue_capacity)
+        # Force the ffmpeg-subprocess backend: the PyAV path opens a fresh
+        # container per fragment, which forces an IDR every fragment and
+        # bloats bitrate 5-8x. The subprocess keeps a single encoder alive
+        # across fragments (IDR only at GOP boundaries).
         self._encoder = fragment_encoder or FragmentEncoder(
             width=self._schedule.width,
             height=self._schedule.height,
             fps=self._fps,
+            force_backend="ffmpeg",
         )
 
         # Control flags.
@@ -129,6 +134,7 @@ class RenderWorker:
                 width=self._schedule.width,
                 height=self._schedule.height,
                 fps=self._fps,
+                force_backend="ffmpeg",
             )
             self._init_emitted = False
         self._last_activity_ts = time.monotonic()
@@ -377,12 +383,21 @@ class RenderCoordinator:
         self._lock = threading.Lock()
 
     def get_worker(self, project_dir: Path) -> RenderWorker:
-        """Lazily spawn or return an existing worker for a project."""
+        """Lazily spawn or return an existing worker for a project.
+
+        A worker whose stop_flag is set has already had its encoder closed and
+        thread joined — reusing it would make fragments() throw on
+        encode_init(). Evict it and spawn a fresh one.
+        """
         key = str(Path(project_dir).resolve())
         with self._lock:
             worker = self._workers.get(key)
             if worker is not None:
-                return worker
+                if not worker._stop_flag.is_set():
+                    return worker
+                # Stopped worker lingered in the dict (e.g., client sent
+                # action=stop then reconnected). Drop it.
+                self._workers.pop(key, None)
 
             # Enforce cap: evict LRU idle worker if we're at the limit.
             if len(self._workers) >= self.max_workers:
