@@ -129,6 +129,15 @@ async def _handle_connection(ws: ServerConnection):
         await ws.send(json.dumps({"type": "error", "error": f"Project not found: {project_name}"}))
         return
 
+    # Preview-stream: MSE fMP4 fragment streaming for playback.
+    if path.startswith("/ws/preview-stream/"):
+        project_name = path.split("/ws/preview-stream/", 1)[1].split("?")[0]
+        from urllib.parse import unquote
+        project_name = unquote(project_name)
+        from scenecraft.render.preview_ws import handle_preview_stream_connection
+        await handle_preview_stream_connection(ws, _work_dir, project_name)
+        return
+
     # Default: job progress handler
     job_manager.register_connection(ws)
     _log(f"Client connected ({len(job_manager._connections)} total)")
