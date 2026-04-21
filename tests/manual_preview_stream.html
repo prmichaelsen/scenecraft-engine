@@ -1,0 +1,174 @@
+<!doctype html>
+<!--
+Manual smoke-test harness for /ws/preview-stream/:project_name.
+
+Usage:
+  1. Start the scenecraft API + WS server against a workdir that contains a
+     project with at least one rendered transition:
+       .venv/bin/python3 -m scenecraft serve --work-dir /path/to/workdir
+     (or however you normally start the server — ws_server.start_ws_server binds
+     to 8891 by default.)
+  2. Open this file in a browser. Adjust the PROJECT and WS_URL constants at the
+     top of the <script> block to match your server.
+  3. Click "Play" — init + media segments will be appended to the MediaSource
+     and the <video> should play through the timeline.
+  4. Click "Seek" to jump; you may need to call stop/play via the buttons to
+     re-open the MediaSource (seek discards the existing source buffer on the
+     server side; the current harness pauses + reopens on seek).
+  5. While playing, edit the underlying project via an API call (e.g. set_meta)
+     and verify the stream stutters briefly then resumes with the new content —
+     this exercises the on_project_invalidate hook.
+-->
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>scenecraft preview-stream smoke test</title>
+    <style>
+        body { font-family: system-ui, sans-serif; padding: 16px; }
+        video { display: block; margin-top: 8px; background: #111; }
+        #log { font-family: monospace; font-size: 12px; white-space: pre; max-height: 40vh; overflow: auto; border: 1px solid #ccc; padding: 8px; margin-top: 8px; }
+        button { margin-right: 4px; }
+    </style>
+</head>
+<body>
+
+<h1>scenecraft preview-stream</h1>
+<p>
+    <label>Project: <input id="project" value="demo" size="20"></label>
+    <label>WS base: <input id="ws-base" value="ws://127.0.0.1:8891" size="30"></label>
+    <label>Seek t: <input id="seek-t" value="2" size="5"> s</label>
+</p>
+<p>
+    <button id="play">Play</button>
+    <button id="seek">Seek</button>
+    <button id="pause">Pause</button>
+    <button id="stop">Stop</button>
+</p>
+
+<video id="video" width="640" height="480" controls autoplay muted></video>
+<div id="log"></div>
+
+<script>
+const logEl = document.getElementById('log');
+function log(msg) {
+    const ts = new Date().toLocaleTimeString();
+    logEl.textContent += `[${ts}] ${msg}\n`;
+    logEl.scrollTop = logEl.scrollHeight;
+}
+
+const video = document.getElementById('video');
+let ws = null;
+let mediaSource = null;
+let sourceBuffer = null;
+let pendingBuffers = [];
+let gotInit = false;
+
+// Codec string advertised by ffmpeg/libx264 ultrafast output; Constrained Baseline Profile, level 1.3 seen in smoke tests.
+const CODEC = 'video/mp4; codecs="avc1.42C01E"';
+
+function openMediaSource() {
+    return new Promise((resolve) => {
+        mediaSource = new MediaSource();
+        video.src = URL.createObjectURL(mediaSource);
+        mediaSource.addEventListener('sourceopen', () => {
+            try {
+                sourceBuffer = mediaSource.addSourceBuffer(CODEC);
+            } catch (err) {
+                log('addSourceBuffer threw: ' + err.message);
+                log('isTypeSupported: ' + MediaSource.isTypeSupported(CODEC));
+                return;
+            }
+            sourceBuffer.addEventListener('updateend', () => {
+                if (pendingBuffers.length > 0 && !sourceBuffer.updating) {
+                    sourceBuffer.appendBuffer(pendingBuffers.shift());
+                }
+            });
+            resolve();
+        }, { once: true });
+    });
+}
+
+function enqueueBinary(data) {
+    if (!sourceBuffer) {
+        log('sourceBuffer not ready, dropping ' + data.byteLength + ' bytes');
+        return;
+    }
+    if (sourceBuffer.updating || pendingBuffers.length > 0) {
+        pendingBuffers.push(data);
+    } else {
+        sourceBuffer.appendBuffer(data);
+    }
+}
+
+async function startPlayback(startT) {
+    await openMediaSource();
+    const base = document.getElementById('ws-base').value.trim();
+    const proj = document.getElementById('project').value.trim();
+    const url = `${base}/ws/preview-stream/${encodeURIComponent(proj)}`;
+    log('connecting to ' + url);
+    ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+    gotInit = false;
+    ws.addEventListener('open', () => {
+        log('ws open; sending play @ t=' + startT);
+        ws.send(JSON.stringify({ action: 'play', t: startT }));
+    });
+    ws.addEventListener('message', (ev) => {
+        if (typeof ev.data === 'string') {
+            log('text frame: ' + ev.data);
+            return;
+        }
+        const bytes = ev.data;
+        if (!gotInit) {
+            log('received init segment: ' + bytes.byteLength + ' bytes');
+            gotInit = true;
+        } else {
+            log('received media segment: ' + bytes.byteLength + ' bytes');
+        }
+        enqueueBinary(bytes);
+    });
+    ws.addEventListener('close', () => log('ws closed'));
+    ws.addEventListener('error', (ev) => log('ws error'));
+}
+
+document.getElementById('play').addEventListener('click', async () => {
+    await stopPlayback();
+    pendingBuffers = [];
+    await startPlayback(0);
+});
+
+document.getElementById('seek').addEventListener('click', async () => {
+    const t = parseFloat(document.getElementById('seek-t').value) || 0;
+    // Reopen the media source — the server returns a fresh init after seek.
+    await stopPlayback();
+    pendingBuffers = [];
+    await startPlayback(t);
+});
+
+document.getElementById('pause').addEventListener('click', () => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: 'pause' }));
+    }
+});
+
+document.getElementById('stop').addEventListener('click', stopPlayback);
+
+async function stopPlayback() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: 'stop' }));
+        ws.close();
+    }
+    ws = null;
+    if (mediaSource && mediaSource.readyState === 'open') {
+        try { mediaSource.endOfStream(); } catch {}
+    }
+    mediaSource = null;
+    sourceBuffer = null;
+    video.removeAttribute('src');
+    video.load();
+    log('stopped');
+}
+</script>
+
+</body>
+</html>
