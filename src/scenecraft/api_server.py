@@ -1503,7 +1503,17 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                         threading.Thread(target=_extract, daemon=True).start()
 
                 _log(f"duplicate-transition-video: {source_id} -> {target_id}")
-                return self._json_response({"success": True})
+
+                # M9 task-89: auto-link audio from the duplicated video
+                audio_link = None
+                try:
+                    from scenecraft.audio.linking import link_audio_for_transition
+                    audio_link = link_audio_for_transition(project_dir, target_id, replace=True)
+                except Exception as e:
+                    _log(f"  audio auto-link failed (non-fatal): {e}")
+                    audio_link = {"status": "error", "transition_id": target_id, "reason": str(e)}
+
+                return self._json_response({"success": True, "audioLink": audio_link})
 
             # POST /api/projects/:name/update-keyframe-label
             m = re.match(r"^/api/projects/([^/]+)/update-keyframe-label$", path)
@@ -5222,10 +5232,21 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     threading.Thread(target=_extract, daemon=True).start()
 
                 _log(f"  Assigned seg={seg_id[:8]} to {tr_id}")
+
+                # M9 task-89: auto-link audio from the newly-selected pool video
+                audio_link = None
+                try:
+                    from scenecraft.audio.linking import link_audio_for_transition
+                    audio_link = link_audio_for_transition(project_dir, tr_id, replace=True)
+                except Exception as e:
+                    _log(f"  audio auto-link failed (non-fatal): {e}")
+                    audio_link = {"status": "error", "transition_id": tr_id, "reason": str(e)}
+
                 self._json_response({
                     "success": True,
                     "transitionId": tr_id,
                     "poolSegmentId": seg_id,
+                    "audioLink": audio_link,
                 })
             except Exception as e:
                 import traceback
