@@ -3359,8 +3359,10 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     update_keyframe, get_keyframe, get_transitions as _get_trs,
                     add_keyframe, next_keyframe_id, next_transition_id,
                     add_transition, get_tracks as _get_tracks, add_track as _add_track,
-                    generate_id,
+                    generate_id, delete_transition, delete_keyframe,
+                    clone_tr_candidates, get_transition_effects, add_transition_effect,
                 )
+                import datetime as _dt
 
                 def parse_ts(ts):
                     parts = str(ts).split(":")
@@ -3651,17 +3653,229 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     update_fields["to"] = new_to_kf_id
                     update_transition(project_dir, tr_id, **update_fields)
 
+                    # Stash new kf ids for overlap resolution below
+                    entry["new_from_kf_id"] = new_from_kf_id
+                    entry["new_to_kf_id"] = new_to_kf_id
+
+                # ── 10. Target-track overlap resolution ───────────────────────
+                # For each placed clip, scan its target track for active trs that
+                # overlap [new_from, new_to] (excluding trs in the moved batch).
+                # Classify and apply:
+                #   Case A: fully inside drop span       -> soft-delete target
+                #   Case B: straddles new_from           -> trim target to [from, new_from_kf]
+                #   Case C: straddles new_to             -> trim target to [new_to_kf, to]
+                #   Case D: drop fully inside target     -> three-way split
+                # Empty-tr targets (selected IS NULL) skip trim math (just move kf).
+                now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                consumed_ids: list[str] = []
+                split_ids: list[str] = []
+                touched_target_tracks: set[str] = set()
+
+                def _is_empty_sel(sel):
+                    if sel is None:
+                        return True
+                    if isinstance(sel, list):
+                        return len(sel) == 0 or all(v is None for v in sel)
+                    return False
+
+                def _trim_fallback(tr_row, from_time, to_time):
+                    """Effective (trim_in, trim_out) when trim_out can be None."""
+                    ti = tr_row.get("trim_in") or 0.0
+                    to = tr_row.get("trim_out")
+                    if to is None:
+                        to = tr_row.get("source_video_duration")
+                    if to is None:
+                        to = max(0.0, to_time - from_time)
+                    return float(ti), float(to)
+
+                def _soft_delete_kf_if_orphan(kf_id: str):
+                    """Soft-delete a kf if no active tr references it."""
+                    if not kf_id:
+                        return
+                    refs = conn_check = None
+                    active_refs = [
+                        t for t in _get_trs(project_dir)
+                        if not t.get("deleted_at") and (t.get("from") == kf_id or t.get("to") == kf_id)
+                    ]
+                    if not active_refs:
+                        delete_keyframe(project_dir, kf_id, now_iso)
+
+                def _copy_selected_transitions_cache(src_tr_id: str, dst_tr_id: str):
+                    """Copy selected_transitions/{src}_slot_*.mp4 to {dst}_slot_*.mp4."""
+                    import shutil as _sh
+                    sel_dir = project_dir / "selected_transitions"
+                    if not sel_dir.exists():
+                        return
+                    for src_file in sel_dir.glob(f"{src_tr_id}_slot_*.mp4"):
+                        suffix = src_file.name[len(src_tr_id):]  # "_slot_N.mp4"
+                        dst_file = sel_dir / f"{dst_tr_id}{suffix}"
+                        try:
+                            _sh.copy2(str(src_file), str(dst_file))
+                        except Exception as _e:
+                            _log(f"  cache copy failed {src_file.name} -> {dst_file.name}: {_e}")
+
+                for entry in trs_to_move:
+                    dragged_tr_id = entry["tr"]["id"]
+                    target_track_id = entry["target_track_id"]
+                    new_from = entry["new_from_time"]
+                    new_to = entry["new_to_time"]
+                    new_from_kf_id = entry["new_from_kf_id"]
+                    new_to_kf_id = entry["new_to_kf_id"]
+                    touched_target_tracks.add(target_track_id)
+
+                    if new_to - new_from < 0.0005:
+                        continue  # zero-length drop — skip overlap
+
+                    # Fetch overlaps on target track, excluding all moved trs + the dragged itself
+                    all_trs_now = _get_trs(project_dir)
+                    overlaps = []
+                    for t in all_trs_now:
+                        if t.get("deleted_at"):
+                            continue
+                        if t["id"] in moved_set or t["id"] == dragged_tr_id:
+                            continue
+                        if t.get("track_id") != target_track_id:
+                            continue
+                        tfrom_kf = get_keyframe(project_dir, t.get("from"))
+                        tto_kf = get_keyframe(project_dir, t.get("to"))
+                        if not tfrom_kf or not tto_kf:
+                            continue
+                        tf = parse_ts(tfrom_kf["timestamp"])
+                        tt = parse_ts(tto_kf["timestamp"])
+                        # Overlap if [tf, tt] intersects [new_from, new_to]
+                        if tt <= new_from + 0.0005 or tf >= new_to - 0.0005:
+                            continue
+                        overlaps.append({"tr": t, "tf": tf, "tt": tt, "from_kf": tfrom_kf, "to_kf": tto_kf})
+
+                    # Case D takes precedence — one target fully contains the drop
+                    case_d = [o for o in overlaps
+                              if o["tf"] < new_from - 0.0005 and o["tt"] > new_to + 0.0005]
+                    if case_d:
+                        tgt = case_d[0]
+                        tr_row = tgt["tr"]
+                        tf, tt = tgt["tf"], tgt["tt"]
+                        is_empty = _is_empty_sel(tr_row.get("selected"))
+                        # Split into left + right remainders
+                        left_id = next_transition_id(project_dir)
+                        right_id = next_transition_id(project_dir)
+                        if is_empty:
+                            left_trim_in = None
+                            left_trim_out = None
+                            right_trim_in = None
+                            right_trim_out = None
+                        else:
+                            ti, to_v = _trim_fallback(tr_row, tf, tt)
+                            factor = (to_v - ti) / max(1e-6, (tt - tf))
+                            left_trim_in = ti
+                            left_trim_out = ti + (new_from - tf) * factor
+                            right_trim_in = ti + (new_to - tf) * factor
+                            right_trim_out = to_v
+                        left_payload = {
+                            "id": left_id,
+                            "from": tr_row.get("from"),
+                            "to": new_from_kf_id,
+                            "duration_seconds": round(new_from - tf, 2),
+                            "selected": tr_row.get("selected"),
+                            "track_id": target_track_id,
+                            "source_video_duration": tr_row.get("source_video_duration"),
+                        }
+                        if not is_empty:
+                            left_payload["trim_in"] = left_trim_in
+                            left_payload["trim_out"] = left_trim_out
+                        right_payload = {
+                            "id": right_id,
+                            "from": new_to_kf_id,
+                            "to": tr_row.get("to"),
+                            "duration_seconds": round(tt - new_to, 2),
+                            "selected": tr_row.get("selected"),
+                            "track_id": target_track_id,
+                            "source_video_duration": tr_row.get("source_video_duration"),
+                        }
+                        if not is_empty:
+                            right_payload["trim_in"] = right_trim_in
+                            right_payload["trim_out"] = right_trim_out
+                        add_transition(project_dir, left_payload)
+                        add_transition(project_dir, right_payload)
+                        if not is_empty:
+                            # Clone junction rows + effects for both remainders
+                            try:
+                                clone_tr_candidates(project_dir,
+                                                    source_transition_id=tr_row["id"],
+                                                    target_transition_id=left_id,
+                                                    new_source="split-inherit")
+                                clone_tr_candidates(project_dir,
+                                                    source_transition_id=tr_row["id"],
+                                                    target_transition_id=right_id,
+                                                    new_source="split-inherit")
+                            except Exception as _e:
+                                _log(f"  clone_tr_candidates failed: {_e}")
+                            try:
+                                for fx in get_transition_effects(project_dir, tr_row["id"]):
+                                    add_transition_effect(project_dir, left_id,
+                                                          fx.get("effect_type") or fx.get("type"),
+                                                          fx.get("params"))
+                                    add_transition_effect(project_dir, right_id,
+                                                          fx.get("effect_type") or fx.get("type"),
+                                                          fx.get("params"))
+                            except Exception as _e:
+                                _log(f"  effects clone failed: {_e}")
+                            _copy_selected_transitions_cache(tr_row["id"], left_id)
+                            _copy_selected_transitions_cache(tr_row["id"], right_id)
+                        delete_transition(project_dir, tr_row["id"], now_iso)
+                        split_ids.append(tr_row["id"])
+                        continue  # case D handled — skip other overlaps for this dragged
+
+                    # Otherwise iterate overlaps and classify A/B/C
+                    for o in overlaps:
+                        tr_row = o["tr"]
+                        tf, tt = o["tf"], o["tt"]
+                        is_empty = _is_empty_sel(tr_row.get("selected"))
+                        # Case A: fully inside
+                        if tf >= new_from - 0.0005 and tt <= new_to + 0.0005:
+                            delete_transition(project_dir, tr_row["id"], now_iso)
+                            _soft_delete_kf_if_orphan(tr_row.get("from"))
+                            _soft_delete_kf_if_orphan(tr_row.get("to"))
+                            consumed_ids.append(tr_row["id"])
+                            continue
+                        # Case B: straddles new_from (tf < new_from < tt, tt <= new_to)
+                        if tf < new_from - 0.0005 and tt <= new_to + 0.0005:
+                            update_fields = {
+                                "to": new_from_kf_id,
+                                "duration_seconds": round(new_from - tf, 2),
+                            }
+                            if not is_empty:
+                                ti, to_v = _trim_fallback(tr_row, tf, tt)
+                                factor = (to_v - ti) / max(1e-6, (tt - tf))
+                                update_fields["trim_out"] = ti + (new_from - tf) * factor
+                            update_transition(project_dir, tr_row["id"], **update_fields)
+                            split_ids.append(tr_row["id"])
+                            continue
+                        # Case C: straddles new_to (tf >= new_from, tf < new_to < tt)
+                        if tf >= new_from - 0.0005 and tt > new_to + 0.0005:
+                            update_fields = {
+                                "from": new_to_kf_id,
+                                "duration_seconds": round(tt - new_to, 2),
+                            }
+                            if not is_empty:
+                                ti, to_v = _trim_fallback(tr_row, tf, tt)
+                                factor = (to_v - ti) / max(1e-6, (tt - tf))
+                                update_fields["trim_in"] = ti + (new_to - tf) * factor
+                            update_transition(project_dir, tr_row["id"], **update_fields)
+                            split_ids.append(tr_row["id"])
+                            continue
+
                 _log(
                     f"move-transitions: {len(transition_ids)} tr(s) by {time_delta_f:.2f}s "
                     f"trackDelta={track_delta_i} createdTracks={len(created_track_ids)} "
+                    f"consumed={len(consumed_ids)} split={len(split_ids)} "
                     f"mode={mode}"
                 )
                 self._json_response({
                     "success": True,
                     "movedTransitionIds": list(transition_ids),
                     "createdTrackIds": created_track_ids,
-                    "consumedTransitionIds": [],
-                    "splitTransitionIds": [],
+                    "consumedTransitionIds": consumed_ids,
+                    "splitTransitionIds": split_ids,
                 })
             except Exception as e:
                 import traceback

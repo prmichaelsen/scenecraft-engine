@@ -183,7 +183,12 @@ class TestMoveTransitionsSingle:
         assert body["movedTransitionIds"] == ["tr_002"]
         assert body["createdTrackIds"] == []
         assert body["consumedTransitionIds"] == []
-        assert body["splitTransitionIds"] == []
+        # tr_002 moves [15,20] -> [18,23] onto a back-to-back track.
+        # Source cleanup inserts an empty bridge on track_1 at [15,20] (from kf_002→kf_003)
+        # which overlaps the drop [18,23]; bridge gets Case B trim (to=new_from_kf at 18).
+        # tr_003 at [20,25] straddles new_to=23 -> Case C trim.
+        assert "tr_003" in body["splitTransitionIds"]
+        assert len(body["splitTransitionIds"]) == 2  # tr_003 + the source bridge
 
         # Verify tr_002's new from/to timestamps are shifted by +3.
         tr_002 = get_transition(project_dir, "tr_002")
@@ -191,21 +196,22 @@ class TestMoveTransitionsSingle:
         to_kf = get_keyframe(project_dir, tr_002["to"])
         assert abs(parse_ts(from_kf["timestamp"]) - 18.0) < 0.01
         assert abs(parse_ts(to_kf["timestamp"]) - 23.0) < 0.01
-        # Duration preserved.
+        # Duration preserved on tr_002.
         assert abs(tr_002["duration_seconds"] - 5.0) < 0.01
 
-        # Verify kf_002 and kf_003 (original boundaries) still exist at original times
-        # (they were shared with tr_001 / tr_003).
-        kf_002 = get_keyframe(project_dir, "kf_002")
-        kf_003 = get_keyframe(project_dir, "kf_003")
-        assert abs(parse_ts(kf_002["timestamp"]) - 15.0) < 0.01
-        assert abs(parse_ts(kf_003["timestamp"]) - 20.0) < 0.01
-
-        # tr_001 and tr_003 untouched (still reference original kfs).
+        # kf_002 still bounds tr_001 on source; tr_001 untouched.
         tr_001 = get_transition(project_dir, "tr_001")
-        tr_003 = get_transition(project_dir, "tr_003")
         assert tr_001["to"] == "kf_002"
-        assert tr_003["from"] == "kf_003"
+        kf_002 = get_keyframe(project_dir, "kf_002")
+        assert abs(parse_ts(kf_002["timestamp"]) - 15.0) < 0.01
+
+        # tr_003's from_kf was trimmed to tr_002's new_to_kf (at 23.0);
+        # duration shrank from 5.0 to 2.0 (25 - 23).
+        tr_003 = get_transition(project_dir, "tr_003")
+        tr_003_from_kf = get_keyframe(project_dir, tr_003["from"])
+        assert abs(parse_ts(tr_003_from_kf["timestamp"]) - 23.0) < 0.01
+        assert abs(tr_003["duration_seconds"] - 2.0) < 0.01
+        assert tr_003["to"] == "kf_004"
 
     def test_single_tr_unshared_kfs_update_in_place(self, project_env):
         """A tr whose boundary kfs are NOT shared: kfs update in place (no new kf)."""
@@ -278,11 +284,14 @@ class TestMoveTransitionsBatch:
         assert abs(parse_ts(tr_002_from["timestamp"]) - 16.0) < 0.01
         assert abs(parse_ts(tr_002_to["timestamp"]) - 21.0) < 0.01
 
-        # tr_003 untouched: still from kf_003(0:20) to kf_004(0:25).
-        assert tr_003["from"] == "kf_003"
+        # tr_003 straddled by tr_002's new_to=21 -> Case C trim (Task 95).
+        # Its from_kf is now tr_002's new_to_kf (at 21); duration shrank 5->4.
+        tr_003 = get_transition(project_dir, "tr_003")
+        tr_003_from_kf = get_keyframe(project_dir, tr_003["from"])
+        assert abs(parse_ts(tr_003_from_kf["timestamp"]) - 21.0) < 0.01
+        assert abs(tr_003["duration_seconds"] - 4.0) < 0.01
         assert tr_003["to"] == "kf_004"
-        kf_003 = get_keyframe(project_dir, "kf_003")
-        assert abs(parse_ts(kf_003["timestamp"]) - 20.0) < 0.01
+        assert "tr_003" in body["splitTransitionIds"]
 
     def test_batch_undo_reverts_together(self, project_env):
         """Undo after a batch move should restore all trs to their original positions
@@ -723,3 +732,154 @@ class TestMoveTransitionsAutoCreateTracks:
         assert len(tracks_after) == 2
         # Appended below => higher z_order => sorts last.
         assert tracks_after[-1]["id"] == new_track_id
+
+
+def _seed_two_track_content(project_dir):
+    """Seed two tracks. Track 1: a single content clip [5,15] (selected=0 -> content).
+    Track 2: empty, for drop landing.
+
+    Use for overlap-resolution tests where we need the dragged clip to land on
+    a distinct track with a known content target.
+    """
+    add_track(project_dir, {"id": "track_2", "name": "Track 2", "z_order": 2,
+                             "blend_mode": "normal", "base_opacity": 1.0, "enabled": 1})
+    add_keyframe(project_dir, {"id": "kf_c1", "timestamp": "0:05.00", "section": "", "source": "",
+                                "prompt": "", "selected": None, "candidates": [], "track_id": "track_2"})
+    add_keyframe(project_dir, {"id": "kf_c2", "timestamp": "0:15.00", "section": "", "source": "",
+                                "prompt": "", "selected": None, "candidates": [], "track_id": "track_2"})
+    add_transition(project_dir, {
+        "id": "tr_target", "from": "kf_c1", "to": "kf_c2",
+        "duration_seconds": 10, "slots": 1, "action": "",
+        "use_global_prompt": False, "selected": 0,
+        "trim_in": 0.0, "trim_out": 10.0, "source_video_duration": 10.0,
+        "remap": {"method": "linear", "target_duration": 10}, "track_id": "track_2",
+    })
+
+
+def _seed_single_clip_on_track_1(project_dir):
+    """Seed one content clip tr_src [30, 35] on track_1. Matches _seed_two_track_content's
+    track_2 target so we can drag tr_src onto track_2 at various positions.
+    """
+    add_keyframe(project_dir, {"id": "kf_s1", "timestamp": "0:30.00", "section": "", "source": "",
+                                "prompt": "", "selected": None, "candidates": [], "track_id": "track_1"})
+    add_keyframe(project_dir, {"id": "kf_s2", "timestamp": "0:35.00", "section": "", "source": "",
+                                "prompt": "", "selected": None, "candidates": [], "track_id": "track_1"})
+    add_transition(project_dir, {
+        "id": "tr_src", "from": "kf_s1", "to": "kf_s2",
+        "duration_seconds": 5, "slots": 1, "action": "",
+        "use_global_prompt": False, "selected": 0,
+        "trim_in": 0.0, "trim_out": 5.0, "source_video_duration": 5.0,
+        "remap": {"method": "linear", "target_duration": 5}, "track_id": "track_1",
+    })
+
+
+class TestMoveTransitionsOverlapResolution:
+    """Task 95 scope — target-track overlap resolution.
+
+    Each test seeds tr_target on track_2 at [5,15] (content, trim [0,10]).
+    Then drags tr_src (content, trim [0,5] at [30,35]) onto track_2 at various positions
+    to exercise Case A (fully inside), B (straddles new_from), C (straddles new_to),
+    and D (drop fully inside target).
+    """
+
+    def test_case_a_fully_consumes_target(self, project_env):
+        """Drag tr_src (5s) onto [3,8] on track_2: target tr_target[5,15] is NOT fully inside.
+        Use a different scenario: drag tr_src onto [5,15] (exactly target's span) -> Case A.
+        """
+        project_dir = project_env["project_dir"]
+        _seed_two_track_content(project_dir)
+        _seed_single_clip_on_track_1(project_dir)
+        # tr_src [30,35] (5s) -> [5,10] would only partially overlap. Make tr_src 10s long.
+        # Simpler: drag tr_src onto exactly tr_target's bounds [5,15]. Requires tr_src to be 10s.
+        # Re-seed tr_src as a 10s clip at [30,40].
+        from scenecraft.db import update_keyframe, update_transition
+        update_keyframe(project_dir, "kf_s2", timestamp="0:40.00")
+        update_transition(project_dir, "tr_src", duration_seconds=10, trim_out=10.0, source_video_duration=10.0)
+
+        # timeDelta = -25 -> tr_src moves from [30,40] to [5,15], trackDelta = 1 -> track_2
+        status, body = api(project_env, "POST",
+            f"/api/projects/{project_env['project_name']}/move-transitions",
+            {"mode": "move", "trackDelta": 1, "timeDeltaSeconds": -25.0, "transitionIds": ["tr_src"]})
+        assert status == 200, f"got {status}: {body}"
+        assert "tr_target" in body["consumedTransitionIds"]
+
+        tr_target = get_transition(project_dir, "tr_target")
+        assert tr_target["deleted_at"] is not None
+
+    def test_case_b_straddles_new_from(self, project_env):
+        """Drag tr_src onto track_2 starting at 10 (mid-target). tr_target [5,15] straddles new_from=10."""
+        project_dir = project_env["project_dir"]
+        _seed_two_track_content(project_dir)
+        _seed_single_clip_on_track_1(project_dir)
+        # tr_src [30,35] -> [10,15] on track_2. Drag delta: timeDelta=-20, trackDelta=1.
+        # tr_target[5,15]: tf=5, tt=15, new_from=10, new_to=15. tf<new_from<tt AND tt<=new_to => Case B.
+        status, body = api(project_env, "POST",
+            f"/api/projects/{project_env['project_name']}/move-transitions",
+            {"mode": "move", "trackDelta": 1, "timeDeltaSeconds": -20.0, "transitionIds": ["tr_src"]})
+        assert status == 200, f"got {status}: {body}"
+        assert "tr_target" in body["splitTransitionIds"]
+
+        tr_target = get_transition(project_dir, "tr_target")
+        # tr_target trimmed: to_kf now points to new_from_kf of tr_src (at 10);
+        # trim_out shrunk to trim_in + (10 - 5) * factor. Factor = (10-0)/(15-5) = 1.0.
+        # new trim_out = 0 + 5 * 1.0 = 5.0; new duration = 5.0.
+        assert abs(tr_target["trim_out"] - 5.0) < 0.01
+        assert abs(tr_target["duration_seconds"] - 5.0) < 0.01
+
+    def test_case_c_straddles_new_to(self, project_env):
+        """Drag tr_src onto track_2 ending mid-target. tr_target[5,15] straddles new_to."""
+        project_dir = project_env["project_dir"]
+        _seed_two_track_content(project_dir)
+        _seed_single_clip_on_track_1(project_dir)
+        # tr_src [30,35] -> [0,5] on track_2. Drag: timeDelta=-30, trackDelta=1.
+        # tr_target[5,15]: tf=5, tt=15, new_from=0, new_to=5. tf>=new_from AND tt>new_to => Case C.
+        status, body = api(project_env, "POST",
+            f"/api/projects/{project_env['project_name']}/move-transitions",
+            {"mode": "move", "trackDelta": 1, "timeDeltaSeconds": -30.0, "transitionIds": ["tr_src"]})
+        assert status == 200, f"got {status}: {body}"
+        # tr_target and tr_src land adjacent (new_to=5 == tr_target.tf=5) => no overlap by strict check.
+        # Actual overlap is between dropped [0,5] and target [5,15]: tt(15) > new_to(5) + epsilon,
+        # tf(5) >= new_from(0) - epsilon. But tf(5) == new_to(5), and our overlap detection skips
+        # tf >= new_to - 0.0005 -> tf=5 >= 4.9995, which means it IS skipped (correctly, since
+        # boundary-touching isn't overlap). So no split fires; this tests the non-overlap boundary case.
+        # Switch to a real Case C: new_to lands strictly inside target.
+        # Re-drag: tr_src -> [2, 7] on track_2. timeDelta from current position: tr_src is now at [0,5]
+        # Move tr_src by +2s (still on track_2): new position [2,7]. tr_target[5,15]:
+        # tf=5, tt=15, new_from=2, new_to=7. tf >= new_from, tt > new_to => Case C.
+        status2, body2 = api(project_env, "POST",
+            f"/api/projects/{project_env['project_name']}/move-transitions",
+            {"mode": "move", "trackDelta": 0, "timeDeltaSeconds": 2.0, "transitionIds": ["tr_src"]})
+        assert status2 == 200, f"got {status2}: {body2}"
+        assert "tr_target" in body2["splitTransitionIds"]
+
+        tr_target = get_transition(project_dir, "tr_target")
+        # factor = 10/10 = 1.0. new trim_in = 0 + (7-5)*1 = 2.0. new duration = 15-7 = 8.0.
+        assert abs(tr_target["trim_in"] - 2.0) < 0.01
+        assert abs(tr_target["duration_seconds"] - 8.0) < 0.01
+
+    def test_case_d_three_way_split(self, project_env):
+        """Drag tr_src fully inside tr_target -> target splits into left + right remainders."""
+        project_dir = project_env["project_dir"]
+        _seed_two_track_content(project_dir)
+        _seed_single_clip_on_track_1(project_dir)
+        # tr_src [30,35] (5s) -> [8,13] on track_2, fully inside tr_target[5,15].
+        # timeDelta=-22, trackDelta=1. tr_target: tf=5 < new_from=8, tt=15 > new_to=13 => Case D.
+        status, body = api(project_env, "POST",
+            f"/api/projects/{project_env['project_name']}/move-transitions",
+            {"mode": "move", "trackDelta": 1, "timeDeltaSeconds": -22.0, "transitionIds": ["tr_src"]})
+        assert status == 200, f"got {status}: {body}"
+        assert "tr_target" in body["splitTransitionIds"]
+
+        tr_target = get_transition(project_dir, "tr_target")
+        assert tr_target["deleted_at"] is not None  # original soft-deleted after split
+
+        # Two new tr rows should have been inserted on track_2 with proportional trim.
+        all_trs = get_transitions(project_dir)
+        track_2_content = [t for t in all_trs
+                           if t["track_id"] == "track_2" and not t.get("deleted_at") and t["id"] != "tr_src"]
+        # Expect two remainders + tr_src = 3 trs on track_2 after the split
+        assert len(track_2_content) == 2
+
+        # Left remainder: [5,8], trim [0, 3]; Right remainder: [13,15], trim [8,10]
+        durs = sorted(round(t["duration_seconds"], 2) for t in track_2_content)
+        assert durs == [2.0, 3.0]
