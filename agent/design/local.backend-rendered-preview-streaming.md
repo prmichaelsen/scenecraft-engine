@@ -353,9 +353,114 @@ function useLatestWinsRequest() {
 }
 ```
 
+#### `PreviewPanel` integration
+
+`PreviewPanel.tsx` in the frontend (`scenecraft/src/components/editor/PreviewPanel.tsx`) is what currently hosts `<BeatEffectPreview>`. The migration replaces the WebGL preview *inside* the panel; the panel's other responsibilities stay.
+
+**Stays:**
+
+- The outer aspect-ratio container (`<div className="h-full aspect-video bg-gray-800 rounded overflow-hidden relative">`) with its `ref` for transform-handle positioning.
+- **Hover overlays** rendered above the preview:
+  - `hoverPreviewUrl` — floating image/video thumbnail when user hovers a candidate elsewhere in the UI.
+  - `hoverVideo` — floating `<video>` overlay for transition-video hover (supports both scrub-mode and auto-play-mode).
+  Both read from `usePreview()` context. They render as siblings on `z-10` above the preview layer — orthogonal to what's underneath, so the migration doesn't touch them.
+- `<TransformHandles>` overlay when a transition is selected — draggable curve pins, anchor, and mask handles. Computes positions from `currentTime`. Works over any underlying surface, so unaffected.
+
+**Changes:**
+
+1. **Swap `<BeatEffectPreview>` for `<PreviewViewport>`**:
+
+```tsx
+// Before
+{currentKeyframe?.hasSelectedImage || crossfadeData.frameA ? (
+  <BeatEffectPreview
+    ref={previewRef}
+    src={…}
+    beats={data.beats}
+    audioEvents={data.audioEvents}
+    userEffects={data.userEffects}
+    suppressions={data.beatSuppressions}
+    currentTime={currentTime}
+    isPlaying={isPlaying}
+    canvasWidth={canvasWidth}
+    canvasHeight={canvasHeight}
+    transitionFrameA={crossfadeData.frameA}
+    transitionFrameB={crossfadeData.frameB}
+    blendFactor={crossfadeData.blendFactor}
+    layers={trackLayers.length > 0 ? trackLayers : undefined}
+  />
+) : (
+  <div className="…">No image</div>
+)}
+
+// After
+<PreviewViewport
+  ref={previewRef}
+  projectName={data.projectName}
+  currentTime={currentTime}
+  playing={isPlaying}
+/>
+```
+
+The backend decides "no content" (returns 404), so the frontend's `currentKeyframe?.hasSelectedImage` check goes away. `<PreviewViewport>` handles its own empty state.
+
+2. **Props that go away:** `src`, `beats`, `audioEvents`, `userEffects`, `suppressions`, `canvasWidth`, `canvasHeight`, `transitionFrameA`, `transitionFrameB`, `blendFactor`, `layers`. These were feeding shader uniforms and inline compositing; they're the backend's job now.
+
+3. **`PreviewContext` shrinks.** These fields become dead weight and are removed:
+   - `crossfadeData` (frameA/frameB/blendFactor)
+   - `trackLayers`
+   - `isTransitionLoading` (replaced by `<PreviewViewport>`'s internal scrub-loading state)
+   - `updatePreview(...)` callback
+   
+   These fields are currently **pushed up from `Timeline`** via `updatePreview()`. The Timeline code that computes them — `trackLayers = useMemo(() => ...)` building `TrackLayer[]` from track data + frame cache, plus the transition-frame preloader that feeds `crossfadeData` — also becomes dead code and is deleted.
+   
+   Kept in `PreviewContext`: `hoverPreviewUrl`, `hoverVideo`, `previewRef`.
+
+4. **Frame preloading pipeline deletes.** `scenecraft/src/lib/frame-cache.ts` (frontend — not the backend cache we just built) currently preloads keyframe images + transition video frames around the playhead. `<PreviewViewport>` doesn't need it; backend rendering + its own L1 cache covers both scrub and playback. Delete `frame-cache.ts` and the `preloadTransition`/`preloadKeyframeImage` call sites in `Timeline.tsx` and `BinPanel.tsx`.
+
+5. **`previewRef` handle narrows.** Today:
+   ```ts
+   export type BeatEffectPreviewHandle = { getCanvas: () => HTMLCanvasElement | null }
+   ```
+   Used in one place: `Timeline.tsx`'s `recordPreview(canvas, audio, …)` call, which calls `canvas.captureStream(24)` for `MediaRecorder` → WebM download.
+   
+   In the new world, `<PreviewViewport>` has a `<canvas>` and a `<video>` child, alternating z-index. Two paths for the download feature:
+   
+   - **Near-term (in the WebGL-removal PR): expose both**
+     ```ts
+     export type PreviewViewportHandle = {
+       getCanvas: () => HTMLCanvasElement | null
+       getVideo: () => HTMLVideoElement | null
+     }
+     ```
+     Recorder picks based on `isPlaying`: `captureStream` the `<video>` during playback, the `<canvas>` during scrub. Works out of the box — both DOM elements expose `.captureStream()`.
+   
+   - **Longer-term: server-side range export.** Add `GET /api/projects/:name/render-range?start=X&end=Y&format=webm` that renders the range on the backend and streams the file. Frontend just downloads it. Removes the `MediaRecorder` dance entirely and guarantees the recording matches the final export. Track as a follow-up; not blocking for the migration PR.
+
+6. **"No image" placeholder.** Currently shown when `!currentKeyframe?.hasSelectedImage && !crossfadeData.frameA`. After migration, `<PreviewViewport>` should show its own equivalent when the backend returns `404 NO_CONTENT` — a small "Add a keyframe to see a preview" state rendered in the canvas area. Internal state, no external prop.
+
+#### Files touched in PR 4 (Frontend `<PreviewViewport>`)
+
+Create:
+- `src/components/editor/PreviewViewport.tsx`
+- `src/hooks/useMSEPlayback.ts`
+- `src/hooks/useLatestWinsRequest.ts`
+- `src/lib/preview-client.ts` — `fetchScrubFrame(project, t, quality?)`, `openPreviewStream(project)`
+
+Modify:
+- `src/components/editor/PreviewPanel.tsx` — swap `<BeatEffectPreview>` for `<PreviewViewport>`; keep hover overlays and `<TransformHandles>`.
+- `src/components/editor/PreviewContext.tsx` — remove `crossfadeData`, `trackLayers`, `isTransitionLoading`, `updatePreview`; keep `hoverPreviewUrl`, `hoverVideo`, `previewRef`. Update `BeatEffectPreviewHandle` → `PreviewViewportHandle`.
+- `src/components/editor/Timeline.tsx` — delete the `trackLayers` memo, the transition-frame preloader, and the `updatePreview(...)` call. Keep currentTime/isPlaying state.
+- `src/lib/preview-recorder.ts` — update to accept either canvas or video element (per point 5 above).
+
 #### WebGL removal
 
 All WebGL shader code, textures, framebuffer management, and per-layer compositing logic in the frontend is deleted in the same PR that introduces `<PreviewViewport>`. No feature flag, no fallback code path. `git revert` is the rollback.
+
+Files deleted:
+- `src/components/editor/BeatEffectPreview.tsx`
+- `src/lib/frame-cache.ts` (see PreviewPanel integration, point 4)
+- Any WebGL-specific helpers these pull in (shader constants, framebuffer utils, texture loaders) — audit via `grep WebGLRenderingContext src/`.
 
 ---
 
