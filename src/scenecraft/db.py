@@ -96,6 +96,15 @@ def transaction(project_dir: Path):
 
 def _ensure_schema(conn: sqlite3.Connection):
     """Create tables if they don't exist."""
+    # Greenfield (M9 task-82): if legacy `volume REAL` column exists on
+    # audio_tracks or audio_clips, drop both tables so they get recreated
+    # with the new `volume_curve TEXT` column. Acceptable because audio
+    # clips have never been user-populated in production.
+    for _tbl in ("audio_clips", "audio_tracks"):
+        _cols = {r[1] for r in conn.execute(f"PRAGMA table_info({_tbl})").fetchall()}
+        if "volume" in _cols and "volume_curve" not in _cols:
+            conn.execute(f"DROP TABLE IF EXISTS {_tbl}")
+
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY,
@@ -264,7 +273,7 @@ def _ensure_schema(conn: sqlite3.Connection):
             enabled INTEGER NOT NULL DEFAULT 1,
             hidden INTEGER NOT NULL DEFAULT 0,
             muted INTEGER NOT NULL DEFAULT 0,
-            volume REAL NOT NULL DEFAULT 1.0
+            volume_curve TEXT NOT NULL DEFAULT '[[0,0],[1,0]]'
         );
 
         CREATE TABLE IF NOT EXISTS audio_clips (
@@ -274,7 +283,7 @@ def _ensure_schema(conn: sqlite3.Connection):
             start_time REAL NOT NULL DEFAULT 0,
             end_time REAL NOT NULL DEFAULT 0,
             source_offset REAL NOT NULL DEFAULT 0,
-            volume REAL NOT NULL DEFAULT 1.0,
+            volume_curve TEXT NOT NULL DEFAULT '[[0,0],[1,0]]',
             muted INTEGER NOT NULL DEFAULT 0,
             remap TEXT NOT NULL DEFAULT '{"method":"linear","target_duration":0}',
             deleted_at TEXT
@@ -282,6 +291,15 @@ def _ensure_schema(conn: sqlite3.Connection):
 
         CREATE INDEX IF NOT EXISTS idx_audio_clips_track ON audio_clips(track_id);
         CREATE INDEX IF NOT EXISTS idx_audio_clips_deleted ON audio_clips(deleted_at);
+
+        CREATE TABLE IF NOT EXISTS audio_clip_links (
+            audio_clip_id TEXT NOT NULL,
+            transition_id TEXT NOT NULL,
+            offset REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY (audio_clip_id, transition_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_acl_transition ON audio_clip_links(transition_id);
+        CREATE INDEX IF NOT EXISTS idx_acl_audio_clip ON audio_clip_links(audio_clip_id);
 
         CREATE TABLE IF NOT EXISTS sections (
             id TEXT PRIMARY KEY,
@@ -1775,26 +1793,37 @@ def set_sections(project_dir: Path, sections: list[dict]):
 
 # ── Audio track operations ────────────────────────────────────────
 
+_DEFAULT_VOLUME_CURVE = '[[0,0],[1,0]]'
+
+
 def get_audio_tracks(project_dir: Path) -> list[dict]:
     conn = get_db(project_dir)
     rows = conn.execute("SELECT * FROM audio_tracks ORDER BY display_order").fetchall()
     return [{
         "id": r["id"], "name": r["name"], "display_order": r["display_order"],
         "enabled": bool(r["enabled"]), "hidden": bool(r["hidden"]),
-        "muted": bool(r["muted"]), "volume": r["volume"],
+        "muted": bool(r["muted"]),
+        "volume_curve": json.loads(r["volume_curve"]) if r["volume_curve"] else [[0, 0], [1, 0]],
     } for r in rows]
 
 
 def add_audio_track(project_dir: Path, track: dict):
     conn = get_db(project_dir)
+    vc = track.get("volume_curve")
+    if vc is None:
+        vc_str = _DEFAULT_VOLUME_CURVE
+    elif isinstance(vc, str):
+        vc_str = vc
+    else:
+        vc_str = json.dumps(vc)
     conn.execute(
-        "INSERT INTO audio_tracks (id, name, display_order, enabled, hidden, muted, volume) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO audio_tracks (id, name, display_order, enabled, hidden, muted, volume_curve) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (track["id"], track.get("name", "Audio Track"),
          track.get("display_order", 0),
          1 if track.get("enabled", True) else 0,
          1 if track.get("hidden", False) else 0,
          1 if track.get("muted", False) else 0,
-         track.get("volume", 1.0)),
+         vc_str),
     )
     conn.commit()
 
@@ -1806,6 +1835,8 @@ def update_audio_track(project_dir: Path, track_id: str, **fields):
     for key, val in fields.items():
         if key in ("enabled", "hidden", "muted"):
             val = 1 if val else 0
+        elif key == "volume_curve" and not isinstance(val, str):
+            val = json.dumps(val)
         sets.append(f"{key} = ?")
         values.append(val)
     values.append(track_id)
@@ -1846,19 +1877,27 @@ def get_audio_clips(project_dir: Path, track_id: str | None = None) -> list[dict
         "source_path": r["source_path"],
         "start_time": r["start_time"], "end_time": r["end_time"],
         "source_offset": r["source_offset"],
-        "volume": r["volume"], "muted": bool(r["muted"]),
+        "volume_curve": json.loads(r["volume_curve"]) if r["volume_curve"] else [[0, 0], [1, 0]],
+        "muted": bool(r["muted"]),
         "remap": json.loads(r["remap"]) if r["remap"] else {"method": "linear", "target_duration": 0},
     } for r in rows]
 
 
 def add_audio_clip(project_dir: Path, clip: dict):
     conn = get_db(project_dir)
+    vc = clip.get("volume_curve")
+    if vc is None:
+        vc_str = _DEFAULT_VOLUME_CURVE
+    elif isinstance(vc, str):
+        vc_str = vc
+    else:
+        vc_str = json.dumps(vc)
     conn.execute(
-        """INSERT INTO audio_clips (id, track_id, source_path, start_time, end_time, source_offset, volume, muted, remap)
+        """INSERT INTO audio_clips (id, track_id, source_path, start_time, end_time, source_offset, volume_curve, muted, remap)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (clip["id"], clip["track_id"], clip.get("source_path", ""),
          clip.get("start_time", 0), clip.get("end_time", 0),
-         clip.get("source_offset", 0), clip.get("volume", 1.0),
+         clip.get("source_offset", 0), vc_str,
          1 if clip.get("muted", False) else 0,
          json.dumps(clip.get("remap", {"method": "linear", "target_duration": 0}))),
     )
@@ -1874,6 +1913,8 @@ def update_audio_clip(project_dir: Path, clip_id: str, **fields):
             val = 1 if val else 0
         elif key == "remap":
             val = json.dumps(val) if isinstance(val, dict) else val
+        elif key == "volume_curve" and not isinstance(val, str):
+            val = json.dumps(val)
         sets.append(f"{key} = ?")
         values.append(val)
     values.append(clip_id)
@@ -1886,4 +1927,66 @@ def delete_audio_clip(project_dir: Path, clip_id: str):
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
     conn.execute("UPDATE audio_clips SET deleted_at = ? WHERE id = ?", (now, clip_id))
+    conn.commit()
+
+
+# ── Audio clip link operations (clips ↔ transitions) ───────────────
+
+def add_audio_clip_link(project_dir: Path, audio_clip_id: str, transition_id: str, offset: float = 0.0):
+    """Link an audio clip to a transition. `offset` is user-intent anchor in seconds."""
+    conn = get_db(project_dir)
+    conn.execute(
+        """INSERT INTO audio_clip_links (audio_clip_id, transition_id, offset) VALUES (?, ?, ?)
+           ON CONFLICT(audio_clip_id, transition_id) DO UPDATE SET offset = excluded.offset""",
+        (audio_clip_id, transition_id, offset),
+    )
+    conn.commit()
+
+
+def get_audio_clip_links_for_transition(project_dir: Path, transition_id: str) -> list[dict]:
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        "SELECT audio_clip_id, transition_id, offset FROM audio_clip_links WHERE transition_id = ?",
+        (transition_id,),
+    ).fetchall()
+    return [{"audio_clip_id": r["audio_clip_id"], "transition_id": r["transition_id"], "offset": r["offset"]} for r in rows]
+
+
+def get_audio_clip_links_for_clip(project_dir: Path, audio_clip_id: str) -> list[dict]:
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        "SELECT audio_clip_id, transition_id, offset FROM audio_clip_links WHERE audio_clip_id = ?",
+        (audio_clip_id,),
+    ).fetchall()
+    return [{"audio_clip_id": r["audio_clip_id"], "transition_id": r["transition_id"], "offset": r["offset"]} for r in rows]
+
+
+def remove_audio_clip_link(project_dir: Path, audio_clip_id: str, transition_id: str):
+    conn = get_db(project_dir)
+    conn.execute(
+        "DELETE FROM audio_clip_links WHERE audio_clip_id = ? AND transition_id = ?",
+        (audio_clip_id, transition_id),
+    )
+    conn.commit()
+
+
+def remove_audio_clip_links_for_transition(project_dir: Path, transition_id: str) -> list[str]:
+    """Remove all links for a transition. Returns the list of audio_clip_ids that were unlinked."""
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        "SELECT audio_clip_id FROM audio_clip_links WHERE transition_id = ?",
+        (transition_id,),
+    ).fetchall()
+    clip_ids = [r["audio_clip_id"] for r in rows]
+    conn.execute("DELETE FROM audio_clip_links WHERE transition_id = ?", (transition_id,))
+    conn.commit()
+    return clip_ids
+
+
+def update_audio_clip_link_offset(project_dir: Path, audio_clip_id: str, transition_id: str, offset: float):
+    conn = get_db(project_dir)
+    conn.execute(
+        "UPDATE audio_clip_links SET offset = ? WHERE audio_clip_id = ? AND transition_id = ?",
+        (offset, audio_clip_id, transition_id),
+    )
     conn.commit()

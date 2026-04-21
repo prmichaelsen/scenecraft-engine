@@ -498,6 +498,11 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             if m:
                 return self._handle_pool_gc(m.group(1), dry_run=True)
 
+            # GET /api/projects/:name/branches — list all branches for a project
+            m = re.match(r"^/api/projects/([^/]+)/branches$", path)
+            if m:
+                return self._handle_list_branches(m.group(1))
+
             # GET /api/projects/:name/version/history (deprecated — git removed)
             m = re.match(r"^/api/projects/([^/]+)/version/history$", path)
             if m:
@@ -1027,7 +1032,10 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 existing = db_get_audio_tracks(project_dir)
                 track_id = generate_id("audio_track")
                 display_order = max((t["display_order"] for t in existing), default=-1) + 1
-                db_add_audio_track(project_dir, {"id": track_id, "name": body.get("name", f"Audio Track {len(existing) + 1}"), "display_order": display_order, **{k: v for k, v in body.items() if k in ("enabled", "hidden", "muted", "volume")}})
+                _track_body = {k: v for k, v in body.items() if k in ("enabled", "hidden", "muted", "volume_curve")}
+                if "volumeCurve" in body and "volume_curve" not in _track_body:
+                    _track_body["volume_curve"] = body["volumeCurve"]
+                db_add_audio_track(project_dir, {"id": track_id, "name": body.get("name", f"Audio Track {len(existing) + 1}"), "display_order": display_order, **_track_body})
                 _log(f"audio-tracks/add: {m.group(1)} -> {track_id} (display_order={display_order})")
                 return self._json_response({"success": True, "id": track_id})
 
@@ -1041,8 +1049,8 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 from scenecraft.db import update_audio_track as db_update_audio_track
                 track_id = body.pop("id", None)
                 if not track_id: return self._error(400, "BAD_REQUEST", "Missing 'id'")
-                field_map = {"displayOrder": "display_order"}
-                mapped = {field_map.get(k, k): v for k, v in body.items() if field_map.get(k, k) in ("name", "display_order", "enabled", "hidden", "muted", "volume")}
+                field_map = {"displayOrder": "display_order", "volumeCurve": "volume_curve"}
+                mapped = {field_map.get(k, k): v for k, v in body.items() if field_map.get(k, k) in ("name", "display_order", "enabled", "hidden", "muted", "volume_curve")}
                 _log(f"audio-tracks/update: {track_id} {mapped}")
                 db_update_audio_track(project_dir, track_id, **mapped)
                 return self._json_response({"success": True})
@@ -1090,7 +1098,7 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     "start_time": body.get("startTime", body.get("start_time", 0)),
                     "end_time": body.get("endTime", body.get("end_time", 0)),
                     "source_offset": body.get("sourceOffset", body.get("source_offset", 0)),
-                    "volume": body.get("volume", 1.0),
+                    "volume_curve": body.get("volumeCurve", body.get("volume_curve")),
                     "muted": body.get("muted", False),
                     "remap": body.get("remap", {"method": "linear", "target_duration": 0}),
                 }
@@ -1109,8 +1117,8 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 from scenecraft.db import update_audio_clip as db_update_audio_clip
                 clip_id = body.pop("id", None)
                 if not clip_id: return self._error(400, "BAD_REQUEST", "Missing 'id'")
-                field_map = {"trackId": "track_id", "sourcePath": "source_path", "startTime": "start_time", "endTime": "end_time", "sourceOffset": "source_offset"}
-                mapped = {field_map.get(k, k): v for k, v in body.items() if field_map.get(k, k) in ("track_id", "source_path", "start_time", "end_time", "source_offset", "volume", "muted", "remap")}
+                field_map = {"trackId": "track_id", "sourcePath": "source_path", "startTime": "start_time", "endTime": "end_time", "sourceOffset": "source_offset", "volumeCurve": "volume_curve"}
+                mapped = {field_map.get(k, k): v for k, v in body.items() if field_map.get(k, k) in ("track_id", "source_path", "start_time", "end_time", "source_offset", "volume_curve", "muted", "remap")}
                 _log(f"audio-clips/update: {clip_id} {mapped}")
                 db_update_audio_clip(project_dir, clip_id, **mapped)
                 return self._json_response({"success": True})
@@ -1806,6 +1814,21 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             m = re.match(r"^/api/projects/([^/]+)/narrative$", path)
             if m:
                 return self._handle_update_narrative(m.group(1))
+
+            # POST /api/projects/:name/branches — create a new branch
+            m = re.match(r"^/api/projects/([^/]+)/branches$", path)
+            if m:
+                return self._handle_create_branch(m.group(1))
+
+            # POST /api/projects/:name/branches/delete — delete a branch
+            m = re.match(r"^/api/projects/([^/]+)/branches/delete$", path)
+            if m:
+                return self._handle_delete_branch(m.group(1))
+
+            # POST /api/projects/:name/checkout — switch branch for current session
+            m = re.match(r"^/api/projects/([^/]+)/checkout$", path)
+            if m:
+                return self._handle_checkout_branch(m.group(1))
 
             # POST /api/projects/:name/version/commit (deprecated — git removed, no-op)
             m = re.match(r"^/api/projects/([^/]+)/version/commit$", path)
@@ -2733,8 +2756,11 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             edge = body.get("edge")
             new_ts = body.get("newBoundaryTimestamp")
             new_trim = body.get("newTrim")
+            mode = body.get("mode", "trim")  # "trim" (default) or "ripple"
             if not tr_id or edge not in ("right", "left") or new_ts is None or new_trim is None:
                 return self._error(400, "BAD_REQUEST", "Missing required fields")
+            if mode not in ("trim", "ripple"):
+                return self._error(400, "BAD_REQUEST", "mode must be 'trim' or 'ripple'")
 
             project_dir = self._require_project_dir(project_name)
             if project_dir is None:
@@ -2744,6 +2770,7 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 from scenecraft.db import (
                     undo_begin as _ub, get_transition, update_transition,
                     update_keyframe, get_keyframe, get_transitions as _get_trs,
+                    get_keyframes as _get_kfs,
                     add_keyframe, add_transition, next_keyframe_id, next_transition_id,
                     delete_transition, delete_keyframe,
                 )
@@ -2805,6 +2832,108 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     self._json_response({"success": True, "transitionId": tr_id, "mode": "trim-only"})
                     return
 
+                if mode == "ripple":
+                    # Ripple: trim one side + shift downstream kfs to close/open the gap.
+                    # Timeline duration changes; factors on non-dragged trs preserved.
+                    all_kfs = _get_kfs(project_dir)
+                    if edge == "right":
+                        # <] ripple: A's to_kf and everything after shift by +delta.
+                        # A's from_kf stays; A's trim_out advances.
+                        shift = delta
+                        anchor_time = old_boundary_time  # shift kfs with time >= this
+                        update_transition(project_dir, tr_id, trim_out=new_trim)
+                    else:
+                        # [> ripple: B's to_kf and everything after shift by -delta.
+                        # B's from_kf stays; B's trim_in advances; B shrinks/grows.
+                        shift = -delta
+                        anchor_time = parse_ts(to_kf["timestamp"])
+                        update_transition(project_dir, tr_id, trim_in=new_trim)
+
+                    for kf in all_kfs:
+                        kf_time = parse_ts(kf["timestamp"])
+                        if kf_time >= anchor_time - 0.0005:
+                            update_keyframe(project_dir, kf["id"], timestamp=fmt_ts(kf_time + shift))
+
+                    # Update this tr's duration (from stayed, to moved by `shift` for edge=right
+                    # or `shift` for edge=left since anchor=to_kf).
+                    from_time_now = parse_ts(from_kf["timestamp"])
+                    to_time_now = parse_ts(to_kf["timestamp"]) + (shift if edge == "left" else 0)
+                    if edge == "right":
+                        to_time_now = old_boundary_time + shift
+                    new_dur = round(abs(to_time_now - from_time_now), 2)
+                    update_transition(project_dir, tr_id, duration_seconds=new_dur)
+
+                    _log(f"clip-trim-edge RIPPLE: {tr_id} edge={edge} delta={delta:.3f} shift={shift:.3f}")
+                    self._json_response({
+                        "success": True, "mode": "ripple",
+                        "transitionId": tr_id, "shift": shift,
+                    })
+                    return
+
+                def _is_empty_tr(t):
+                    sel = t.get("selected") if t else None
+                    if sel is None:
+                        return True
+                    if isinstance(sel, list):
+                        return len(sel) == 0 or all(v is None for v in sel)
+                    return False
+
+                if shrinking and neighbor is not None and _is_empty_tr(neighbor):
+                    # Adjacent tr on the shrinking side is already an empty gap — just
+                    # shift the shared boundary kf and grow the empty tr. No new kf or
+                    # tr needed. This is the compaction path for subsequent trims on the
+                    # same side: one empty gap regardless of how many times the user trims.
+                    update_keyframe(project_dir, old_boundary_kf["id"], timestamp=fmt_ts(new_boundary_time))
+
+                    if edge == "right":
+                        new_current_dur = round(abs(new_boundary_time - parse_ts(from_kf["timestamp"])), 2)
+                        empty_far_kf = get_keyframe(project_dir, neighbor.get("to"))
+                        empty_far_time = parse_ts(empty_far_kf["timestamp"]) if empty_far_kf else old_boundary_time
+                        new_empty_dur = round(abs(empty_far_time - new_boundary_time), 2)
+                        update_transition(project_dir, tr_id, trim_out=new_trim, duration_seconds=new_current_dur)
+                        update_transition(project_dir, neighbor["id"], duration_seconds=new_empty_dur)
+                    else:
+                        new_current_dur = round(abs(parse_ts(to_kf["timestamp"]) - new_boundary_time), 2)
+                        empty_far_kf = get_keyframe(project_dir, neighbor.get("from"))
+                        empty_far_time = parse_ts(empty_far_kf["timestamp"]) if empty_far_kf else old_boundary_time
+                        new_empty_dur = round(abs(new_boundary_time - empty_far_time), 2)
+                        update_transition(project_dir, tr_id, trim_in=new_trim, duration_seconds=new_current_dur)
+                        update_transition(project_dir, neighbor["id"], duration_seconds=new_empty_dur)
+
+                    # Re-extract the boundary kf's frame at the new trim position so the
+                    # VideoTrack thumbnail stays in sync with what plays.
+                    sel_video = project_dir / "selected_transitions" / f"{tr_id}_slot_0.mp4"
+                    if sel_video.exists():
+                        try:
+                            import subprocess as _sp, shutil as _sh
+                            sel_kf_dir = project_dir / "selected_keyframes"
+                            sel_kf_dir.mkdir(parents=True, exist_ok=True)
+                            kf_img = sel_kf_dir / f"{old_boundary_kf['id']}.png"
+                            _sp.run(
+                                ["ffmpeg", "-y", "-ss", f"{float(new_trim):.3f}",
+                                 "-i", str(sel_video), "-vframes", "1", "-q:v", "2", str(kf_img)],
+                                capture_output=True, timeout=10,
+                            )
+                            if kf_img.exists() and kf_img.stat().st_size > 0:
+                                cand_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{old_boundary_kf['id']}"
+                                cand_dir.mkdir(parents=True, exist_ok=True)
+                                _sh.copy2(str(kf_img), str(cand_dir / "v1.png"))
+                                update_keyframe(
+                                    project_dir, old_boundary_kf["id"],
+                                    selected=1,
+                                    candidates=[f"keyframe_candidates/candidates/section_{old_boundary_kf['id']}/v1.png"],
+                                )
+                        except Exception as _e:
+                            _log(f"  re-extract failed: {_e}")
+
+                    _log(f"clip-trim-edge SHRINK-EXTEND-EMPTY: {tr_id} edge={edge} "
+                         f"moved_kf={old_boundary_kf['id']} empty={neighbor['id']}")
+                    self._json_response({
+                        "success": True, "mode": "shrink-extend-empty",
+                        "transitionId": tr_id, "movedKfId": old_boundary_kf["id"], "emptyTrId": neighbor["id"],
+                    })
+                    return
+
                 if shrinking:
                     # Insert new boundary kf + empty tr filling the gap.
                     # Original kf stays put, so the neighbor is unaffected.
@@ -2851,6 +2980,43 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                             project_dir, tr_id,
                             **{"from": new_kf_id, "trim_in": new_trim, "duration_seconds": new_current_dur},
                         )
+
+                    # Clear the old boundary kf — it's now just a gap boundary, no longer
+                    # represents the trimmed tr's entry/exit frame. Leaving selected=null
+                    # is also how later trims detect "this side already has an empty gap,
+                    # just shift the boundary" instead of inserting another empty.
+                    update_keyframe(
+                        project_dir, old_boundary_kf["id"],
+                        selected=None, candidates=[],
+                    )
+
+                    # Extract a frame from the trimmed tr's source video at the new trim
+                    # position → new kf's thumbnail. So the VideoTrack shows the same
+                    # frame where playback actually starts/ends.
+                    sel_video = project_dir / "selected_transitions" / f"{tr_id}_slot_0.mp4"
+                    if sel_video.exists():
+                        try:
+                            import subprocess as _sp, shutil as _sh
+                            sel_kf_dir = project_dir / "selected_keyframes"
+                            sel_kf_dir.mkdir(parents=True, exist_ok=True)
+                            kf_img = sel_kf_dir / f"{new_kf_id}.png"
+                            _sp.run(
+                                ["ffmpeg", "-y", "-ss", f"{float(new_trim):.3f}",
+                                 "-i", str(sel_video), "-vframes", "1", "-q:v", "2", str(kf_img)],
+                                capture_output=True, timeout=10,
+                            )
+                            if kf_img.exists() and kf_img.stat().st_size > 0:
+                                cand_dir = project_dir / "keyframe_candidates" / "candidates" / f"section_{new_kf_id}"
+                                cand_dir.mkdir(parents=True, exist_ok=True)
+                                _sh.copy2(str(kf_img), str(cand_dir / "v1.png"))
+                                update_keyframe(
+                                    project_dir, new_kf_id,
+                                    selected=1,
+                                    candidates=[f"keyframe_candidates/candidates/section_{new_kf_id}/v1.png"],
+                                )
+                                _log(f"  extracted frame at source_offset={float(new_trim):.2f}s → {new_kf_id}.png")
+                        except Exception as _e:
+                            _log(f"  frame extraction failed: {_e}")
 
                     _log(f"clip-trim-edge SHRINK: {tr_id} edge={edge} delta={delta:.3f} "
                          f"new_kf={new_kf_id} empty_tr={empty_tr_id}")
@@ -6927,6 +7093,167 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 set_sections(project_dir, sections)
             result = get_sections(project_dir)
             self._json_response({"success": True, "sections": len(result)})
+
+        # ── Branch Handlers (VCS) ─────────────────────────────────
+
+        def _resolve_project_dir_for_branches(self, project_name: str):
+            """Find the VCS project_dir (under .scenecraft/orgs/{org}/projects/{name}).
+
+            Returns (sc_root, org, project_dir) or sends a 404 and returns None.
+            """
+            if _sc_root is None:
+                self._error(503, "VCS_UNAVAILABLE", "VCS not initialized (no .scenecraft root)")
+                return None
+
+            if not self._authenticated_user:
+                self._error(401, "UNAUTHORIZED", "Authentication required for branch operations")
+                return None
+
+            org = self._find_user_org_for_project(project_name)
+            if org is None:
+                self._error(404, "NOT_FOUND", f"Project not found under any org: {project_name}")
+                return None
+
+            project_dir = _sc_root / "orgs" / org / "projects" / project_name
+            if not project_dir.is_dir():
+                self._error(404, "NOT_FOUND", f"Project directory missing: {project_dir}")
+                return None
+
+            return _sc_root, org, project_dir
+
+        def _resolve_session_for_branches(self, project_name: str, org: str):
+            """Find the current session for the authenticated user on this project.
+
+            Uses the X-Scenecraft-Branch header (defaulting to 'main') to scope lookup.
+            Returns the session dict or None (and sends the error response).
+            """
+            from scenecraft.vcs.sessions import get_session_for_user
+            branch = self.headers.get("X-Scenecraft-Branch", "main")
+            session = get_session_for_user(_sc_root, self._authenticated_user, org, project_name, branch)
+            if session is None:
+                self._error(400, "NO_SESSION", f"No active session on branch '{branch}'")
+            return session
+
+        def _handle_list_branches(self, project_name: str):
+            """GET /api/projects/:name/branches — list all branches."""
+            resolved = self._resolve_project_dir_for_branches(project_name)
+            if resolved is None:
+                return
+            _sc, org, project_dir = resolved
+
+            from scenecraft.vcs.branches import list_branches
+            from scenecraft.vcs.sessions import get_session_for_user
+
+            # Determine which branch is "current" for this session (best-effort)
+            branch = self.headers.get("X-Scenecraft-Branch", "main")
+            session = get_session_for_user(_sc_root, self._authenticated_user, org, project_name, branch)
+            current = session["branch"] if session else None
+
+            branches = list_branches(project_dir, current_branch=current)
+            self._json_response({"branches": branches, "current": current})
+
+        def _handle_create_branch(self, project_name: str):
+            """POST /api/projects/:name/branches — create a new branch ref."""
+            body = self._read_json_body()
+            if body is None:
+                return
+
+            name = (body.get("name") or "").strip()
+            from_branch = (body.get("fromBranch") or "main").strip()
+
+            resolved = self._resolve_project_dir_for_branches(project_name)
+            if resolved is None:
+                return
+            _sc, _org, project_dir = resolved
+
+            from scenecraft.vcs.branches import create_branch, BranchError
+            try:
+                result = create_branch(project_dir, name, from_branch=from_branch)
+            except BranchError as e:
+                # Conflict for already-exists, 400 otherwise
+                msg = str(e)
+                code = "CONFLICT" if "already exists" in msg else "BAD_REQUEST"
+                status = 409 if code == "CONFLICT" else 400
+                return self._error(status, code, msg)
+
+            self._json_response({
+                "success": True,
+                "branch": result["name"],
+                "commitHash": result["commit_hash"],
+                "fromBranch": result["from_branch"],
+            })
+
+        def _handle_delete_branch(self, project_name: str):
+            """POST /api/projects/:name/branches/delete — delete a branch ref."""
+            body = self._read_json_body()
+            if body is None:
+                return
+
+            name = (body.get("name") or "").strip()
+            if not name:
+                return self._error(400, "BAD_REQUEST", "Missing 'name'")
+
+            resolved = self._resolve_project_dir_for_branches(project_name)
+            if resolved is None:
+                return
+            _sc, org, project_dir = resolved
+
+            # Current branch guard — can't delete the branch you're on
+            from scenecraft.vcs.sessions import get_session_for_user
+            header_branch = self.headers.get("X-Scenecraft-Branch", "main")
+            session = get_session_for_user(_sc_root, self._authenticated_user, org, project_name, header_branch)
+            current = session["branch"] if session else None
+
+            from scenecraft.vcs.branches import delete_branch, BranchError
+            try:
+                delete_branch(project_dir, name, current_branch=current)
+            except BranchError as e:
+                msg = str(e)
+                if "not found" in msg.lower():
+                    return self._error(404, "NOT_FOUND", msg)
+                return self._error(400, "BAD_REQUEST", msg)
+
+            self._json_response({"success": True, "deleted": name})
+
+        def _handle_checkout_branch(self, project_name: str):
+            """POST /api/projects/:name/checkout — switch the session's active branch."""
+            body = self._read_json_body()
+            if body is None:
+                return
+
+            target = (body.get("branch") or "").strip()
+            force = bool(body.get("force", False))
+            if not target:
+                return self._error(400, "BAD_REQUEST", "Missing 'branch'")
+
+            resolved = self._resolve_project_dir_for_branches(project_name)
+            if resolved is None:
+                return
+            _sc, org, project_dir = resolved
+
+            session = self._resolve_session_for_branches(project_name, org)
+            if session is None:
+                return
+
+            from scenecraft.vcs.branches import checkout_branch, BranchError
+            try:
+                updated = checkout_branch(
+                    _sc_root, session["id"], target, project_dir, force=force,
+                )
+            except BranchError as e:
+                msg = str(e)
+                if "uncommitted" in msg.lower():
+                    return self._error(409, "UNCOMMITTED_CHANGES", msg)
+                if "not found" in msg.lower():
+                    return self._error(404, "NOT_FOUND", msg)
+                return self._error(400, "BAD_REQUEST", msg)
+
+            self._json_response({
+                "success": True,
+                "branch": updated["branch"],
+                "commitHash": updated["commit_hash"],
+                "sessionId": updated["id"],
+            })
 
         # ── Helpers ──────────────────────────────────────────────
 
