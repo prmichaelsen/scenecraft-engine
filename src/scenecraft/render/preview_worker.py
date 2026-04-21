@@ -119,24 +119,18 @@ class RenderWorker:
         self._playing.set()
 
     def seek(self, t: float) -> None:
-        """Flush pending fragments past the current playhead, resume rendering from t."""
+        """Flush pending fragments past the current playhead, resume rendering from t.
+
+        Does NOT rebuild the encoder. The client uses sb.mode = 'sequence'
+        so DTS continuity doesn't matter — fragments are appended in order
+        and video.currentTime tracks the sequence-of-delivery, not the
+        project timecode. Keeping the encoder alive also keeps SPS/PPS
+        identical, so the client's existing SourceBuffer can accept the
+        post-seek fragments without needing a fresh init segment.
+        """
         with self._seek_lock:
             self._playhead_t = max(0.0, float(t))
             self._drain_queue()
-            # New encoder is required — tfdt continuity breaks across seeks; the
-            # client is expected to stop/reopen the MediaSource or abort() the
-            # SourceBuffer. We rebuild and emit a fresh init.
-            try:
-                self._encoder.close()
-            except Exception:
-                pass
-            self._encoder = FragmentEncoder(
-                width=self._schedule.width,
-                height=self._schedule.height,
-                fps=self._fps,
-                force_backend="ffmpeg",
-            )
-            self._init_emitted = False
         self._last_activity_ts = time.monotonic()
         self._playing.set()
 
