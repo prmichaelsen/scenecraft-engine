@@ -575,6 +575,15 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             if m:
                 return self._handle_video_thumbnail(m.group(1), m.group(2))
 
+            # GET /api/projects/:name/transitions/:tr_id/filmstrip?t=SECONDS&height=PX
+            m = re.match(r"^/api/projects/([^/]+)/transitions/([^/]+)/filmstrip$", path)
+            if m:
+                from urllib.parse import parse_qs
+                qs = parse_qs(parsed.query)
+                t_str = qs.get("t", ["0"])[0]
+                h_str = qs.get("height", ["48"])[0]
+                return self._handle_transition_filmstrip(m.group(1), m.group(2), t_str, h_str)
+
             # GET /api/projects/:name/files/(.*)
             m = re.match(r"^/api/projects/([^/]+)/files/(.+)$", path)
             if m:
@@ -7491,6 +7500,65 @@ def make_handler(work_dir: Path, no_auth: bool = False):
 
             # Fallback: couldn't generate thumbnail
             return self._error(500, "INTERNAL_ERROR", "Failed to generate thumbnail")
+
+        def _handle_transition_filmstrip(self, project_name: str, tr_id: str, t_str: str, h_str: str):
+            """GET /api/projects/:name/transitions/:tr_id/filmstrip?t=SECONDS&height=PX
+
+            Extract and cache a single frame from the transition's selected video
+            at source-time `t` seconds. Used by the Timeline filmstrip renderer
+            to show multiple frames along a long transition block.
+
+            Cached at selected_transitions/.filmstrip/<tr_id>_<mtime>_<t_ms>_<h>.jpg
+            so keys invalidate automatically when the source video is replaced.
+            """
+            import subprocess as sp
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None: return
+            try:
+                t_seconds = max(0.0, float(t_str))
+                height = max(16, min(256, int(h_str)))
+            except (ValueError, TypeError):
+                return self._error(400, "BAD_REQUEST", "t and height must be numbers")
+
+            sel_dir = project_dir / "selected_transitions"
+            video_path = sel_dir / f"{tr_id}_slot_0.mp4"
+            if not video_path.exists():
+                return self._error(404, "NOT_FOUND", f"No selected video for transition {tr_id}")
+
+            mtime = int(video_path.stat().st_mtime)
+            t_ms = int(round(t_seconds * 1000))
+            cache_dir = sel_dir / ".filmstrip"
+            cache_dir.mkdir(exist_ok=True)
+            cache_path = cache_dir / f"{tr_id}_{mtime}_{t_ms}_{height}.jpg"
+
+            if not cache_path.exists():
+                try:
+                    # -ss before -i uses input-seek (fast, keyframe-accurate for mp4).
+                    # scale=-2:h preserves aspect ratio, width rounds to even pixels.
+                    sp.run(
+                        ["ffmpeg", "-y", "-ss", str(t_seconds), "-i", str(video_path),
+                         "-frames:v", "1", "-vf", f"scale=-2:{height}", "-q:v", "5",
+                         str(cache_path)],
+                        capture_output=True, timeout=15,
+                    )
+                except Exception as e:
+                    _log(f"filmstrip extract failed: {e}")
+
+            if not cache_path.exists():
+                return self._error(500, "INTERNAL_ERROR", "Failed to generate filmstrip frame")
+
+            data = cache_path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(data)))
+            # Immutable cache — key includes mtime so a new video gets a new URL.
+            self.send_header("Cache-Control", "public, max-age=86400, immutable")
+            self._cors_headers()
+            self.end_headers()
+            try:
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         def _handle_serve_file(self, project_name: str, file_path: str):
             """GET /api/projects/:name/files/* — serve project files with Range support and caching."""
