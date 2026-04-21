@@ -1136,6 +1136,22 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 db_reorder_audio_tracks(project_dir, track_ids)
                 return self._json_response({"success": True})
 
+            # POST /api/projects/:name/transitions/:tr_id/link-audio
+            # M9 task-84: extract audio from the transition's selected video,
+            # create audio_clips + audio_clip_links, route to the paired slot.
+            m = re.match(r"^/api/projects/([^/]+)/transitions/([^/]+)/link-audio$", path)
+            if m:
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None:
+                    return
+                tr_id = m.group(2)
+                body = self._read_json_body() or {}
+                force = bool(body.get("force", False))
+                from scenecraft.audio.linking import link_audio_for_transition
+                result = link_audio_for_transition(project_dir, tr_id, force=force)
+                status_code = 200 if result["status"] in ("linked", "exists", "skipped") else 500
+                return self._json_response(result, status=status_code)
+
             # POST /api/projects/:name/audio-clips/add
             m = re.match(r"^/api/projects/([^/]+)/audio-clips/add$", path)
             if m:
