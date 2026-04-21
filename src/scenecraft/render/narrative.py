@@ -1295,7 +1295,22 @@ def assemble_final(project_dir: str | Path, output_path: str, max_time: float | 
     _log(f"  Render done in {elapsed:.0f}s ({total_output_frames / elapsed:.0f} fps)")
     _log(f"  Output: {total_output_frames} frames ({total_output_frames / schedule.fps:.2f}s)")
 
-    _mux_audio(tmp_path, output_path, schedule.audio_path, preview=schedule.preview)
+    # M9 task-91: multi-track mixdown. If the project has audio_tracks with
+    # clips, render them into a single WAV and mux that. Otherwise fall back
+    # to the legacy single-audio-file path (beats track) for projects that
+    # haven't been migrated.
+    audio_to_mux = schedule.audio_path
+    try:
+        from scenecraft.audio.mixdown import render_project_audio
+        mix_path = Path(project_dir) / "audio_staging" / "_mixdown.wav"
+        mix = render_project_audio(Path(project_dir), schedule.duration_seconds, mix_path)
+        if mix is not None:
+            audio_to_mux = str(mix)
+            _log(f"Phase 3: Using multi-track mixdown: {audio_to_mux}")
+    except Exception as e:
+        _log(f"  multi-track mixdown failed, falling back to legacy audio: {e}")
+
+    _mux_audio(tmp_path, output_path, audio_to_mux, preview=schedule.preview)
     return output_path
 
 
