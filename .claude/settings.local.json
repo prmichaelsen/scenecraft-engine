@@ -16,7 +16,8 @@
       "Bash(.venv/bin/pip list *)",
       "Bash(.venv/bin/python3 -c \"import cv2; print\\(cv2.__version__\\)\")",
       "Bash(.venv/bin/python3 *)",
-      "Bash(git merge worktree-agent-a99fdbe7 --no-ff -m 'merge: M11 task-34 — MSE playback \\(FragmentEncoder, RenderWorker, RenderCoordinator, /ws/preview-stream\\) *)"
+      "Bash(git merge worktree-agent-a99fdbe7 --no-ff -m 'merge: M11 task-34 — MSE playback \\(FragmentEncoder, RenderWorker, RenderCoordinator, /ws/preview-stream\\) *)",
+      "Bash(./node_modules/.bin/tsc --noEmit)"
     ]
   }
 }
