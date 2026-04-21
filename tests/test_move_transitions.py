@@ -1,14 +1,21 @@
-"""E2E tests for POST /api/projects/:name/move-transitions (Task 93 scope).
+"""E2E tests for POST /api/projects/:name/move-transitions (Tasks 93 + 94).
 
-Task 93 scope: same-track, single-delta time-shift only.
+Task 93 scope (same-track):
 - mode="copy" -> 501
-- trackDelta != 0 -> 501
 - new_from_time < 0 -> 400
 - single tr timeDelta=+3 -> from/to shifted +3s
 - batch of 2 trs -> both shifted; undo reverts together
 
-Downstream tasks (94/95/96) extend this endpoint with cross-track, overlap,
-and copy-mode support.
+Task 94 scope (cross-track + kf ownership + auto-create tracks):
+- cross-track single clip (shared boundary kfs) -> duplicated on target, empty bridge on source
+- cross-track single clip (orphan boundary kfs) -> migrated on target, source kfs moved
+- multi-track source selection with uniform trackDelta -> per-clip target track preserved
+- overflow with autoCreateTracks=True -> new track created, clips land on it
+- overflow with autoCreateTracks=False -> 400 OUT_OF_RANGE_TRACK
+- interior kf between two dragged clips -> migrates in a single row update
+- empty-tr bridge has duration_seconds equal to span length
+
+Downstream tasks (95/96) extend this endpoint with overlap resolution and copy mode.
 """
 
 import json
@@ -24,8 +31,9 @@ import pytest
 
 from scenecraft.api_server import make_handler
 from scenecraft.db import (
-    add_keyframe, add_transition, close_db, get_keyframe, get_keyframes,
-    get_transition, get_transitions, set_meta, _migrated_dbs,
+    add_keyframe, add_transition, add_track, close_db, get_db,
+    get_keyframe, get_keyframes, get_transition, get_transitions,
+    get_tracks, set_meta, _migrated_dbs,
 )
 
 
@@ -83,6 +91,21 @@ def parse_ts(ts):
     return float(ts)
 
 
+def _ensure_track(project_dir, track_id: str, z_order: int, name: str | None = None):
+    """Idempotently ensure a track exists at a given z_order."""
+    tracks = {t["id"] for t in get_tracks(project_dir)}
+    if track_id in tracks:
+        return
+    add_track(project_dir, {
+        "id": track_id,
+        "name": name or track_id.replace("_", " ").title(),
+        "z_order": z_order,
+        "blend_mode": "normal",
+        "base_opacity": 1.0,
+        "enabled": True,
+    })
+
+
 def _seed_three_clip_track(project_dir):
     """Seed a single track with 3 consecutive clips sharing boundary kfs.
 
@@ -124,13 +147,6 @@ class TestMoveTransitionsValidation:
         status, body = api(project_env, "POST",
             f"/api/projects/{project_env['project_name']}/move-transitions",
             {"mode": "copy", "trackDelta": 0, "timeDeltaSeconds": 1.0, "transitionIds": ["tr_001"]})
-        assert status == 501, f"expected 501, got {status}: {body}"
-
-    def test_cross_track_rejected_with_501(self, project_env):
-        _seed_three_clip_track(project_env["project_dir"])
-        status, body = api(project_env, "POST",
-            f"/api/projects/{project_env['project_name']}/move-transitions",
-            {"mode": "move", "trackDelta": 1, "timeDeltaSeconds": 0.0, "transitionIds": ["tr_001"]})
         assert status == 501, f"expected 501, got {status}: {body}"
 
     def test_empty_transition_ids_rejected(self, project_env):
@@ -238,8 +254,6 @@ class TestMoveTransitionsBatch:
         project_dir = project_env["project_dir"]
         _seed_three_clip_track(project_dir)
 
-        kfs_before = {k["id"] for k in get_keyframes(project_dir)}
-
         status, body = api(project_env, "POST",
             f"/api/projects/{project_env['project_name']}/move-transitions",
             {"mode": "move", "trackDelta": 0, "timeDeltaSeconds": 1.0,
@@ -311,3 +325,401 @@ class TestMoveTransitionsBatch:
         kf_002_time_after = parse_ts(get_keyframe(project_dir, from_kf_002_before)["timestamp"])
         assert abs(kf_001_time_after - kf_001_time_before) < 0.01
         assert abs(kf_002_time_after - kf_002_time_before) < 0.01
+
+
+# ── Task 94: cross-track moves ─────────────────────────────────────────
+
+
+class TestMoveTransitionsCrossTrack:
+    def test_cross_track_shared_boundary_kfs_duplicate_and_bridge(self, project_env):
+        """Move tr_002 (middle of 3-clip track) to track_2 with trackDelta=+1.
+
+        - kf_002 and kf_003 are boundary kfs (shared with tr_001 / tr_003 on source).
+        - Source keeps kf_002 / kf_003 (non-moved neighbors still reference them).
+        - Target gets a pair of fresh duplicated kfs on track_2.
+        - An empty-tr bridge [kf_002 -> kf_003] is inserted on track_1 (source) so
+          tr_001 and tr_003 stay joined by a bridge.
+        """
+        project_dir = project_env["project_dir"]
+        _ensure_track(project_dir, "track_2", z_order=1, name="Track 2")
+        _seed_three_clip_track(project_dir)
+
+        trs_before = {t["id"] for t in get_transitions(project_dir)}
+        kfs_before = {k["id"] for k in get_keyframes(project_dir)}
+
+        status, body = api(project_env, "POST",
+            f"/api/projects/{project_env['project_name']}/move-transitions",
+            {"mode": "move", "trackDelta": 1, "timeDeltaSeconds": 0.0,
+             "transitionIds": ["tr_002"]})
+        assert status == 200, f"got {status}: {body}"
+        assert body["createdTrackIds"] == []
+
+        tr_002 = get_transition(project_dir, "tr_002")
+        assert tr_002["track_id"] == "track_2"
+        # New from/to kfs on track_2.
+        new_from_kf = get_keyframe(project_dir, tr_002["from"])
+        new_to_kf = get_keyframe(project_dir, tr_002["to"])
+        assert new_from_kf["track_id"] == "track_2"
+        assert new_to_kf["track_id"] == "track_2"
+        assert new_from_kf["id"] not in kfs_before, "expected fresh from_kf on target"
+        assert new_to_kf["id"] not in kfs_before, "expected fresh to_kf on target"
+        # Timestamps unchanged (timeDelta=0).
+        assert abs(parse_ts(new_from_kf["timestamp"]) - 15.0) < 0.01
+        assert abs(parse_ts(new_to_kf["timestamp"]) - 20.0) < 0.01
+
+        # Source kfs kf_002, kf_003 remain on track_1 with unchanged timestamps.
+        src_kf_002 = get_keyframe(project_dir, "kf_002")
+        src_kf_003 = get_keyframe(project_dir, "kf_003")
+        assert src_kf_002["track_id"] == "track_1"
+        assert src_kf_003["track_id"] == "track_1"
+        assert abs(parse_ts(src_kf_002["timestamp"]) - 15.0) < 0.01
+        assert abs(parse_ts(src_kf_003["timestamp"]) - 20.0) < 0.01
+
+        # tr_001 / tr_003 still reference source kfs.
+        tr_001 = get_transition(project_dir, "tr_001")
+        tr_003 = get_transition(project_dir, "tr_003")
+        assert tr_001["to"] == "kf_002"
+        assert tr_003["from"] == "kf_003"
+
+        # An empty bridge tr on track_1 from kf_002 to kf_003 should exist.
+        bridge_trs = [
+            t for t in get_transitions(project_dir)
+            if t["id"] not in trs_before
+            and t.get("track_id") == "track_1"
+            and t.get("from") == "kf_002" and t.get("to") == "kf_003"
+        ]
+        assert len(bridge_trs) == 1, f"expected one bridge tr, got {len(bridge_trs)}"
+        bridge = bridge_trs[0]
+        # selected=[None] means "empty" — frontend flattens [None] to None.
+        assert bridge["selected"] is None
+        assert abs(bridge["duration_seconds"] - 5.0) < 0.01
+
+    def test_cross_track_orphan_boundary_kfs_migrate(self, project_env):
+        """Solo clip on track_1 cross-track moved to track_2: boundary kfs are
+        "unshared" (no non-moved tr references them), so both are interior
+        and migrate in place — no duplicate kfs, no bridge on source.
+        """
+        project_dir = project_env["project_dir"]
+        _ensure_track(project_dir, "track_2", z_order=1, name="Track 2")
+        # Seed a lone clip on track_1.
+        add_keyframe(project_dir, {
+            "id": "kf_a", "timestamp": "0:05.00", "section": "", "source": "",
+            "prompt": "", "selected": None, "candidates": [], "track_id": "track_1",
+        })
+        add_keyframe(project_dir, {
+            "id": "kf_b", "timestamp": "0:10.00", "section": "", "source": "",
+            "prompt": "", "selected": None, "candidates": [], "track_id": "track_1",
+        })
+        add_transition(project_dir, {
+            "id": "tr_solo", "from": "kf_a", "to": "kf_b",
+            "duration_seconds": 5, "slots": 1, "action": "",
+            "use_global_prompt": False, "selected": None,
+            "remap": {"method": "linear", "target_duration": 5}, "track_id": "track_1",
+        })
+
+        kfs_before = {k["id"] for k in get_keyframes(project_dir)}
+        trs_before = {t["id"] for t in get_transitions(project_dir)}
+
+        status, body = api(project_env, "POST",
+            f"/api/projects/{project_env['project_name']}/move-transitions",
+            {"mode": "move", "trackDelta": 1, "timeDeltaSeconds": 0.0,
+             "transitionIds": ["tr_solo"]})
+        assert status == 200, f"got {status}: {body}"
+
+        # No new kfs, no new trs (no bridge — no neighbors to bridge).
+        kfs_after = {k["id"] for k in get_keyframes(project_dir) if not k.get("deleted_at")}
+        trs_after = {t["id"] for t in get_transitions(project_dir)}
+        assert kfs_after == kfs_before, f"expected no new kfs, got diff {kfs_after ^ kfs_before}"
+        assert trs_after == trs_before, "expected no new trs (no bridge)"
+
+        # kf_a and kf_b migrated to track_2.
+        kf_a = get_keyframe(project_dir, "kf_a")
+        kf_b = get_keyframe(project_dir, "kf_b")
+        assert kf_a["track_id"] == "track_2"
+        assert kf_b["track_id"] == "track_2"
+        # Timestamps unchanged.
+        assert abs(parse_ts(kf_a["timestamp"]) - 5.0) < 0.01
+        assert abs(parse_ts(kf_b["timestamp"]) - 10.0) < 0.01
+
+        # tr_solo lives on track_2 now.
+        tr_solo = get_transition(project_dir, "tr_solo")
+        assert tr_solo["track_id"] == "track_2"
+        assert tr_solo["from"] == "kf_a"
+        assert tr_solo["to"] == "kf_b"
+
+    def test_interior_kf_between_two_dragged_clips_migrates_once(self, project_env):
+        """Drag tr_001 + tr_002 together cross-track. kf_002 is interior to the
+        moved set (only tr_001 and tr_002 reference it, both moved). kf_002
+        should migrate in a single row update, ending up on track_2.
+
+        kf_001 is referenced only by tr_001 (moved) -> interior -> migrates.
+        kf_003 is shared with tr_003 (non-moved) -> boundary -> duplicated.
+        """
+        project_dir = project_env["project_dir"]
+        _ensure_track(project_dir, "track_2", z_order=1, name="Track 2")
+        _seed_three_clip_track(project_dir)
+
+        status, body = api(project_env, "POST",
+            f"/api/projects/{project_env['project_name']}/move-transitions",
+            {"mode": "move", "trackDelta": 1, "timeDeltaSeconds": 2.0,
+             "transitionIds": ["tr_001", "tr_002"]})
+        assert status == 200, f"got {status}: {body}"
+
+        # kf_001 (interior): migrated to track_2 with timestamp 12 (was 10 + 2).
+        kf_001 = get_keyframe(project_dir, "kf_001")
+        assert kf_001["track_id"] == "track_2"
+        assert abs(parse_ts(kf_001["timestamp"]) - 12.0) < 0.01
+
+        # kf_002 (interior): migrated to track_2 with timestamp 17 (was 15 + 2).
+        kf_002 = get_keyframe(project_dir, "kf_002")
+        assert kf_002["track_id"] == "track_2"
+        assert abs(parse_ts(kf_002["timestamp"]) - 17.0) < 0.01
+
+        # kf_003 (boundary with non-moved tr_003): source copy stays on track_1 at 20.
+        src_kf_003 = get_keyframe(project_dir, "kf_003")
+        assert src_kf_003["track_id"] == "track_1"
+        assert abs(parse_ts(src_kf_003["timestamp"]) - 20.0) < 0.01
+
+        # tr_002's to_kf is a NEW kf on track_2 at 22.
+        tr_002 = get_transition(project_dir, "tr_002")
+        assert tr_002["track_id"] == "track_2"
+        new_to_kf = get_keyframe(project_dir, tr_002["to"])
+        assert new_to_kf["id"] != "kf_003"
+        assert new_to_kf["track_id"] == "track_2"
+        assert abs(parse_ts(new_to_kf["timestamp"]) - 22.0) < 0.01
+
+        # tr_001 and tr_002 both share kf_002 (interior, single row).
+        tr_001 = get_transition(project_dir, "tr_001")
+        assert tr_001["track_id"] == "track_2"
+        assert tr_001["to"] == "kf_002"
+        assert tr_002["from"] == "kf_002"
+
+        # tr_003 untouched, still references kf_003 on track_1.
+        tr_003 = get_transition(project_dir, "tr_003")
+        assert tr_003["track_id"] == "track_1"
+        assert tr_003["from"] == "kf_003"
+
+    def test_multi_track_source_uniform_track_delta(self, project_env):
+        """Select clips from T2 and T3 simultaneously with trackDelta=-1:
+        T2 clips land on T1, T3 clips land on T2.
+        """
+        project_dir = project_env["project_dir"]
+        _ensure_track(project_dir, "track_2", z_order=1, name="Track 2")
+        _ensure_track(project_dir, "track_3", z_order=2, name="Track 3")
+
+        # Solo clip on track_2.
+        add_keyframe(project_dir, {
+            "id": "kf_t2a", "timestamp": "0:05.00", "section": "", "source": "",
+            "prompt": "", "selected": None, "candidates": [], "track_id": "track_2",
+        })
+        add_keyframe(project_dir, {
+            "id": "kf_t2b", "timestamp": "0:08.00", "section": "", "source": "",
+            "prompt": "", "selected": None, "candidates": [], "track_id": "track_2",
+        })
+        add_transition(project_dir, {
+            "id": "tr_t2", "from": "kf_t2a", "to": "kf_t2b",
+            "duration_seconds": 3, "slots": 1, "action": "",
+            "use_global_prompt": False, "selected": None,
+            "remap": {"method": "linear", "target_duration": 3}, "track_id": "track_2",
+        })
+
+        # Solo clip on track_3.
+        add_keyframe(project_dir, {
+            "id": "kf_t3a", "timestamp": "0:10.00", "section": "", "source": "",
+            "prompt": "", "selected": None, "candidates": [], "track_id": "track_3",
+        })
+        add_keyframe(project_dir, {
+            "id": "kf_t3b", "timestamp": "0:13.00", "section": "", "source": "",
+            "prompt": "", "selected": None, "candidates": [], "track_id": "track_3",
+        })
+        add_transition(project_dir, {
+            "id": "tr_t3", "from": "kf_t3a", "to": "kf_t3b",
+            "duration_seconds": 3, "slots": 1, "action": "",
+            "use_global_prompt": False, "selected": None,
+            "remap": {"method": "linear", "target_duration": 3}, "track_id": "track_3",
+        })
+
+        status, body = api(project_env, "POST",
+            f"/api/projects/{project_env['project_name']}/move-transitions",
+            {"mode": "move", "trackDelta": -1, "timeDeltaSeconds": 0.0,
+             "transitionIds": ["tr_t2", "tr_t3"]})
+        assert status == 200, f"got {status}: {body}"
+
+        tr_t2 = get_transition(project_dir, "tr_t2")
+        tr_t3 = get_transition(project_dir, "tr_t3")
+        assert tr_t2["track_id"] == "track_1"
+        assert tr_t3["track_id"] == "track_2"
+
+        # Both were orphan kfs -> migrated in place, now on new tracks.
+        for kf_id, tgt in [("kf_t2a", "track_1"), ("kf_t2b", "track_1"),
+                           ("kf_t3a", "track_2"), ("kf_t3b", "track_2")]:
+            kf = get_keyframe(project_dir, kf_id)
+            assert kf["track_id"] == tgt, f"{kf_id} should be on {tgt}, got {kf['track_id']}"
+
+    def test_empty_bridge_duration_equals_span_length(self, project_env):
+        """With tr_001 + tr_002 moved off track_1 together, the vacated span is
+        [kf_001.ts=10, kf_003.ts=20] = 10.0s. But kf_001 is not a surviving left
+        boundary (no non-moved tr uses it). Use a 4-clip track so the span has
+        surviving left (kf_001) and right (kf_004) bounds.
+        """
+        project_dir = project_env["project_dir"]
+        _ensure_track(project_dir, "track_2", z_order=1, name="Track 2")
+        # Seed 4-clip chain: kf_001-tr_a-kf_002-tr_b-kf_003-tr_c-kf_004-tr_d-kf_005.
+        for kf_id, ts in [
+            ("kf_001", "0:05.00"),
+            ("kf_002", "0:10.00"),
+            ("kf_003", "0:15.00"),
+            ("kf_004", "0:20.00"),
+            ("kf_005", "0:25.00"),
+        ]:
+            add_keyframe(project_dir, {
+                "id": kf_id, "timestamp": ts, "section": "", "source": "",
+                "prompt": "", "selected": None, "candidates": [], "track_id": "track_1",
+            })
+        for tr_id, frm, to in [
+            ("tr_a", "kf_001", "kf_002"),
+            ("tr_b", "kf_002", "kf_003"),
+            ("tr_c", "kf_003", "kf_004"),
+            ("tr_d", "kf_004", "kf_005"),
+        ]:
+            add_transition(project_dir, {
+                "id": tr_id, "from": frm, "to": to,
+                "duration_seconds": 5, "slots": 1, "action": "",
+                "use_global_prompt": False, "selected": None,
+                "remap": {"method": "linear", "target_duration": 5}, "track_id": "track_1",
+            })
+
+        trs_before = {t["id"] for t in get_transitions(project_dir)}
+
+        # Move tr_b and tr_c (middle two) cross-track. Vacated span on track_1 is
+        # [kf_002.ts=10, kf_004.ts=20] -> expect bridge from kf_002 to kf_004 with
+        # duration 10s. kf_003 is interior (only tr_b + tr_c reference it).
+        status, body = api(project_env, "POST",
+            f"/api/projects/{project_env['project_name']}/move-transitions",
+            {"mode": "move", "trackDelta": 1, "timeDeltaSeconds": 0.0,
+             "transitionIds": ["tr_b", "tr_c"]})
+        assert status == 200, f"got {status}: {body}"
+
+        # Find the new bridge tr.
+        bridge_trs = [
+            t for t in get_transitions(project_dir)
+            if t["id"] not in trs_before
+            and t.get("track_id") == "track_1"
+            and t.get("from") == "kf_002" and t.get("to") == "kf_004"
+        ]
+        assert len(bridge_trs) == 1, f"expected one bridge, got {len(bridge_trs)}"
+        assert abs(bridge_trs[0]["duration_seconds"] - 10.0) < 0.01
+
+        # kf_003 was interior -> migrated to track_2.
+        kf_003 = get_keyframe(project_dir, "kf_003")
+        assert kf_003["track_id"] == "track_2"
+
+
+class TestMoveTransitionsAutoCreateTracks:
+    def test_overflow_auto_create_true_makes_new_track_above(self, project_env):
+        """trackDelta=-1 when clip on track_1 (only track) => new track prepended
+        above and clip lands on it.
+        """
+        project_dir = project_env["project_dir"]
+        # Start with only track_1 (default).
+        add_keyframe(project_dir, {
+            "id": "kf_a", "timestamp": "0:05.00", "section": "", "source": "",
+            "prompt": "", "selected": None, "candidates": [], "track_id": "track_1",
+        })
+        add_keyframe(project_dir, {
+            "id": "kf_b", "timestamp": "0:10.00", "section": "", "source": "",
+            "prompt": "", "selected": None, "candidates": [], "track_id": "track_1",
+        })
+        add_transition(project_dir, {
+            "id": "tr_solo", "from": "kf_a", "to": "kf_b",
+            "duration_seconds": 5, "slots": 1, "action": "",
+            "use_global_prompt": False, "selected": None,
+            "remap": {"method": "linear", "target_duration": 5}, "track_id": "track_1",
+        })
+
+        tracks_before = get_tracks(project_dir)
+        assert len(tracks_before) == 1 and tracks_before[0]["id"] == "track_1"
+
+        status, body = api(project_env, "POST",
+            f"/api/projects/{project_env['project_name']}/move-transitions",
+            {"mode": "move", "trackDelta": -1, "timeDeltaSeconds": 0.0,
+             "transitionIds": ["tr_solo"], "autoCreateTracks": True})
+        assert status == 200, f"got {status}: {body}"
+        assert len(body["createdTrackIds"]) == 1
+        new_track_id = body["createdTrackIds"][0]
+
+        # tr_solo should live on the new track.
+        tr_solo = get_transition(project_dir, "tr_solo")
+        assert tr_solo["track_id"] == new_track_id
+
+        # New track is at the top (z_order lower than track_1's 0 -> rendered below
+        # in the compositor; per spec the new track has z_order extending the range).
+        tracks_after = get_tracks(project_dir)
+        assert len(tracks_after) == 2
+        new_track = next(t for t in tracks_after if t["id"] == new_track_id)
+        assert new_track["blend_mode"] == "normal"
+        assert abs(new_track["base_opacity"] - 1.0) < 0.01
+        assert new_track["enabled"] is True
+        # Because we prepended above, the new track sorts first in get_tracks
+        # (get_tracks ORDERs BY z_order).
+        assert tracks_after[0]["id"] == new_track_id
+
+    def test_overflow_auto_create_false_returns_400(self, project_env):
+        """trackDelta=-1 on track_1-only project with autoCreateTracks=False => 400."""
+        project_dir = project_env["project_dir"]
+        add_keyframe(project_dir, {
+            "id": "kf_a", "timestamp": "0:05.00", "section": "", "source": "",
+            "prompt": "", "selected": None, "candidates": [], "track_id": "track_1",
+        })
+        add_keyframe(project_dir, {
+            "id": "kf_b", "timestamp": "0:10.00", "section": "", "source": "",
+            "prompt": "", "selected": None, "candidates": [], "track_id": "track_1",
+        })
+        add_transition(project_dir, {
+            "id": "tr_solo", "from": "kf_a", "to": "kf_b",
+            "duration_seconds": 5, "slots": 1, "action": "",
+            "use_global_prompt": False, "selected": None,
+            "remap": {"method": "linear", "target_duration": 5}, "track_id": "track_1",
+        })
+
+        status, body = api(project_env, "POST",
+            f"/api/projects/{project_env['project_name']}/move-transitions",
+            {"mode": "move", "trackDelta": -1, "timeDeltaSeconds": 0.0,
+             "transitionIds": ["tr_solo"], "autoCreateTracks": False})
+        assert status == 400, f"expected 400, got {status}: {body}"
+        # Error code should surface OUT_OF_RANGE_TRACK in body.
+        assert "OUT_OF_RANGE_TRACK" in json.dumps(body), f"expected OUT_OF_RANGE_TRACK in {body}"
+
+    def test_overflow_below_auto_create_true(self, project_env):
+        """trackDelta=+1 when clip on track_1 (only track) -> new track appended below."""
+        project_dir = project_env["project_dir"]
+        add_keyframe(project_dir, {
+            "id": "kf_a", "timestamp": "0:05.00", "section": "", "source": "",
+            "prompt": "", "selected": None, "candidates": [], "track_id": "track_1",
+        })
+        add_keyframe(project_dir, {
+            "id": "kf_b", "timestamp": "0:10.00", "section": "", "source": "",
+            "prompt": "", "selected": None, "candidates": [], "track_id": "track_1",
+        })
+        add_transition(project_dir, {
+            "id": "tr_solo", "from": "kf_a", "to": "kf_b",
+            "duration_seconds": 5, "slots": 1, "action": "",
+            "use_global_prompt": False, "selected": None,
+            "remap": {"method": "linear", "target_duration": 5}, "track_id": "track_1",
+        })
+
+        status, body = api(project_env, "POST",
+            f"/api/projects/{project_env['project_name']}/move-transitions",
+            {"mode": "move", "trackDelta": 1, "timeDeltaSeconds": 0.0,
+             "transitionIds": ["tr_solo"], "autoCreateTracks": True})
+        assert status == 200, f"got {status}: {body}"
+        assert len(body["createdTrackIds"]) == 1
+        new_track_id = body["createdTrackIds"][0]
+
+        tr_solo = get_transition(project_dir, "tr_solo")
+        assert tr_solo["track_id"] == new_track_id
+
+        tracks_after = get_tracks(project_dir)
+        assert len(tracks_after) == 2
+        # Appended below => higher z_order => sorts last.
+        assert tracks_after[-1]["id"] == new_track_id

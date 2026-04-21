@@ -397,6 +397,53 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 clips = get_audio_clips(project_dir, track_id)
                 return self._json_response({"audioClips": clips})
 
+            # GET /api/projects/:name/audio-clips/:id/peaks?resolution=400
+            m = re.match(r"^/api/projects/([^/]+)/audio-clips/([^/]+)/peaks$", path)
+            if m:
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None:
+                    return
+                clip_id = m.group(2)
+                from urllib.parse import parse_qs
+                qs = parse_qs(parsed.query)
+                try:
+                    resolution = int(qs.get("resolution", ["400"])[0])
+                except ValueError:
+                    resolution = 400
+                from scenecraft.db import get_audio_clips as _get_clips
+                clip = next((c for c in _get_clips(project_dir) if c["id"] == clip_id), None)
+                if clip is None:
+                    return self._error(404, "NOT_FOUND", f"Audio clip not found: {clip_id}")
+                source_rel = clip.get("source_path", "")
+                if not source_rel:
+                    return self._error(400, "BAD_REQUEST", f"Audio clip has no source_path: {clip_id}")
+                source_path = (project_dir / source_rel).resolve()
+                try:
+                    source_path.relative_to(project_dir.resolve())
+                except ValueError:
+                    return self._error(400, "BAD_REQUEST", "source_path outside project")
+                if not source_path.exists():
+                    return self._error(404, "NOT_FOUND", f"Source audio missing on disk: {source_rel}")
+                duration = float(clip.get("end_time", 0)) - float(clip.get("start_time", 0))
+                source_offset = float(clip.get("source_offset", 0))
+                try:
+                    from scenecraft.audio.peaks import compute_peaks
+                    data = compute_peaks(source_path, source_offset, duration, resolution, project_dir=project_dir)
+                except RuntimeError as e:
+                    return self._error(500, "PEAKS_FAILED", str(e))
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("X-Peak-Resolution", str(resolution))
+                    self.send_header("X-Peak-Duration", f"{duration:.6f}")
+                    self._cors_headers()
+                    self.end_headers()
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
+
             # GET /api/projects/:name/unselected-candidates
             m = re.match(r"^/api/projects/([^/]+)/unselected-candidates$", path)
             if m:
@@ -3141,39 +3188,48 @@ def make_handler(work_dir: Path, no_auth: bool = False):
 
             Body: {
               "mode": "move" | "copy",                  # default "move"
-              "trackDelta": 0,                          # applied to each tr's current track
+              "trackDelta": 0,                          # applied to each tr's current track index
               "timeDeltaSeconds": 3.5,                  # applied to each tr's from/to timestamps
               "transitionIds": ["tr_001", ...],         # flat list of clips in the batch
-              "autoCreateTracks": true                  # default true (unused in this task)
+              "autoCreateTracks": true                  # default true
             }
 
-            Task 93 scope — same-track, single-delta time-shift only:
+            Task 94 scope — same-track + cross-track + auto-create-tracks, move mode only:
               - mode="copy" -> 501 Not Implemented (Task 96)
-              - trackDelta != 0 -> 501 Not Implemented (Task 94)
-              - overlap on target -> not handled in this task (Task 95); downstream tasks extend this
-                handler with resolution logic. For now, timestamps are shifted without regard to
-                target-track overlaps (same track only, so collisions within the moved set alone).
+              - target overlap resolution -> not handled (Task 95). Caller is responsible for
+                ensuring the drop lands on empty space on the target track.
 
-            Same-track move algorithm:
-              For each tr_id:
-                - Fetch tr + from_kf + to_kf.
-                - new_from_time = parse_ts(from_kf.timestamp) + timeDeltaSeconds
-                - new_to_time   = parse_ts(to_kf.timestamp)   + timeDeltaSeconds
-                - If new_from_time < 0 -> 400.
-                - Boundary kf is "shared" if any OTHER tr (not in transitionIds, deleted_at IS NULL)
-                  references it as from or to:
-                    * unshared -> update kf.timestamp in place
-                    * shared   -> create a fresh kf on the same track at new_time;
-                                 repoint this tr's from/to at the new kf
-                - Update tr.duration_seconds = round(new_to_time - new_from_time, 2).
+            Kf ownership model (see agent/design/local.clip-move-cross-track.md):
+              A kf is "interior" when every active tr (deleted_at IS NULL) that references it
+              (as from or to) is in the moved set. A kf is "boundary" when at least one
+              non-moved tr references it — the boundary kf stays on source to keep bounding
+              the neighbor, and a fresh copy is inserted on target.
+
+            Per tr:
+              - Interior from/to kf -> UPDATE keyframes SET track_id=target, timestamp=new_time.
+              - Boundary from/to kf -> INSERT new kf on target at new_time, repoint tr.
+              - Update tr.track_id=target, tr.from/to=new_kf_ids, tr.duration_seconds=round(Δ,2).
+
+            Source cleanup (move mode, per distinct source track):
+              - Collect vacated spans [from_kf.ts, to_kf.ts] for moved trs on that source track.
+              - Merge consecutive/overlapping spans.
+              - For each merged span, if both ends have a surviving boundary kf (a non-moved tr's
+                to_kf at span_from and a non-moved tr's from_kf at span_to), insert an empty tr
+                bridging them with selected=[None].
+
+            Auto-create tracks:
+              - If any tr's target_index falls outside the existing track range and
+                autoCreateTracks is True, prepend/append tracks with safe defaults
+                (blendMode="normal", baseOpacity=1.0, enabled=1, name="Track N").
+              - Otherwise return 400 OUT_OF_RANGE_TRACK.
 
             Response:
               {
                 "success": true,
                 "movedTransitionIds": [...],
-                "createdTrackIds": [],      # always empty in this task
-                "consumedTransitionIds": [],
-                "splitTransitionIds": []
+                "createdTrackIds": [...],         # auto-created (if any)
+                "consumedTransitionIds": [],      # Task 95
+                "splitTransitionIds": []          # Task 95
               }
             """
             body = self._read_json_body()
@@ -3184,8 +3240,7 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             track_delta = body.get("trackDelta")
             time_delta = body.get("timeDeltaSeconds")
             transition_ids = body.get("transitionIds")
-            # autoCreateTracks parsed but unused in Task 93 (same-track only); kept for forward compat.
-            _auto_create_tracks = body.get("autoCreateTracks", True)
+            auto_create_tracks = bool(body.get("autoCreateTracks", True))
 
             if mode not in ("move", "copy"):
                 return self._error(400, "BAD_REQUEST", "mode must be 'move' or 'copy'")
@@ -3199,8 +3254,6 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 track_delta_i = int(track_delta)
             except (TypeError, ValueError):
                 return self._error(400, "BAD_REQUEST", "trackDelta must be an integer")
-            if track_delta_i != 0:
-                return self._error(501, "NOT_IMPLEMENTED", "cross-track move not yet implemented (Task 94)")
             if time_delta is None:
                 return self._error(400, "BAD_REQUEST", "Missing 'timeDeltaSeconds'")
             try:
@@ -3216,7 +3269,9 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 from scenecraft.db import (
                     undo_begin as _ub, get_transition, update_transition,
                     update_keyframe, get_keyframe, get_transitions as _get_trs,
-                    add_keyframe, next_keyframe_id,
+                    add_keyframe, next_keyframe_id, next_transition_id,
+                    add_transition, get_tracks as _get_tracks, add_track as _add_track,
+                    generate_id,
                 )
 
                 def parse_ts(ts):
@@ -3231,9 +3286,18 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     rem = s - m * 60
                     return f"{m}:{rem:05.2f}"
 
-                # Pre-validate: all tr_ids exist and are active, all new_from_time >= 0.
+                # ── 1. Fetch track layout (sorted by z_order) ─────────────────
+                tracks = _get_tracks(project_dir)  # sorted by z_order
+                if not tracks:
+                    return self._error(500, "INTERNAL_ERROR", "No tracks in project")
+                track_index_by_id = {t["id"]: i for i, t in enumerate(tracks)}
+
+                # ── 2. Pre-validate each tr and compute target_index ──────────
                 moved_set = set(transition_ids)
                 trs_to_move: list[dict] = []
+                overflow_above = 0  # how many tracks need to be added before index 0
+                overflow_below = 0  # how many tracks need to be added after the last index
+
                 for tr_id in transition_ids:
                     tr = get_transition(project_dir, tr_id)
                     if not tr:
@@ -3251,23 +3315,102 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                             400, "BAD_REQUEST",
                             f"Move would push {tr_id} past timeline start (new_from={new_from_time:.2f})",
                         )
+                    source_track_id = tr.get("track_id") or "track_1"
+                    if source_track_id not in track_index_by_id:
+                        return self._error(500, "INTERNAL_ERROR", f"tr {tr_id} on unknown track {source_track_id}")
+                    source_index = track_index_by_id[source_track_id]
+                    target_index = source_index + track_delta_i
+                    if target_index < 0:
+                        overflow_above = max(overflow_above, -target_index)
+                    elif target_index >= len(tracks):
+                        overflow_below = max(overflow_below, target_index - (len(tracks) - 1))
                     trs_to_move.append({
                         "tr": tr,
                         "from_kf": from_kf,
                         "to_kf": to_kf,
                         "new_from_time": new_from_time,
                         "new_to_time": new_to_time,
+                        "source_track_id": source_track_id,
+                        "source_index": source_index,
+                        "target_index_raw": target_index,  # may be negative or past range
                     })
 
-                _ub(project_dir, f"Move {len(transition_ids)} tr(s) by {time_delta_f:.2f}s")
+                if (overflow_above > 0 or overflow_below > 0) and not auto_create_tracks:
+                    return self._error(
+                        400, "OUT_OF_RANGE_TRACK",
+                        f"trackDelta={track_delta_i} would exceed track range "
+                        f"(need {overflow_above} above, {overflow_below} below) "
+                        f"and autoCreateTracks=false",
+                    )
 
-                # Snapshot all active trs once for shareability checks; rebuild after kf writes?
-                # Shareability is determined against non-moved trs, which are unaffected by our
-                # updates within this batch, so a single snapshot suffices.
+                # ── 3. Begin undo group ───────────────────────────────────────
+                _ub(project_dir, f"Move {len(transition_ids)} tr(s) "
+                                 f"by {time_delta_f:.2f}s trackDelta={track_delta_i}")
+
+                # ── 4. Auto-create tracks if needed ───────────────────────────
+                created_track_ids: list[str] = []
+                if overflow_above > 0 or overflow_below > 0:
+                    # Existing z_orders span [min_z..max_z]; new tracks extend the range.
+                    min_z = min(t["z_order"] for t in tracks)
+                    max_z = max(t["z_order"] for t in tracks)
+                    next_ordinal = len(tracks) + 1  # for "Track N" naming
+
+                    # Above (prepended at the front of the sorted list): decreasing z_orders.
+                    new_above: list[dict] = []
+                    for i in range(overflow_above):
+                        tid = generate_id("track")
+                        z = min_z - (overflow_above - i)
+                        tr_obj = {
+                            "id": tid,
+                            "name": f"Track {next_ordinal}",
+                            "z_order": z,
+                            "blend_mode": "normal",
+                            "base_opacity": 1.0,
+                            "enabled": True,
+                        }
+                        _add_track(project_dir, tr_obj)
+                        new_above.append(tr_obj)
+                        created_track_ids.append(tid)
+                        next_ordinal += 1
+
+                    # Below (appended at the end): increasing z_orders.
+                    new_below: list[dict] = []
+                    for i in range(overflow_below):
+                        tid = generate_id("track")
+                        z = max_z + (i + 1)
+                        tr_obj = {
+                            "id": tid,
+                            "name": f"Track {next_ordinal}",
+                            "z_order": z,
+                            "blend_mode": "normal",
+                            "base_opacity": 1.0,
+                            "enabled": True,
+                        }
+                        _add_track(project_dir, tr_obj)
+                        new_below.append(tr_obj)
+                        created_track_ids.append(tid)
+                        next_ordinal += 1
+
+                    # Rebuild tracks list with the new tracks in the correct order.
+                    tracks = new_above + tracks + new_below
+                    track_index_by_id = {t["id"]: i for i, t in enumerate(tracks)}
+
+                # ── 5. Resolve each tr's target_track_id ──────────────────────
+                for entry in trs_to_move:
+                    # target_index_raw was computed against the original tracks list.
+                    # After auto-create, indices shift by overflow_above.
+                    final_index = entry["target_index_raw"] + overflow_above
+                    if final_index < 0 or final_index >= len(tracks):
+                        # Should not happen after auto-create.
+                        return self._error(500, "INTERNAL_ERROR",
+                                           f"target_index {final_index} still out of range after auto-create")
+                    entry["target_track_id"] = tracks[final_index]["id"]
+
+                # ── 6. Snapshot all active trs for boundary-kf classification ─
                 all_active_trs = _get_trs(project_dir)
 
-                def kf_shared_with_other(kf_id: str) -> bool:
-                    """Return True if any active, non-moved tr references this kf (from or to)."""
+                def is_boundary(kf_id: str) -> bool:
+                    """A kf is boundary if at least one non-moved active tr references it."""
                     for other in all_active_trs:
                         if other["id"] in moved_set:
                             continue
@@ -3277,59 +3420,158 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                             return True
                     return False
 
+                # ── 7. Source-track cleanup: compute merged vacated spans ─────
+                spans_by_src: dict[str, list[tuple[float, float]]] = {}
+                for entry in trs_to_move:
+                    src = entry["source_track_id"]
+                    a = parse_ts(entry["from_kf"]["timestamp"])
+                    b = parse_ts(entry["to_kf"]["timestamp"])
+                    spans_by_src.setdefault(src, []).append((a, b))
+
+                def merge_spans(spans: list[tuple[float, float]]) -> list[tuple[float, float]]:
+                    if not spans:
+                        return []
+                    s = sorted(spans, key=lambda x: x[0])
+                    merged = [s[0]]
+                    for a, b in s[1:]:
+                        la, lb = merged[-1]
+                        # Consecutive if touching (kf shared) or overlapping.
+                        if a <= lb + 1e-4:
+                            merged[-1] = (la, max(lb, b))
+                        else:
+                            merged.append((a, b))
+                    return merged
+
+                merged_by_src = {src: merge_spans(sp) for src, sp in spans_by_src.items()}
+
+                def find_surviving_left(src_track_id: str, span_from_t: float) -> str | None:
+                    """Find a kf on src_track_id at timestamp span_from_t that a non-moved
+                    tr uses as to_kf (so it remains as the right-side of the left neighbor).
+                    """
+                    for other in all_active_trs:
+                        if other["id"] in moved_set or other.get("deleted_at"):
+                            continue
+                        if other.get("track_id") != src_track_id:
+                            continue
+                        to_kf_id = other.get("to")
+                        if not to_kf_id:
+                            continue
+                        to_kf = get_keyframe(project_dir, to_kf_id)
+                        if not to_kf or to_kf.get("track_id") != src_track_id:
+                            continue
+                        if abs(parse_ts(to_kf["timestamp"]) - span_from_t) < 1e-3:
+                            return to_kf_id
+                    return None
+
+                def find_surviving_right(src_track_id: str, span_to_t: float) -> str | None:
+                    """Find a kf on src_track_id at timestamp span_to_t that a non-moved
+                    tr uses as from_kf (so it remains as the left-side of the right neighbor).
+                    """
+                    for other in all_active_trs:
+                        if other["id"] in moved_set or other.get("deleted_at"):
+                            continue
+                        if other.get("track_id") != src_track_id:
+                            continue
+                        from_kf_id = other.get("from")
+                        if not from_kf_id:
+                            continue
+                        from_kf = get_keyframe(project_dir, from_kf_id)
+                        if not from_kf or from_kf.get("track_id") != src_track_id:
+                            continue
+                        if abs(parse_ts(from_kf["timestamp"]) - span_to_t) < 1e-3:
+                            return from_kf_id
+                    return None
+
+                # ── 8. Insert empty-tr bridges on each source track ──────────
+                for src_track_id, merged in merged_by_src.items():
+                    for span_from_t, span_to_t in merged:
+                        left_kf_id = find_surviving_left(src_track_id, span_from_t)
+                        right_kf_id = find_surviving_right(src_track_id, span_to_t)
+                        if left_kf_id and right_kf_id and left_kf_id != right_kf_id:
+                            new_tr_id = next_transition_id(project_dir)
+                            bridge_dur = round(max(0.0, span_to_t - span_from_t), 2)
+                            add_transition(project_dir, {
+                                "id": new_tr_id,
+                                "from": left_kf_id,
+                                "to": right_kf_id,
+                                "duration_seconds": bridge_dur,
+                                "slots": 1,
+                                "action": "",
+                                "use_global_prompt": False,
+                                "selected": [None],
+                                "remap": {"method": "linear", "target_duration": bridge_dur},
+                                "track_id": src_track_id,
+                            })
+
+                # ── 9. Apply kf writes + tr updates for each moved tr ────────
+                # Interior kfs: UPDATE in place (track_id + timestamp flipped) once per kf.
+                # Boundary kfs: INSERT one fresh kf per unique (orig_kf, target_track, new_ts).
+                interior_updated: set[str] = set()
+                boundary_new: dict[tuple[str, str, str], str] = {}  # (orig_kf, tgt_track, new_ts) -> new_kf_id
+
+                def resolve_new_kf(orig_kf: dict, new_time: float, target_track_id: str) -> str:
+                    orig_id = orig_kf["id"]
+                    if is_boundary(orig_id):
+                        key = (orig_id, target_track_id, fmt_ts(new_time))
+                        if key in boundary_new:
+                            return boundary_new[key]
+                        new_kf_id = next_keyframe_id(project_dir)
+                        add_keyframe(project_dir, {
+                            "id": new_kf_id,
+                            "timestamp": fmt_ts(new_time),
+                            "section": orig_kf.get("section", "") or "",
+                            "source": "",
+                            "prompt": "",
+                            "track_id": target_track_id,
+                            "selected": None,
+                            "candidates": [],
+                        })
+                        boundary_new[key] = new_kf_id
+                        return new_kf_id
+                    # Interior: UPDATE in place. Only update once; subsequent moved trs
+                    # referencing the same kf will already see the migrated kf.
+                    if orig_id not in interior_updated:
+                        update_keyframe(project_dir, orig_id,
+                                        track_id=target_track_id,
+                                        timestamp=fmt_ts(new_time))
+                        interior_updated.add(orig_id)
+                    return orig_id
+
                 for entry in trs_to_move:
                     tr = entry["tr"]
-                    from_kf = entry["from_kf"]
-                    to_kf = entry["to_kf"]
+                    tr_id = tr["id"]
+                    target_track_id = entry["target_track_id"]
                     new_from_time = entry["new_from_time"]
                     new_to_time = entry["new_to_time"]
-                    tr_id = tr["id"]
+                    from_kf = entry["from_kf"]
+                    to_kf = entry["to_kf"]
 
-                    # Handle from_kf
-                    from_kf_id = from_kf["id"]
-                    if kf_shared_with_other(from_kf_id):
-                        new_kf_id = next_keyframe_id(project_dir)
-                        add_keyframe(project_dir, {
-                            "id": new_kf_id,
-                            "timestamp": fmt_ts(new_from_time),
-                            "track_id": from_kf.get("track_id", "track_1"),
-                            "selected": None,
-                            "candidates": [],
-                        })
-                        update_transition(project_dir, tr_id, **{"from": new_kf_id})
+                    new_from_kf_id = resolve_new_kf(from_kf, new_from_time, target_track_id)
+
+                    if to_kf["id"] == from_kf["id"]:
+                        # Degenerate zero-length tr; both pointers share one kf.
+                        new_to_kf_id = new_from_kf_id
                     else:
-                        update_keyframe(project_dir, from_kf_id, timestamp=fmt_ts(new_from_time))
+                        new_to_kf_id = resolve_new_kf(to_kf, new_to_time, target_track_id)
 
-                    # Handle to_kf (refetch in case to_kf == from_kf, shouldn't happen but be safe)
-                    to_kf_id = to_kf["id"]
-                    if to_kf_id == from_kf_id:
-                        # Degenerate tr (zero-length); the from_kf branch already handled it.
-                        pass
-                    elif kf_shared_with_other(to_kf_id):
-                        new_kf_id = next_keyframe_id(project_dir)
-                        add_keyframe(project_dir, {
-                            "id": new_kf_id,
-                            "timestamp": fmt_ts(new_to_time),
-                            "track_id": to_kf.get("track_id", "track_1"),
-                            "selected": None,
-                            "candidates": [],
-                        })
-                        update_transition(project_dir, tr_id, **{"to": new_kf_id})
-                    else:
-                        update_keyframe(project_dir, to_kf_id, timestamp=fmt_ts(new_to_time))
-
-                    # Update this tr's duration to match the new from/to spacing.
                     new_dur = round(max(0.0, new_to_time - new_from_time), 2)
-                    update_transition(project_dir, tr_id, duration_seconds=new_dur)
+                    update_fields = {
+                        "track_id": target_track_id,
+                        "duration_seconds": new_dur,
+                    }
+                    update_fields["from"] = new_from_kf_id
+                    update_fields["to"] = new_to_kf_id
+                    update_transition(project_dir, tr_id, **update_fields)
 
                 _log(
                     f"move-transitions: {len(transition_ids)} tr(s) by {time_delta_f:.2f}s "
-                    f"(trackDelta={track_delta_i}, mode={mode})"
+                    f"trackDelta={track_delta_i} createdTracks={len(created_track_ids)} "
+                    f"mode={mode}"
                 )
                 self._json_response({
                     "success": True,
                     "movedTransitionIds": list(transition_ids),
-                    "createdTrackIds": [],
+                    "createdTrackIds": created_track_ids,
                     "consumedTransitionIds": [],
                     "splitTransitionIds": [],
                 })
