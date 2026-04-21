@@ -672,6 +672,14 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             if m:
                 return self._handle_clip_trim_edge(m.group(1))
 
+            # POST /api/projects/:name/move-transitions — drag-to-move clips in time
+            # and/or across tracks. See design/local.clip-move-cross-track.md.
+            # Task 93 scope: same-track, time-delta only. Cross-track (Task 94),
+            # overlap resolution (Task 95), and copy mode (Task 96) come later.
+            m = re.match(r"^/api/projects/([^/]+)/move-transitions$", path)
+            if m:
+                return self._handle_move_transitions(m.group(1))
+
             # POST /api/projects/:name/update-prompt
             m = re.match(r"^/api/projects/([^/]+)/update-prompt$", path)
             if m:
@@ -3122,6 +3130,208 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 self._json_response({
                     "success": True, "mode": "extend-partial",
                     "transitionId": tr_id, "neighborId": neighbor["id"],
+                })
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self._error(500, "INTERNAL_ERROR", str(e))
+
+        def _handle_move_transitions(self, project_name: str):
+            """POST /api/projects/:name/move-transitions — drag-to-move clips.
+
+            Body: {
+              "mode": "move" | "copy",                  # default "move"
+              "trackDelta": 0,                          # applied to each tr's current track
+              "timeDeltaSeconds": 3.5,                  # applied to each tr's from/to timestamps
+              "transitionIds": ["tr_001", ...],         # flat list of clips in the batch
+              "autoCreateTracks": true                  # default true (unused in this task)
+            }
+
+            Task 93 scope — same-track, single-delta time-shift only:
+              - mode="copy" -> 501 Not Implemented (Task 96)
+              - trackDelta != 0 -> 501 Not Implemented (Task 94)
+              - overlap on target -> not handled in this task (Task 95); downstream tasks extend this
+                handler with resolution logic. For now, timestamps are shifted without regard to
+                target-track overlaps (same track only, so collisions within the moved set alone).
+
+            Same-track move algorithm:
+              For each tr_id:
+                - Fetch tr + from_kf + to_kf.
+                - new_from_time = parse_ts(from_kf.timestamp) + timeDeltaSeconds
+                - new_to_time   = parse_ts(to_kf.timestamp)   + timeDeltaSeconds
+                - If new_from_time < 0 -> 400.
+                - Boundary kf is "shared" if any OTHER tr (not in transitionIds, deleted_at IS NULL)
+                  references it as from or to:
+                    * unshared -> update kf.timestamp in place
+                    * shared   -> create a fresh kf on the same track at new_time;
+                                 repoint this tr's from/to at the new kf
+                - Update tr.duration_seconds = round(new_to_time - new_from_time, 2).
+
+            Response:
+              {
+                "success": true,
+                "movedTransitionIds": [...],
+                "createdTrackIds": [],      # always empty in this task
+                "consumedTransitionIds": [],
+                "splitTransitionIds": []
+              }
+            """
+            body = self._read_json_body()
+            if body is None:
+                return
+
+            mode = body.get("mode", "move")
+            track_delta = body.get("trackDelta")
+            time_delta = body.get("timeDeltaSeconds")
+            transition_ids = body.get("transitionIds")
+            # autoCreateTracks parsed but unused in Task 93 (same-track only); kept for forward compat.
+            _auto_create_tracks = body.get("autoCreateTracks", True)
+
+            if mode not in ("move", "copy"):
+                return self._error(400, "BAD_REQUEST", "mode must be 'move' or 'copy'")
+            if mode == "copy":
+                return self._error(501, "NOT_IMPLEMENTED", "copy mode not yet implemented (Task 96)")
+            if not isinstance(transition_ids, list) or len(transition_ids) == 0:
+                return self._error(400, "BAD_REQUEST", "transitionIds must be a non-empty list")
+            if track_delta is None:
+                return self._error(400, "BAD_REQUEST", "Missing 'trackDelta'")
+            try:
+                track_delta_i = int(track_delta)
+            except (TypeError, ValueError):
+                return self._error(400, "BAD_REQUEST", "trackDelta must be an integer")
+            if track_delta_i != 0:
+                return self._error(501, "NOT_IMPLEMENTED", "cross-track move not yet implemented (Task 94)")
+            if time_delta is None:
+                return self._error(400, "BAD_REQUEST", "Missing 'timeDeltaSeconds'")
+            try:
+                time_delta_f = float(time_delta)
+            except (TypeError, ValueError):
+                return self._error(400, "BAD_REQUEST", "timeDeltaSeconds must be a number")
+
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+
+            try:
+                from scenecraft.db import (
+                    undo_begin as _ub, get_transition, update_transition,
+                    update_keyframe, get_keyframe, get_transitions as _get_trs,
+                    add_keyframe, next_keyframe_id,
+                )
+
+                def parse_ts(ts):
+                    parts = str(ts).split(":")
+                    if len(parts) == 2:
+                        return int(parts[0]) * 60 + float(parts[1])
+                    return float(ts) if isinstance(ts, (int, float)) else 0.0
+
+                def fmt_ts(seconds: float) -> str:
+                    s = max(0.0, seconds)
+                    m = int(s // 60)
+                    rem = s - m * 60
+                    return f"{m}:{rem:05.2f}"
+
+                # Pre-validate: all tr_ids exist and are active, all new_from_time >= 0.
+                moved_set = set(transition_ids)
+                trs_to_move: list[dict] = []
+                for tr_id in transition_ids:
+                    tr = get_transition(project_dir, tr_id)
+                    if not tr:
+                        return self._error(404, "NOT_FOUND", f"Transition not found: {tr_id}")
+                    if tr.get("deleted_at"):
+                        return self._error(400, "BAD_REQUEST", f"Transition is deleted: {tr_id}")
+                    from_kf = get_keyframe(project_dir, tr.get("from"))
+                    to_kf = get_keyframe(project_dir, tr.get("to"))
+                    if not from_kf or not to_kf:
+                        return self._error(500, "INTERNAL_ERROR", f"Missing boundary kfs for {tr_id}")
+                    new_from_time = parse_ts(from_kf["timestamp"]) + time_delta_f
+                    new_to_time = parse_ts(to_kf["timestamp"]) + time_delta_f
+                    if new_from_time < -0.0005:
+                        return self._error(
+                            400, "BAD_REQUEST",
+                            f"Move would push {tr_id} past timeline start (new_from={new_from_time:.2f})",
+                        )
+                    trs_to_move.append({
+                        "tr": tr,
+                        "from_kf": from_kf,
+                        "to_kf": to_kf,
+                        "new_from_time": new_from_time,
+                        "new_to_time": new_to_time,
+                    })
+
+                _ub(project_dir, f"Move {len(transition_ids)} tr(s) by {time_delta_f:.2f}s")
+
+                # Snapshot all active trs once for shareability checks; rebuild after kf writes?
+                # Shareability is determined against non-moved trs, which are unaffected by our
+                # updates within this batch, so a single snapshot suffices.
+                all_active_trs = _get_trs(project_dir)
+
+                def kf_shared_with_other(kf_id: str) -> bool:
+                    """Return True if any active, non-moved tr references this kf (from or to)."""
+                    for other in all_active_trs:
+                        if other["id"] in moved_set:
+                            continue
+                        if other.get("deleted_at"):
+                            continue
+                        if other.get("from") == kf_id or other.get("to") == kf_id:
+                            return True
+                    return False
+
+                for entry in trs_to_move:
+                    tr = entry["tr"]
+                    from_kf = entry["from_kf"]
+                    to_kf = entry["to_kf"]
+                    new_from_time = entry["new_from_time"]
+                    new_to_time = entry["new_to_time"]
+                    tr_id = tr["id"]
+
+                    # Handle from_kf
+                    from_kf_id = from_kf["id"]
+                    if kf_shared_with_other(from_kf_id):
+                        new_kf_id = next_keyframe_id(project_dir)
+                        add_keyframe(project_dir, {
+                            "id": new_kf_id,
+                            "timestamp": fmt_ts(new_from_time),
+                            "track_id": from_kf.get("track_id", "track_1"),
+                            "selected": None,
+                            "candidates": [],
+                        })
+                        update_transition(project_dir, tr_id, **{"from": new_kf_id})
+                    else:
+                        update_keyframe(project_dir, from_kf_id, timestamp=fmt_ts(new_from_time))
+
+                    # Handle to_kf (refetch in case to_kf == from_kf, shouldn't happen but be safe)
+                    to_kf_id = to_kf["id"]
+                    if to_kf_id == from_kf_id:
+                        # Degenerate tr (zero-length); the from_kf branch already handled it.
+                        pass
+                    elif kf_shared_with_other(to_kf_id):
+                        new_kf_id = next_keyframe_id(project_dir)
+                        add_keyframe(project_dir, {
+                            "id": new_kf_id,
+                            "timestamp": fmt_ts(new_to_time),
+                            "track_id": to_kf.get("track_id", "track_1"),
+                            "selected": None,
+                            "candidates": [],
+                        })
+                        update_transition(project_dir, tr_id, **{"to": new_kf_id})
+                    else:
+                        update_keyframe(project_dir, to_kf_id, timestamp=fmt_ts(new_to_time))
+
+                    # Update this tr's duration to match the new from/to spacing.
+                    new_dur = round(max(0.0, new_to_time - new_from_time), 2)
+                    update_transition(project_dir, tr_id, duration_seconds=new_dur)
+
+                _log(
+                    f"move-transitions: {len(transition_ids)} tr(s) by {time_delta_f:.2f}s "
+                    f"(trackDelta={track_delta_i}, mode={mode})"
+                )
+                self._json_response({
+                    "success": True,
+                    "movedTransitionIds": list(transition_ids),
+                    "createdTrackIds": [],
+                    "consumedTransitionIds": [],
+                    "splitTransitionIds": [],
                 })
             except Exception as e:
                 import traceback
