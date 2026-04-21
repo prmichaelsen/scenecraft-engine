@@ -4904,26 +4904,41 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 self._error(500, "INTERNAL_ERROR", str(e))
 
         def _handle_paste_group(self, project_name: str):
-            """POST /api/projects/:name/paste-group — duplicate a group of keyframes+transitions to a new position/track.
+            """POST /api/projects/:name/paste-group — duplicate a group of keyframes+transitions
+            (and optionally audio_clips) to a new position/track.
 
-            Body: { "keyframeIds": ["kf_001", ...], "targetTime": "0:30.00", "targetTrackId": "track_2" }
+            Body: {
+              "keyframeIds": ["kf_001", ...],
+              "audioClipIds": ["audio_clip_xxx", ...]  (optional),
+              "targetTime": "0:30.00",
+              "targetTrackId": "track_2"
+            }
+
+            Anchoring: all pasted items are offset by
+              delta = targetTime - min(source_start_times_across_all_pasted_items)
+            so the relative layout is preserved. Audio clips are cloned with new IDs,
+            shifted start/end, and stay on their original audio_track. Clones are
+            always unlinked — the link-to-transition is not restored, even if the
+            source transition is also pasted (the new pasted transition has a new
+            ID, so re-linking would need its own logic).
             """
             body = self._read_json_body()
             if body is None:
                 return
 
             kf_ids = body.get("keyframeIds", [])
+            audio_clip_ids = body.get("audioClipIds", [])
             target_time_str = body.get("targetTime")
             target_track = body.get("targetTrackId", "track_1")
-            if not kf_ids or not target_time_str:
-                return self._error(400, "BAD_REQUEST", "Missing 'keyframeIds' or 'targetTime'")
+            if (not kf_ids and not audio_clip_ids) or not target_time_str:
+                return self._error(400, "BAD_REQUEST", "Missing content ('keyframeIds' or 'audioClipIds') or 'targetTime'")
 
             project_dir = self._require_project_dir(project_name)
             if project_dir is None:
                 return
 
             from scenecraft.db import undo_begin
-            undo_begin(project_dir, f"Paste {len(kf_ids)} keyframes")
+            undo_begin(project_dir, f"Paste {len(kf_ids)} keyframes + {len(audio_clip_ids)} audio clips")
 
             try:
                 from scenecraft.db import (
@@ -4946,17 +4961,32 @@ def make_handler(work_dir: Path, no_auth: bool = False):
 
                 target_time = parse_ts(target_time_str)
 
-                # 1. Read source keyframes, sort by time
+                # 1. Read source keyframes + audio clips, compute the anchor (earliest start).
+                from scenecraft.db import get_audio_clips as db_get_audio_clips
                 src_kfs = []
                 for kid in kf_ids:
                     kf = db_get_kf(project_dir, kid)
                     if kf and not kf.get("deleted_at"):
                         src_kfs.append(kf)
-                if not src_kfs:
-                    return self._error(404, "NOT_FOUND", "No valid keyframes found")
+
+                src_audio_clips = []
+                if audio_clip_ids:
+                    all_clips = {c["id"]: c for c in db_get_audio_clips(project_dir)}
+                    for cid in audio_clip_ids:
+                        c = all_clips.get(cid)
+                        if c:
+                            src_audio_clips.append(c)
+
+                if not src_kfs and not src_audio_clips:
+                    return self._error(404, "NOT_FOUND", "No valid keyframes or audio clips found")
 
                 src_kfs.sort(key=lambda k: parse_ts(k["timestamp"]))
-                min_time = parse_ts(src_kfs[0]["timestamp"])
+                candidate_mins = []
+                if src_kfs:
+                    candidate_mins.append(parse_ts(src_kfs[0]["timestamp"]))
+                if src_audio_clips:
+                    candidate_mins.append(min(float(c["start_time"]) for c in src_audio_clips))
+                min_time = min(candidate_mins)
 
                 # 2. Create new keyframes with offset times
                 id_map = {}  # old_kf_id -> new_kf_id
@@ -5103,11 +5133,36 @@ def make_handler(work_dir: Path, no_auth: bool = False):
 
                     created_trs.append({"id": new_tr_id, "from": new_from, "to": new_to})
 
-                _log(f"paste-group: {len(created_kfs)} kfs, {len(created_trs)} trs pasted at {target_time_str} on {target_track}")
+                # 4. Clone audio clips — new ID, shifted start/end, original audio track,
+                # no link restored (source_path reused, not re-extracted).
+                from scenecraft.db import add_audio_clip as db_add_audio_clip, generate_id
+                created_audio_clips = []
+                for src_clip in src_audio_clips:
+                    src_start = float(src_clip["start_time"])
+                    src_end = float(src_clip["end_time"])
+                    offset = src_start - min_time
+                    new_start = target_time + offset
+                    new_end = new_start + (src_end - src_start)
+                    new_clip_id = generate_id("audio_clip")
+                    db_add_audio_clip(project_dir, {
+                        "id": new_clip_id,
+                        "track_id": src_clip["track_id"],
+                        "source_path": src_clip["source_path"],
+                        "start_time": new_start,
+                        "end_time": new_end,
+                        "source_offset": src_clip.get("source_offset", 0.0),
+                        "volume_curve": src_clip.get("volume_curve"),
+                        "muted": src_clip.get("muted", False),
+                        "remap": src_clip.get("remap"),
+                    })
+                    created_audio_clips.append({"id": new_clip_id, "track_id": src_clip["track_id"], "start_time": new_start, "end_time": new_end})
+
+                _log(f"paste-group: {len(created_kfs)} kfs, {len(created_trs)} trs, {len(created_audio_clips)} clips pasted at {target_time_str} on {target_track}")
                 self._json_response({
                     "success": True,
                     "keyframes": created_kfs,
                     "transitions": created_trs,
+                    "audioClips": created_audio_clips,
                 })
             except Exception as e:
                 _log(f"paste-group FAILED: {e}")
