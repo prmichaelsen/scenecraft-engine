@@ -142,12 +142,13 @@ def _seed_three_clip_track(project_dir):
 
 
 class TestMoveTransitionsValidation:
-    def test_copy_mode_rejected_with_501(self, project_env):
+    def test_copy_mode_accepted(self, project_env):
+        """Task 96: copy mode is now implemented. A valid copy request returns 200."""
         _seed_three_clip_track(project_env["project_dir"])
         status, body = api(project_env, "POST",
             f"/api/projects/{project_env['project_name']}/move-transitions",
-            {"mode": "copy", "trackDelta": 0, "timeDeltaSeconds": 1.0, "transitionIds": ["tr_001"]})
-        assert status == 501, f"expected 501, got {status}: {body}"
+            {"mode": "copy", "trackDelta": 0, "timeDeltaSeconds": 100.0, "transitionIds": ["tr_001"]})
+        assert status == 200, f"expected 200, got {status}: {body}"
 
     def test_empty_transition_ids_rejected(self, project_env):
         _seed_three_clip_track(project_env["project_dir"])
@@ -883,3 +884,292 @@ class TestMoveTransitionsOverlapResolution:
         # Left remainder: [5,8], trim [0, 3]; Right remainder: [13,15], trim [8,10]
         durs = sorted(round(t["duration_seconds"], 2) for t in track_2_content)
         assert durs == [2.0, 3.0]
+
+
+# ── Task 96: copy mode ────────────────────────────────────────────────
+
+
+def _seed_tr_candidate_for(project_dir, tr_id: str, slot: int = 0):
+    """Seed one pool_segments row + tr_candidates junction row for tr_id/slot.
+
+    Returns the pool_segment_id so tests can assert the copy references the same
+    underlying pool file (no duplication).
+    """
+    from scenecraft.db import add_pool_segment, add_tr_candidate
+    seg_id = add_pool_segment(
+        project_dir,
+        kind="generated",
+        created_by="test",
+        pool_path=f"pool/segments/seg_{tr_id}_{slot}.mp4",
+        duration_seconds=5.0,
+    )
+    add_tr_candidate(
+        project_dir,
+        transition_id=tr_id,
+        slot=slot,
+        pool_segment_id=seg_id,
+        source="generated",
+    )
+    return seg_id
+
+
+def _seed_cache_file(project_dir, tr_id: str, slot: int = 0) -> Path:
+    """Create a dummy selected_transitions/{tr}_slot_{N}.mp4 file so the cache-copy
+    path has something to copy. Returns the created path.
+    """
+    sel_dir = project_dir / "selected_transitions"
+    sel_dir.mkdir(exist_ok=True)
+    p = sel_dir / f"{tr_id}_slot_{slot}.mp4"
+    p.write_bytes(b"fake-mp4-bytes-for-" + tr_id.encode())
+    return p
+
+
+def _get_tr_candidates_raw(project_dir, tr_id: str) -> list[dict]:
+    """Fetch raw tr_candidates rows for a transition (slot 0) without the pool join."""
+    from scenecraft.db import get_db
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        "SELECT transition_id, slot, pool_segment_id, source FROM tr_candidates "
+        "WHERE transition_id = ? ORDER BY slot, added_at",
+        (tr_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+class TestMoveTransitionsCopyMode:
+    def test_same_track_copy_leaves_source_intact(self, project_env):
+        """Copy tr_002 in place +10s on track_1.
+
+        The source tr_002 must remain active at its original position. A fresh tr
+        copy with a new id must sit on track_1 at [25, 30]. The copy's tr_candidates
+        must be a clone of the source's (same pool_segment_id).
+        """
+        project_dir = project_env["project_dir"]
+        _seed_three_clip_track(project_dir)
+        source_seg = _seed_tr_candidate_for(project_dir, "tr_002")
+        _seed_cache_file(project_dir, "tr_002")
+
+        trs_before = {t["id"] for t in get_transitions(project_dir)}
+        tr_002_before = get_transition(project_dir, "tr_002")
+
+        status, body = api(project_env, "POST",
+            f"/api/projects/{project_env['project_name']}/move-transitions",
+            {"mode": "copy", "trackDelta": 0, "timeDeltaSeconds": 10.0,
+             "transitionIds": ["tr_002"]})
+        assert status == 200, f"got {status}: {body}"
+
+        # Source unchanged.
+        tr_002_after = get_transition(project_dir, "tr_002")
+        assert tr_002_after["deleted_at"] is None
+        assert tr_002_after["from"] == tr_002_before["from"]
+        assert tr_002_after["to"] == tr_002_before["to"]
+        assert tr_002_after["track_id"] == "track_1"
+
+        # Response returns the new tr id (not the source).
+        assert len(body["movedTransitionIds"]) == 1
+        new_tr_id = body["movedTransitionIds"][0]
+        assert new_tr_id != "tr_002"
+        assert new_tr_id not in trs_before
+
+        # The copy sits on track_1 with shifted from/to.
+        new_tr = get_transition(project_dir, new_tr_id)
+        assert new_tr is not None
+        assert new_tr["track_id"] == "track_1"
+        new_from_kf = get_keyframe(project_dir, new_tr["from"])
+        new_to_kf = get_keyframe(project_dir, new_tr["to"])
+        assert abs(parse_ts(new_from_kf["timestamp"]) - 25.0) < 0.01
+        assert abs(parse_ts(new_to_kf["timestamp"]) - 30.0) < 0.01
+        # Cloned fields
+        assert new_tr["duration_seconds"] == tr_002_before["duration_seconds"]
+        assert new_tr["selected"] == tr_002_before["selected"]
+
+        # tr_candidates references the SAME pool_segment_id (no file duplication).
+        copy_junction = _get_tr_candidates_raw(project_dir, new_tr_id)
+        assert len(copy_junction) == 1
+        assert copy_junction[0]["pool_segment_id"] == source_seg
+        assert copy_junction[0]["source"] == "copy-inherit"
+
+        # Source junction still intact.
+        src_junction = _get_tr_candidates_raw(project_dir, "tr_002")
+        assert len(src_junction) == 1
+        assert src_junction[0]["pool_segment_id"] == source_seg
+
+    def test_cross_track_copy_source_untouched(self, project_env):
+        """Copy tr_002 to track_2 (trackDelta=+1). Source stays on track_1."""
+        project_dir = project_env["project_dir"]
+        _ensure_track(project_dir, "track_2", z_order=1, name="Track 2")
+        _seed_three_clip_track(project_dir)
+        _seed_tr_candidate_for(project_dir, "tr_002")
+
+        status, body = api(project_env, "POST",
+            f"/api/projects/{project_env['project_name']}/move-transitions",
+            {"mode": "copy", "trackDelta": 1, "timeDeltaSeconds": 0.0,
+             "transitionIds": ["tr_002"]})
+        assert status == 200, f"got {status}: {body}"
+
+        # Source unchanged on track_1.
+        tr_002_after = get_transition(project_dir, "tr_002")
+        assert tr_002_after["deleted_at"] is None
+        assert tr_002_after["track_id"] == "track_1"
+        assert tr_002_after["from"] == "kf_002"
+        assert tr_002_after["to"] == "kf_003"
+
+        # Copy on track_2 with cloned timestamps.
+        new_tr_id = body["movedTransitionIds"][0]
+        new_tr = get_transition(project_dir, new_tr_id)
+        assert new_tr["track_id"] == "track_2"
+        new_from_kf = get_keyframe(project_dir, new_tr["from"])
+        new_to_kf = get_keyframe(project_dir, new_tr["to"])
+        assert new_from_kf["track_id"] == "track_2"
+        assert new_to_kf["track_id"] == "track_2"
+        assert abs(parse_ts(new_from_kf["timestamp"]) - 15.0) < 0.01
+        assert abs(parse_ts(new_to_kf["timestamp"]) - 20.0) < 0.01
+
+    def test_multi_clip_copy_creates_n_fresh_copies(self, project_env):
+        """Copying tr_001 + tr_002 together: both sources stay put; two fresh copies appear."""
+        project_dir = project_env["project_dir"]
+        _ensure_track(project_dir, "track_2", z_order=1, name="Track 2")
+        _seed_three_clip_track(project_dir)
+        _seed_tr_candidate_for(project_dir, "tr_001")
+        _seed_tr_candidate_for(project_dir, "tr_002")
+
+        trs_before = {t["id"] for t in get_transitions(project_dir)}
+
+        status, body = api(project_env, "POST",
+            f"/api/projects/{project_env['project_name']}/move-transitions",
+            {"mode": "copy", "trackDelta": 1, "timeDeltaSeconds": 100.0,
+             "transitionIds": ["tr_001", "tr_002"]})
+        assert status == 200, f"got {status}: {body}"
+
+        # Source trs unchanged.
+        tr_001_after = get_transition(project_dir, "tr_001")
+        tr_002_after = get_transition(project_dir, "tr_002")
+        assert tr_001_after["deleted_at"] is None
+        assert tr_002_after["deleted_at"] is None
+        assert tr_001_after["track_id"] == "track_1"
+        assert tr_002_after["track_id"] == "track_1"
+        assert tr_001_after["from"] == "kf_001" and tr_001_after["to"] == "kf_002"
+        assert tr_002_after["from"] == "kf_002" and tr_002_after["to"] == "kf_003"
+
+        # Two fresh copies, both on track_2.
+        assert len(body["movedTransitionIds"]) == 2
+        for new_id in body["movedTransitionIds"]:
+            assert new_id not in trs_before
+            new_tr = get_transition(project_dir, new_id)
+            assert new_tr["track_id"] == "track_2"
+
+        # Pair order: index i in request -> index i in response.
+        new_tr_0 = get_transition(project_dir, body["movedTransitionIds"][0])
+        new_tr_1 = get_transition(project_dir, body["movedTransitionIds"][1])
+        k0_from = get_keyframe(project_dir, new_tr_0["from"])
+        k1_from = get_keyframe(project_dir, new_tr_1["from"])
+        # tr_001 source at 10 -> copy at 110; tr_002 source at 15 -> copy at 115.
+        assert abs(parse_ts(k0_from["timestamp"]) - 110.0) < 0.01
+        assert abs(parse_ts(k1_from["timestamp"]) - 115.0) < 0.01
+
+    def test_copy_lands_on_overlap_triggers_resolution(self, project_env):
+        """Copy tr_src onto track_2 fully inside tr_target -> Case D three-way split.
+
+        Source tr_src stays intact on track_1. tr_target is soft-deleted, two
+        remainder trs appear on track_2, and the copy itself is unaffected.
+        """
+        project_dir = project_env["project_dir"]
+        _seed_two_track_content(project_dir)   # track_2: tr_target [5,15]
+        _seed_single_clip_on_track_1(project_dir)  # track_1: tr_src [30,35]
+        _seed_tr_candidate_for(project_dir, "tr_src")
+
+        # Copy tr_src fully inside tr_target: [30,35] -> [8,13] on track_2.
+        # timeDelta=-22, trackDelta=+1.
+        status, body = api(project_env, "POST",
+            f"/api/projects/{project_env['project_name']}/move-transitions",
+            {"mode": "copy", "trackDelta": 1, "timeDeltaSeconds": -22.0,
+             "transitionIds": ["tr_src"]})
+        assert status == 200, f"got {status}: {body}"
+
+        # Source unchanged on track_1.
+        tr_src_after = get_transition(project_dir, "tr_src")
+        assert tr_src_after["deleted_at"] is None
+        assert tr_src_after["track_id"] == "track_1"
+
+        # tr_target split fires.
+        tr_target = get_transition(project_dir, "tr_target")
+        assert tr_target["deleted_at"] is not None
+        assert "tr_target" in body["splitTransitionIds"]
+
+        # The copy itself is alive on track_2.
+        new_tr_id = body["movedTransitionIds"][0]
+        new_tr = get_transition(project_dir, new_tr_id)
+        assert new_tr["deleted_at"] is None
+        assert new_tr["track_id"] == "track_2"
+
+    def test_no_pool_file_duplication(self, project_env):
+        """Both the source and the copy reference the SAME pool_segment_id rows."""
+        project_dir = project_env["project_dir"]
+        _ensure_track(project_dir, "track_2", z_order=1, name="Track 2")
+        _seed_three_clip_track(project_dir)
+        src_seg_slot0 = _seed_tr_candidate_for(project_dir, "tr_001", slot=0)
+        # Also seed a second candidate at slot 0 to verify multi-row cloning.
+        from scenecraft.db import add_pool_segment, add_tr_candidate
+        seg_b = add_pool_segment(project_dir, kind="generated", created_by="test",
+                                 pool_path="pool/segments/seg_b.mp4", duration_seconds=5.0)
+        add_tr_candidate(project_dir, transition_id="tr_001", slot=0,
+                         pool_segment_id=seg_b, source="generated")
+
+        status, body = api(project_env, "POST",
+            f"/api/projects/{project_env['project_name']}/move-transitions",
+            {"mode": "copy", "trackDelta": 1, "timeDeltaSeconds": 0.0,
+             "transitionIds": ["tr_001"]})
+        assert status == 200
+
+        new_tr_id = body["movedTransitionIds"][0]
+        copy_junction = _get_tr_candidates_raw(project_dir, new_tr_id)
+        copy_seg_ids = {r["pool_segment_id"] for r in copy_junction}
+        assert copy_seg_ids == {src_seg_slot0, seg_b}
+
+        # All copy rows have source="copy-inherit"
+        for r in copy_junction:
+            assert r["source"] == "copy-inherit"
+
+    def test_selected_transitions_cache_copied(self, project_env):
+        """After a copy, selected_transitions/{new_tr_id}_slot_0.mp4 exists."""
+        project_dir = project_env["project_dir"]
+        _ensure_track(project_dir, "track_2", z_order=1, name="Track 2")
+        _seed_three_clip_track(project_dir)
+        src_cache = _seed_cache_file(project_dir, "tr_001", slot=0)
+        assert src_cache.exists()
+
+        status, body = api(project_env, "POST",
+            f"/api/projects/{project_env['project_name']}/move-transitions",
+            {"mode": "copy", "trackDelta": 1, "timeDeltaSeconds": 0.0,
+             "transitionIds": ["tr_001"]})
+        assert status == 200
+
+        new_tr_id = body["movedTransitionIds"][0]
+        copy_cache = project_dir / "selected_transitions" / f"{new_tr_id}_slot_0.mp4"
+        assert copy_cache.exists(), f"expected cache file at {copy_cache}"
+        # Source cache still present.
+        assert src_cache.exists()
+        # Contents match (shutil.copy2 preserves bytes).
+        assert copy_cache.read_bytes() == src_cache.read_bytes()
+
+    def test_response_contains_new_ids_not_source(self, project_env):
+        """movedTransitionIds must be the NEW tr ids in copy mode."""
+        project_dir = project_env["project_dir"]
+        _seed_three_clip_track(project_dir)
+
+        status, body = api(project_env, "POST",
+            f"/api/projects/{project_env['project_name']}/move-transitions",
+            {"mode": "copy", "trackDelta": 0, "timeDeltaSeconds": 100.0,
+             "transitionIds": ["tr_001", "tr_002"]})
+        assert status == 200
+
+        # Neither tr_001 nor tr_002 should appear in the response.
+        assert "tr_001" not in body["movedTransitionIds"]
+        assert "tr_002" not in body["movedTransitionIds"]
+        assert len(body["movedTransitionIds"]) == 2
+
+        # All new ids point to active trs.
+        for new_id in body["movedTransitionIds"]:
+            t = get_transition(project_dir, new_id)
+            assert t is not None
+            assert t["deleted_at"] is None

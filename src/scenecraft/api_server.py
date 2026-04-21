@@ -3282,10 +3282,11 @@ def make_handler(work_dir: Path, no_auth: bool = False):
               "autoCreateTracks": true                  # default true
             }
 
-            Task 94 scope — same-track + cross-track + auto-create-tracks, move mode only:
-              - mode="copy" -> 501 Not Implemented (Task 96)
-              - target overlap resolution -> not handled (Task 95). Caller is responsible for
-                ensuring the drop lands on empty space on the target track.
+            Modes:
+              - "move" (default): source clips migrate to target per kf ownership model.
+              - "copy" (Task 96): source clips unchanged; fresh clones land on target with
+                cloned tr_candidates junction rows, transition_effects rows, and
+                selected_transitions cache. Overlap resolution on target fires identically.
 
             Kf ownership model (see agent/design/local.clip-move-cross-track.md):
               A kf is "interior" when every active tr (deleted_at IS NULL) that references it
@@ -3332,8 +3333,6 @@ def make_handler(work_dir: Path, no_auth: bool = False):
 
             if mode not in ("move", "copy"):
                 return self._error(400, "BAD_REQUEST", "mode must be 'move' or 'copy'")
-            if mode == "copy":
-                return self._error(501, "NOT_IMPLEMENTED", "copy mode not yet implemented (Task 96)")
             if not isinstance(transition_ids, list) or len(transition_ids) == 0:
                 return self._error(400, "BAD_REQUEST", "transitionIds must be a non-empty list")
             if track_delta is None:
@@ -3510,13 +3509,29 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                             return True
                     return False
 
+                def _copy_selected_transitions_cache(src_tr_id: str, dst_tr_id: str):
+                    """Copy selected_transitions/{src}_slot_*.mp4 to {dst}_slot_*.mp4."""
+                    import shutil as _sh
+                    sel_dir = project_dir / "selected_transitions"
+                    if not sel_dir.exists():
+                        return
+                    for src_file in sel_dir.glob(f"{src_tr_id}_slot_*.mp4"):
+                        suffix = src_file.name[len(src_tr_id):]  # "_slot_N.mp4"
+                        dst_file = sel_dir / f"{dst_tr_id}{suffix}"
+                        try:
+                            _sh.copy2(str(src_file), str(dst_file))
+                        except Exception as _e:
+                            _log(f"  cache copy failed {src_file.name} -> {dst_file.name}: {_e}")
+
                 # ── 7. Source-track cleanup: compute merged vacated spans ─────
+                # Copy mode skips source cleanup entirely — source clips stay put.
                 spans_by_src: dict[str, list[tuple[float, float]]] = {}
-                for entry in trs_to_move:
-                    src = entry["source_track_id"]
-                    a = parse_ts(entry["from_kf"]["timestamp"])
-                    b = parse_ts(entry["to_kf"]["timestamp"])
-                    spans_by_src.setdefault(src, []).append((a, b))
+                if mode == "move":
+                    for entry in trs_to_move:
+                        src = entry["source_track_id"]
+                        a = parse_ts(entry["from_kf"]["timestamp"])
+                        b = parse_ts(entry["to_kf"]["timestamp"])
+                        spans_by_src.setdefault(src, []).append((a, b))
 
                 def merge_spans(spans: list[tuple[float, float]]) -> list[tuple[float, float]]:
                     if not spans:
@@ -3594,10 +3609,18 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                             })
 
                 # ── 9. Apply kf writes + tr updates for each moved tr ────────
-                # Interior kfs: UPDATE in place (track_id + timestamp flipped) once per kf.
-                # Boundary kfs: INSERT one fresh kf per unique (orig_kf, target_track, new_ts).
+                # Move mode:
+                #   Interior kfs: UPDATE in place (track_id + timestamp flipped) once per kf.
+                #   Boundary kfs: INSERT one fresh kf per unique (orig_kf, target_track, new_ts).
+                # Copy mode:
+                #   Source clips stay put. Every target kf is a FRESH INSERT (or reuse an existing
+                #   target-track kf that already exists at an exact matching timestamp). Clone the
+                #   tr row, junction rows, effects, and cache.
                 interior_updated: set[str] = set()
                 boundary_new: dict[tuple[str, str, str], str] = {}  # (orig_kf, tgt_track, new_ts) -> new_kf_id
+                copy_kf_cache: dict[tuple[str, str], str] = {}  # (target_track, ts_str) -> kf_id
+                new_tr_ids: list[str] = []
+                source_to_new_tr: dict[str, str] = {}
 
                 def resolve_new_kf(orig_kf: dict, new_time: float, target_track_id: str) -> str:
                     orig_id = orig_kf["id"]
@@ -3627,6 +3650,87 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                         interior_updated.add(orig_id)
                     return orig_id
 
+                def resolve_copy_kf(orig_kf: dict, new_time: float, target_track_id: str) -> str:
+                    """Copy mode: always allocate a fresh kf on target, unless an existing
+                    target-track kf already sits at the exact timestamp (strict equality
+                    within epsilon). Snap semantics land in Task 99+."""
+                    ts_str = fmt_ts(new_time)
+                    cache_key = (target_track_id, ts_str)
+                    if cache_key in copy_kf_cache:
+                        return copy_kf_cache[cache_key]
+                    # Look for an existing active kf on the target track at the same timestamp.
+                    from scenecraft.db import get_keyframes as _get_kfs
+                    for existing in _get_kfs(project_dir):
+                        if existing.get("deleted_at"):
+                            continue
+                        if existing.get("track_id") != target_track_id:
+                            continue
+                        if abs(parse_ts(existing["timestamp"]) - new_time) < 1e-4:
+                            copy_kf_cache[cache_key] = existing["id"]
+                            return existing["id"]
+                    # Otherwise insert a fresh kf on target.
+                    new_kf_id = next_keyframe_id(project_dir)
+                    add_keyframe(project_dir, {
+                        "id": new_kf_id,
+                        "timestamp": ts_str,
+                        "section": orig_kf.get("section", "") or "",
+                        "source": "",
+                        "prompt": "",
+                        "track_id": target_track_id,
+                        "selected": None,
+                        "candidates": [],
+                    })
+                    copy_kf_cache[cache_key] = new_kf_id
+                    return new_kf_id
+
+                def _build_clone_tr_payload(src_tr: dict, new_id: str, target_track_id: str,
+                                            new_from_kf_id: str, new_to_kf_id: str,
+                                            new_dur: float) -> dict:
+                    """Build an add_transition payload that copies ALL fields from src_tr
+                    except id/track_id/from/to/duration_seconds."""
+                    payload = {
+                        "id": new_id,
+                        "from": new_from_kf_id,
+                        "to": new_to_kf_id,
+                        "duration_seconds": new_dur,
+                        "track_id": target_track_id,
+                        "slots": src_tr.get("slots", 1),
+                        "action": src_tr.get("action", ""),
+                        "use_global_prompt": src_tr.get("use_global_prompt", False),
+                        "selected": src_tr.get("selected"),
+                        "remap": src_tr.get("remap") or {"method": "linear", "target_duration": new_dur},
+                        "trim_in": src_tr.get("trim_in"),
+                        "trim_out": src_tr.get("trim_out"),
+                        "source_video_duration": src_tr.get("source_video_duration"),
+                        "label": src_tr.get("label", ""),
+                        "label_color": src_tr.get("label_color", ""),
+                        "tags": src_tr.get("tags", []),
+                        "blend_mode": src_tr.get("blend_mode", ""),
+                        "opacity": src_tr.get("opacity"),
+                        "opacity_curve": src_tr.get("opacity_curve"),
+                        "red_curve": src_tr.get("red_curve"),
+                        "green_curve": src_tr.get("green_curve"),
+                        "blue_curve": src_tr.get("blue_curve"),
+                        "black_curve": src_tr.get("black_curve"),
+                        "hue_shift_curve": src_tr.get("hue_shift_curve"),
+                        "saturation_curve": src_tr.get("saturation_curve"),
+                        "invert_curve": src_tr.get("invert_curve"),
+                        "is_adjustment": src_tr.get("is_adjustment", False),
+                        "mask_center_x": src_tr.get("mask_center_x"),
+                        "mask_center_y": src_tr.get("mask_center_y"),
+                        "mask_radius": src_tr.get("mask_radius"),
+                        "mask_feather": src_tr.get("mask_feather"),
+                        "transform_x": src_tr.get("transform_x"),
+                        "transform_y": src_tr.get("transform_y"),
+                        "transform_x_curve": src_tr.get("transform_x_curve"),
+                        "transform_y_curve": src_tr.get("transform_y_curve"),
+                        "transform_z_curve": src_tr.get("transform_z_curve"),
+                        "hidden": src_tr.get("hidden", False),
+                        "anchor_x": src_tr.get("anchor_x"),
+                        "anchor_y": src_tr.get("anchor_y"),
+                    }
+                    return payload
+
                 for entry in trs_to_move:
                     tr = entry["tr"]
                     tr_id = tr["id"]
@@ -3635,7 +3739,46 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     new_to_time = entry["new_to_time"]
                     from_kf = entry["from_kf"]
                     to_kf = entry["to_kf"]
+                    new_dur = round(max(0.0, new_to_time - new_from_time), 2)
 
+                    if mode == "copy":
+                        new_from_kf_id = resolve_copy_kf(from_kf, new_from_time, target_track_id)
+                        if to_kf["id"] == from_kf["id"]:
+                            new_to_kf_id = new_from_kf_id
+                        else:
+                            new_to_kf_id = resolve_copy_kf(to_kf, new_to_time, target_track_id)
+
+                        new_tr_id = next_transition_id(project_dir)
+                        payload = _build_clone_tr_payload(
+                            tr, new_tr_id, target_track_id,
+                            new_from_kf_id, new_to_kf_id, new_dur,
+                        )
+                        add_transition(project_dir, payload)
+                        # Clone junction rows + effects + selected_transitions cache.
+                        try:
+                            clone_tr_candidates(project_dir,
+                                                source_transition_id=tr_id,
+                                                target_transition_id=new_tr_id,
+                                                new_source="copy-inherit")
+                        except Exception as _e:
+                            _log(f"  copy: clone_tr_candidates failed: {_e}")
+                        try:
+                            for fx in get_transition_effects(project_dir, tr_id):
+                                add_transition_effect(project_dir, new_tr_id,
+                                                      fx.get("effect_type") or fx.get("type"),
+                                                      fx.get("params"))
+                        except Exception as _e:
+                            _log(f"  copy: effects clone failed: {_e}")
+                        _copy_selected_transitions_cache(tr_id, new_tr_id)
+
+                        entry["new_from_kf_id"] = new_from_kf_id
+                        entry["new_to_kf_id"] = new_to_kf_id
+                        entry["new_tr_id"] = new_tr_id
+                        new_tr_ids.append(new_tr_id)
+                        source_to_new_tr[tr_id] = new_tr_id
+                        continue
+
+                    # ─ move mode ─
                     new_from_kf_id = resolve_new_kf(from_kf, new_from_time, target_track_id)
 
                     if to_kf["id"] == from_kf["id"]:
@@ -3644,7 +3787,6 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     else:
                         new_to_kf_id = resolve_new_kf(to_kf, new_to_time, target_track_id)
 
-                    new_dur = round(max(0.0, new_to_time - new_from_time), 2)
                     update_fields = {
                         "track_id": target_track_id,
                         "duration_seconds": new_dur,
@@ -3700,22 +3842,16 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     if not active_refs:
                         delete_keyframe(project_dir, kf_id, now_iso)
 
-                def _copy_selected_transitions_cache(src_tr_id: str, dst_tr_id: str):
-                    """Copy selected_transitions/{src}_slot_*.mp4 to {dst}_slot_*.mp4."""
-                    import shutil as _sh
-                    sel_dir = project_dir / "selected_transitions"
-                    if not sel_dir.exists():
-                        return
-                    for src_file in sel_dir.glob(f"{src_tr_id}_slot_*.mp4"):
-                        suffix = src_file.name[len(src_tr_id):]  # "_slot_N.mp4"
-                        dst_file = sel_dir / f"{dst_tr_id}{suffix}"
-                        try:
-                            _sh.copy2(str(src_file), str(dst_file))
-                        except Exception as _e:
-                            _log(f"  cache copy failed {src_file.name} -> {dst_file.name}: {_e}")
+                # In copy mode, the "dragged" tr for overlap purposes is the newly cloned
+                # tr, not the source. Exclude all new cloned tr ids from the overlap set so
+                # copies don't treat each other as overlaps.
+                new_tr_ids_set = set(new_tr_ids)
 
                 for entry in trs_to_move:
-                    dragged_tr_id = entry["tr"]["id"]
+                    if mode == "copy":
+                        dragged_tr_id = entry.get("new_tr_id")
+                    else:
+                        dragged_tr_id = entry["tr"]["id"]
                     target_track_id = entry["target_track_id"]
                     new_from = entry["new_from_time"]
                     new_to = entry["new_to_time"]
@@ -3726,14 +3862,19 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     if new_to - new_from < 0.0005:
                         continue  # zero-length drop — skip overlap
 
-                    # Fetch overlaps on target track, excluding all moved trs + the dragged itself
+                    # Fetch overlaps on target track, excluding moved trs (move mode) or new
+                    # cloned tr ids (copy mode) + the dragged itself.
                     all_trs_now = _get_trs(project_dir)
                     overlaps = []
                     for t in all_trs_now:
                         if t.get("deleted_at"):
                             continue
-                        if t["id"] in moved_set or t["id"] == dragged_tr_id:
-                            continue
+                        if mode == "copy":
+                            if t["id"] in new_tr_ids_set or t["id"] == dragged_tr_id:
+                                continue
+                        else:
+                            if t["id"] in moved_set or t["id"] == dragged_tr_id:
+                                continue
                         if t.get("track_id") != target_track_id:
                             continue
                         tfrom_kf = get_keyframe(project_dir, t.get("from"))
@@ -3870,9 +4011,15 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     f"consumed={len(consumed_ids)} split={len(split_ids)} "
                     f"mode={mode}"
                 )
+                # In copy mode, return the NEW tr ids so the frontend can select the copies.
+                # Pair order: index i in request -> index i in response.
+                if mode == "copy":
+                    moved_ids_response = [e["new_tr_id"] for e in trs_to_move]
+                else:
+                    moved_ids_response = list(transition_ids)
                 self._json_response({
                     "success": True,
-                    "movedTransitionIds": list(transition_ids),
+                    "movedTransitionIds": moved_ids_response,
                     "createdTrackIds": created_track_ids,
                     "consumedTransitionIds": consumed_ids,
                     "splitTransitionIds": split_ids,
