@@ -129,7 +129,11 @@ def _render_track(
         end_s = float(clip["end_time"])
         if end_s <= start_s:
             continue
-        offset_s = float(clip.get("source_offset", 0.0))
+        # Derived fields from get_audio_clips: linked clips carry the linear
+        # remap factor and trim-adjusted source offset. Unlinked clips default
+        # to rate=1 and effective_source_offset==source_offset.
+        rate = float(clip.get("playback_rate") or 1.0)
+        eff_offset_s = float(clip.get("effective_source_offset") or clip.get("source_offset") or 0.0)
 
         try:
             samples = _decode_to_float32(source, sr)
@@ -138,8 +142,24 @@ def _render_track(
             continue
 
         clip_len = int(round((end_s - start_s) * sr))
-        src_start = int(round(offset_s * sr))
-        src_slice = samples[:, src_start : src_start + clip_len]
+        src_start = int(round(eff_offset_s * sr))
+
+        if abs(rate - 1.0) < 1e-4:
+            # Fast path: no resample
+            src_slice = samples[:, src_start : src_start + clip_len]
+        else:
+            # Linear remap: read `clip_len * rate` source samples, resample to `clip_len`
+            src_needed = max(1, int(round(clip_len * rate)))
+            src_block = samples[:, src_start : src_start + src_needed]
+            if src_block.shape[1] == 0:
+                src_slice = np.zeros((2, clip_len), dtype=np.float32)
+            else:
+                # np.interp on each channel → linear time-stretch/compress
+                src_idx = np.linspace(0, src_block.shape[1] - 1, clip_len, dtype=np.float32)
+                src_slice = np.stack([
+                    np.interp(src_idx, np.arange(src_block.shape[1]), src_block[0]),
+                    np.interp(src_idx, np.arange(src_block.shape[1]), src_block[1]),
+                ]).astype(np.float32)
         if src_slice.shape[1] < clip_len:
             # Pad with silence if source shorter than requested length
             pad = np.zeros((2, clip_len - src_slice.shape[1]), dtype=np.float32)

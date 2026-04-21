@@ -2073,6 +2073,19 @@ def reorder_audio_tracks(project_dir: Path, track_ids: list[str]):
 # ── Audio clip operations ─────────────────────────────────────────
 
 def get_audio_clips(project_dir: Path, track_id: str | None = None) -> list[dict]:
+    """Return audio clips enriched with derived playback fields.
+
+    For clips linked to a transition (`audio_clip_links`), `playback_rate` and
+    `effective_source_offset` reflect the transition's linear remap:
+
+        rate     = source_span / kf_span
+        eff_off  = trim_in + stored_source_offset
+
+    where `source_span = (trim_out or source_duration) - trim_in` and
+    `kf_span = to_kf.ts - from_kf.ts`. For unlinked clips, rate=1.0 and
+    eff_off == stored source_offset. The stored `source_offset` column is
+    untouched — callers that want the raw value can still read it.
+    """
     conn = get_db(project_dir)
     if track_id:
         rows = conn.execute(
@@ -2081,16 +2094,100 @@ def get_audio_clips(project_dir: Path, track_id: str | None = None) -> list[dict
     else:
         rows = conn.execute(
             "SELECT * FROM audio_clips WHERE deleted_at IS NULL ORDER BY track_id, start_time").fetchall()
-    return [{
-        "id": r["id"], "track_id": r["track_id"],
-        "source_path": r["source_path"],
-        "start_time": r["start_time"], "end_time": r["end_time"],
-        "source_offset": r["source_offset"],
-        "volume_curve": json.loads(r["volume_curve"]) if r["volume_curve"] else [[0, 0], [1, 0]],
-        "muted": bool(r["muted"]),
-        "remap": json.loads(r["remap"]) if r["remap"] else {"method": "linear", "target_duration": 0},
-        "selected": r["selected"],
-    } for r in rows]
+
+    # Preload all links + their transitions in one pass to avoid N+1 queries
+    clip_ids = [r["id"] for r in rows]
+    link_map: dict[str, str] = {}  # audio_clip_id → transition_id
+    if clip_ids:
+        placeholders = ",".join("?" for _ in clip_ids)
+        link_rows = conn.execute(
+            f"SELECT audio_clip_id, transition_id FROM audio_clip_links WHERE audio_clip_id IN ({placeholders})",
+            clip_ids,
+        ).fetchall()
+        for lr in link_rows:
+            link_map[lr["audio_clip_id"]] = lr["transition_id"]
+
+    # Fetch linked transitions + their keyframes in bulk
+    tr_cache: dict[str, dict] = {}
+    kf_cache: dict[str, dict] = {}
+    if link_map:
+        tr_ids = list(set(link_map.values()))
+        tr_placeholders = ",".join("?" for _ in tr_ids)
+        tr_rows = conn.execute(
+            f"SELECT id, \"from\" AS from_kf, \"to\" AS to_kf, trim_in, trim_out, source_video_duration FROM transitions WHERE id IN ({tr_placeholders})",
+            tr_ids,
+        ).fetchall()
+        kf_ids = set()
+        for tr in tr_rows:
+            tr_cache[tr["id"]] = {
+                "from_kf": tr["from_kf"], "to_kf": tr["to_kf"],
+                "trim_in": tr["trim_in"] if tr["trim_in"] is not None else 0.0,
+                "trim_out": tr["trim_out"],
+                "source_video_duration": tr["source_video_duration"],
+            }
+            if tr["from_kf"]: kf_ids.add(tr["from_kf"])
+            if tr["to_kf"]: kf_ids.add(tr["to_kf"])
+        if kf_ids:
+            kf_placeholders = ",".join("?" for _ in kf_ids)
+            kf_rows = conn.execute(
+                f"SELECT id, timestamp FROM keyframes WHERE id IN ({kf_placeholders})",
+                list(kf_ids),
+            ).fetchall()
+            for kf in kf_rows:
+                ts_str = kf["timestamp"]
+                ts_val: float = 0.0
+                try:
+                    parts = str(ts_str).split(":")
+                    if len(parts) == 1: ts_val = float(parts[0])
+                    elif len(parts) == 2: ts_val = float(parts[0]) * 60 + float(parts[1])
+                    elif len(parts) == 3: ts_val = float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+                except (ValueError, TypeError):
+                    ts_val = 0.0
+                kf_cache[kf["id"]] = {"timestamp": ts_val}
+
+    def _derive(clip_id: str, stored_offset: float, start_time: float, end_time: float) -> tuple[float, float]:
+        """Return (playback_rate, effective_source_offset) for this clip."""
+        tr_id = link_map.get(clip_id)
+        if not tr_id:
+            return 1.0, stored_offset
+        tr = tr_cache.get(tr_id)
+        if not tr:
+            return 1.0, stored_offset
+        from_kf = kf_cache.get(tr["from_kf"])
+        to_kf = kf_cache.get(tr["to_kf"])
+        if not from_kf or not to_kf:
+            return 1.0, stored_offset
+        kf_span = to_kf["timestamp"] - from_kf["timestamp"]
+        trim_in = float(tr["trim_in"])
+        trim_out = tr["trim_out"]
+        if trim_out is None:
+            trim_out = tr["source_video_duration"]
+        if trim_out is None:
+            # Fall back to kf_span — neither trim_out nor source duration known
+            return 1.0, stored_offset + trim_in
+        source_span = float(trim_out) - trim_in
+        if kf_span <= 0 or source_span <= 0:
+            return 1.0, stored_offset + trim_in
+        rate = source_span / kf_span
+        return rate, stored_offset + trim_in
+
+    result = []
+    for r in rows:
+        rate, eff_off = _derive(r["id"], float(r["source_offset"]), float(r["start_time"]), float(r["end_time"]))
+        result.append({
+            "id": r["id"], "track_id": r["track_id"],
+            "source_path": r["source_path"],
+            "start_time": r["start_time"], "end_time": r["end_time"],
+            "source_offset": r["source_offset"],
+            "volume_curve": json.loads(r["volume_curve"]) if r["volume_curve"] else [[0, 0], [1, 0]],
+            "muted": bool(r["muted"]),
+            "remap": json.loads(r["remap"]) if r["remap"] else {"method": "linear", "target_duration": 0},
+            "selected": r["selected"],
+            # Derived fields (computed from linked transition at query time; not stored)
+            "playback_rate": rate,
+            "effective_source_offset": eff_off,
+        })
+    return result
 
 
 def add_audio_clip(project_dir: Path, clip: dict):

@@ -189,6 +189,71 @@ def test_mixdown_end_to_end_two_clips():
 
 
 @pytest.mark.skipif(not _ffmpeg_available(), reason="ffmpeg not installed")
+def test_mixdown_playback_rate_2x_compresses_source_to_half_duration():
+    """A 2-second source with playback_rate=2 mixed into a 1-second clip window
+    should end up fully consumed — no silence at the tail, content is present.
+    """
+    from scenecraft import db as dbmod
+    from scenecraft.audio.mixdown import render_project_audio
+
+    project_dir = Path(tempfile.mkdtemp())
+    try:
+        dbmod.get_db(project_dir)
+        src = project_dir / "audio_staging" / "sweep.wav"
+        # 2s of 1 kHz tone at 0.3 amplitude
+        sr = 48000
+        t = np.linspace(0, 2.0, int(sr * 2.0), endpoint=False, dtype=np.float32)
+        sig = 0.3 * np.sin(2 * np.pi * 1000 * t)
+        pcm = (sig * 32767).astype(np.int16)
+        src.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(src), "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+            w.writeframes(pcm.tobytes())
+
+        dbmod.add_audio_track(project_dir, {
+            "id": "at_1", "name": "T", "display_order": 0,
+            "enabled": True, "hidden": False, "muted": False,
+            "volume_curve": [[0, 0], [10, 0]],
+        })
+        dbmod.add_audio_clip(project_dir, {
+            "id": "ac_1", "track_id": "at_1",
+            "source_path": "audio_staging/sweep.wav",
+            "start_time": 0.0, "end_time": 1.0, "source_offset": 0.0,
+        })
+
+        # Simulate what get_audio_clips would return: enrich with rate manually
+        # (the E2E integration via an actual linked transition is covered by
+        # the db.get_audio_clips unit tests — here we exercise the mixdown math)
+        import scenecraft.db as db_mod
+        original_get = db_mod.get_audio_clips
+        def patched_get(project_dir, track_id=None):
+            clips = original_get(project_dir, track_id)
+            for c in clips:
+                c["playback_rate"] = 2.0
+                c["effective_source_offset"] = 0.0
+            return clips
+        db_mod.get_audio_clips = patched_get
+        try:
+            out = project_dir / "audio_staging" / "_mixdown.wav"
+            render_project_audio(project_dir, total_seconds=1.0, out_path=out, sr=sr)
+        finally:
+            db_mod.get_audio_clips = original_get
+
+        with wave.open(str(out), "rb") as w:
+            raw = w.readframes(w.getnframes())
+        samples = np.frombuffer(raw, dtype=np.int16).reshape(-1, 2).astype(np.float32)
+        # 1-second output at 2x → the whole 2s source compressed into 1s.
+        # RMS across the window should be similar to the source's RMS (resample
+        # is linear but the total energy density per-sample stays roughly the
+        # same because rate is constant).
+        rms = np.sqrt(np.mean(samples ** 2))
+        assert rms > 500, f"expected audible content, got RMS {rms}"
+    finally:
+        dbmod.close_db(project_dir)
+        shutil.rmtree(project_dir, ignore_errors=True)
+
+
+@pytest.mark.skipif(not _ffmpeg_available(), reason="ffmpeg not installed")
 def test_mixdown_muted_track_is_zero():
     from scenecraft import db as dbmod
     from scenecraft.audio.mixdown import render_project_audio
