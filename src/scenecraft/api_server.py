@@ -7562,9 +7562,18 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     self.end_headers()
 
                     try:
+                        # Chunked range read — never load full range into memory.
+                        # A browser request for `Range: bytes=0-` translates to
+                        # length = full file size, so a naive f.read(length) OOMs.
                         with open(full_path, "rb") as f:
                             f.seek(start)
-                            self.wfile.write(f.read(length))
+                            remaining = length
+                            while remaining > 0:
+                                chunk = f.read(min(65536, remaining))
+                                if not chunk:
+                                    break
+                                self.wfile.write(chunk)
+                                remaining -= len(chunk)
                     except (BrokenPipeError, ConnectionResetError):
                         pass
                     return
