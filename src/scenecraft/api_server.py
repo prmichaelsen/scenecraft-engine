@@ -1241,6 +1241,48 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 db_delete_audio_clip(project_dir, del_id)
                 return self._json_response({"success": True})
 
+            # POST /api/projects/:name/audio-clips/align-detect — waveform-
+            # sync cross-correlation (see agent/... or audio/align.py docstring).
+            m = re.match(r"^/api/projects/([^/]+)/audio-clips/align-detect$", path)
+            if m:
+                body = self._read_json_body()
+                if body is None: return
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                anchor_id = body.get("anchorClipId")
+                clip_ids = body.get("clipIds") or []
+                if not anchor_id or not isinstance(clip_ids, list) or len(clip_ids) < 2:
+                    return self._error(400, "BAD_REQUEST",
+                                       "anchorClipId + clipIds (>=2) required")
+                if anchor_id not in clip_ids:
+                    return self._error(400, "BAD_REQUEST",
+                                       "anchorClipId must be in clipIds")
+                try:
+                    from scenecraft.db import get_audio_clips
+                    from scenecraft.audio.align import detect_offsets
+                    all_clips = get_audio_clips(project_dir)
+                    by_id = {c["id"]: c for c in all_clips}
+                    selected = []
+                    for cid in clip_ids:
+                        if cid not in by_id:
+                            return self._error(404, "NOT_FOUND",
+                                               f"Audio clip not found: {cid}")
+                        selected.append(by_id[cid])
+                    offsets, confidence = detect_offsets(project_dir, selected, anchor_id)
+                    _log(f"align-detect: anchor={anchor_id} n={len(clip_ids)} "
+                         f"offsets={ {k: round(v, 3) for k, v in offsets.items()} }")
+                    return self._json_response({
+                        "anchorClipId": anchor_id,
+                        "offsets": offsets,
+                        "confidence": confidence,
+                    })
+                except FileNotFoundError as e:
+                    return self._error(404, "SOURCE_NOT_FOUND", str(e))
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    return self._error(500, "INTERNAL_ERROR", str(e))
+
             # POST /api/projects/:name/update-rules (stub — audio intelligence removed)
             m = re.match(r"^/api/projects/([^/]+)/update-rules$", path)
             if m:
