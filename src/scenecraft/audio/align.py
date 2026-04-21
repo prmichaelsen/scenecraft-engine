@@ -36,10 +36,14 @@ import numpy as np
 from scipy.signal import correlate  # type: ignore[import-not-found]
 
 
-_SAMPLE_RATE = 4000   # 4 kHz mono is enough for onset-envelope sync
-_HOP_LENGTH = 512     # onset envelope frame rate: ~8 fps at 4 kHz
-_MAX_SYNC_SECONDS = 90.0  # cap per-clip decode to bound memory
-_MAX_LAG_SECONDS = 30.0   # reject offsets > this (likely spurious)
+# 22.05 kHz matches librosa's default + captures transient energy that gets
+# aliased at lower rates. 4 kHz (prior value) was blurring the onset envelope
+# so cross-correlation peaks were broad and ambiguous on long clips.
+_SAMPLE_RATE = 22050
+_HOP_LENGTH = 512     # ≈23 ms per frame at 22050 Hz — standard onset grid
+_MAX_SYNC_SECONDS = 180.0  # per-clip decode cap. Librosa streams, so memory
+                           # stays bounded at sr*dur*4 bytes (~15 MB for 180s).
+_MAX_LAG_SECONDS = 30.0    # reject offsets > this (likely spurious)
 
 
 def _log(msg: str):
@@ -105,9 +109,21 @@ def _cross_correlate_offset(anchor_env: np.ndarray, clip_env: np.ndarray,
     if len(anchor_env) == 0 or len(clip_env) == 0:
         return 0.0, 0.0
 
+    # Zero-mean + L2-normalize each envelope before correlating. Without this
+    # a louder clip dominates the product and shifts the peak away from the
+    # actual pattern match. This is normalized cross-correlation (NCC) — the
+    # same fix used by every sync tool worth using.
+    def _normalize(e: np.ndarray) -> np.ndarray:
+        e = e - float(np.mean(e))
+        n = float(np.linalg.norm(e))
+        return e / n if n > 1e-9 else e
+
+    anchor_n = _normalize(anchor_env)
+    clip_n = _normalize(clip_env)
+
     # mode='full' gives correlation at every possible lag; center index is
     # len(clip_env) - 1 (where 0-lag sits).
-    corr = correlate(anchor_env, clip_env, mode="full", method="fft")
+    corr = correlate(anchor_n, clip_n, mode="full", method="fft")
 
     # Cap the search window to ±max_lag_seconds
     max_lag_frames = int(max_lag_seconds * sr / hop_length)
@@ -123,14 +139,16 @@ def _cross_correlate_offset(anchor_env: np.ndarray, clip_env: np.ndarray,
     lag_frames = peak_idx_abs - center
     lag_seconds = float(lag_frames * hop_length / sr)
 
-    # Confidence: peak height versus the 95th-percentile of the correlation.
-    # Normalise by peak so the result is bounded and scale-invariant.
+    # Confidence: ratio of peak height to the median absolute correlation
+    # (signal-to-"floor" ratio). For normalized inputs the peak value itself
+    # is in [-1, 1] — we report min(1, peak) for the "strength" side and
+    # combine with a "sharpness" score (how much the peak stands above the
+    # median). Captures both "good match" and "sharp peak".
     peak_val = float(corr[peak_idx_abs])
-    background = float(np.percentile(np.abs(corr), 95))
-    if peak_val <= 0.0:
-        confidence = 0.0
-    else:
-        confidence = float(max(0.0, min(1.0, (peak_val - background) / (peak_val + 1e-9))))
+    median_abs = float(np.median(np.abs(corr)))
+    strength = max(0.0, min(1.0, peak_val))
+    sharpness = max(0.0, min(1.0, (peak_val - median_abs) / (peak_val + 1e-9))) if peak_val > 0 else 0.0
+    confidence = float(strength * sharpness)
 
     return lag_seconds, confidence
 
