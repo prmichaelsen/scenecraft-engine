@@ -414,32 +414,97 @@ milestones:
         dependencies:
           - task-15
 
+  - id: M11
+    title: Backend-Rendered Preview Streaming
+    file: agent/milestones/milestone-11-backend-rendered-preview-streaming.md
+    status: in_progress
+    started: 2026-04-20
+    completed: null
+    estimated_weeks: 2.5
+    tasks_total: 5
+    tasks_completed: 2
+    tasks:
+      - id: task-32
+        title: Extract build_schedule + render_frame_at + parity tests
+        file: agent/tasks/milestone-11-backend-rendered-preview-streaming/task-32-extract-schedule-and-compositor.md
+        status: completed
+        estimated_hours: 20
+        started: 2026-04-20T00:00:00Z
+        completed_date: 2026-04-20T00:00:00Z
+        actual_hours: null
+        dependencies: []
+      - id: task-33
+        title: GET /render-frame endpoint + L1 memory cache
+        file: agent/tasks/milestone-11-backend-rendered-preview-streaming/task-33-render-frame-endpoint-and-cache.md
+        status: completed
+        estimated_hours: 20
+        started: 2026-04-20T00:00:00Z
+        completed_date: 2026-04-20T00:00:00Z
+        actual_hours: null
+        dependencies:
+          - task-32
+      - id: task-34
+        title: MSE playback — RenderWorker, PyAV encoder, /preview-stream WebSocket
+        file: agent/tasks/milestone-11-backend-rendered-preview-streaming/task-34-mse-playback-streaming.md
+        status: not_started
+        estimated_hours: 32
+        started: null
+        completed_date: null
+        actual_hours: null
+        dependencies:
+          - task-32
+          - task-33
+      - id: task-35
+        title: Frontend <PreviewViewport> — video+canvas swap, scrub queue, MSE hook
+        file: agent/tasks/milestone-11-backend-rendered-preview-streaming/task-35-frontend-preview-viewport.md
+        status: not_started
+        estimated_hours: 20
+        started: null
+        completed_date: null
+        actual_hours: null
+        dependencies:
+          - task-33
+          - task-34
+      - id: task-36
+        title: WebGL removal + end-to-end validation
+        file: agent/tasks/milestone-11-backend-rendered-preview-streaming/task-36-webgl-removal.md
+        status: not_started
+        estimated_hours: 12
+        started: null
+        completed_date: null
+        actual_hours: null
+        dependencies:
+          - task-35
+
 documentation:
-  design_documents: 5
-  milestone_documents: 10
+  design_documents: 6
+  milestone_documents: 11
   pattern_documents: 0
-  task_documents: 30
+  task_documents: 35
 
 progress:
   planning: 100
-  implementation: 80
-  overall: 80
+  implementation: 82
+  overall: 82
 
 recent_work:
+  - date: 2026-04-20
+    description: "M11 planning — retroactive milestone for backend-rendered preview streaming. 2/5 tasks completed (schedule+compositor refactor, render-frame endpoint+cache). 3/5 remaining (MSE, frontend viewport, WebGL removal)."
   - date: 2026-03-25
     description: "M10 complete — Hit Marker Web UI MVP. marker_server.py, marker_ui.html (wavesurfer.js), SENSATION_MAP, --hits flag on generate, beatlab marker-ui CLI command."
   - date: 2026-03-24
     description: "M9 complete — Wan2.1 + FILM pipeline. wan.py, film.py, wan_pipeline.py, --engine wan/--preview flags, AI plan wan_denoise/transition_frames."
 
 next_steps:
-  - "Test marker UI with a real audio file"
-  - "Test Wan2.1 pipeline on sample clip with cloud GPU"
-  - "Compare EbSynth vs Wan2.1 output quality"
+  - "Task 34: implement MSE playback (RenderWorker + PyAV fMP4 encoder + /preview-stream WS)"
+  - "Task 35: frontend <PreviewViewport> + MSE hook + scrub queue"
+  - "Task 36: delete WebGL BeatEffectPreview + frame-cache.ts"
+  - "Unassigned task-31: split api_server.py into per-domain modules (prereq for preview streaming)"
 
 notes:
-  - "Total estimated: ~87 hours across 30 tasks"
-  - "M1-M3, M5-M10 complete (28/30 tasks)"
+  - "M1-M3, M5-M11 tracked (33/35 tasks if M11 completes)"
   - "M4 (Resolve integration) deferred"
+  - "M11 task IDs 32-36 (30/31 are unassigned one-offs in agent/tasks/unassigned/)"
   - "Wan2.1 requires 24GB+ VRAM (cloud GPU)"
   - "FILM runs between ALL clip boundaries (intra-section smoothing + inter-section style morphing)"
   - "FILM falls back to ffmpeg minterpolate if torch not available"
