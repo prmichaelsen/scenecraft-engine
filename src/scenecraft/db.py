@@ -939,8 +939,25 @@ def update_transition(project_dir: Path, tr_id: str, **fields):
 
 
 def delete_transition(project_dir: Path, tr_id: str, deleted_at: str):
+    """Soft-delete a transition. Per M9 task-86, also soft-deletes every
+    linked audio clip and removes the link rows. Undo restores both.
+    """
     conn = get_db(project_dir)
+    # Collect linked audio clip ids before we drop the links
+    link_rows = conn.execute(
+        "SELECT audio_clip_id FROM audio_clip_links WHERE transition_id = ?",
+        (tr_id,),
+    ).fetchall()
+    linked_clip_ids = [r["audio_clip_id"] for r in link_rows]
+
     conn.execute("UPDATE transitions SET deleted_at = ? WHERE id = ?", (deleted_at, tr_id))
+    if linked_clip_ids:
+        placeholders = ",".join("?" for _ in linked_clip_ids)
+        conn.execute(
+            f"UPDATE audio_clips SET deleted_at = ? WHERE id IN ({placeholders}) AND deleted_at IS NULL",
+            [deleted_at, *linked_clip_ids],
+        )
+        conn.execute("DELETE FROM audio_clip_links WHERE transition_id = ?", (tr_id,))
     conn.commit()
 
 
