@@ -91,7 +91,11 @@ class RenderWorker:
         self._init_emitted = False
 
         # Worker-local frame cache (source-video handles, not JPEGs).
-        self._frame_cache: dict = {}
+        # `stream_caps` lets the compositor keep a long-lived VideoCapture per
+        # segment and advance sequentially instead of batch-loading every
+        # frame of the segment into RAM — O(1) memory per open source, which
+        # is the only survivable strategy for multi-hour base segments.
+        self._frame_cache: dict = {"stream_caps": {}}
 
         self._thread: threading.Thread | None = None
 
@@ -159,6 +163,13 @@ class RenderWorker:
                     except Exception:
                         pass
                     seg.pop(key, None)
+        # Release streaming caps owned by this worker's frame cache.
+        for entry in self._frame_cache.get("stream_caps", {}).values():
+            try:
+                entry["cap"].release()
+            except Exception:
+                pass
+        self._frame_cache["stream_caps"] = {}
 
     def fragments(self) -> Iterator[bytes]:
         """Blocking iterator yielding init segment first, then media segments.
@@ -215,9 +226,16 @@ class RenderWorker:
                 if self._invalidated.is_set():
                     self._invalidated.clear()
                     try:
+                        # Release any open stream caps before swapping the schedule —
+                        # the new one may have different segment indices.
+                        for entry in self._frame_cache.get("stream_caps", {}).values():
+                            try:
+                                entry["cap"].release()
+                            except Exception:
+                                pass
                         new_sched = build_schedule(self.project_dir)
                         self._schedule = new_sched
-                        self._frame_cache = {}
+                        self._frame_cache = {"stream_caps": {}}
                         _log(f"schedule rebuilt for {self.project_dir.name}")
                     except Exception as exc:
                         _log(f"rebuild failed: {exc}")
@@ -234,6 +252,7 @@ class RenderWorker:
                 frames_to_render = self._frames_per_fragment
                 t0 = self._playhead_t
                 frames: list[np.ndarray] = []
+                black_count = 0
                 for i in range(frames_to_render):
                     t = t0 + i / self._fps
                     if t >= self._schedule.duration_seconds:
@@ -243,11 +262,14 @@ class RenderWorker:
                     try:
                         frame = render_frame_at(self._schedule, t, frame_cache=self._frame_cache)
                     except Exception as exc:
-                        _log(f"render_frame_at({t:.3f}) failed: {exc}")
+                        import traceback
+                        _log(f"render_frame_at({t:.3f}) failed: {exc}\n{traceback.format_exc()}")
                         frame = np.zeros(
                             (self._schedule.height, self._schedule.width, 3),
                             dtype=np.uint8,
                         )
+                    if frame is None or not frame.any():
+                        black_count += 1
                     # Ensure encoder-expected shape (may require even dims).
                     if (
                         frame.shape[0] != self._encoder.height
@@ -275,6 +297,11 @@ class RenderWorker:
                     self._playing.clear()
                     continue
 
+                _log(
+                    f"fragment t0={t0:.3f} frames={len(frames)} black={black_count} "
+                    f"first_shape={frames[0].shape} dtype={frames[0].dtype}"
+                )
+
                 # Ensure init has been emitted for the encoder; if a consumer
                 # hasn't called fragments() yet we still can (encode_init sets
                 # internal state but returning the bytes is a no-op for the queue).
@@ -287,9 +314,11 @@ class RenderWorker:
                 try:
                     segment = self._encoder.encode_range(frames)
                 except Exception as exc:
-                    _log(f"encode_range failed: {exc}")
+                    import traceback
+                    _log(f"encode_range failed: {exc}\n{traceback.format_exc()}")
                     self._playing.clear()
                     continue
+                _log(f"fragment encoded: {len(segment)} bytes")
 
                 # Backpressure: block if queue is full.
                 try:

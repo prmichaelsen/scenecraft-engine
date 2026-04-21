@@ -116,6 +116,7 @@ job_manager = JobManager()
 async def _handle_connection(ws: ServerConnection):
     # Route chat connections to the chat handler
     path = ws.request.path if ws.request else ""
+    _log(f"ws connection opened: path={path!r}")
     if path.startswith("/ws/chat/"):
         project_name = path.split("/ws/chat/", 1)[1].split("?")[0]
         from urllib.parse import unquote

@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,12 @@ from scenecraft.render.preview_worker import RenderCoordinator, RenderWorker
 
 
 logger = logging.getLogger(__name__)
+
+
+def _log(msg: str) -> None:
+    from datetime import datetime
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] [preview-ws] {msg}", file=sys.stderr, flush=True)
 
 
 async def _pump_fragments(ws: ServerConnection, worker: RenderWorker) -> None:
@@ -79,6 +86,7 @@ async def _read_commands(ws: ServerConnection, worker: RenderWorker) -> None:
                 t = float(t)
             except (TypeError, ValueError):
                 t = 0.0
+            _log(f"action={action} t={t:.3f}")
             if action == "play":
                 worker.play(t)
             elif action == "seek":
@@ -100,6 +108,7 @@ async def handle_preview_stream_connection(
     project_name: str,
 ) -> None:
     """Entry point invoked from ws_server._handle_connection."""
+    _log(f"connection opened project={project_name}")
     if not work_dir or not project_name:
         await ws.send(json.dumps({"type": "error", "error": "work_dir not configured"}))
         await ws.close(code=1011, reason="work_dir unset")
@@ -113,7 +122,10 @@ async def handle_preview_stream_connection(
     coordinator = RenderCoordinator.instance()
     try:
         worker = coordinator.get_worker(project_dir)
+        _log(f"worker ready for {project_name}")
     except Exception as exc:
+        import traceback
+        _log(f"worker spawn failed: {exc}\n{traceback.format_exc()}")
         await ws.send(json.dumps({"type": "error", "error": f"Worker spawn failed: {exc}"}))
         await ws.close(code=1011, reason="worker spawn failed")
         return

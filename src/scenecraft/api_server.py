@@ -4108,6 +4108,7 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             Hits a process-global in-memory LRU cache keyed on (project, db mtime, t, quality).
             Any DB write bumps mtime → cache miss for affected project automatically.
             """
+            _log(f"render-frame: project={project_dir.name} t={t:.3f} q={quality}")
             try:
                 import cv2
 
@@ -4115,16 +4116,22 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 from scenecraft.render.frame_cache import global_cache
                 from scenecraft.render.schedule import build_schedule
             except ImportError as e:
+                _log(f"render-frame: import failed: {e}", level="error")
                 return self._error(500, "INTERNAL_ERROR", f"Render dependencies not installed: {e}")
 
             cached_jpeg = global_cache.get(project_dir, t, quality)
             cache_status = "HIT" if cached_jpeg is not None else "MISS"
+            _log(f"render-frame: cache {cache_status} t={t:.3f}")
 
             if cached_jpeg is None:
                 try:
                     schedule = build_schedule(project_dir)
                 except Exception as e:
+                    import traceback
+                    _log(f"render-frame: build_schedule failed: {e}\n{traceback.format_exc()}", level="error")
                     return self._error(500, "INTERNAL_ERROR", f"build_schedule failed: {e}")
+
+                _log(f"render-frame: schedule dur={schedule.duration_seconds:.2f}s segs={len(schedule.segments)} fps={schedule.fps}")
 
                 if schedule.duration_seconds <= 0 or not schedule.segments:
                     return self._error(404, "NO_CONTENT", "Project has no renderable content yet")
@@ -4132,15 +4139,21 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 t = max(0.0, min(t, schedule.duration_seconds - 1.0 / schedule.fps))
 
                 try:
-                    frame = render_frame_at(schedule, t, frame_cache={})
+                    frame = render_frame_at(schedule, t, frame_cache={}, scrub=True)
                 except Exception as e:
+                    import traceback
+                    _log(f"render-frame: render_frame_at failed at t={t:.3f}: {e}\n{traceback.format_exc()}", level="error")
                     return self._error(500, "INTERNAL_ERROR", f"render_frame_at failed: {e}")
+
+                _log(f"render-frame: frame shape={frame.shape} dtype={frame.dtype}")
 
                 ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
                 if not ok:
+                    _log("render-frame: JPEG encode failed", level="error")
                     return self._error(500, "INTERNAL_ERROR", "JPEG encode failed")
                 cached_jpeg = bytes(buf)
                 global_cache.put(project_dir, t, quality, cached_jpeg)
+                _log(f"render-frame: encoded {len(cached_jpeg)} bytes, cached")
 
             try:
                 self.send_response(200)

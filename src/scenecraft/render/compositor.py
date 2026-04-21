@@ -561,12 +561,28 @@ def _get_frame_at(
     w: int,
     h: int,
     preview: bool,
+    *,
+    scrub: bool = False,
+    stream_caps: dict | None = None,
 ):
-    """Get source frame from segment at given progress (0-1), with remap."""
+    """Get source frame from segment at given progress (0-1), with remap.
+
+    Three paths:
+    - Offline render (default): `_ensure_loaded` batch-decodes every frame of
+      the active segment into RAM and indexes. Fast for sequential reads on
+      short clips; blows up on multi-hour segments.
+    - `scrub=True` (HTTP /render-frame): opens a cv2.VideoCapture, seeks to
+      the target frame, reads one, closes. O(1) memory, O(seek) CPU.
+    - `stream_caps` provided (playback worker): reuses a long-lived
+      VideoCapture per segment across calls, advancing sequentially on
+      monotonic idx and seeking only when the cursor jumps. O(1) memory,
+      cheap sequential reads. The caller owns the dict lifetime so they
+      can release captures on teardown.
+    """
+    import cv2
     import numpy as np
 
     seg = segments[seg_idx]
-    _ensure_loaded(seg_idx, segments, loaded_segs, w, h, preview)
     use_curve = seg["remap_method"] == "curve" and seg.get("curve_points")
     p = progress
     if use_curve:
@@ -575,6 +591,47 @@ def _get_frame_at(
     if n == 0:
         return np.zeros((h, w, 3), dtype=np.uint8)
     idx = min(int(p * n), n - 1)
+
+    if seg["is_still"]:
+        _ensure_loaded(seg_idx, segments, loaded_segs, w, h, preview)
+        return seg["_frames"][idx]
+
+    def _fit(frame):
+        if frame is None:
+            return np.zeros((h, w, 3), dtype=np.uint8)
+        fh, fw = frame.shape[:2]
+        if fw != w or fh != h:
+            return cv2.resize(
+                frame, (w, h),
+                interpolation=cv2.INTER_AREA if preview else cv2.INTER_LINEAR,
+            )
+        if preview:
+            return cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+        return frame
+
+    if scrub:
+        cap = cv2.VideoCapture(seg["source"])
+        try:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            return _fit(frame if ret else None)
+        finally:
+            cap.release()
+
+    if stream_caps is not None:
+        entry = stream_caps.get(seg_idx)
+        if entry is None:
+            entry = {"cap": cv2.VideoCapture(seg["source"]), "cursor": -1}
+            stream_caps[seg_idx] = entry
+        cap = entry["cap"]
+        cursor = entry["cursor"]
+        if idx != cursor + 1:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        entry["cursor"] = idx if ret else cursor
+        return _fit(frame if ret else None)
+
+    _ensure_loaded(seg_idx, segments, loaded_segs, w, h, preview)
     return seg["_frames"][idx]
 
 
@@ -608,6 +665,7 @@ def render_frame_at(
     t: float,
     *,
     frame_cache: dict | None = None,
+    scrub: bool = False,
 ) -> Any:
     """Render a single composited BGR frame at time t.
 
@@ -615,15 +673,25 @@ def render_frame_at(
     assemble_final loop at the same `(project_dir, t)`.
 
     `frame_cache` holds per-call mutable state (loaded segment indices,
-    overlay crossfade memory). Passing the same dict across sequential
-    calls enables the original loop's cache reuse; passing None creates a
+    overlay crossfade memory, and — for long-lived callers like the
+    preview worker — a `stream_caps` dict of open VideoCaptures keyed
+    by segment index). Passing the same dict across sequential calls
+    enables the original loop's cache reuse; passing None creates a
     fresh one.
+
+    `scrub=True` opens/seeks/closes a capture per call (O(1) memory,
+    slow per frame). Otherwise, when `frame_cache["stream_caps"]` is
+    present, video segments stream through a kept-open capture with a
+    cursor (O(1) memory, cheap sequential reads). Absent both flags,
+    the legacy batch-load path runs — fine for short clips, fatal on
+    multi-hour segments.
     """
     import cv2
     import numpy as np
 
     if frame_cache is None:
         frame_cache = {}
+    stream_caps = frame_cache.get("stream_caps") if not scrub else None
 
     segments = schedule.segments
     overlay_tracks = schedule.overlay_tracks
@@ -658,7 +726,7 @@ def render_frame_at(
         raw_progress = (t - seg["from_ts"]) / seg_dur if seg_dur > 0 else 0
         progress = ext + raw_progress * (1.0 - 2 * ext)
         progress = max(0.0, min(0.999, progress))
-        frame = _get_frame_at(seg_idx, progress, segments, loaded_segs, w, h, preview)
+        frame = _get_frame_at(seg_idx, progress, segments, loaded_segs, w, h, preview, scrub=scrub, stream_caps=stream_caps)
 
         # Crossfade at segment boundaries — start
         if seg_idx > 0 and (t - seg["from_ts"]) < eff_half_xfade:
@@ -671,7 +739,7 @@ def render_frame_at(
                 prev_raw = (t - prev_seg["from_ts"]) / prev_dur if prev_dur > 0 else 0
                 prev_progress = prev_ext + prev_raw * (1.0 - 2 * prev_ext)
                 prev_progress = max(0.0, min(0.999, prev_progress))
-                prev_frame = _get_frame_at(seg_idx - 1, prev_progress, segments, loaded_segs, w, h, preview)
+                prev_frame = _get_frame_at(seg_idx - 1, prev_progress, segments, loaded_segs, w, h, preview, scrub=scrub, stream_caps=stream_caps)
                 frame = cv2.addWeighted(prev_frame, 1.0 - alpha, frame, alpha, 0)
 
         # Crossfade at segment boundaries — end
@@ -685,7 +753,7 @@ def render_frame_at(
                 next_raw = (t - next_seg["from_ts"]) / next_dur if next_dur > 0 else 0
                 next_progress = next_ext + next_raw * (1.0 - 2 * next_ext)
                 next_progress = max(0.0, min(0.999, next_progress))
-                next_frame = _get_frame_at(seg_idx + 1, next_progress, segments, loaded_segs, w, h, preview)
+                next_frame = _get_frame_at(seg_idx + 1, next_progress, segments, loaded_segs, w, h, preview, scrub=scrub, stream_caps=stream_caps)
                 frame = cv2.addWeighted(frame, alpha, next_frame, 1.0 - alpha, 0)
 
         # Base track opacity curve (fade to/from black)
