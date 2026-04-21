@@ -480,7 +480,7 @@ documentation:
   design_documents: 6
   milestone_documents: 11
   pattern_documents: 0
-  task_documents: 35
+  task_documents: 37
 
 progress:
   planning: 100
@@ -500,11 +500,13 @@ next_steps:
   - "Task 35: frontend <PreviewViewport> + MSE hook + scrub queue"
   - "Task 36: delete WebGL BeatEffectPreview + frame-cache.ts"
   - "Unassigned task-31: split api_server.py into per-domain modules (prereq for preview streaming)"
+  - "Unassigned task-37: unified WebSocket protocol (follow-up to M11 34/35 — replaces per-feature WS lifecycle with one socket + typed envelopes)"
+  - "Unassigned task-38: range-based preview frame cache invalidation + client-side bitmap cache (depends on 37 for push)"
 
 notes:
   - "M1-M3, M5-M11 tracked (33/35 tasks if M11 completes)"
   - "M4 (Resolve integration) deferred"
-  - "M11 task IDs 32-36 (30/31 are unassigned one-offs in agent/tasks/unassigned/)"
+  - "M11 task IDs 32-36 (30/31/37/38 are unassigned one-offs in agent/tasks/unassigned/)"
   - "Wan2.1 requires 24GB+ VRAM (cloud GPU)"
   - "FILM runs between ALL clip boundaries (intra-section smoothing + inter-section style morphing)"
   - "FILM falls back to ffmpeg minterpolate if torch not available"
