@@ -651,8 +651,81 @@ def add_keyframe(project_dir: Path, kf: dict):
     _retry_on_locked(_do)
 
 
+def _parse_kf_timestamp(ts) -> float:
+    """Parse 'm:ss(.fff)', 'H:MM:SS(.fff)', or a numeric timestamp to seconds.
+
+    Returns None-like 0.0 on unparseable input — safe for delta computation
+    (a zero delta is a no-op in propagation).
+    """
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    if not ts:
+        return 0.0
+    parts = str(ts).split(":")
+    try:
+        if len(parts) == 1:
+            return float(parts[0])
+        if len(parts) == 2:
+            return float(parts[0]) * 60 + float(parts[1])
+        if len(parts) == 3:
+            return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+    except ValueError:
+        return 0.0
+    return 0.0
+
+
+def _propagate_linked_audio_on_from_kf_shift(project_dir: Path, kf_id: str, delta: float):
+    """When a keyframe's timestamp shifts by `delta`, for every transition
+    where kf is `from_kf` (i.e. the transition's start), shift each linked
+    audio clip's start_time and end_time by the same delta. Per the M9
+    design invariant table: "Transition trimmed start by Δ → clip start
+    +Δ, clip end +Δ" (which also subsumes the move case).
+
+    Zero-delta calls are a no-op.
+    """
+    if abs(delta) < 1e-9:
+        return
+    conn = get_db(project_dir)
+    # Find transitions where this kf is the start anchor
+    tr_rows = conn.execute(
+        "SELECT id FROM transitions WHERE from_kf = ? AND deleted_at IS NULL",
+        (kf_id,),
+    ).fetchall()
+    if not tr_rows:
+        return
+    tr_ids = [r["id"] for r in tr_rows]
+    # Collect all linked audio clip ids across those transitions
+    placeholders = ",".join("?" for _ in tr_ids)
+    link_rows = conn.execute(
+        f"SELECT DISTINCT audio_clip_id FROM audio_clip_links WHERE transition_id IN ({placeholders})",
+        tr_ids,
+    ).fetchall()
+    clip_ids = [r["audio_clip_id"] for r in link_rows]
+    if not clip_ids:
+        return
+    # Shift each clip's start/end by delta in one pass
+    clip_placeholders = ",".join("?" for _ in clip_ids)
+    conn.execute(
+        f"UPDATE audio_clips SET start_time = start_time + ?, end_time = end_time + ? "
+        f"WHERE id IN ({clip_placeholders}) AND deleted_at IS NULL",
+        [delta, delta, *clip_ids],
+    )
+    conn.commit()
+
+
 def update_keyframe(project_dir: Path, kf_id: str, **fields):
     conn = get_db(project_dir)
+    # M9 task-85: if the keyframe's timestamp is being changed, compute the
+    # delta against the current stored value and propagate to linked audio
+    # clips on any transition where this kf is the start anchor.
+    ts_delta: float = 0.0
+    if "timestamp" in fields:
+        old_row = conn.execute("SELECT timestamp FROM keyframes WHERE id = ?", (kf_id,)).fetchone()
+        if old_row is not None:
+            old_sec = _parse_kf_timestamp(old_row["timestamp"])
+            new_sec = _parse_kf_timestamp(fields["timestamp"])
+            ts_delta = new_sec - old_sec
+
     sets = []
     values = []
     for key, val in fields.items():
@@ -663,6 +736,15 @@ def update_keyframe(project_dir: Path, kf_id: str, **fields):
         values.append(val)
     values.append(kf_id)
     _retry_on_locked(lambda: (conn.execute(f"UPDATE keyframes SET {', '.join(sets)} WHERE id = ?", values), conn.commit()))
+
+    if ts_delta != 0.0:
+        try:
+            _propagate_linked_audio_on_from_kf_shift(project_dir, kf_id, ts_delta)
+        except sqlite3.DatabaseError as e:
+            # Don't block the main update if audio propagation fails — log and move on
+            import sys as _sys
+            print(f"[db.update_keyframe] linked-audio propagation failed for {kf_id} Δ={ts_delta}: {e}",
+                  file=_sys.stderr, flush=True)
 
 
 def delete_keyframe(project_dir: Path, kf_id: str, deleted_at: str):
