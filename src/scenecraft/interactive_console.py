@@ -29,6 +29,60 @@ import time
 from typing import Callable
 
 
+# ── Terminal mode management ─────────────────────────────────────────────
+
+
+def _ensure_cooked_mode() -> tuple[Callable[[], None], bool]:
+    """Force the TTY into canonical/cooked mode with echo + CR→LF.
+
+    Some environments leave the terminal in raw / non-canonical mode
+    (a prior program crashed without restoring termios, or the shell
+    set it up oddly). In that mode Enter sends `\\r` and the terminal
+    echoes it as `^M` instead of completing the input line.
+
+    Returns (restore_fn, changed) — call restore_fn when the REPL
+    exits to put the terminal back the way we found it.
+    """
+    noop = (lambda: None)
+    try:
+        import termios
+        import tty
+    except Exception:
+        return noop, False
+    try:
+        fd = sys.stdin.fileno()
+    except Exception:
+        return noop, False
+    try:
+        saved = termios.tcgetattr(fd)
+    except Exception:
+        return noop, False
+
+    # Set the input flags we care about without stomping on unrelated
+    # ones (e.g. baud, character size).
+    new = termios.tcgetattr(fd)
+    iflag, oflag, cflag, lflag, ispeed, ospeed, cc = new
+    iflag |= termios.ICRNL      # translate CR (Enter) to LF on input
+    lflag |= termios.ICANON     # line-at-a-time input
+    lflag |= termios.ECHO       # echo typed characters
+    lflag |= termios.ECHOE      # echo erase as backspace-space-backspace
+    lflag |= termios.ECHOK      # echo kill char
+    new = [iflag, oflag, cflag, lflag, ispeed, ospeed, cc]
+
+    try:
+        termios.tcsetattr(fd, termios.TCSANOW, new)
+    except Exception:
+        return noop, False
+
+    def _restore() -> None:
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, saved)
+        except Exception:
+            pass
+
+    return _restore, True
+
+
 # ── Logging that matches the rest of the server's conventions ────────────
 
 
@@ -208,44 +262,46 @@ def _sorted_commands() -> list[tuple[tuple[str, ...], tuple[Callable[[str], None
 
 
 def _repl() -> None:
+    restore_tty, tty_changed = _ensure_cooked_mode()
+    if tty_changed:
+        _log("terminal: forced canonical mode (ICANON | ICRNL | ECHO)")
     _log("interactive console ready — type `help` for commands (press Enter to submit)")
     # input() is more reliable than sys.stdin.readline() across terminals —
     # handles cooked-mode line buffering the way the user expects, echoes
     # typed characters, and handles Ctrl-D / Ctrl-C more predictably.
-    while True:
-        try:
-            line = input("scenecraft> ")
-        except EOFError:
-            # Ctrl-D or stdin closed — stop REPL, leave server running.
-            _log("stdin EOF — console exiting (server still running)")
-            return
-        except KeyboardInterrupt:
-            # Ctrl-C in the REPL is a request to interrupt the typed line,
-            # not to kill the process. Just swallow and prompt again.
-            print()  # newline so the next prompt doesn't stack on the ^C
-            continue
-        except Exception as exc:
-            _log(f"readline error: {exc}")
-            # Brief pause to avoid spinning if the error is persistent.
-            time.sleep(0.5)
-            continue
-        cmd_line = line.strip()
-        if not cmd_line:
-            continue
-        parts = cmd_line.split(maxsplit=1)
-        cmd = parts[0].lower()
-        arg = parts[1] if len(parts) > 1 else ""
-        handler = _COMMANDS.get(cmd)
-        if handler is None:
-            _log(f"unknown command: {cmd!r} (try `help`)")
-            continue
-        try:
-            handler[0](arg)
-        except SystemExit:
-            raise
-        except Exception as exc:
-            import traceback
-            _log(f"{cmd}: failed: {exc}\n{traceback.format_exc()}")
+    try:
+        while True:
+            try:
+                line = input("scenecraft> ")
+            except EOFError:
+                _log("stdin EOF — console exiting (server still running)")
+                return
+            except KeyboardInterrupt:
+                print()
+                continue
+            except Exception as exc:
+                _log(f"readline error: {exc}")
+                time.sleep(0.5)
+                continue
+            cmd_line = line.strip()
+            if not cmd_line:
+                continue
+            parts = cmd_line.split(maxsplit=1)
+            cmd = parts[0].lower()
+            arg = parts[1] if len(parts) > 1 else ""
+            handler = _COMMANDS.get(cmd)
+            if handler is None:
+                _log(f"unknown command: {cmd!r} (try `help`)")
+                continue
+            try:
+                handler[0](arg)
+            except SystemExit:
+                raise
+            except Exception as exc:
+                import traceback
+                _log(f"{cmd}: failed: {exc}\n{traceback.format_exc()}")
+    finally:
+        restore_tty()
 
 
 def start_if_tty() -> None:
