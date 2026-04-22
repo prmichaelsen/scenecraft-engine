@@ -28,6 +28,18 @@ import threading
 import time
 from typing import Callable
 
+# readline gives us access to the in-flight input buffer — needed to
+# redraw "scenecraft> <partial input>" after a log line clears it.
+try:
+    import readline as _readline
+except ImportError:
+    _readline = None  # type: ignore[assignment]
+
+
+_PROMPT_TEXT = "scenecraft> "
+_io_lock = threading.Lock()
+_repl_active = False  # True while the REPL is running and owns the prompt line
+
 
 # ── Terminal mode management ─────────────────────────────────────────────
 
@@ -262,9 +274,12 @@ def _sorted_commands() -> list[tuple[tuple[str, ...], tuple[Callable[[str], None
 
 
 def _repl() -> None:
+    global _repl_active
     restore_tty, tty_changed = _ensure_cooked_mode()
     if tty_changed:
         _log("terminal: forced canonical mode (ICANON | ICRNL | ECHO)")
+    restore_stderr = _install_prompt_aware_stderr()
+    _repl_active = True
     _log("interactive console ready — type `help` for commands (press Enter to submit)")
     # input() is more reliable than sys.stdin.readline() across terminals —
     # handles cooked-mode line buffering the way the user expects, echoes
@@ -301,7 +316,88 @@ def _repl() -> None:
                 import traceback
                 _log(f"{cmd}: failed: {exc}\n{traceback.format_exc()}")
     finally:
+        _repl_active = False
+        restore_stderr()
         restore_tty()
+
+
+# ── Prompt-aware log interleaving ─────────────────────────────────────────
+
+
+class _PromptAwareStream:
+    """Wraps stderr so log writes don't trample an in-flight typed prompt.
+
+    When a write arrives:
+      1. ANSI carriage-return + clear-to-end-of-line wipes the current
+         line (which is either blank or the live prompt + partial input).
+      2. The log bytes go out, ending in newline so the terminal advances.
+      3. The prompt is re-emitted with the in-flight input buffer pulled
+         from readline. Cursor lands after that buffer — readline will
+         reconcile cursor state on the next keystroke via its redisplay.
+
+    Only active while the REPL is running (``_repl_active``). Before then
+    (startup) and after (REPL exited), writes pass through untouched.
+    """
+
+    def __init__(self, underlying) -> None:
+        self._u = underlying
+
+    def write(self, data: str) -> int:
+        if not data:
+            return 0
+        if not _repl_active:
+            return self._u.write(data)
+        try:
+            if not self._u.isatty():
+                return self._u.write(data)
+        except Exception:
+            return self._u.write(data)
+
+        with _io_lock:
+            buffer = ""
+            if _readline is not None:
+                try:
+                    buffer = _readline.get_line_buffer()
+                except Exception:
+                    pass
+            # \r  — move cursor to start of line
+            # \x1b[2K — ANSI "erase entire line"
+            self._u.write("\r\x1b[2K")
+            self._u.write(data)
+            if not data.endswith("\n"):
+                self._u.write("\n")
+            self._u.write(_PROMPT_TEXT + buffer)
+            self._u.flush()
+        return len(data)
+
+    def flush(self) -> None:
+        try:
+            self._u.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):  # fall through for isatty, fileno, etc.
+        return getattr(self._u, name)
+
+
+def _install_prompt_aware_stderr() -> Callable[[], None]:
+    """Replace sys.stderr with the prompt-aware wrapper.
+
+    Returns a restore function. No-op if stderr isn't a TTY.
+    """
+    noop = (lambda: None)
+    try:
+        if not sys.stderr.isatty():
+            return noop
+    except Exception:
+        return noop
+    original = sys.stderr
+    sys.stderr = _PromptAwareStream(original)  # type: ignore[assignment]
+
+    def _restore() -> None:
+        sys.stderr = original  # type: ignore[assignment]
+
+    return _restore
 
 
 def start_if_tty() -> None:
