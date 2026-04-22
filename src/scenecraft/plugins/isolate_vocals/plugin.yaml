@@ -1,0 +1,36 @@
+name: isolate-vocals
+version: 0.2.0
+displayName: "Isolate Vocals"
+description: "Separate a voice-over-noise audio source into vocal and background stems using DeepFilterNet3."
+publisher: scenecraft
+license: MIT
+
+activationEvents:
+  - onCommand:isolate-vocals.run
+  - onContextMenu:audio_clip
+  - onContextMenu:transition
+
+contributes:
+  operations:
+    - id: isolate-vocals.run
+      label: "Isolate vocals"
+      entityTypes: [audio_clip, transition]
+      handler: "backend:isolate_vocals.run"
+      panel: "frontend:isolate_vocals.AudioIsolationsPanel"
+      outputs:
+        - kind: pool_segment
+          stem_type_enum: [vocal, background]
+
+  contextMenus:
+    - entityType: audio_clip
+      items:
+        - operation: isolate-vocals.run
+          label: "Isolate vocals…"
+          icon: wave
+          reveals: panel:audio-isolations
+    - entityType: transition
+      items:
+        - operation: isolate-vocals.run
+          label: "Isolate vocals from audio track…"
+          icon: wave
+          reveals: panel:audio-isolations

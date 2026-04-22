@@ -41,6 +41,10 @@ describe-local = [
     "torch>=2.0.0",
     "accelerate>=0.27.0",
 ]
+plugins = [
+    # isolate-vocals plugin (M11). DFN3 weights lazy-download on first run.
+    "deepfilternet>=0.5.6",
+]
 all = [
     "scenecraft-engine[ai,describe]",
 ]
