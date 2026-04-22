@@ -1076,7 +1076,7 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 track_id = generate_id("track")
                 # Add at top (highest z_order = rendered on top in compositor)
                 z_order = max((t["z_order"] for t in existing), default=-1) + 1
-                db_add_track(project_dir, {"id": track_id, "name": body.get("name", f"Track {len(existing) + 1}"), "z_order": z_order, **{k: v for k, v in body.items() if k in ("blend_mode", "base_opacity", "enabled")}})
+                db_add_track(project_dir, {"id": track_id, "name": body.get("name", f"Track {len(existing) + 1}"), "z_order": z_order, **{k: v for k, v in body.items() if k in ("blend_mode", "base_opacity", "muted")}})
                 _log(f"tracks/add: {m.group(1)} -> {track_id} (z_order={z_order})")
                 return self._json_response({"success": True, "id": track_id})
 
@@ -1091,7 +1091,7 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 track_id = body.pop("id", None)
                 if not track_id: return self._error(400, "BAD_REQUEST", "Missing 'id'")
                 field_map = {"blendMode": "blend_mode", "baseOpacity": "base_opacity", "chromaKey": "chroma_key"}
-                mapped = {field_map.get(k, k): v for k, v in body.items() if field_map.get(k, k) in ("name", "blend_mode", "base_opacity", "enabled", "z_order", "chroma_key", "hidden", "solo")}
+                mapped = {field_map.get(k, k): v for k, v in body.items() if field_map.get(k, k) in ("name", "blend_mode", "base_opacity", "muted", "z_order", "chroma_key", "hidden", "solo")}
                 _log(f"tracks/update: {track_id} {mapped}")
                 db_update_track(project_dir, track_id, **mapped)
                 return self._json_response({"success": True})
@@ -1133,7 +1133,7 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 existing = db_get_audio_tracks(project_dir)
                 track_id = generate_id("audio_track")
                 display_order = max((t["display_order"] for t in existing), default=-1) + 1
-                _track_body = {k: v for k, v in body.items() if k in ("enabled", "hidden", "muted", "volume_curve")}
+                _track_body = {k: v for k, v in body.items() if k in ("hidden", "muted", "solo", "volume_curve")}
                 if "volumeCurve" in body and "volume_curve" not in _track_body:
                     _track_body["volume_curve"] = body["volumeCurve"]
                 db_add_audio_track(project_dir, {"id": track_id, "name": body.get("name", f"Audio Track {len(existing) + 1}"), "display_order": display_order, **_track_body})
@@ -1151,7 +1151,7 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 track_id = body.pop("id", None)
                 if not track_id: return self._error(400, "BAD_REQUEST", "Missing 'id'")
                 field_map = {"displayOrder": "display_order", "volumeCurve": "volume_curve"}
-                mapped = {field_map.get(k, k): v for k, v in body.items() if field_map.get(k, k) in ("name", "display_order", "enabled", "hidden", "muted", "volume_curve")}
+                mapped = {field_map.get(k, k): v for k, v in body.items() if field_map.get(k, k) in ("name", "display_order", "hidden", "muted", "solo", "volume_curve")}
                 _log(f"audio-tracks/update: {track_id} {mapped}")
                 db_update_audio_track(project_dir, track_id, **mapped)
                 return self._json_response({"success": True})
@@ -2332,7 +2332,7 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 return self._json_response({
                     "meta": {"title": project_name, "fps": 24, "resolution": [1920, 1080]},
                     "keyframes": [], "transitions": [], "audioFile": None, "projectName": project_name,
-                    "tracks": [{"id": "track_1", "name": "Track 1", "zOrder": 0, "blendMode": "normal", "baseOpacity": 1.0, "enabled": True}],
+                    "tracks": [{"id": "track_1", "name": "Track 1", "zOrder": 0, "blendMode": "normal", "baseOpacity": 1.0, "muted": False, "solo": False}],
                 })
 
             meta = get_meta(project_dir)
@@ -2530,8 +2530,9 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 "tracks": [{
                     "id": t["id"], "name": t["name"], "zOrder": t["z_order"],
                     "blendMode": t["blend_mode"], "baseOpacity": t["base_opacity"],
-                    "enabled": t["enabled"], "chromaKey": t.get("chroma_key"), "hidden": t.get("hidden", False),
-                } for t in (get_tracks(project_dir) if (project_dir / "project.db").exists() else [{"id": "track_1", "name": "Track 1", "z_order": 0, "blend_mode": "normal", "base_opacity": 1.0, "enabled": True}])],
+                    "muted": t.get("muted", False), "solo": t.get("solo", False),
+                    "chromaKey": t.get("chroma_key"), "hidden": t.get("hidden", False),
+                } for t in (get_tracks(project_dir) if (project_dir / "project.db").exists() else [{"id": "track_1", "name": "Track 1", "z_order": 0, "blend_mode": "normal", "base_opacity": 1.0, "muted": False, "solo": False}])],
             })
 
         def _handle_get_beats(self, project_name: str):

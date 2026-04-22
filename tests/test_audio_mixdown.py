@@ -254,6 +254,64 @@ def test_mixdown_playback_rate_2x_compresses_source_to_half_duration():
 
 
 @pytest.mark.skipif(not _ffmpeg_available(), reason="ffmpeg not installed")
+def test_mixdown_solo_silences_non_solo_tracks():
+    """When any track has solo=True, non-solo tracks are skipped in the mix —
+    matches DAW solo semantics (Premiere / Resolve / Logic / Pro Tools)."""
+    from scenecraft import db as dbmod
+    from scenecraft.audio.mixdown import render_project_audio
+
+    project_dir = Path(tempfile.mkdtemp())
+    try:
+        dbmod.get_db(project_dir)
+        src_solo = project_dir / "audio_staging" / "solo.wav"
+        src_other = project_dir / "audio_staging" / "other.wav"
+        _make_test_wav(src_solo, 440.0, 1.0)
+        _make_test_wav(src_other, 880.0, 1.0)
+
+        dbmod.add_audio_track(project_dir, {
+            "id": "at_solo", "name": "Solo", "display_order": 0,
+            "muted": False, "solo": True,
+            "volume_curve": [[0, 0], [10, 0]],
+        })
+        dbmod.add_audio_track(project_dir, {
+            "id": "at_other", "name": "Other", "display_order": 1,
+            "muted": False, "solo": False,
+            "volume_curve": [[0, 0], [10, 0]],
+        })
+        dbmod.add_audio_clip(project_dir, {
+            "id": "ac_solo", "track_id": "at_solo",
+            "source_path": "audio_staging/solo.wav",
+            "start_time": 0.0, "end_time": 1.0, "source_offset": 0.0,
+        })
+        dbmod.add_audio_clip(project_dir, {
+            "id": "ac_other", "track_id": "at_other",
+            "source_path": "audio_staging/other.wav",
+            "start_time": 0.0, "end_time": 1.0, "source_offset": 0.0,
+        })
+
+        out = project_dir / "audio_staging" / "_mixdown.wav"
+        result = render_project_audio(project_dir, total_seconds=2.0, out_path=out, sr=48000)
+        assert result is not None  # solo track contributes
+
+        # Render output should match solo-only rendering. Compare spectrum:
+        # the solo clip is 440 Hz; other is 880 Hz. Peak FFT bin for first
+        # second should be near 440, not 880.
+        with wave.open(str(out), "rb") as w:
+            raw = w.readframes(w.getnframes())
+        samples = np.frombuffer(raw, dtype=np.int16).reshape(-1, 2).astype(np.float32)[:48000, 0]
+        if samples.size > 0:
+            fft_mag = np.abs(np.fft.rfft(samples))
+            peak_hz = float(np.argmax(fft_mag) * 48000 / samples.size)
+            # Tolerance ±20 Hz for FFT bin resolution
+            assert abs(peak_hz - 440.0) < 30.0, (
+                f"expected dominant frequency ~440 Hz (solo), got {peak_hz:.0f} Hz"
+            )
+    finally:
+        dbmod.close_db(project_dir)
+        shutil.rmtree(project_dir, ignore_errors=True)
+
+
+@pytest.mark.skipif(not _ffmpeg_available(), reason="ffmpeg not installed")
 def test_mixdown_muted_track_is_zero():
     from scenecraft import db as dbmod
     from scenecraft.audio.mixdown import render_project_audio
@@ -265,7 +323,7 @@ def test_mixdown_muted_track_is_zero():
         _make_test_wav(src, 440.0, 1.0)
         dbmod.add_audio_track(project_dir, {
             "id": "at_muted", "name": "Muted", "display_order": 0,
-            "enabled": True, "hidden": False, "muted": True,
+            "hidden": False, "muted": True,
             "volume_curve": [[0, 0], [10, 0]],
         })
         dbmod.add_audio_clip(project_dir, {
@@ -276,13 +334,10 @@ def test_mixdown_muted_track_is_zero():
 
         out = project_dir / "audio_staging" / "_mixdown.wav"
         result = render_project_audio(project_dir, total_seconds=2.0, out_path=out, sr=48000)
-        assert result is not None
-
-        with wave.open(str(out), "rb") as w:
-            raw = w.readframes(w.getnframes())
-        samples = np.frombuffer(raw, dtype=np.int16)
-        assert samples.max() == 0
-        assert samples.min() == 0
+        # With every enabled track muted there's nothing to mix — render
+        # returns None and the caller falls back to the legacy single-audio
+        # path (or skips audio entirely for multi-track-only projects).
+        assert result is None
     finally:
         dbmod.close_db(project_dir)
         shutil.rmtree(project_dir, ignore_errors=True)

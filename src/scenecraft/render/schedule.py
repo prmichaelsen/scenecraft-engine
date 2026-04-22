@@ -262,8 +262,14 @@ def build_schedule(
     all_db_kfs = db_get_kfs(work_dir)
     all_db_trs = db_get_trs(work_dir)
 
+    # Effective mute: track.muted OR (anySolo AND NOT this.solo). Matches
+    # DAW convention — solo'ing any track implicitly mutes all non-solo'd.
+    any_solo = any(t.get("solo", False) for t in tracks)
+
     for track in tracks[1:]:  # skip base track
-        if not track.get("enabled", True):
+        if track.get("muted", False) or track.get("hidden", False):
+            continue
+        if any_solo and not track.get("solo", False):
             continue
         tid = track["id"]
         blend_mode = track.get("blend_mode", "normal")

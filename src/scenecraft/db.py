@@ -180,7 +180,8 @@ def _ensure_schema(conn: sqlite3.Connection):
             z_order INTEGER NOT NULL DEFAULT 0,
             blend_mode TEXT NOT NULL DEFAULT 'normal',
             base_opacity REAL NOT NULL DEFAULT 1.0,
-            enabled INTEGER NOT NULL DEFAULT 1
+            muted INTEGER NOT NULL DEFAULT 0,
+            solo INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS opacity_keyframes (
@@ -270,9 +271,9 @@ def _ensure_schema(conn: sqlite3.Connection):
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL DEFAULT 'Audio Track 1',
             display_order INTEGER NOT NULL DEFAULT 0,
-            enabled INTEGER NOT NULL DEFAULT 1,
             hidden INTEGER NOT NULL DEFAULT 0,
             muted INTEGER NOT NULL DEFAULT 0,
+            solo INTEGER NOT NULL DEFAULT 0,
             volume_curve TEXT NOT NULL DEFAULT '[[0,0],[1,0]]'
         );
 
@@ -443,6 +444,37 @@ def _ensure_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE tracks ADD COLUMN chroma_key TEXT")
     if "hidden" not in track_cols:
         conn.execute("ALTER TABLE tracks ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+    if "solo" not in track_cols:
+        conn.execute("ALTER TABLE tracks ADD COLUMN solo INTEGER NOT NULL DEFAULT 0")
+
+    # Replace `enabled` with `muted` on tracks. Semantically `enabled=false`
+    # always meant "mute this track" in the UI (tooltip literally said so).
+    # Adding `muted` (back-filled from !enabled) and dropping `enabled`.
+    if "muted" not in track_cols:
+        conn.execute("ALTER TABLE tracks ADD COLUMN muted INTEGER NOT NULL DEFAULT 0")
+        if "enabled" in track_cols:
+            conn.execute("UPDATE tracks SET muted = CASE WHEN enabled = 0 THEN 1 ELSE 0 END")
+    if "enabled" in track_cols:
+        try:
+            conn.execute("ALTER TABLE tracks DROP COLUMN enabled")
+        except sqlite3.OperationalError:
+            pass  # SQLite <3.35 — leave the column, it's unused going forward
+
+    # Add solo column to audio_tracks if missing. When any track is solo'd,
+    # non-solo tracks are effectively muted — same convention as Premiere /
+    # Resolve. Multiple tracks can solo simultaneously.
+    audio_track_cols = {row[1] for row in conn.execute("PRAGMA table_info(audio_tracks)").fetchall()}
+    if "solo" not in audio_track_cols:
+        conn.execute("ALTER TABLE audio_tracks ADD COLUMN solo INTEGER NOT NULL DEFAULT 0")
+
+    # Drop `enabled` on audio_tracks. Was always OR'd with `muted` in the
+    # mixer so redundant; consolidate to `muted`.
+    if "enabled" in audio_track_cols:
+        conn.execute("UPDATE audio_tracks SET muted = 1 WHERE enabled = 0")
+        try:
+            conn.execute("ALTER TABLE audio_tracks DROP COLUMN enabled")
+        except sqlite3.OperationalError:
+            pass
 
     # Add anchor_x/anchor_y columns to transitions if missing
     tr_cols4 = {row[1] for row in conn.execute("PRAGMA table_info(transitions)").fetchall()}
@@ -458,7 +490,7 @@ def _ensure_schema(conn: sqlite3.Connection):
     # Ensure default track exists
     try:
         if not conn.execute("SELECT 1 FROM tracks WHERE id = 'track_1'").fetchone():
-            conn.execute("INSERT OR IGNORE INTO tracks (id, name, z_order, blend_mode, base_opacity, enabled) VALUES ('track_1', 'Track 1', 0, 'normal', 1.0, 1)")
+            conn.execute("INSERT OR IGNORE INTO tracks (id, name, z_order, blend_mode, base_opacity, muted) VALUES ('track_1', 'Track 1', 0, 'normal', 1.0, 0)")
     except Exception:
         pass  # another thread may have inserted it
 
@@ -1589,19 +1621,22 @@ def get_tracks(project_dir: Path) -> list[dict]:
     return [{
         "id": r["id"], "name": r["name"], "z_order": r["z_order"],
         "blend_mode": r["blend_mode"], "base_opacity": r["base_opacity"],
-        "enabled": bool(r["enabled"]),
+        "muted": bool(r["muted"]) if "muted" in r.keys() else False,
         "chroma_key": json.loads(r["chroma_key"]) if r["chroma_key"] else None,
         "hidden": bool(r["hidden"]) if "hidden" in r.keys() else False,
+        # Solo: when any track is solo'd, non-solo tracks are effectively
+        # muted (DAW convention). Consumers compute effective_muted themselves.
+        "solo": bool(r["solo"]) if "solo" in r.keys() else False,
     } for r in rows]
 
 
 def add_track(project_dir: Path, track: dict):
     conn = get_db(project_dir)
     conn.execute(
-        "INSERT INTO tracks (id, name, z_order, blend_mode, base_opacity, enabled) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO tracks (id, name, z_order, blend_mode, base_opacity, muted) VALUES (?, ?, ?, ?, ?, ?)",
         (track["id"], track.get("name", "New Track"), track.get("z_order", 0),
          track.get("blend_mode", "normal"), track.get("base_opacity", 1.0),
-         1 if track.get("enabled", True) else 0),
+         1 if track.get("muted", False) else 0),
     )
     conn.commit()
 
@@ -1611,7 +1646,7 @@ def update_track(project_dir: Path, track_id: str, **fields):
     sets = []
     values = []
     for key, val in fields.items():
-        if key == "enabled" or key == "hidden":
+        if key in ("muted", "hidden", "solo"):
             val = 1 if val else 0
         elif key == "chroma_key":
             val = json.dumps(val) if val is not None else None
@@ -2010,8 +2045,11 @@ def get_audio_tracks(project_dir: Path) -> list[dict]:
     rows = conn.execute("SELECT * FROM audio_tracks ORDER BY display_order").fetchall()
     return [{
         "id": r["id"], "name": r["name"], "display_order": r["display_order"],
-        "enabled": bool(r["enabled"]), "hidden": bool(r["hidden"]),
+        "hidden": bool(r["hidden"]),
         "muted": bool(r["muted"]),
+        # `solo` column may not exist on un-migrated rows — sqlite3.Row raises
+        # IndexError for unknown keys; guard with keys() lookup.
+        "solo": bool(r["solo"]) if "solo" in r.keys() else False,
         "volume_curve": json.loads(r["volume_curve"]) if r["volume_curve"] else [[0, 0], [1, 0]],
     } for r in rows]
 
@@ -2026,12 +2064,12 @@ def add_audio_track(project_dir: Path, track: dict):
     else:
         vc_str = json.dumps(vc)
     conn.execute(
-        "INSERT INTO audio_tracks (id, name, display_order, enabled, hidden, muted, volume_curve) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO audio_tracks (id, name, display_order, hidden, muted, solo, volume_curve) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (track["id"], track.get("name", "Audio Track"),
          track.get("display_order", 0),
-         1 if track.get("enabled", True) else 0,
          1 if track.get("hidden", False) else 0,
          1 if track.get("muted", False) else 0,
+         1 if track.get("solo", False) else 0,
          vc_str),
     )
     conn.commit()
@@ -2042,7 +2080,7 @@ def update_audio_track(project_dir: Path, track_id: str, **fields):
     sets = []
     values = []
     for key, val in fields.items():
-        if key in ("enabled", "hidden", "muted"):
+        if key in ("hidden", "muted", "solo"):
             val = 1 if val else 0
         elif key == "volume_curve" and not isinstance(val, str):
             val = json.dumps(val)

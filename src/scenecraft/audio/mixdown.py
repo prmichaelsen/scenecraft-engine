@@ -228,8 +228,14 @@ def render_project_audio(
     master = np.zeros((2, total_samples), dtype=np.float32)
     contributed = 0
 
+    # Effective mute: track.muted OR (anySolo AND NOT this.solo). When any
+    # track is solo'd, only solo'd tracks contribute to the mix.
+    any_solo = any(t.get("solo", False) for t in tracks)
+
     for track in tracks:
-        if track.get("hidden") or not track.get("enabled", True):
+        if track.get("hidden") or track.get("muted", False):
+            continue
+        if any_solo and not track.get("solo", False):
             continue
         clips = dbmod.get_audio_clips(project_dir, track["id"])
         if not clips:
