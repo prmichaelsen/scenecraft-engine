@@ -27,6 +27,7 @@ import asyncio
 import json
 import logging
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -45,21 +46,51 @@ def _log(msg: str) -> None:
     print(f"[{ts}] [preview-ws] {msg}", file=sys.stderr, flush=True)
 
 
+_PUMP_SENTINEL: Any = object()
+
+
 async def _pump_fragments(ws: ServerConnection, worker: RenderWorker) -> None:
-    """Forward fragments from the worker to the websocket as binary frames."""
+    """Forward fragments from the worker to the websocket as binary frames.
+
+    Uses a bare daemon thread + asyncio.Queue instead of
+    loop.run_in_executor(None, ...) — the default ThreadPoolExecutor can
+    be spuriously marked 'shutdown' in long-running servers (seen as
+    "cannot schedule new futures after interpreter shutdown") which
+    breaks the pump on reconnect. A dedicated thread per pump sidesteps
+    the executor lifecycle entirely.
+    """
     loop = asyncio.get_running_loop()
     iterator = worker.fragments()
+    q: asyncio.Queue = asyncio.Queue(maxsize=8)
+    stop_event = threading.Event()
 
-    def _next_chunk():
+    def _producer() -> None:
         try:
-            return next(iterator)
-        except StopIteration:
-            return None
+            for chunk in iterator:
+                if stop_event.is_set():
+                    return
+                fut = asyncio.run_coroutine_threadsafe(q.put(chunk), loop)
+                try:
+                    fut.result()
+                except Exception:
+                    return
+        except Exception as exc:
+            logger.exception("preview-stream producer failed: %s", exc)
+        finally:
+            try:
+                asyncio.run_coroutine_threadsafe(q.put(_PUMP_SENTINEL), loop)
+            except Exception:
+                pass
+
+    producer_thread = threading.Thread(
+        target=_producer, name="preview-pump-producer", daemon=True
+    )
+    producer_thread.start()
 
     try:
         while True:
-            chunk = await loop.run_in_executor(None, _next_chunk)
-            if chunk is None:
+            chunk = await q.get()
+            if chunk is _PUMP_SENTINEL:
                 break
             try:
                 await ws.send(chunk)
@@ -67,6 +98,8 @@ async def _pump_fragments(ws: ServerConnection, worker: RenderWorker) -> None:
                 break
     except Exception as exc:  # pragma: no cover — best-effort
         logger.exception("preview-stream pump failed: %s", exc)
+    finally:
+        stop_event.set()
 
 
 async def _read_commands(ws: ServerConnection, worker: RenderWorker) -> None:

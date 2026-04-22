@@ -17,6 +17,7 @@ scrub and playback share warmed data.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import math
 import os
@@ -45,6 +46,17 @@ BUFFER_SECONDS = 10          # how far ahead of the playhead to pre-render
 FRAGMENT_SECONDS = 2.0       # one fMP4 media segment per 2s — aligns with 2s GOP
 IDLE_TIMEOUT_S = 300         # tear down workers idle for this long
 SCRUB_JPEG_QUALITY = 85      # JPEG quality used when opportunistically warming the scrub cache
+# Max number of parallel threads rendering frames within a single fragment.
+# cv2 releases the GIL during decode/compose so real parallelism holds.
+# Each thread keeps its own VideoCapture handles (stream_caps) for the
+# duration of its chunk — opened on first frame, released after chunk.
+#
+# At fragment boundaries each thread pays a fixed cost (open cap + seek
+# to chunk-start frame ≈ 50-100ms at 1080p). If chunks shrink below ~2
+# frames the open/seek overhead dominates decode, so the actual
+# parallelism used is min(RENDER_MAX_PARALLELISM, frames_to_render // 2).
+RENDER_MAX_PARALLELISM = max(2, os.cpu_count() or 2)
+MIN_FRAMES_PER_CHUNK = 2
 
 
 def _log(msg: str) -> None:
@@ -253,50 +265,96 @@ class RenderWorker:
                     self._playing.clear()
                     continue
 
-                # Render one fragment's worth of frames.
+                # Render one fragment's worth of frames in parallel chunks.
+                # Sequential rendering at 1080p runs at ~1.4x realtime which
+                # has no headroom for hiccups → stutter. N threads each with
+                # their own stream_caps decode in parallel (cv2 releases the
+                # GIL during decode/compose).
                 frames_to_render = self._frames_per_fragment
                 t0 = self._playhead_t
-                _log(f"rendering fragment: t0={t0:.3f} frames_to_render={frames_to_render}")
-                frames: list[np.ndarray] = []
-                black_count = 0
-                for i in range(frames_to_render):
-                    t = t0 + i / self._fps
-                    if t >= self._schedule.duration_seconds:
-                        break
-                    if self._stop_flag.is_set():
-                        return
-                    try:
-                        frame = render_frame_at(self._schedule, t, frame_cache=self._frame_cache)
-                    except Exception as exc:
-                        import traceback
-                        _log(f"render_frame_at({t:.3f}) failed: {exc}\n{traceback.format_exc()}")
-                        frame = np.zeros(
-                            (self._schedule.height, self._schedule.width, 3),
-                            dtype=np.uint8,
-                        )
-                    if frame is None or not frame.any():
-                        black_count += 1
-                    # Ensure encoder-expected shape (may require even dims).
-                    if (
-                        frame.shape[0] != self._encoder.height
-                        or frame.shape[1] != self._encoder.width
-                    ):
-                        frame = cv2.resize(
-                            frame,
-                            (self._encoder.width, self._encoder.height),
-                            interpolation=cv2.INTER_LINEAR,
-                        )
-                    frames.append(frame)
+                parallelism = max(
+                    1,
+                    min(RENDER_MAX_PARALLELISM, frames_to_render // MIN_FRAMES_PER_CHUNK),
+                )
+                _log(
+                    f"rendering fragment: t0={t0:.3f} "
+                    f"frames_to_render={frames_to_render} parallelism={parallelism}"
+                )
 
-                # (Previously: opportunistically warmed the scrub JPEG cache here
-                # via cv2.imencode per frame. That cost ~50-100ms per 1080p frame
-                # and was blocking the render thread — adding 2-4s per 2s fragment
-                # for no realtime-playback benefit. Removed. Scrub still works via
-                # its own HTTP path; the cache warms on actual scrub visits.)
+                schedule = self._schedule
+                dur = schedule.duration_seconds
+                fps = self._fps
+                enc_h = self._encoder.height
+                enc_w = self._encoder.width
+
+                # Clamp frames_to_render to schedule end so we don't ask
+                # render_frame_at for out-of-range times.
+                effective = frames_to_render
+                for i in range(frames_to_render):
+                    if t0 + i / fps >= dur:
+                        effective = i
+                        break
+                if effective == 0:
+                    self._playing.clear()
+                    continue
+
+                chunk_size = max(1, math.ceil(effective / parallelism))
+
+                def render_chunk(start_i: int, end_i: int) -> list[np.ndarray]:
+                    # Fresh frame_cache per chunk so each thread owns its own
+                    # VideoCapture handles (stream_caps) and overlay state.
+                    # Slight correctness cost: overlay crossfade history isn't
+                    # continuous across chunk boundaries — acceptable for
+                    # preview; no visible artifact except at chunk-boundary
+                    # overlay-clip transitions.
+                    local_cache: dict = {"stream_caps": {}}
+                    try:
+                        out: list[np.ndarray] = []
+                        for i in range(start_i, end_i):
+                            if self._stop_flag.is_set():
+                                return out
+                            t = t0 + i / fps
+                            try:
+                                f = render_frame_at(schedule, t, frame_cache=local_cache)
+                            except Exception as exc:
+                                import traceback
+                                _log(
+                                    f"render_frame_at({t:.3f}) failed: {exc}\n{traceback.format_exc()}"
+                                )
+                                f = np.zeros((schedule.height, schedule.width, 3), dtype=np.uint8)
+                            if f.shape[0] != enc_h or f.shape[1] != enc_w:
+                                f = cv2.resize(f, (enc_w, enc_h), interpolation=cv2.INTER_LINEAR)
+                            out.append(f)
+                        return out
+                    finally:
+                        for entry in local_cache.get("stream_caps", {}).values():
+                            try:
+                                entry["cap"].release()
+                            except Exception:
+                                pass
+
+                ranges = [
+                    (i, min(i + chunk_size, effective))
+                    for i in range(0, effective, chunk_size)
+                ]
+                render_t0 = time.monotonic()
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=len(ranges), thread_name_prefix="render-chunk"
+                ) as pool:
+                    chunk_results = list(
+                        pool.map(lambda ab: render_chunk(*ab), ranges)
+                    )
+                frames = [f for chunk in chunk_results for f in chunk]
+                render_elapsed = time.monotonic() - render_t0
+                black_count = sum(1 for f in frames if f is None or not f.any())
 
                 if not frames:
                     self._playing.clear()
                     continue
+                _log(
+                    f"parallel render done: {len(frames)} frames in "
+                    f"{render_elapsed:.2f}s ({len(frames) / max(render_elapsed, 1e-6):.1f} fps)"
+                )
 
                 _log(
                     f"fragment t0={t0:.3f} frames={len(frames)} black={black_count} "
