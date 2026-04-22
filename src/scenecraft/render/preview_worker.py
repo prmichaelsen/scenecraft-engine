@@ -170,6 +170,30 @@ class RenderWorker:
         # See fragment_cache.CacheKey for the full justification.
         self._encoder_generation: int = 0
 
+        # Encoder lock — serializes encode_range calls between the main
+        # loop and the BackgroundRenderer so we never interleave frames
+        # into the shared ffmpeg subprocess stdin.
+        self._encoder_lock = threading.Lock()
+
+        # Main-busy flag — set while the render loop is inside its
+        # render-then-encode section. BackgroundRenderer polls this via
+        # a callback and yields when it's True.
+        self._main_busy = threading.Event()
+
+        # Background renderer — proactively populates the fragment cache
+        # around the playhead while idle. Lazy-start on first play.
+        from scenecraft.render.background_renderer import BackgroundRenderer
+        self._background_renderer = BackgroundRenderer(
+            project_dir=self.project_dir,
+            schedule=self._schedule,
+            encoder=self._encoder,
+            encoder_generation_cb=lambda: self._encoder_generation,
+            main_busy_cb=self._main_busy.is_set,
+            fragment_seconds=FRAGMENT_SECONDS,
+            fps=self._fps,
+        )
+        self._background_renderer.set_encoder_lock(self._encoder_lock)
+
         # Control flags.
         self._playing = threading.Event()          # set while render loop should produce
         self._stop_flag = threading.Event()        # set to terminate worker entirely
@@ -213,6 +237,12 @@ class RenderWorker:
             self._thread = threading.Thread(target=self._render_loop, daemon=True)
             self._thread.start()
         self._playing.set()
+        # Kick background renderer — populates fragment cache around the
+        # playhead so replay is free and near-future playback starts
+        # from cache.
+        self._background_renderer.start()
+        self._background_renderer.update_playhead(self._playhead_t)
+        self._background_renderer.prime_around_playhead(radius_s=20.0)
 
     def seek(self, t: float) -> None:
         """Flush pending fragments past the current playhead, resume rendering from t.
@@ -229,16 +259,29 @@ class RenderWorker:
             self._drain_queue()
         self._last_activity_ts = time.monotonic()
         self._playing.set()
+        # Reprioritize background work around the new playhead so we
+        # catch up quickly in the likely direction of playback.
+        self._background_renderer.update_playhead(self._playhead_t)
+        self._background_renderer.prime_around_playhead(radius_s=20.0)
 
     def pause(self) -> None:
         """Stop rendering. Queued fragments remain available."""
         self._playing.clear()
         self._last_activity_ts = time.monotonic()
+        # Keep the background worker going — paused user likely scrolls
+        # forward, so pre-rendering ahead saves them the cold-start cost
+        # on resume.
 
     def stop(self) -> None:
         """Halt and release all resources."""
         self._stop_flag.set()
         self._playing.set()  # unblock any wait
+        # Stop background renderer first so it doesn't contend for the
+        # encoder lock while the main thread is tearing down.
+        try:
+            self._background_renderer.stop(timeout=2.0)
+        except Exception:
+            pass
         try:
             self._drain_queue()
         except Exception:
@@ -310,8 +353,11 @@ class RenderWorker:
         Returns when the worker is stopped. Safe to call exactly once per
         consumer — a second consumer would starve the first.
         """
-        # Emit init segment synchronously.
-        init = self._encoder.encode_init()
+        # Emit init segment synchronously — hold the encoder lock so we
+        # don't race the background renderer's encode_range feeding the
+        # shared ffmpeg subprocess.
+        with self._encoder_lock:
+            init = self._encoder.encode_init()
         self._init_emitted = True
         yield init
         while not self._stop_flag.is_set():
@@ -578,19 +624,27 @@ class RenderWorker:
                 # internal state but returning the bytes is a no-op for the queue).
                 if not self._init_emitted:
                     try:
-                        self._encoder.encode_init()
+                        with self._encoder_lock:
+                            self._encoder.encode_init()
                     except Exception as exc:
                         _log(f"encode_init failed: {exc}")
 
                 _log(f"encode_range: submitting {len(frames)} frames")
                 _t0 = time.monotonic()
+                # Signal main-busy so background renderer yields while we
+                # feed the shared ffmpeg subprocess.
+                self._main_busy.set()
                 try:
-                    segment = self._encoder.encode_range(frames)
+                    with self._encoder_lock:
+                        segment = self._encoder.encode_range(frames)
                 except Exception as exc:
                     import traceback
                     _log(f"encode_range failed: {exc}\n{traceback.format_exc()}")
+                    self._main_busy.clear()
                     self._playing.clear()
                     continue
+                finally:
+                    self._main_busy.clear()
                 enc_timing = getattr(self._encoder, "last_encode_timing", {})
                 enc_detail = (
                     f" feed={enc_timing.get('feed', 0.0):.2f}s drain={enc_timing.get('drain', 0.0):.2f}s"
