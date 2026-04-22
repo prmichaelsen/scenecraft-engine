@@ -626,6 +626,16 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             if m:
                 return self._handle_serve_file(m.group(1), m.group(2))
 
+            # GET /api/projects/:name/pool/:seg_id/peaks?resolution=400
+            m = re.match(r"^/api/projects/([^/]+)/pool/([^/]+)/peaks$", path)
+            if m:
+                return self._handle_pool_peaks(m.group(1), m.group(2), parsed.query)
+
+            # GET /api/projects/:name/audio-isolations?entityType=&entityId=
+            m = re.match(r"^/api/projects/([^/]+)/audio-isolations$", path)
+            if m:
+                return self._handle_audio_isolations_list(m.group(1), parsed.query)
+
             self._error(404, "NOT_FOUND", f"No route: GET {path}")
 
         def do_POST(self):
@@ -2045,6 +2055,23 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             m = re.match(r"^/api/projects/([^/]+)/section-settings$", path)
             if m:
                 return self._handle_section_settings(m.group(1))
+
+            # Plugin-registered POST routes (fallback — after all built-in routes).
+            m = re.match(r"^/api/projects/([^/]+)/plugins/[^/]+/", path)
+            if m:
+                project_name = m.group(1)
+                project_dir = self._require_project_dir(project_name)
+                if project_dir is None:
+                    return
+                body = self._read_json_body() or {}
+                from scenecraft.plugin_host import PluginHost
+                try:
+                    result = PluginHost.dispatch_rest(path, project_dir, project_name, body)
+                except Exception as e:
+                    _log(f"  plugin dispatch error: {e}")
+                    return self._error(500, "PLUGIN_ERROR", str(e))
+                if result is not None:
+                    return self._json_response(result)
 
             self._error(404, "NOT_FOUND", f"No route: POST {path}")
 
@@ -8500,6 +8527,85 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Scenecraft-Branch")
 
+        def _handle_pool_peaks(self, project_name: str, seg_id: str, query: str):
+            """GET /api/projects/:name/pool/:seg_id/peaks?resolution=N.
+
+            Thin shim over ``compute_peaks`` for raw ``pool_segments`` rows —
+            parallels the audio-clip peaks route but keyed by segment id, so
+            AudioIsolationsPanel can render stem waveforms without going
+            through an audio_clip proxy.
+            """
+            from urllib.parse import parse_qs
+
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+            try:
+                resolution = int(parse_qs(query).get("resolution", ["400"])[0])
+            except ValueError:
+                resolution = 400
+
+            from scenecraft.db import get_pool_segment
+
+            seg = get_pool_segment(project_dir, seg_id)
+            if seg is None:
+                return self._error(404, "NOT_FOUND", f"Pool segment not found: {seg_id}")
+            pool_rel = seg.get("poolPath") or seg.get("pool_path", "")
+            if not pool_rel:
+                return self._error(400, "BAD_REQUEST", "pool segment has no pool_path")
+            pool_path = (project_dir / pool_rel).resolve()
+            try:
+                pool_path.relative_to(project_dir.resolve())
+            except ValueError:
+                return self._error(400, "BAD_REQUEST", "pool_path outside project")
+            if not pool_path.exists():
+                return self._error(404, "NOT_FOUND", f"File missing on disk: {pool_rel}")
+
+            duration = float(seg.get("durationSeconds") or seg.get("duration_seconds") or 0)
+            try:
+                from scenecraft.audio.peaks import compute_peaks
+                data = compute_peaks(
+                    pool_path, 0.0, duration, resolution, project_dir=project_dir
+                )
+            except RuntimeError as e:
+                return self._error(500, "PEAKS_FAILED", str(e))
+
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("X-Peak-Resolution", str(resolution))
+                self.send_header("X-Peak-Duration", f"{duration:.6f}")
+                self._cors_headers()
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def _handle_audio_isolations_list(self, project_name: str, query: str):
+            """GET /api/projects/:name/audio-isolations?entityType=&entityId=.
+
+            Thin wrapper over ``get_isolations_for_entity``. Used by
+            AudioIsolationsPanel to populate its run list on mount and after
+            each job completion.
+            """
+            from urllib.parse import parse_qs
+
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+            qs = parse_qs(query)
+            entity_type = qs.get("entityType", [""])[0]
+            entity_id = qs.get("entityId", [""])[0]
+            if not entity_type or not entity_id:
+                return self._error(
+                    400, "BAD_REQUEST", "entityType and entityId query params required"
+                )
+            from scenecraft.db import get_isolations_for_entity
+
+            rows = get_isolations_for_entity(project_dir, entity_type, entity_id)
+            return self._json_response({"isolations": rows})
+
         def _handle_get_section_settings(self, project_name: str):
             """GET /api/projects/:name/section-settings?section=label — get persisted settings for a section."""
             from urllib.parse import parse_qs
@@ -8892,12 +8998,12 @@ def run_server(host: str = "0.0.0.0", port: int = 8890, work_dir: str | None = N
     _ws_mod.folder_watcher = FolderWatcher(wd)
     start_ws_server(host, ws_port, work_dir=wd)
 
-    # Plugin host — static registry for MVP. Task 102 will uncomment the
-    # plugin import below to activate the isolate-vocals plugin.
-    from scenecraft.plugin_host import PluginHost  # noqa: F401
-    # TODO(task-102): uncomment once scenecraft.plugins.isolate_vocals exists
-    # from scenecraft.plugins import isolate_vocals
-    # PluginHost.register(isolate_vocals)
+    # Plugin host — static registry for MVP. First-party plugins register
+    # here at startup; a future dynamic loader will reuse the same surface.
+    from scenecraft.plugin_host import PluginHost
+    from scenecraft.plugins import isolate_vocals
+
+    PluginHost.register(isolate_vocals)
     _log(f"  Plugins: {len(PluginHost._registered)} registered, {len(PluginHost._operations)} operations")
 
     # Folder watches are lazy — activated when frontend opens a project and calls watch-folder,
