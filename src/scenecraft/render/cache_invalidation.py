@@ -72,7 +72,16 @@ def invalidate_frames_for_mutation(
     # state eventually on the next explicit seek/restart.
     try:
         from scenecraft.render.preview_worker import RenderCoordinator
-        RenderCoordinator.instance().invalidate_project(project_dir)
+        coord = RenderCoordinator.instance()
+        coord.invalidate_project(project_dir)
+        # Nudge the background renderer to re-enqueue buckets inside the
+        # invalidated ranges. When ``ranges`` is None (wholesale
+        # invalidation) we skip the bg requeue — its queue is already
+        # cheap to repopulate from play()/seek() and a full requeue
+        # would be wasteful for a full-project invalidation (e.g.,
+        # schedule rebuild triggers re-priming on the next play).
+        if range_list is not None:
+            coord.invalidate_ranges_in_background(project_dir, range_list)
     except Exception:
         pass
 

@@ -818,6 +818,35 @@ class RenderCoordinator:
         worker.on_project_invalidate()
         return True
 
+    def invalidate_ranges_in_background(
+        self,
+        project_dir: Path,
+        ranges: list[tuple[float, float]],
+    ) -> int:
+        """Tell the project's background renderer to re-queue buckets
+        overlapping any of ``ranges``.
+
+        Called from ``cache_invalidation.invalidate_frames_for_mutation``
+        after the fragment cache has dropped the affected entries.
+        Returns total buckets re-queued; 0 if no worker is alive.
+        """
+        key = str(Path(project_dir).resolve())
+        with self._lock:
+            worker = self._workers.get(key)
+        if worker is None:
+            return 0
+        bg = getattr(worker, "_background_renderer", None)
+        if bg is None:
+            return 0
+        total = 0
+        for a, b in ranges:
+            if b >= a:
+                try:
+                    total += bg.invalidate_range(a, b)
+                except Exception:
+                    pass
+        return total
+
     def _evict_lru_locked(self) -> None:
         """Evict the least-recently-used worker. Caller holds self._lock."""
         if not self._workers:

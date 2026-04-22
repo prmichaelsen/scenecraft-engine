@@ -111,7 +111,21 @@ class BackgroundRenderer:
         self._playhead_t: float = 0.0
         self._stop = threading.Event()
         self._wake = threading.Event()
+        self._paused = threading.Event()  # set → bg worker idles
         self._thread: threading.Thread | None = None
+
+        # Track in-flight bucket t0 so ``state`` can report 'rendering'
+        # without racing the fragment cache (the cache entry only lands
+        # after encode completes). Only one bucket at a time — we're
+        # single-threaded here.
+        self._rendering_t0: float | None = None
+
+        # Snapshot of every bucket we've ever seen — keyed by t0_bucket
+        # (rounded to ms, matching FragmentCache._bucket_ms). Used only
+        # by ``state`` to distinguish 'unrendered' (in queue, never
+        # touched) from the fragment cache's 'cached' (bytes present).
+        # Population is lazy: ``request_range`` adds entries.
+        self._known_t0s: set[int] = set()
 
         # Encoder lock — shared with main worker to prevent simultaneous
         # feeds into the ffmpeg stdin (interleaves frames). Passed via
@@ -177,6 +191,9 @@ class BackgroundRenderer:
         t = math.floor(max(0.0, t_start) / fs) * fs
         with self._lock:
             while t < t_end and not self._stop.is_set():
+                # Record every bucket we've ever considered — used by
+                # ``state`` to label 'unrendered' vs 'cached'.
+                self._known_t0s.add(int(round(t * 1000)))
                 # Only enqueue if cache miss — cheap check, avoids
                 # re-rendering already-cached buckets.
                 if global_fragment_cache.get(
@@ -189,6 +206,66 @@ class BackgroundRenderer:
                         _Bucket(priority=prio, seq=self._seq, t0=t, fragment_seconds=fs),
                     )
                 t += fs
+        self._wake.set()
+
+    def invalidate_range(self, t_start: float, t_end: float) -> int:
+        """Re-enqueue every known bucket whose window overlaps
+        ``[t_start, t_end]``.
+
+        The fragment cache's ``invalidate_range`` has already dropped
+        the bytes for those buckets by the time we get here; our job is
+        to put them back on the priority queue so the background
+        worker re-renders them. Returns the count of buckets queued.
+
+        Called from ``cache_invalidation.invalidate_frames_for_mutation``
+        via ``RenderCoordinator.invalidate_range``.
+        """
+        if t_end < t_start:
+            return 0
+        fs = self._fragment_seconds
+        dur = self._schedule.duration_seconds
+        # Expand to bucket boundaries so an edit at t=3.7 invalidates
+        # the [2.0, 4.0) bucket — the one-second-before and one-second-
+        # after buckets are outside the edit's scope.
+        t_lo = max(0.0, math.floor(t_start / fs) * fs)
+        t_hi = min(dur, math.ceil(t_end / fs) * fs)
+        count = 0
+        with self._lock:
+            t = t_lo
+            while t < t_hi and not self._stop.is_set():
+                self._known_t0s.add(int(round(t * 1000)))
+                self._seq += 1
+                # Priority = distance from playhead. The edit-adjacent
+                # bucket the user is currently viewing wins naturally.
+                heapq.heappush(
+                    self._queue,
+                    _Bucket(
+                        priority=abs(t - self._playhead_t),
+                        seq=self._seq,
+                        t0=t,
+                        fragment_seconds=fs,
+                    ),
+                )
+                count += 1
+                t += fs
+        if count:
+            self._wake.set()
+            _log(f"invalidate_range({t_start:.2f}, {t_end:.2f}) → requeued {count} buckets")
+        return count
+
+    def pause(self) -> None:
+        """Stop rendering but keep queue state — resume with ``resume``
+        or any ``update_playhead`` / ``request_range`` call (both wake
+        the loop).
+
+        A bucket already in-flight runs to completion before the loop
+        idles — keeps partial fragments out of the cache.
+        """
+        self._paused.set()
+
+    def resume(self) -> None:
+        """Resume rendering after ``pause``. Idempotent."""
+        self._paused.clear()
         self._wake.set()
 
     def prime_around_playhead(self, radius_s: float = 20.0) -> None:
@@ -206,6 +283,59 @@ class BackgroundRenderer:
     def queue_size(self) -> int:
         with self._lock:
             return len(self._queue)
+
+    @property
+    def state(self) -> dict[str, str]:
+        """Map of ``t0_ms_bucket`` (as a str) → state label.
+
+        State labels:
+            * ``'cached'``     — fragment cache holds bytes for this bucket
+            * ``'rendering'``  — currently mid-render (only ever one)
+            * ``'unrendered'`` — we know about it (enqueued or requested)
+                                 but it's neither cached nor in flight
+            * ``'stale'``      — cached under a stale encoder_generation;
+                                 will be re-rendered if still in queue
+
+        Buckets outside of ``known_t0s`` don't appear — they've never
+        been touched by this renderer. Task-42 builds the Timeline
+        render-state bar from this map.
+        """
+        gen = self._encoder_generation_cb()
+        fs = self._fragment_seconds
+        with self._lock:
+            queued = {int(round(b.t0 * 1000)) for b in self._queue}
+            rendering_ms = (
+                int(round(self._rendering_t0 * 1000))
+                if self._rendering_t0 is not None
+                else None
+            )
+            known = set(self._known_t0s)
+        out: dict[str, str] = {}
+        for t0_ms in known:
+            t0_s = t0_ms / 1000.0
+            # Cache check — works across generations: if present under
+            # current gen it's cached; if absent, it may still be in
+            # queue or unrendered.
+            cached = global_fragment_cache.get(
+                self.project_dir, t0_s, gen,
+            ) is not None
+            if cached:
+                out[str(t0_ms)] = "cached"
+            elif rendering_ms is not None and t0_ms == rendering_ms:
+                out[str(t0_ms)] = "rendering"
+            elif t0_ms in queued:
+                out[str(t0_ms)] = "unrendered"
+            else:
+                # Known but not in any of the above — edit invalidated
+                # it and nothing has reclaimed it yet. "stale" surfaces
+                # the gap so the UI can paint it distinctly from
+                # never-rendered.
+                out[str(t0_ms)] = "stale"
+        # Also pretend we know the fragment_seconds aligned zero-bucket
+        # if the schedule has duration — callers that haven't poked the
+        # renderer yet still get a reasonable answer.
+        _ = fs  # kept for future symmetry with task-42 formatters
+        return out
 
     # ── Internals ─────────────────────────────────────────────────────────
 
@@ -311,6 +441,12 @@ class BackgroundRenderer:
         _log(f"started for {self.project_dir.name}")
         try:
             while not self._stop.is_set():
+                # Paused? Sit idle until stop or resume.
+                if self._paused.is_set():
+                    self._wake.clear()
+                    self._wake.wait(timeout=BACKGROUND_IDLE_SLEEP_S)
+                    continue
+
                 # If the main worker is busy, back off briefly.
                 if self._main_busy_cb():
                     time.sleep(BACKGROUND_BLOCKED_YIELD_S)
@@ -323,8 +459,16 @@ class BackgroundRenderer:
                     self._wake.wait(timeout=BACKGROUND_IDLE_SLEEP_S)
                     continue
 
+                # Expose the in-flight bucket for ``state``. Cleared in
+                # the finally below even if _render_bucket raises.
+                with self._lock:
+                    self._rendering_t0 = bucket.t0
                 _t0 = time.monotonic()
-                self._render_bucket(bucket)
+                try:
+                    self._render_bucket(bucket)
+                finally:
+                    with self._lock:
+                        self._rendering_t0 = None
                 elapsed = time.monotonic() - _t0
                 if elapsed > 0.1:
                     _log(
