@@ -476,11 +476,73 @@ milestones:
         dependencies:
           - task-35
 
+  - id: M12
+    title: NLE-Style Preview Rendering Pipeline
+    file: agent/milestones/milestone-12-nle-preview-pipeline.md
+    status: not_started
+    started: null
+    completed: null
+    estimated_weeks: 1.5
+    tasks_total: 5
+    tasks_completed: 0
+    tasks:
+      - id: task-39
+        title: 540p proxy generation + proxy-backed compositor read path
+        file: agent/tasks/milestone-12-nle-preview-pipeline/task-39-proxy-generation.md
+        status: not_started
+        estimated_hours: 12
+        started: null
+        completed_date: null
+        actual_hours: null
+        dependencies: []
+      - id: task-40
+        title: Backend fMP4 fragment cache
+        file: agent/tasks/milestone-12-nle-preview-pipeline/task-40-fragment-cache.md
+        status: not_started
+        estimated_hours: 8
+        started: null
+        completed_date: null
+        actual_hours: null
+        dependencies: []
+      - id: task-41
+        title: Background render worker (proactive fragment rendering)
+        file: agent/tasks/milestone-12-nle-preview-pipeline/task-41-background-render-worker.md
+        status: not_started
+        estimated_hours: 16
+        started: null
+        completed_date: null
+        actual_hours: null
+        dependencies:
+          - task-39
+          - task-40
+      - id: task-42
+        title: Render-state tracking + snapshot/WS-delta API
+        file: agent/tasks/milestone-12-nle-preview-pipeline/task-42-render-state-tracking.md
+        status: not_started
+        estimated_hours: 8
+        started: null
+        completed_date: null
+        actual_hours: null
+        dependencies:
+          - task-40
+          - task-41
+      - id: task-43
+        title: Timeline render-state UI bar
+        file: agent/tasks/milestone-12-nle-preview-pipeline/task-43-timeline-render-state-ui.md
+        status: not_started
+        estimated_hours: 12
+        started: null
+        completed_date: null
+        actual_hours: null
+        dependencies:
+          - task-42
+          - task-37
+
 documentation:
   design_documents: 6
-  milestone_documents: 11
+  milestone_documents: 12
   pattern_documents: 0
-  task_documents: 37
+  task_documents: 42
 
 progress:
   planning: 100
@@ -488,6 +550,8 @@ progress:
   overall: 82
 
 recent_work:
+  - date: 2026-04-22
+    description: "M12 planning — NLE-style preview rendering pipeline. 5 tasks: 540p proxies, fragment cache, background renderer, render-state tracking, Timeline state-bar UI. Shifts preview from 'render realtime from source' to 'render in background, play from cache, show what's rendered'."
   - date: 2026-04-20
     description: "M11 planning — retroactive milestone for backend-rendered preview streaming. 2/5 tasks completed (schedule+compositor refactor, render-frame endpoint+cache). 3/5 remaining (MSE, frontend viewport, WebGL removal)."
   - date: 2026-03-25
@@ -502,11 +566,13 @@ next_steps:
   - "Unassigned task-31: split api_server.py into per-domain modules (prereq for preview streaming)"
   - "Unassigned task-37: unified WebSocket protocol (follow-up to M11 34/35 — replaces per-feature WS lifecycle with one socket + typed envelopes)"
   - "Unassigned task-38: range-based preview frame cache invalidation + client-side bitmap cache (depends on 37 for push)"
+  - "M12: NLE-style preview rendering — proxies + fragment cache + background render + render-state bar (depends on 37, 38)"
 
 notes:
-  - "M1-M3, M5-M11 tracked (33/35 tasks if M11 completes)"
+  - "M1-M3, M5-M12 tracked (38/40 tasks if M11+M12 complete)"
   - "M4 (Resolve integration) deferred"
   - "M11 task IDs 32-36 (30/31/37/38 are unassigned one-offs in agent/tasks/unassigned/)"
+  - "M12 task IDs 39-43; 37 (unified WS) is a prereq for task-43's live UI push"
   - "Wan2.1 requires 24GB+ VRAM (cloud GPU)"
   - "FILM runs between ALL clip boundaries (intra-section smoothing + inter-section style morphing)"
   - "FILM falls back to ffmpeg minterpolate if torch not available"
