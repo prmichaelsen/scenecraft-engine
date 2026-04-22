@@ -46,6 +46,43 @@ BUFFER_SECONDS = 10          # how far ahead of the playhead to pre-render
 FRAGMENT_SECONDS = 2.0       # one fMP4 media segment per 2s — aligns with 2s GOP
 IDLE_TIMEOUT_S = 300         # tear down workers idle for this long
 SCRUB_JPEG_QUALITY = 85      # JPEG quality used when opportunistically warming the scrub cache
+# Fallback preview scale factor when settings.json is missing / malformed.
+# Live value is read per-worker from `{project}/settings.json` →
+# `preview_scale_factor`. See _read_preview_scale_factor().
+DEFAULT_PREVIEW_SCALE_FACTOR = 0.5
+
+
+def _read_preview_scale_factor(project_dir: Path) -> float:
+    """Read `preview_scale_factor` from the project's settings.json.
+
+    Returns DEFAULT_PREVIEW_SCALE_FACTOR if the file is missing / invalid
+    / the key is absent. Clamped to [0.25, 1.0] — smaller than 0.25 would
+    emit degenerate fragments, larger than 1.0 is never desired for
+    preview (that's export territory).
+    """
+    try:
+        import json as _json
+        settings_path = project_dir / "settings.json"
+        if not settings_path.exists():
+            return DEFAULT_PREVIEW_SCALE_FACTOR
+        with open(settings_path) as f:
+            data = _json.load(f)
+        raw = data.get("preview_scale_factor", DEFAULT_PREVIEW_SCALE_FACTOR)
+        v = float(raw)
+    except Exception:
+        return DEFAULT_PREVIEW_SCALE_FACTOR
+    return max(0.25, min(1.0, v))
+
+
+def _preview_dims(native_w: int, native_h: int, scale: float) -> tuple[int, int]:
+    """Compute even-aligned preview encoder dims at the given scale."""
+    preview_w = max(320, int(native_w * scale))
+    preview_h = max(180, int(native_h * scale))
+    if preview_w % 2:
+        preview_w -= 1
+    if preview_h % 2:
+        preview_h -= 1
+    return preview_w, preview_h
 # Max number of parallel threads rendering frames within a single fragment.
 # cv2 releases the GIL during decode/compose so real parallelism holds.
 # Each thread keeps its own VideoCapture handles (stream_caps) for the
@@ -81,17 +118,49 @@ class RenderWorker:
         # Build schedule (may raise if project has no renderable content).
         self._schedule = build_schedule(self.project_dir)
         self._fps = self._schedule.fps or 24.0
+
+        # Kick off 540p proxy generation for every video base-track source.
+        # Proxies cut base-frame decode cost ~4x. First fragment(s) may still
+        # fall back to originals if the proxy isn't ready; subsequent
+        # fragments transparently switch to proxies as they land (keyed on
+        # (seg_idx, effective_source) in stream_caps, new caps open on
+        # switch). Non-blocking — Futures discarded; compositor
+        # re-checks proxy_exists on every frame.
+        try:
+            from scenecraft.render.proxy_generator import ProxyCoordinator
+            seen_sources: set[str] = set()
+            for seg in self._schedule.segments:
+                if seg.get("is_still"):
+                    continue
+                src = seg.get("source")
+                if not src or src in seen_sources:
+                    continue
+                seen_sources.add(src)
+                ProxyCoordinator.instance().ensure_proxy(self.project_dir, src)
+        except Exception as exc:
+            _log(f"proxy prewarm failed (non-fatal): {exc}")
         self._frames_per_fragment = max(1, int(round(FRAGMENT_SECONDS * self._fps)))
         if queue_capacity is None:
             queue_capacity = max(1, math.ceil(BUFFER_SECONDS / FRAGMENT_SECONDS))
         self._queue: queue.Queue[bytes] = queue.Queue(maxsize=queue_capacity)
+
+        # Preview encoder resolution — scale project native dimensions by
+        # the user-configurable `preview_scale_factor` (settings.json).
+        # Matches proxy resolution when both are 0.5, so the render loop's
+        # resize-to-encoder-dims is a no-op when a proxy is active. Remembered
+        # on the worker so we can detect settings changes on invalidation.
+        self._preview_scale_factor = _read_preview_scale_factor(self.project_dir)
+        self._preview_width, self._preview_height = _preview_dims(
+            self._schedule.width, self._schedule.height, self._preview_scale_factor,
+        )
+
         # Force the ffmpeg-subprocess backend: the PyAV path opens a fresh
         # container per fragment, which forces an IDR every fragment and
         # bloats bitrate 5-8x. The subprocess keeps a single encoder alive
         # across fragments (IDR only at GOP boundaries).
         self._encoder = fragment_encoder or FragmentEncoder(
-            width=self._schedule.width,
-            height=self._schedule.height,
+            width=self._preview_width,
+            height=self._preview_height,
             fps=self._fps,
             force_backend="ffmpeg",
         )
@@ -301,6 +370,38 @@ class RenderWorker:
                         self._schedule = new_sched
                         self._frame_cache = {"stream_caps": {}}
                         _log(f"schedule rebuilt for {self.project_dir.name}")
+
+                        # Re-read preview_scale_factor from settings.json; if
+                        # it changed, rebuild the encoder at the new dims.
+                        # Callers on the client side are expected to tear down
+                        # and reopen their MediaSource on settings-driven
+                        # resolution changes — same contract as seek.
+                        new_scale = _read_preview_scale_factor(self.project_dir)
+                        new_w, new_h = _preview_dims(
+                            self._schedule.width, self._schedule.height, new_scale,
+                        )
+                        if (new_scale != self._preview_scale_factor
+                                or new_w != self._preview_width
+                                or new_h != self._preview_height):
+                            _log(
+                                f"preview_scale_factor {self._preview_scale_factor} "
+                                f"→ {new_scale} (encoder dims {self._preview_width}x{self._preview_height} "
+                                f"→ {new_w}x{new_h}) — rebuilding encoder"
+                            )
+                            try:
+                                self._encoder.close()
+                            except Exception:
+                                pass
+                            self._preview_scale_factor = new_scale
+                            self._preview_width = new_w
+                            self._preview_height = new_h
+                            self._encoder = FragmentEncoder(
+                                width=new_w,
+                                height=new_h,
+                                fps=self._fps,
+                                force_backend="ffmpeg",
+                            )
+                            self._init_emitted = False
                     except Exception as exc:
                         _log(f"rebuild failed: {exc}")
                         self._playing.clear()
@@ -362,7 +463,11 @@ class RenderWorker:
                             return out, chunk_timing
                         t = t0 + i / fps
                         try:
-                            f = render_frame_at(schedule, t, frame_cache=local_cache)
+                            f = render_frame_at(
+                                schedule, t,
+                                frame_cache=local_cache,
+                                prefer_proxy=True,  # playback reads proxies when available
+                            )
                         except Exception as exc:
                             import traceback
                             _log(

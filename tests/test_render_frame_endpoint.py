@@ -152,9 +152,15 @@ def test_render_frame_is_cached(project_env):
     assert first_body == second_body
 
 
-def test_cache_invalidates_on_db_write(project_env):
-    """Writing to project.db bumps mtime → cache key changes → re-render."""
-    from scenecraft.db import set_meta
+def test_cache_invalidates_on_range_call(project_env):
+    """Cache entries drop when invalidate_range hits the stored t.
+
+    Note: task-38 shifted invalidation from mtime-based wholesale to
+    explicit range calls from mutating endpoints. A bare DB write no longer
+    triggers invalidation on its own — the endpoint that wrote to the DB
+    must call the invalidator. This test covers the cache's range-drop
+    behavior directly, which is the new contract.
+    """
     from scenecraft.render.frame_cache import global_cache
     global_cache.clear()
 
@@ -162,9 +168,10 @@ def test_cache_invalidates_on_db_write(project_env):
     _get(url).read()
     assert _get(url).headers.get("X-Scenecraft-Cache") == "HIT"
 
-    # Any DB write bumps mtime and invalidates
-    import time; time.sleep(0.01)  # ensure mtime changes
-    set_meta(project_env["project_dir"], "motion_prompt", "new prompt")
+    # Invalidate a range covering t=0.25
+    dropped = global_cache.invalidate_range(project_env["project_dir"], 0.0, 1.0)
+    assert dropped >= 1
+
     assert _get(url).headers.get("X-Scenecraft-Cache") == "MISS"
 
 

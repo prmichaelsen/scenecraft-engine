@@ -7642,6 +7642,11 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             defaults = {
                 "preview_quality": 50,
                 "render_preview_fps": 24,
+                # Preview render resolution as a factor of the project's native
+                # dimensions. 0.5 = 540p out of 1080p. Lower = cheaper to
+                # decode+encode but lower-quality preview. Applied to encoder
+                # output; browser upscales in <video>.
+                "preview_scale_factor": 0.5,
             }
             if settings_path.exists():
                 with open(settings_path) as f:
@@ -7665,13 +7670,23 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     existing = json.load(f)
 
             # Only allow known fields
-            allowed = {"preview_quality", "render_preview_fps"}
+            allowed = {"preview_quality", "render_preview_fps", "preview_scale_factor"}
             for key in allowed:
                 if key in body:
                     existing[key] = body[key]
 
             with open(settings_path, "w") as f:
                 json.dump(existing, f, indent=2)
+
+            # Nudge the preview worker (if any) to re-read settings — the
+            # worker will pick up a changed preview_scale_factor on its next
+            # invalidation check and rebuild its encoder accordingly.
+            try:
+                from scenecraft.render.preview_worker import RenderCoordinator
+                project_dir = work_dir / project_name
+                RenderCoordinator.instance().invalidate_project(project_dir)
+            except Exception:
+                pass
 
             self._json_response({"success": True, **existing})
 

@@ -554,6 +554,43 @@ def _find_segment(segments: list[dict], t: float) -> int:
     return -1
 
 
+def _resolve_source_for_read(
+    seg: dict,
+    project_dir: "Path | None",
+    prefer_proxy: bool,
+) -> str:
+    """Decide which file to decode from for a base-track segment.
+
+    When `prefer_proxy=True` and a fresh 540p proxy exists for the
+    segment's source, return the proxy path — cuts decode CPU ~4x.
+    Otherwise return the original source, and if `prefer_proxy=True` but
+    no proxy exists, kick off background proxy generation so the NEXT
+    playback session (or later fragment) can use it.
+
+    Scrub / export paths pass `prefer_proxy=False` and always get the
+    original.
+    """
+    source = seg["source"]
+    if not prefer_proxy or project_dir is None:
+        return source
+    try:
+        from scenecraft.render.proxy_generator import (
+            proxy_path_for, proxy_exists, ProxyCoordinator,
+        )
+    except ImportError:
+        return source
+    if proxy_exists(project_dir, source):
+        pp = proxy_path_for(project_dir, source)
+        if pp is not None:
+            return str(pp)
+    # Proxy missing — kick off background gen and return original for now.
+    try:
+        ProxyCoordinator.instance().ensure_proxy(project_dir, source)
+    except Exception:
+        pass
+    return source
+
+
 def _get_frame_at(
     seg_idx: int,
     progress: float,
@@ -565,6 +602,8 @@ def _get_frame_at(
     *,
     scrub: bool = False,
     stream_caps: dict | None = None,
+    project_dir: "Path | None" = None,
+    prefer_proxy: bool = False,
 ):
     """Get source frame from segment at given progress (0-1), with remap.
 
@@ -579,6 +618,10 @@ def _get_frame_at(
       monotonic idx and seeking only when the cursor jumps. O(1) memory,
       cheap sequential reads. The caller owns the dict lifetime so they
       can release captures on teardown.
+
+    `prefer_proxy=True` routes reads through a 540p proxy of the source
+    when available (see proxy_generator). `project_dir` must be supplied
+    for proxy resolution.
     """
     import cv2
     import numpy as np
@@ -597,6 +640,8 @@ def _get_frame_at(
         _ensure_loaded(seg_idx, segments, loaded_segs, w, h, preview)
         return seg["_frames"][idx]
 
+    effective_source = _resolve_source_for_read(seg, project_dir, prefer_proxy)
+
     def _fit(frame):
         if frame is None:
             return np.zeros((h, w, 3), dtype=np.uint8)
@@ -611,7 +656,7 @@ def _get_frame_at(
         return frame
 
     if scrub:
-        cap = cv2.VideoCapture(seg["source"])
+        cap = cv2.VideoCapture(effective_source)
         try:
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ret, frame = cap.read()
@@ -620,10 +665,15 @@ def _get_frame_at(
             cap.release()
 
     if stream_caps is not None:
-        entry = stream_caps.get(seg_idx)
+        # Key the cache by (seg_idx, effective_source) so that switching
+        # from original to proxy (e.g. background gen finished since the
+        # previous fragment) transparently opens a new cap instead of
+        # reading from a now-stale handle.
+        cache_key = (seg_idx, effective_source)
+        entry = stream_caps.get(cache_key)
         if entry is None:
-            entry = {"cap": cv2.VideoCapture(seg["source"]), "cursor": -1}
-            stream_caps[seg_idx] = entry
+            entry = {"cap": cv2.VideoCapture(effective_source), "cursor": -1}
+            stream_caps[cache_key] = entry
         cap = entry["cap"]
         cursor = entry["cursor"]
         if idx != cursor + 1:
@@ -676,6 +726,7 @@ def render_frame_at(
     *,
     frame_cache: dict | None = None,
     scrub: bool = False,
+    prefer_proxy: bool = False,
 ) -> Any:
     """Render a single composited BGR frame at time t.
 
@@ -713,6 +764,7 @@ def render_frame_at(
     w = schedule.width
     h = schedule.height
     preview = schedule.preview
+    project_dir = schedule.work_dir
 
     loaded_segs = frame_cache.setdefault("loaded_segs", set())
     overlay_prev = frame_cache.setdefault("overlay_prev", {})
@@ -738,7 +790,7 @@ def render_frame_at(
         raw_progress = (t - seg["from_ts"]) / seg_dur if seg_dur > 0 else 0
         progress = ext + raw_progress * (1.0 - 2 * ext)
         progress = max(0.0, min(0.999, progress))
-        frame = _get_frame_at(seg_idx, progress, segments, loaded_segs, w, h, preview, scrub=scrub, stream_caps=stream_caps)
+        frame = _get_frame_at(seg_idx, progress, segments, loaded_segs, w, h, preview, scrub=scrub, stream_caps=stream_caps, project_dir=project_dir, prefer_proxy=prefer_proxy)
         _tick(timing, "base_frame", _phase_t); _phase_t = time.monotonic()
 
         # Crossfade at segment boundaries — start
@@ -752,7 +804,7 @@ def render_frame_at(
                 prev_raw = (t - prev_seg["from_ts"]) / prev_dur if prev_dur > 0 else 0
                 prev_progress = prev_ext + prev_raw * (1.0 - 2 * prev_ext)
                 prev_progress = max(0.0, min(0.999, prev_progress))
-                prev_frame = _get_frame_at(seg_idx - 1, prev_progress, segments, loaded_segs, w, h, preview, scrub=scrub, stream_caps=stream_caps)
+                prev_frame = _get_frame_at(seg_idx - 1, prev_progress, segments, loaded_segs, w, h, preview, scrub=scrub, stream_caps=stream_caps, project_dir=project_dir, prefer_proxy=prefer_proxy)
                 frame = cv2.addWeighted(prev_frame, 1.0 - alpha, frame, alpha, 0)
 
         # Crossfade at segment boundaries — end
@@ -766,7 +818,7 @@ def render_frame_at(
                 next_raw = (t - next_seg["from_ts"]) / next_dur if next_dur > 0 else 0
                 next_progress = next_ext + next_raw * (1.0 - 2 * next_ext)
                 next_progress = max(0.0, min(0.999, next_progress))
-                next_frame = _get_frame_at(seg_idx + 1, next_progress, segments, loaded_segs, w, h, preview, scrub=scrub, stream_caps=stream_caps)
+                next_frame = _get_frame_at(seg_idx + 1, next_progress, segments, loaded_segs, w, h, preview, scrub=scrub, stream_caps=stream_caps, project_dir=project_dir, prefer_proxy=prefer_proxy)
                 frame = cv2.addWeighted(frame, alpha, next_frame, 1.0 - alpha, 0)
         _tick(timing, "crossfade", _phase_t); _phase_t = time.monotonic()
 
