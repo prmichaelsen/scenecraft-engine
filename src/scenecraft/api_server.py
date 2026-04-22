@@ -8909,6 +8909,12 @@ def run_server(host: str = "0.0.0.0", port: int = 8890, work_dir: str | None = N
     _log(f"  Projects: {len([d for d in wd.iterdir() if d.is_dir()])}")
     _log("")
 
+    # Interactive console (TTY only) — type `help` for commands; `restart`
+    # tears down workers and execs a fresh interpreter so the latest
+    # on-disk code takes effect without a manual kill + relaunch cycle.
+    from scenecraft.interactive_console import start_if_tty as _start_console
+    _start_console()
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
