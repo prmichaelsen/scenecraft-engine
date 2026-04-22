@@ -316,6 +316,43 @@ def _ensure_schema(conn: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_audio_cand_clip ON audio_candidates(audio_clip_id);
         CREATE INDEX IF NOT EXISTS idx_audio_cand_seg ON audio_candidates(pool_segment_id);
 
+        -- M11 task-100b: multi-stem isolation runs. One audio_isolations row per
+        -- invocation of an isolation plugin (vocal/background split, etc.);
+        -- isolation_stems is the junction from run → pool_segments rows (one
+        -- per emitted stem, typed 'vocal' | 'background' for MVP).
+        CREATE TABLE IF NOT EXISTS audio_isolations (
+            id TEXT PRIMARY KEY,
+            entity_type TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            range_mode TEXT NOT NULL,
+            trim_in REAL,
+            trim_out REAL,
+            status TEXT NOT NULL,
+            error TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_isolations_entity
+            ON audio_isolations(entity_type, entity_id);
+        CREATE INDEX IF NOT EXISTS idx_isolations_created
+            ON audio_isolations(created_at);
+
+        -- FK is DEFERRABLE INITIALLY DEFERRED so undo/redo can replay rows in
+        -- seq order (stems before their parent isolation row) inside a single
+        -- commit — SQLite defers FK checks to commit boundary.
+        CREATE TABLE IF NOT EXISTS isolation_stems (
+            isolation_id TEXT NOT NULL,
+            pool_segment_id TEXT NOT NULL REFERENCES pool_segments(id),
+            stem_type TEXT NOT NULL,
+            PRIMARY KEY (isolation_id, pool_segment_id),
+            FOREIGN KEY (isolation_id) REFERENCES audio_isolations(id)
+                DEFERRABLE INITIALLY DEFERRED
+        );
+        CREATE INDEX IF NOT EXISTS idx_isolation_stems_run
+            ON isolation_stems(isolation_id);
+        CREATE INDEX IF NOT EXISTS idx_isolation_stems_segment
+            ON isolation_stems(pool_segment_id);
+
         CREATE TABLE IF NOT EXISTS sections (
             id TEXT PRIMARY KEY,
             label TEXT NOT NULL DEFAULT '',
@@ -525,7 +562,7 @@ def _ensure_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE audio_clips ADD COLUMN selected TEXT")
 
     # ── Undo triggers (AFTER all migrations so PRAGMA table_info sees all columns) ──
-    _undo_tracked_tables = ["keyframes", "transitions", "suppressions", "effects", "tracks", "transition_effects", "markers", "audio_tracks", "audio_clips"]
+    _undo_tracked_tables = ["keyframes", "transitions", "suppressions", "effects", "tracks", "transition_effects", "markers", "audio_tracks", "audio_clips", "audio_isolations"]
     for table in _undo_tracked_tables:
         cols_info = conn.execute(f"PRAGMA table_info({table})").fetchall()
         col_names = [row[1] for row in cols_info]
@@ -545,6 +582,40 @@ def _ensure_schema(conn: sqlite3.Connection):
         col_list = ", ".join(col_names)
         val_exprs = " || ',' || ".join([f"quote(OLD.{col})" for col in col_names])
         conn.execute(f"CREATE TRIGGER {table}_delete_undo AFTER DELETE ON {table} WHEN (SELECT value FROM undo_state WHERE key='active') = 1 BEGIN INSERT INTO undo_log (undo_group, sql_text) SELECT value, 'INSERT INTO {table} ({col_list}) VALUES (' || {val_exprs} || ')' FROM undo_state WHERE key='current_group'; END;")
+
+    # ── Composite-PK undo triggers for isolation_stems ──
+    # isolation_stems has a composite PK (isolation_id, pool_segment_id) rather
+    # than a single `id`, so it needs explicit trigger SQL keyed on both columns.
+    conn.execute("DROP TRIGGER IF EXISTS isolation_stems_insert_undo")
+    conn.execute("DROP TRIGGER IF EXISTS isolation_stems_update_undo")
+    conn.execute("DROP TRIGGER IF EXISTS isolation_stems_delete_undo")
+    conn.execute(
+        "CREATE TRIGGER isolation_stems_insert_undo AFTER INSERT ON isolation_stems "
+        "WHEN (SELECT value FROM undo_state WHERE key='active') = 1 "
+        "BEGIN INSERT INTO undo_log (undo_group, sql_text) "
+        "SELECT value, 'DELETE FROM isolation_stems WHERE isolation_id=' || quote(NEW.isolation_id) "
+        "|| ' AND pool_segment_id=' || quote(NEW.pool_segment_id) "
+        "FROM undo_state WHERE key='current_group'; END;"
+    )
+    conn.execute(
+        "CREATE TRIGGER isolation_stems_update_undo AFTER UPDATE ON isolation_stems "
+        "WHEN (SELECT value FROM undo_state WHERE key='active') = 1 "
+        "BEGIN INSERT INTO undo_log (undo_group, sql_text) "
+        "SELECT value, 'UPDATE isolation_stems SET isolation_id=' || quote(OLD.isolation_id) "
+        "|| ',pool_segment_id=' || quote(OLD.pool_segment_id) "
+        "|| ',stem_type=' || quote(OLD.stem_type) "
+        "|| ' WHERE isolation_id=' || quote(OLD.isolation_id) "
+        "|| ' AND pool_segment_id=' || quote(OLD.pool_segment_id) "
+        "FROM undo_state WHERE key='current_group'; END;"
+    )
+    conn.execute(
+        "CREATE TRIGGER isolation_stems_delete_undo AFTER DELETE ON isolation_stems "
+        "WHEN (SELECT value FROM undo_state WHERE key='active') = 1 "
+        "BEGIN INSERT INTO undo_log (undo_group, sql_text) "
+        "SELECT value, 'INSERT INTO isolation_stems (isolation_id, pool_segment_id, stem_type) VALUES (' "
+        "|| quote(OLD.isolation_id) || ',' || quote(OLD.pool_segment_id) || ',' || quote(OLD.stem_type) || ')' "
+        "FROM undo_state WHERE key='current_group'; END;"
+    )
 
     # Commit all DDL + seed inserts. Without this, the connection holds an open
     # transaction that blocks writes from other threads (e.g., background workers,
@@ -1611,6 +1682,198 @@ def get_audio_clip_effective_path(project_dir: Path, audio_clip: dict) -> str:
         if seg and seg.get("poolPath"):
             return seg["poolPath"]
     return audio_clip.get("source_path", "")
+
+
+# ── Audio isolation runs (M11 task-100b) ───────────────────────────
+
+_ISOLATION_ENTITY_TYPES = ("audio_clip", "transition")
+_ISOLATION_RANGE_MODES = ("full", "subset")
+_ISOLATION_STATUSES = ("pending", "running", "completed", "failed")
+
+
+def add_audio_isolation(
+    project_dir: Path,
+    *,
+    entity_type: str,
+    entity_id: str,
+    model: str,
+    range_mode: str,
+    trim_in: float | None,
+    trim_out: float | None,
+) -> str:
+    """Insert a new audio_isolations row in status='pending'.
+
+    Returns the generated isolation_id. Undo triggers will capture this insert
+    automatically when called inside an undo group.
+    """
+    assert entity_type in _ISOLATION_ENTITY_TYPES, f"bad entity_type: {entity_type}"
+    assert range_mode in _ISOLATION_RANGE_MODES, f"bad range_mode: {range_mode}"
+    isolation_id = generate_id("iso")
+    conn = get_db(project_dir)
+
+    def _do():
+        conn.execute(
+            """INSERT INTO audio_isolations
+               (id, entity_type, entity_id, model, range_mode, trim_in, trim_out,
+                status, error, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?)""",
+            (isolation_id, entity_type, entity_id, model, range_mode,
+             trim_in, trim_out, _now_iso()),
+        )
+        conn.commit()
+
+    _retry_on_locked(_do)
+    return isolation_id
+
+
+def update_audio_isolation_status(
+    project_dir: Path,
+    isolation_id: str,
+    status: str,
+    error: str | None = None,
+) -> None:
+    """Transition an isolation run's status: pending → running → completed | failed.
+
+    ``error`` is stored verbatim when provided (typically on 'failed'); passing
+    None clears any previously-stored error message.
+    """
+    assert status in _ISOLATION_STATUSES, f"bad status: {status}"
+    conn = get_db(project_dir)
+
+    def _do():
+        conn.execute(
+            "UPDATE audio_isolations SET status = ?, error = ? WHERE id = ?",
+            (status, error, isolation_id),
+        )
+        conn.commit()
+
+    _retry_on_locked(_do)
+
+
+def add_isolation_stem(
+    project_dir: Path,
+    isolation_id: str,
+    pool_segment_id: str,
+    stem_type: str,
+) -> None:
+    """Insert a junction row linking an isolation run to an emitted stem.
+
+    Idempotent: a duplicate (isolation_id, pool_segment_id) pair is a no-op
+    via ``INSERT OR IGNORE`` so retries and re-ingests don't double-insert.
+    ``stem_type`` is kept open-ended in the schema but the MVP callers use
+    'vocal' or 'background'.
+    """
+    conn = get_db(project_dir)
+
+    def _do():
+        conn.execute(
+            """INSERT OR IGNORE INTO isolation_stems
+               (isolation_id, pool_segment_id, stem_type)
+               VALUES (?, ?, ?)""",
+            (isolation_id, pool_segment_id, stem_type),
+        )
+        conn.commit()
+
+    _retry_on_locked(_do)
+
+
+def get_isolations_for_entity(
+    project_dir: Path, entity_type: str, entity_id: str,
+) -> list[dict]:
+    """Return all isolation runs for an entity, newest first, with their stems.
+
+    Each run dict shape::
+
+        {
+          "id": str, "status": str, "model": str, "range_mode": str,
+          "trim_in": float | None, "trim_out": float | None, "error": str | None,
+          "created_at": str,
+          "stems": [
+            {"pool_segment_id": str, "stem_type": str,
+             "pool_path": str, "duration_seconds": float | None}, ...
+          ],
+        }
+    """
+    conn = get_db(project_dir)
+
+    def _do():
+        run_rows = conn.execute(
+            """SELECT id, entity_type, entity_id, model, range_mode, trim_in, trim_out,
+                      status, error, created_at
+               FROM audio_isolations
+               WHERE entity_type = ? AND entity_id = ?
+               ORDER BY created_at DESC""",
+            (entity_type, entity_id),
+        ).fetchall()
+        results: list[dict] = []
+        for row in run_rows:
+            stem_rows = conn.execute(
+                """SELECT s.pool_segment_id, s.stem_type,
+                          ps.pool_path, ps.duration_seconds
+                   FROM isolation_stems s
+                   JOIN pool_segments ps ON ps.id = s.pool_segment_id
+                   WHERE s.isolation_id = ?
+                   ORDER BY s.stem_type""",
+                (row["id"],),
+            ).fetchall()
+            stems = [
+                {
+                    "pool_segment_id": sr["pool_segment_id"],
+                    "stem_type": sr["stem_type"],
+                    "pool_path": sr["pool_path"],
+                    "duration_seconds": sr["duration_seconds"],
+                }
+                for sr in stem_rows
+            ]
+            results.append({
+                "id": row["id"],
+                "entity_type": row["entity_type"],
+                "entity_id": row["entity_id"],
+                "model": row["model"],
+                "range_mode": row["range_mode"],
+                "trim_in": row["trim_in"],
+                "trim_out": row["trim_out"],
+                "status": row["status"],
+                "error": row["error"],
+                "created_at": row["created_at"],
+                "stems": stems,
+            })
+        return results
+
+    return _retry_on_locked(_do)
+
+
+def get_isolation_stems(project_dir: Path, isolation_id: str) -> list[dict]:
+    """Return stems for a single isolation run, joined with pool_segments.
+
+    Each entry::
+
+        {"pool_segment_id": str, "stem_type": str,
+         "pool_path": str, "duration_seconds": float | None}
+    """
+    conn = get_db(project_dir)
+
+    def _do():
+        rows = conn.execute(
+            """SELECT s.pool_segment_id, s.stem_type,
+                      ps.pool_path, ps.duration_seconds
+               FROM isolation_stems s
+               JOIN pool_segments ps ON ps.id = s.pool_segment_id
+               WHERE s.isolation_id = ?
+               ORDER BY s.stem_type""",
+            (isolation_id,),
+        ).fetchall()
+        return [
+            {
+                "pool_segment_id": r["pool_segment_id"],
+                "stem_type": r["stem_type"],
+                "pool_path": r["pool_path"],
+                "duration_seconds": r["duration_seconds"],
+            }
+            for r in rows
+        ]
+
+    return _retry_on_locked(_do)
 
 
 # ── Track operations ───────────────────────────────────────────────

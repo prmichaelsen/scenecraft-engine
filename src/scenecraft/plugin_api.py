@@ -23,6 +23,11 @@ from scenecraft.db import (
     add_audio_candidate,
     assign_audio_candidate,
     get_audio_clip_effective_path,
+    add_audio_isolation,
+    update_audio_isolation_status,
+    add_isolation_stem,
+    get_isolations_for_entity,
+    get_isolation_stems,
     undo_begin,
 )
 
@@ -37,6 +42,11 @@ __all__ = [
     "add_audio_candidate",
     "assign_audio_candidate",
     "get_audio_clip_effective_path",
+    "add_audio_isolation",
+    "update_audio_isolation_status",
+    "add_isolation_stem",
+    "get_isolations_for_entity",
+    "get_isolation_stems",
     "undo_begin",
     "job_manager",
     "extract_audio_as_wav",
