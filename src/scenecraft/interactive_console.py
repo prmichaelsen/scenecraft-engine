@@ -327,20 +327,19 @@ def _repl() -> None:
 class _PromptAwareStream:
     """Wraps stderr so log writes don't trample an in-flight typed prompt.
 
-    When a write arrives:
-      1. ANSI carriage-return + clear-to-end-of-line wipes the current
-         line (which is either blank or the live prompt + partial input).
-      2. The log bytes go out, ending in newline so the terminal advances.
-      3. The prompt is re-emitted with the in-flight input buffer pulled
-         from readline. Cursor lands after that buffer — readline will
-         reconcile cursor state on the next keystroke via its redisplay.
+    Python's ``print()`` emits text and trailing ``\\n`` as SEPARATE
+    ``write()`` calls. If we did the prompt-redraw dance on every
+    write, each log line would print an extra blank line between it
+    and the redrawn prompt.
 
-    Only active while the REPL is running (``_repl_active``). Before then
-    (startup) and after (REPL exited), writes pass through untouched.
+    Solution: buffer incomplete writes. Only emit + redraw the prompt
+    when we see a ``\\n`` boundary. Pass-through when the REPL isn't
+    active or the stream isn't a TTY.
     """
 
     def __init__(self, underlying) -> None:
         self._u = underlying
+        self._pending = ""
 
     def write(self, data: str) -> int:
         if not data:
@@ -353,24 +352,36 @@ class _PromptAwareStream:
         except Exception:
             return self._u.write(data)
 
+        n = len(data)
         with _io_lock:
-            buffer = ""
-            if _readline is not None:
-                try:
-                    buffer = _readline.get_line_buffer()
-                except Exception:
-                    pass
-            # \r  — move cursor to start of line
-            # \x1b[2K — ANSI "erase entire line"
-            self._u.write("\r\x1b[2K")
-            self._u.write(data)
-            if not data.endswith("\n"):
-                self._u.write("\n")
-            self._u.write(_PROMPT_TEXT + buffer)
-            self._u.flush()
-        return len(data)
+            self._pending += data
+            # Emit every complete line; keep any trailing partial.
+            while "\n" in self._pending:
+                line, self._pending = self._pending.split("\n", 1)
+                self._emit_line(line + "\n")
+        return n
+
+    def _emit_line(self, line: str) -> None:
+        """Caller holds _io_lock."""
+        buffer = ""
+        if _readline is not None:
+            try:
+                buffer = _readline.get_line_buffer()
+            except Exception:
+                pass
+        # \r → start of line; \x1b[2K → erase entire line
+        self._u.write("\r\x1b[2K")
+        self._u.write(line)
+        self._u.write(_PROMPT_TEXT + buffer)
+        self._u.flush()
 
     def flush(self) -> None:
+        # Flush any partial line that's pending — otherwise a write
+        # without a trailing \n would stay buffered indefinitely.
+        with _io_lock:
+            if self._pending:
+                self._emit_line(self._pending)
+                self._pending = ""
         try:
             self._u.flush()
         except Exception:
