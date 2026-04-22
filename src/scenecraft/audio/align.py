@@ -1,27 +1,31 @@
-"""Audio-clip alignment via onset-envelope cross-correlation (librosa-based).
+"""Audio-clip alignment via raw-waveform cross-correlation.
 
 Feature: "Align waveforms" — given an anchor clip and N other clips that
 should be time-synced to it (multi-mic shoots, re-dubbed takes, music +
 room capture, etc.), compute per-clip signed time offsets that would shift
 each non-anchor clip so its waveform lines up with the anchor's.
 
-Approach:
-  1. Load a bounded slice of each clip via librosa (which decodes + down-
-     samples + mono-ifies in one call, using ffmpeg/soundfile under the
-     hood). We pass offset + duration so a clip sourced from a multi-hour
-     file decodes only the seconds we need, not the whole file.
-  2. Compute onset-strength envelope for each signal (spectral flux). This
-     representation is invariant to gain/EQ/mic differences — what matters
-     is WHERE peaks happen, not their absolute magnitude.
-  3. FFT cross-correlate the anchor's envelope against each other clip's
-     envelope. The argmax gives the lag in frames; multiply by hop_length /
-     sr to convert to seconds.
-  4. Derive a confidence score from the peak height relative to the 95th
-     percentile of the correlation — a sharp clear peak reads high, a
-     diffuse plateau reads low.
+Approach (matches Premiere / Resolve / PluralEyes):
+  1. Load a bounded slice of each clip as mono PCM at 16 kHz via librosa
+     (which streams decode + downsample + mono-ify in one call). We pass
+     offset + duration so a clip sourced from a multi-hour file decodes
+     only the seconds we need, not the whole file.
+  2. High-pass filter at 80 Hz to remove DC and low-frequency rumble that
+     would dominate the correlation without contributing to sync signal.
+  3. Zero-mean + L2-normalize each signal (normalized cross-correlation).
+     Without this the louder clip's raw magnitude pulls the peak.
+  4. FFT cross-correlate anchor vs each other clip on the RAW waveform
+     (not an onset envelope). When two mics capture the same event the
+     PCM is highly similar, so the correlation peak is narrow and
+     sample-accurate. Onset envelopes discard this detail and only give
+     hop-length (~23 ms) granularity — too coarse for proper sync.
+  5. Argmax gives the lag in samples; divide by sr to get seconds.
+  6. Confidence = strength × sharpness, where strength is the peak value
+     (0..1 after NCC) and sharpness is (peak - median_abs) / peak.
 
-This is the same broad approach professional sync tools (Acoustica,
-PluralEyes, Premiere's Synchronize) use internally.
+Prior implementation used onset-envelope cross-correlation, which was
+robust to amplitude/EQ differences but too low-resolution to align
+recordings of the same source properly.
 """
 
 from __future__ import annotations
@@ -33,17 +37,17 @@ from typing import Iterable
 
 import librosa  # type: ignore[import-not-found]
 import numpy as np
-from scipy.signal import correlate  # type: ignore[import-not-found]
+from scipy.signal import butter, correlate, sosfiltfilt  # type: ignore[import-not-found]
 
 
-# 22.05 kHz matches librosa's default + captures transient energy that gets
-# aliased at lower rates. 4 kHz (prior value) was blurring the onset envelope
-# so cross-correlation peaks were broad and ambiguous on long clips.
-_SAMPLE_RATE = 22050
-_HOP_LENGTH = 512     # ≈23 ms per frame at 22050 Hz — standard onset grid
-_MAX_SYNC_SECONDS = 180.0  # per-clip decode cap. Librosa streams, so memory
-                           # stays bounded at sr*dur*4 bytes (~15 MB for 180s).
-_MAX_LAG_SECONDS = 30.0    # reject offsets > this (likely spurious)
+# 16 kHz mono is enough for sync — Nyquist of 8 kHz covers speech +
+# music transients. Decode + correlate time stays modest for multi-minute
+# windows. 4 kHz (original) was too aliased; 22 kHz (previous) wasted compute
+# without improving peak quality meaningfully.
+_SAMPLE_RATE = 16000
+_HIGHPASS_HZ = 80.0          # cut DC + low-freq rumble before correlating
+_MAX_SYNC_SECONDS = 180.0    # per-clip decode cap. ~11 MB per clip at 16 kHz.
+_MAX_LAG_SECONDS = 60.0      # reject offsets > this (likely spurious)
 
 
 def _log(msg: str):
@@ -81,69 +85,62 @@ def _load_clip_signal(
     return y
 
 
-def _onset_envelope(y: np.ndarray, *, sr: int = _SAMPLE_RATE,
-                    hop_length: int = _HOP_LENGTH) -> np.ndarray:
-    """Onset-strength envelope — amplitude-invariant temporal fingerprint."""
-    if len(y) < hop_length:
-        # Signal shorter than one frame; return a zero envelope so the
-        # correlation will yield a peak of 0 (→ confidence 0, offset 0).
+def _preprocess(y: np.ndarray, *, sr: int = _SAMPLE_RATE,
+                highpass_hz: float = _HIGHPASS_HZ) -> np.ndarray:
+    """High-pass → zero-mean → L2-normalize. Output norm = 1 (or zero vector)."""
+    if len(y) < 16:
         return np.zeros(1, dtype=np.float32)
-    env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
-    return env.astype(np.float32)
+    # 2nd-order Butterworth high-pass. Zero-phase via filtfilt so no
+    # time shift is introduced.
+    nyq = sr * 0.5
+    if highpass_hz > 0 and highpass_hz < nyq:
+        sos = butter(2, highpass_hz / nyq, btype="high", output="sos")
+        y = sosfiltfilt(sos, y).astype(np.float32)
+    y = y - float(np.mean(y))
+    n = float(np.linalg.norm(y))
+    return (y / n).astype(np.float32) if n > 1e-9 else y.astype(np.float32)
 
 
-def _cross_correlate_offset(anchor_env: np.ndarray, clip_env: np.ndarray,
+def _cross_correlate_offset(anchor: np.ndarray, clip: np.ndarray,
                             *, sr: int = _SAMPLE_RATE,
-                            hop_length: int = _HOP_LENGTH,
                             max_lag_seconds: float = _MAX_LAG_SECONDS,
                             ) -> tuple[float, float]:
-    """Return (lag_seconds, confidence).
+    """Return (lag_seconds, confidence) — raw-waveform normalized cross-correlation.
+
+    Inputs are expected to be already preprocessed (high-pass + zero-mean +
+    L2-normalized). Correlates at the full sample rate, so the resulting lag
+    is sample-accurate (1/sr seconds precision).
 
     Sign convention: positive lag_seconds means the clip should shift LATER
-    on the timeline to align with the anchor (clip's first-onset is currently
-    BEFORE anchor's first-onset; pushing clip forward by `lag` puts them
-    together).
+    on the timeline to align with the anchor (clip's content is currently
+    BEFORE anchor's; pushing clip forward by `lag` lines them up).
 
-    Confidence ∈ [0, 1]: 1 = peak towers over baseline, 0 = no clear peak.
+    Confidence ∈ [0, 1]: 1 = sharp tall peak, 0 = no clear peak.
     """
-    if len(anchor_env) == 0 or len(clip_env) == 0:
+    if len(anchor) == 0 or len(clip) == 0:
         return 0.0, 0.0
 
-    # Zero-mean + L2-normalize each envelope before correlating. Without this
-    # a louder clip dominates the product and shifts the peak away from the
-    # actual pattern match. This is normalized cross-correlation (NCC) — the
-    # same fix used by every sync tool worth using.
-    def _normalize(e: np.ndarray) -> np.ndarray:
-        e = e - float(np.mean(e))
-        n = float(np.linalg.norm(e))
-        return e / n if n > 1e-9 else e
+    # FFT cross-correlation. mode='full' output length = N+M-1; center index
+    # (zero lag) is at len(clip) - 1.
+    corr = correlate(anchor, clip, mode="full", method="fft")
 
-    anchor_n = _normalize(anchor_env)
-    clip_n = _normalize(clip_env)
-
-    # mode='full' gives correlation at every possible lag; center index is
-    # len(clip_env) - 1 (where 0-lag sits).
-    corr = correlate(anchor_n, clip_n, mode="full", method="fft")
-
-    # Cap the search window to ±max_lag_seconds
-    max_lag_frames = int(max_lag_seconds * sr / hop_length)
-    center = len(clip_env) - 1
-    lo = max(0, center - max_lag_frames)
-    hi = min(len(corr), center + max_lag_frames + 1)
+    # Cap search window to ±max_lag_seconds (in samples now, not frames).
+    max_lag_samples = int(max_lag_seconds * sr)
+    center = len(clip) - 1
+    lo = max(0, center - max_lag_samples)
+    hi = min(len(corr), center + max_lag_samples + 1)
     windowed = corr[lo:hi]
     if len(windowed) == 0:
         return 0.0, 0.0
 
     peak_idx_rel = int(np.argmax(windowed))
     peak_idx_abs = lo + peak_idx_rel
-    lag_frames = peak_idx_abs - center
-    lag_seconds = float(lag_frames * hop_length / sr)
+    lag_samples = peak_idx_abs - center
+    lag_seconds = float(lag_samples / sr)
 
-    # Confidence: ratio of peak height to the median absolute correlation
-    # (signal-to-"floor" ratio). For normalized inputs the peak value itself
-    # is in [-1, 1] — we report min(1, peak) for the "strength" side and
-    # combine with a "sharpness" score (how much the peak stands above the
-    # median). Captures both "good match" and "sharp peak".
+    # Confidence = strength × sharpness. After NCC the peak value is in
+    # [-1, 1]; strength = clamp(peak, 0, 1). Sharpness = how much it stands
+    # above the median absolute value of the correlation.
     peak_val = float(corr[peak_idx_abs])
     median_abs = float(np.median(np.abs(corr)))
     strength = max(0.0, min(1.0, peak_val))
@@ -159,9 +156,9 @@ def detect_offsets(
     anchor_id: str,
     *,
     sr: int = _SAMPLE_RATE,
-    hop_length: int = _HOP_LENGTH,
     max_sync_seconds: float = _MAX_SYNC_SECONDS,
     max_lag_seconds: float = _MAX_LAG_SECONDS,
+    highpass_hz: float = _HIGHPASS_HZ,
 ) -> tuple[dict[str, float], dict[str, float]]:
     """Compute signed-seconds offsets to align each non-anchor clip to anchor.
 
@@ -180,8 +177,8 @@ def detect_offsets(
     if anchor_id not in clip_by_id:
         raise ValueError(f"Anchor clip {anchor_id!r} not in clips list")
 
-    # Load + envelope-extract each clip
-    envs: dict[str, np.ndarray] = {}
+    # Load + preprocess each clip's raw PCM
+    signals: dict[str, np.ndarray] = {}
     for c in clips_list:
         try:
             y = _load_clip_signal(
@@ -191,22 +188,22 @@ def detect_offsets(
                 float(c["end_time"]) - float(c["start_time"]),
                 sr=sr, max_sync_seconds=max_sync_seconds,
             )
-            envs[c["id"]] = _onset_envelope(y, sr=sr, hop_length=hop_length)
+            signals[c["id"]] = _preprocess(y, sr=sr, highpass_hz=highpass_hz)
         except FileNotFoundError as e:
             _log(f"skipping {c['id']}: {e}")
-            envs[c["id"]] = np.zeros(1, dtype=np.float32)
+            signals[c["id"]] = np.zeros(1, dtype=np.float32)
 
     offsets: dict[str, float] = {anchor_id: 0.0}
     confidence: dict[str, float] = {anchor_id: 1.0}
-    anchor_env = envs[anchor_id]
+    anchor_sig = signals[anchor_id]
 
     for c in clips_list:
         cid = c["id"]
         if cid == anchor_id:
             continue
         lag, conf = _cross_correlate_offset(
-            anchor_env, envs[cid],
-            sr=sr, hop_length=hop_length, max_lag_seconds=max_lag_seconds,
+            anchor_sig, signals[cid],
+            sr=sr, max_lag_seconds=max_lag_seconds,
         )
         offsets[cid] = lag
         confidence[cid] = conf
