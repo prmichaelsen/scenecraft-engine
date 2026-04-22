@@ -1,12 +1,15 @@
-"""Tests for scenecraft.audio.align — raw-waveform cross-correlation.
+"""Tests for scenecraft.audio.align — band-limited envelope cross-correlation.
 
-We synthesise test audio inline (pseudo-random clicks) so tests don't depend
-on external sound files. Each test fabricates two signals with a known
-ground-truth offset and asserts the detected offset matches to within one
-sample's-worth of tolerance at the operating sample rate.
+Two kinds of coverage:
+  - Synthetic signals with known ground-truth offsets (identity + shift)
+  - Real comedy-show audio from the oktoberfest_show_01 project, with
+    applied shifts and mic-style distortions, to verify the algorithm
+    handles the cross-mic case it exists to solve.
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -74,6 +77,93 @@ def test_detects_known_shift():
     assert abs(abs(lag) - shift_s) < SAMPLE_TOLERANCE_SECONDS * 4, \
         f"expected ~±{shift_s}s, got {lag}s"
     assert conf > 0.1, f"expected nonzero confidence, got {conf}"
+
+
+FIXTURE_MIC = Path(__file__).parent / "fixtures" / "oktoberfest_mic_slice_15min.ogg"
+
+
+def _load_fixture_mic() -> np.ndarray:
+    """Load the 15 min oktoberfest_show_01 comedian-mic fixture (16 kHz mono).
+
+    Real stand-up-comedy audio — dense continuous speech with laughter
+    breaks — from a 2.4 h live recording. Multi-minute length exercises
+    larger shifts and realistic decode windows, matching the real workflow
+    where source mics have minute-scale start-time differences.
+    """
+    import soundfile as sf  # type: ignore[import-not-found]
+    y, sr = sf.read(str(FIXTURE_MIC), dtype="float32")
+    if sr != _SAMPLE_RATE:
+        raise RuntimeError(f"fixture sr {sr} != expected {_SAMPLE_RATE}")
+    if y.ndim > 1:
+        y = y.mean(axis=1)
+    return y.astype(np.float32)
+
+
+@pytest.mark.skipif(not FIXTURE_MIC.exists(), reason="mic fixture missing")
+def test_aligns_real_comedian_mic_with_small_shift():
+    """Real comedy audio, 3.5 s known shift. Baseline sanity."""
+    y = _load_fixture_mic()
+    shift_s = 3.5
+    shift_samples = int(shift_s * _SAMPLE_RATE)
+    shifted = y[shift_samples:]
+    a = _preprocess(y)
+    b = _preprocess(shifted)
+    lag, conf = _cross_correlate_offset(a, b)
+    assert abs(abs(lag) - shift_s) < 0.05, f"expected ~±{shift_s}s, got {lag}s"
+    assert conf > 0.3, f"confidence too low: {conf}"
+
+
+@pytest.mark.skipif(not FIXTURE_MIC.exists(), reason="mic fixture missing")
+def test_aligns_real_comedian_mic_with_large_shift():
+    """Real comedy audio, 90 s known shift — minute-scale start offsets are
+    typical for multi-recorder live shoots. Verifies max_lag_seconds default
+    accommodates real workflows.
+    """
+    y = _load_fixture_mic()
+    shift_s = 90.0
+    shift_samples = int(shift_s * _SAMPLE_RATE)
+    shifted = y[shift_samples:]
+    a = _preprocess(y)
+    b = _preprocess(shifted)
+    lag, conf = _cross_correlate_offset(a, b)
+    assert abs(abs(lag) - shift_s) < 0.1, f"expected ~±{shift_s}s, got {lag}s"
+    assert conf > 0.2, f"confidence too low: {conf}"
+
+
+@pytest.mark.skipif(not FIXTURE_MIC.exists(), reason="mic fixture missing")
+def test_aligns_real_audio_through_cross_mic_distortions():
+    """Simulate cross-mic case on REAL comedy audio: apply a mic-like
+    band-pass (500–3000 Hz), add 10 ms room delay, add ambience noise,
+    then a known 2.0 s sync shift. Envelope correlation must still recover
+    the shift — this is the failure mode raw-PCM correlation hits in
+    multi-mic shoots (comedian lav vs crowd shotgun vs camera audio).
+    """
+    from scipy.signal import butter as _butter, sosfiltfilt as _sosfiltfilt
+
+    y = _load_fixture_mic()
+    sr = _SAMPLE_RATE
+    nyq = sr * 0.5
+
+    # Different-mic EQ: narrower band-pass than our analyzer uses
+    sos_bp = _butter(2, [500 / nyq, 3000 / nyq], btype="band", output="sos")
+    b_eq = _sosfiltfilt(sos_bp, y).astype(np.float32)
+    # Room reflection / distance delay
+    delay_samples = int(0.01 * sr)
+    b_phase = np.concatenate([np.zeros(delay_samples, dtype=np.float32),
+                               b_eq[:-delay_samples]])
+    # Crowd ambience
+    rng = np.random.default_rng(7)
+    b_noisy = b_phase + rng.normal(0, 0.02, size=len(b_phase)).astype(np.float32)
+
+    shift_s = 2.0
+    shift_samples = int(shift_s * sr)
+    mic_b = b_noisy[shift_samples:]
+
+    a = _preprocess(y)
+    b = _preprocess(mic_b)
+    lag, conf = _cross_correlate_offset(a, b)
+    assert abs(abs(lag) - shift_s) < 0.10, f"expected ~±{shift_s}s, got {lag}s"
+    assert conf > 0.1, f"confidence too low: {conf}"
 
 
 def test_detect_offsets_end_to_end_with_real_file(tmp_path):
