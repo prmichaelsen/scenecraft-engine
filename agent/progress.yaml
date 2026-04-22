@@ -484,7 +484,7 @@ milestones:
     completed: null
     estimated_weeks: 2
     tasks_total: 6
-    tasks_completed: 4
+    tasks_completed: 5
     tasks:
       - id: task-39
         title: 540p proxy generation + proxy-backed compositor read path
@@ -529,11 +529,11 @@ milestones:
       - id: task-43
         title: Timeline render-state UI bar
         file: agent/tasks/milestone-12-nle-preview-pipeline/task-43-timeline-render-state-ui.md
-        status: not_started
+        status: completed
         estimated_hours: 12
-        started: null
-        completed_date: null
-        actual_hours: null
+        started: 2026-04-22T23:00:00Z
+        completed_date: 2026-04-22T23:15:00Z
+        actual_hours: 0.25
         dependencies:
           - task-42
           - task-37
@@ -560,6 +560,10 @@ progress:
   overall: 82
 
 recent_work:
+  - date: 2026-04-22
+    description: "M12 task-43 complete — Timeline render-state UI bar + useRenderState hook (polls /render-state every 2s; will switch to WS push once task-37 lands). Virtualized (only visible buckets as DOM). Colors per user pref: dark-red / bright-red / blue / dark-red-striped. Backend plumbing: BackgroundRenderer.state property, RenderCoordinator.invalidate_ranges_in_background, cache_invalidation nudges bg requeue."
+  - date: 2026-04-22
+    description: "M12 task-42 complete — render-state tracking + /render-state HTTP snapshot. render_state.build_snapshot derives bucket states from fragment cache + bg queue. _DeltaDispatcher coalesces transitions over 100ms for future WS push. Tests: 9 new, all passing."
   - date: 2026-04-22
     description: "M12 task-41 complete — background render worker. BackgroundRenderer with priority queue (distance from playhead), update_playhead/request_range/prime_around_playhead, shares encoder+lock with main worker (playback preempts via main_busy flag). Starts on play(), stops on stop(). Tests: 10 new, all passing."
   - date: 2026-04-22
