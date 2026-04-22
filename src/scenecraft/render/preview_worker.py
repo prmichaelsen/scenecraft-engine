@@ -164,6 +164,11 @@ class RenderWorker:
             fps=self._fps,
             force_backend="ffmpeg",
         )
+        # Encoder-generation counter: bumped on every encoder rebuild so
+        # the fragment cache never serves a cached fragment to a client
+        # whose MediaSource was initialized with a different init/SPS/PPS.
+        # See fragment_cache.CacheKey for the full justification.
+        self._encoder_generation: int = 0
 
         # Control flags.
         self._playing = threading.Event()          # set while render loop should produce
@@ -402,6 +407,10 @@ class RenderWorker:
                                 force_backend="ffmpeg",
                             )
                             self._init_emitted = False
+                            # Bump gen so the fragment cache stops serving
+                            # old-SPS/PPS fragments to the new-encoder
+                            # client.
+                            self._encoder_generation += 1
                     except Exception as exc:
                         _log(f"rebuild failed: {exc}")
                         self._playing.clear()
@@ -413,19 +422,48 @@ class RenderWorker:
                     self._playing.clear()
                     continue
 
+                # Fragment cache check: if a fresh entry exists for this
+                # (project, t0_bucket, encoder_generation), skip render +
+                # encode entirely and queue the cached bytes directly. This
+                # is the "replay is free" path — background worker (task-41)
+                # populates the cache proactively so non-first playback of
+                # any region is instant.
+                from scenecraft.render.fragment_cache import global_fragment_cache
+                t0 = self._playhead_t
+                cached_fragment = global_fragment_cache.get(
+                    self.project_dir, t0, self._encoder_generation,
+                )
+                if cached_fragment is not None:
+                    _log(
+                        f"fragment cache HIT t0={t0:.3f} "
+                        f"gen={self._encoder_generation} bytes={len(cached_fragment)}"
+                    )
+                    try:
+                        while not self._stop_flag.is_set():
+                            try:
+                                self._queue.put(cached_fragment, timeout=0.25)
+                                break
+                            except queue.Full:
+                                continue
+                    except Exception:
+                        break
+                    # Advance playhead by one fragment's worth and loop.
+                    self._playhead_t = t0 + FRAGMENT_SECONDS
+                    self._last_activity_ts = time.monotonic()
+                    continue
+
                 # Render one fragment's worth of frames in parallel chunks.
                 # Sequential rendering at 1080p runs at ~1.4x realtime which
                 # has no headroom for hiccups → stutter. N threads each with
                 # their own stream_caps decode in parallel (cv2 releases the
                 # GIL during decode/compose).
                 frames_to_render = self._frames_per_fragment
-                t0 = self._playhead_t
                 parallelism = max(
                     1,
                     min(RENDER_MAX_PARALLELISM, frames_to_render // MIN_FRAMES_PER_CHUNK),
                 )
                 _log(
-                    f"rendering fragment: t0={t0:.3f} "
+                    f"rendering fragment: t0={t0:.3f} (cache MISS gen={self._encoder_generation}) "
                     f"frames_to_render={frames_to_render} parallelism={parallelism}"
                 )
 
@@ -562,6 +600,20 @@ class RenderWorker:
                     f"fragment encoded: {len(segment)} bytes in "
                     f"{(time.monotonic() - _t0):.2f}s{enc_detail}"
                 )
+
+                # Populate fragment cache so replaying this range hits the
+                # cache next time. Duration is the actual rendered span
+                # (effective frames / fps) — matters for range invalidation
+                # overlap detection in FragmentCache.invalidate_range.
+                try:
+                    duration_ms = int(round(len(frames) / self._fps * 1000))
+                    global_fragment_cache.put(
+                        self.project_dir, t0, self._encoder_generation,
+                        segment, duration_ms,
+                    )
+                except Exception as exc:
+                    _log(f"fragment_cache.put failed (non-fatal): {exc}")
+
                 # Mark when fragment was produced — the queue.put + pump
                 # pickup latency below shows how long it sits before reaching
                 # the client.

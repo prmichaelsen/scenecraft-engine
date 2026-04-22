@@ -1,12 +1,16 @@
 """Cache invalidation chokepoint for mutating API endpoints.
 
 A mutating endpoint calls `invalidate_frames_for_mutation(project_dir,
-ranges)` after its DB write commits. The helper does two things:
+ranges)` after its DB write commits. The helper does three things:
 
 1. Drops matching entries from the L1 preview frame cache
    (`scenecraft.render.frame_cache.global_cache`) — so the next scrub
    request re-renders rather than serving stale pixels.
-2. Tells the `RenderCoordinator` the project changed so any active
+2. Drops matching entries from the fMP4 fragment cache
+   (`scenecraft.render.fragment_cache.global_fragment_cache`) — so the
+   next playback of the affected range re-renders rather than serving
+   stale encoded bytes.
+3. Tells the `RenderCoordinator` the project changed so any active
    playback worker rebuilds its schedule on the next fragment cycle.
 
 Ranges are a list of `[t_start, t_end]` seconds tuples describing the
@@ -24,29 +28,42 @@ from typing import Iterable
 def invalidate_frames_for_mutation(
     project_dir: Path,
     ranges: Iterable[tuple[float, float]] | None = None,
-) -> int:
-    """Invalidate preview frame cache + notify playback worker.
+) -> tuple[int, int]:
+    """Invalidate preview caches + notify playback worker.
 
-    Returns the number of cache entries dropped. Safe to call even if
-    nothing is cached (returns 0). Never raises — designed to be called
-    at the tail of an endpoint handler without risking a 500 on the
-    write path.
+    Returns (scrub_frames_dropped, fragments_dropped). Safe to call even
+    if nothing is cached (returns (0, 0)). Never raises — designed to be
+    called at the tail of an endpoint handler without risking a 500 on
+    the write path.
     """
-    dropped = 0
+    frames_dropped = 0
+    fragments_dropped = 0
+
+    # Materialize ranges once — we need them twice (frame + fragment cache).
+    range_list: list[tuple[float, float]] | None
+    if ranges is None:
+        range_list = None
+    else:
+        rl = [(a, b) for a, b in ranges if b >= a]
+        range_list = rl if rl else None  # empty list → wholesale
+
     try:
         from scenecraft.render.frame_cache import global_cache
-        if ranges is None:
-            dropped = global_cache.invalidate_project(project_dir)
+        if range_list is None:
+            frames_dropped = global_cache.invalidate_project(project_dir)
         else:
-            range_list = [(a, b) for a, b in ranges if b >= a]
-            if not range_list:
-                # Empty ranges — treat as wholesale. Callers should use
-                # `None` to mean wholesale; explicit empty list likely
-                # indicates "no ranges computed" which is a bug, but
-                # be defensive.
-                dropped = global_cache.invalidate_project(project_dir)
-            else:
-                dropped = global_cache.invalidate_ranges(project_dir, range_list)
+            frames_dropped = global_cache.invalidate_ranges(project_dir, range_list)
+    except Exception:
+        pass
+
+    try:
+        from scenecraft.render.fragment_cache import global_fragment_cache
+        if range_list is None:
+            fragments_dropped = global_fragment_cache.invalidate_project(project_dir)
+        else:
+            fragments_dropped = global_fragment_cache.invalidate_ranges(
+                project_dir, range_list,
+            )
     except Exception:
         pass
 
@@ -59,4 +76,4 @@ def invalidate_frames_for_mutation(
     except Exception:
         pass
 
-    return dropped
+    return (frames_dropped, fragments_dropped)

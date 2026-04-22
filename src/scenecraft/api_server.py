@@ -332,10 +332,14 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             if m:
                 return self._json_response({"activeFile": None, "events": [], "sections": [], "rules": [], "ruleCount": 0, "onsets": {}})
 
-            # GET /api/render-cache/stats — global frame cache hit/miss stats
+            # GET /api/render-cache/stats — scrub frame + playback fragment cache stats
             if path == "/api/render-cache/stats":
                 from scenecraft.render.frame_cache import global_cache
-                return self._json_response(global_cache.stats())
+                from scenecraft.render.fragment_cache import global_fragment_cache
+                return self._json_response({
+                    "frame_cache": global_cache.stats(),
+                    "fragment_cache": global_fragment_cache.stats(),
+                })
 
             # GET /api/projects/:name/render-frame?t=<seconds>[&quality=<1-100>]
             m = re.match(r"^/api/projects/([^/]+)/render-frame$", path)
