@@ -208,17 +208,27 @@ def _sorted_commands() -> list[tuple[tuple[str, ...], tuple[Callable[[str], None
 
 
 def _repl() -> None:
-    _log("interactive console ready — type `help` for commands")
+    _log("interactive console ready — type `help` for commands (press Enter to submit)")
+    # input() is more reliable than sys.stdin.readline() across terminals —
+    # handles cooked-mode line buffering the way the user expects, echoes
+    # typed characters, and handles Ctrl-D / Ctrl-C more predictably.
     while True:
         try:
-            line = sys.stdin.readline()
+            line = input("scenecraft> ")
+        except EOFError:
+            # Ctrl-D or stdin closed — stop REPL, leave server running.
+            _log("stdin EOF — console exiting (server still running)")
+            return
+        except KeyboardInterrupt:
+            # Ctrl-C in the REPL is a request to interrupt the typed line,
+            # not to kill the process. Just swallow and prompt again.
+            print()  # newline so the next prompt doesn't stack on the ^C
+            continue
         except Exception as exc:
-            _log(f"stdin closed: {exc}")
-            return
-        if not line:
-            # EOF — stdin closed (piped input finished). Exit the REPL
-            # without killing the server.
-            return
+            _log(f"readline error: {exc}")
+            # Brief pause to avoid spinning if the error is persistent.
+            time.sleep(0.5)
+            continue
         cmd_line = line.strip()
         if not cmd_line:
             continue
