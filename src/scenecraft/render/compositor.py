@@ -11,6 +11,7 @@ intended to be pixel-identical to the old inline implementation.
 from __future__ import annotations
 
 import math
+import time
 from typing import Any
 
 from scenecraft.render.narrative import _blend_frames, _evaluate_curve, _log
@@ -660,6 +661,15 @@ def _prime_segments(segments: list[dict], w: int, h: int, preview: bool) -> None
             seg["_loaded"] = False
 
 
+# Per-phase timing accumulator for perf audits. When a dict is passed via
+# frame_cache["_timing"], each phase adds its elapsed time (seconds).
+# Consumers read and reset externally.
+def _tick(timing: dict | None, key: str, t0: float) -> None:
+    if timing is None:
+        return
+    timing[key] = timing.get(key, 0.0) + (time.monotonic() - t0)
+
+
 def render_frame_at(
     schedule: Schedule,
     t: float,
@@ -692,6 +702,7 @@ def render_frame_at(
     if frame_cache is None:
         frame_cache = {}
     stream_caps = frame_cache.get("stream_caps") if not scrub else None
+    timing = frame_cache.get("_timing")  # may be None (no instrumentation)
 
     segments = schedule.segments
     overlay_tracks = schedule.overlay_tracks
@@ -717,6 +728,7 @@ def render_frame_at(
     else:
         seg = segments[seg_idx]
         seg_dur = seg["to_ts"] - seg["from_ts"]
+        _phase_t = time.monotonic()
 
         seg_frames = round(seg_dur * fps)
         eff_xfade = min(XFADE_FRAMES, max(2, seg_frames // 4))
@@ -727,6 +739,7 @@ def render_frame_at(
         progress = ext + raw_progress * (1.0 - 2 * ext)
         progress = max(0.0, min(0.999, progress))
         frame = _get_frame_at(seg_idx, progress, segments, loaded_segs, w, h, preview, scrub=scrub, stream_caps=stream_caps)
+        _tick(timing, "base_frame", _phase_t); _phase_t = time.monotonic()
 
         # Crossfade at segment boundaries — start
         if seg_idx > 0 and (t - seg["from_ts"]) < eff_half_xfade:
@@ -755,6 +768,7 @@ def render_frame_at(
                 next_progress = max(0.0, min(0.999, next_progress))
                 next_frame = _get_frame_at(seg_idx + 1, next_progress, segments, loaded_segs, w, h, preview, scrub=scrub, stream_caps=stream_caps)
                 frame = cv2.addWeighted(frame, alpha, next_frame, 1.0 - alpha, 0)
+        _tick(timing, "crossfade", _phase_t); _phase_t = time.monotonic()
 
         # Base track opacity curve (fade to/from black)
         if seg.get("opacity_curve"):
@@ -762,6 +776,7 @@ def render_frame_at(
             opacity = max(0.0, min(1.0, opacity))
             if opacity < 0.999:
                 frame = cv2.convertScaleAbs(frame, alpha=opacity, beta=0)
+        _tick(timing, "opacity", _phase_t); _phase_t = time.monotonic()
 
         # Color grading
         has_curves = any(seg.get(k) for k in (
@@ -771,6 +786,7 @@ def render_frame_at(
         ))
         if has_curves:
             frame = _apply_color_grading(frame, seg, raw_progress)
+        _tick(timing, "color_grade", _phase_t); _phase_t = time.monotonic()
 
         # Per-transition effects (strobe etc.)
         for efx in seg.get("effects", []):
@@ -781,6 +797,7 @@ def render_frame_at(
                 duty = efx["params"].get("duty", 0.5)
                 if (progress * freq) % 1 > duty:
                     frame = np.zeros_like(frame)
+        _tick(timing, "effects", _phase_t); _phase_t = time.monotonic()
 
         # Base track transform (X/Y/Z)
         if any(seg.get(k) for k in (
@@ -788,10 +805,17 @@ def render_frame_at(
             "transform_x_curve", "transform_y_curve", "transform_z_curve",
         )):
             frame = _apply_transform(frame, seg, raw_progress)
+        _tick(timing, "transform", _phase_t); _phase_t = time.monotonic()
 
     # Composite overlays first, then beat-synced effects
+    _ov_t = time.monotonic()
     frame = _composite_overlays(
         frame, t, w, h, overlay_tracks, fps, XFADE_FRAMES, overlay_prev,
     )
+    _tick(timing, "overlays", _ov_t)
+    _fx_t = time.monotonic()
     frame = _apply_frame_effects(frame, t, w, h, effect_events, suppressions)
+    _tick(timing, "frame_effects", _fx_t)
+    if timing is not None:
+        timing["_frames"] = timing.get("_frames", 0) + 1
     return frame

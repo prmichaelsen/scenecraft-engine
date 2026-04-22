@@ -114,6 +114,16 @@ class RenderWorker:
         # is the only survivable strategy for multi-hour base segments.
         self._frame_cache: dict = {"stream_caps": {}}
 
+        # Persistent thread pool for parallel fragment rendering. Threads in
+        # this pool hold thread-local `stream_caps` that survive across
+        # fragments — opening cv2.VideoCapture on a 2.4h 1080p file costs
+        # ~100-200ms each time; doing that 16× per fragment (once per chunk)
+        # was dominating the render phase. With persistence, the open/seek
+        # happens once per (thread × source), after which we do sequential
+        # cap.read() calls which are cheap.
+        self._render_pool: concurrent.futures.ThreadPoolExecutor | None = None
+        self._render_pool_thread_local = threading.local()
+
         self._thread: threading.Thread | None = None
 
     # ── Public API ────────────────────────────────────────────────────
@@ -182,6 +192,43 @@ class RenderWorker:
             except Exception:
                 pass
         self._frame_cache["stream_caps"] = {}
+
+        # Release thread-local stream_caps inside each render pool worker,
+        # then shut the pool down. We submit release tasks equal to 2× the
+        # pool size to reasonably cover every worker thread (ThreadPoolExecutor
+        # may have spun fewer than max_workers if the pool was lightly used).
+        pool = self._render_pool
+        if pool is not None:
+            tl = self._render_pool_thread_local
+
+            def _release_tl_caps() -> None:
+                caps = getattr(tl, "stream_caps", None)
+                if caps is None:
+                    return
+                for entry in caps.values():
+                    try:
+                        entry["cap"].release()
+                    except Exception:
+                        pass
+                tl.stream_caps = {}
+
+            try:
+                futures = [
+                    pool.submit(_release_tl_caps)
+                    for _ in range(RENDER_MAX_PARALLELISM * 2)
+                ]
+                for f in futures:
+                    try:
+                        f.result(timeout=1.0)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                pool.shutdown(wait=False)
+            except Exception:
+                pass
+            self._render_pool = None
 
     def fragments(self) -> Iterator[bytes]:
         """Blocking iterator yielding init segment first, then media segments.
@@ -300,51 +347,63 @@ class RenderWorker:
 
                 chunk_size = max(1, math.ceil(effective / parallelism))
 
-                def render_chunk(start_i: int, end_i: int) -> list[np.ndarray]:
-                    # Fresh frame_cache per chunk so each thread owns its own
-                    # VideoCapture handles (stream_caps) and overlay state.
-                    # Slight correctness cost: overlay crossfade history isn't
-                    # continuous across chunk boundaries — acceptable for
-                    # preview; no visible artifact except at chunk-boundary
-                    # overlay-clip transitions.
-                    local_cache: dict = {"stream_caps": {}}
-                    try:
-                        out: list[np.ndarray] = []
-                        for i in range(start_i, end_i):
-                            if self._stop_flag.is_set():
-                                return out
-                            t = t0 + i / fps
-                            try:
-                                f = render_frame_at(schedule, t, frame_cache=local_cache)
-                            except Exception as exc:
-                                import traceback
-                                _log(
-                                    f"render_frame_at({t:.3f}) failed: {exc}\n{traceback.format_exc()}"
-                                )
-                                f = np.zeros((schedule.height, schedule.width, 3), dtype=np.uint8)
-                            if f.shape[0] != enc_h or f.shape[1] != enc_w:
-                                f = cv2.resize(f, (enc_w, enc_h), interpolation=cv2.INTER_LINEAR)
-                            out.append(f)
-                        return out
-                    finally:
-                        for entry in local_cache.get("stream_caps", {}).values():
-                            try:
-                                entry["cap"].release()
-                            except Exception:
-                                pass
+                def render_chunk(start_i: int, end_i: int) -> tuple[list[np.ndarray], dict]:
+                    # Thread-local stream_caps: persist across fragments so
+                    # cv2.VideoCapture opens happen at most once per
+                    # (thread × source) instead of once per fragment.
+                    tl = self._render_pool_thread_local
+                    if not hasattr(tl, "stream_caps"):
+                        tl.stream_caps = {}
+                    chunk_timing: dict = {}
+                    local_cache: dict = {"stream_caps": tl.stream_caps, "_timing": chunk_timing}
+                    out: list[np.ndarray] = []
+                    for i in range(start_i, end_i):
+                        if self._stop_flag.is_set():
+                            return out, chunk_timing
+                        t = t0 + i / fps
+                        try:
+                            f = render_frame_at(schedule, t, frame_cache=local_cache)
+                        except Exception as exc:
+                            import traceback
+                            _log(
+                                f"render_frame_at({t:.3f}) failed: {exc}\n{traceback.format_exc()}"
+                            )
+                            f = np.zeros((schedule.height, schedule.width, 3), dtype=np.uint8)
+                        if f.shape[0] != enc_h or f.shape[1] != enc_w:
+                            _rs = time.monotonic()
+                            f = cv2.resize(f, (enc_w, enc_h), interpolation=cv2.INTER_LINEAR)
+                            chunk_timing["resize"] = chunk_timing.get("resize", 0.0) + (time.monotonic() - _rs)
+                        out.append(f)
+                    return out, chunk_timing
 
                 ranges = [
                     (i, min(i + chunk_size, effective))
                     for i in range(0, effective, chunk_size)
                 ]
-                render_t0 = time.monotonic()
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=len(ranges), thread_name_prefix="render-chunk"
-                ) as pool:
-                    chunk_results = list(
-                        pool.map(lambda ab: render_chunk(*ab), ranges)
+                # Lazy-init the persistent pool on first fragment. max_workers
+                # is fixed at RENDER_MAX_PARALLELISM so thread-local caps
+                # settle and stay warm across the session.
+                if self._render_pool is None:
+                    self._render_pool = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=RENDER_MAX_PARALLELISM,
+                        thread_name_prefix="render-chunk",
                     )
-                frames = [f for chunk in chunk_results for f in chunk]
+                render_t0 = time.monotonic()
+                chunk_results = list(
+                    self._render_pool.map(lambda ab: render_chunk(*ab), ranges)
+                )
+                frames = [f for chunk, _t in chunk_results for f in chunk]
+                # Merge per-phase timings across all chunks for aggregate
+                # per-fragment view. Parallel chunks overlap in wall time so
+                # summed phase times will exceed render_elapsed — the ratio
+                # tells us which phase is the hot spot.
+                merged_timing: dict[str, float] = {}
+                for _frames, t_dict in chunk_results:
+                    for k, v in t_dict.items():
+                        if k == "_frames":
+                            merged_timing[k] = merged_timing.get(k, 0) + v
+                        else:
+                            merged_timing[k] = merged_timing.get(k, 0.0) + v
                 render_elapsed = time.monotonic() - render_t0
                 black_count = sum(1 for f in frames if f is None or not f.any())
 
@@ -355,6 +414,16 @@ class RenderWorker:
                     f"parallel render done: {len(frames)} frames in "
                     f"{render_elapsed:.2f}s ({len(frames) / max(render_elapsed, 1e-6):.1f} fps)"
                 )
+                if merged_timing:
+                    # Print summed phase times (across parallel chunks) so we
+                    # can see which phase dominates.
+                    phase_report = " ".join(
+                        f"{k}={v:.2f}s"
+                        for k, v in sorted(merged_timing.items(), key=lambda kv: -kv[1] if isinstance(kv[1], float) else 0)
+                        if isinstance(v, float) and v >= 0.01
+                    )
+                    frames_summed = merged_timing.get("_frames", 0)
+                    _log(f"phase times (summed across chunks, {frames_summed} frames): {phase_report}")
 
                 _log(
                     f"fragment t0={t0:.3f} frames={len(frames)} black={black_count} "
@@ -371,8 +440,7 @@ class RenderWorker:
                         _log(f"encode_init failed: {exc}")
 
                 _log(f"encode_range: submitting {len(frames)} frames")
-                import time as _time
-                _t0 = _time.monotonic()
+                _t0 = time.monotonic()
                 try:
                     segment = self._encoder.encode_range(frames)
                 except Exception as exc:
@@ -380,9 +448,24 @@ class RenderWorker:
                     _log(f"encode_range failed: {exc}\n{traceback.format_exc()}")
                     self._playing.clear()
                     continue
-                _log(f"fragment encoded: {len(segment)} bytes in {(_time.monotonic() - _t0):.2f}s")
+                enc_timing = getattr(self._encoder, "last_encode_timing", {})
+                enc_detail = (
+                    f" feed={enc_timing.get('feed', 0.0):.2f}s drain={enc_timing.get('drain', 0.0):.2f}s"
+                    if "feed" in enc_timing else ""
+                )
+                _log(
+                    f"fragment encoded: {len(segment)} bytes in "
+                    f"{(time.monotonic() - _t0):.2f}s{enc_detail}"
+                )
+                # Mark when fragment was produced — the queue.put + pump
+                # pickup latency below shows how long it sits before reaching
+                # the client.
+                produced_at = time.monotonic()
 
-                # Backpressure: block if queue is full.
+                # Backpressure: block if queue is full. Duration here shows
+                # how much the worker stalled waiting for the client to
+                # consume — if it's large, pump/client is the bottleneck.
+                _q_wait = time.monotonic()
                 try:
                     while not self._stop_flag.is_set():
                         try:
@@ -392,6 +475,17 @@ class RenderWorker:
                             continue
                 except Exception:
                     break
+                q_wait = time.monotonic() - _q_wait
+                if q_wait > 0.1:
+                    _log(f"queue.put waited {q_wait:.2f}s (backpressure from pump/client)")
+
+                total_cycle = time.monotonic() - render_t0
+                _log(
+                    f"fragment cycle total: {total_cycle:.2f}s "
+                    f"(render {render_elapsed:.2f}s + encode+queue {total_cycle - render_elapsed:.2f}s) "
+                    f"target ≤ {FRAGMENT_SECONDS:.1f}s for realtime"
+                )
+                _ = produced_at  # keep variable for future pump-pickup tracking
 
                 # Advance playhead by however many frames we actually rendered.
                 self._playhead_t = t0 + len(frames) / self._fps

@@ -388,6 +388,10 @@ class FragmentEncoder:
                 self._ffmpeg_tail_prefix = tail
                 return self._init_bytes
 
+    # Public per-phase timing for the last encode_range call. Caller reads
+    # then doesn't reset — we overwrite each call.
+    last_encode_timing: dict[str, float] = {}
+
     def encode_range(self, frames: Iterable[np.ndarray]) -> bytes:
         """Encode a sequence of BGR frames into one media segment (moof+mdat).
 
@@ -395,6 +399,8 @@ class FragmentEncoder:
         encoder's width/height. Callers are responsible for providing the
         correct count per segment (typically ~1s worth of frames).
         """
+        import time as _time
+        t_total = _time.monotonic()
         # Materialize — we need len for tfdt advancement.
         frame_list = [f for f in frames]
         if not frame_list:
@@ -412,14 +418,22 @@ class FragmentEncoder:
                 patched = _patch_tfdt(media, self._accumulated_ticks)
                 duration_ticks = int(round(len(frame_list) * self._timescale / self.fps))
                 self._accumulated_ticks += duration_ticks
+                self.last_encode_timing = {
+                    "total": _time.monotonic() - t_total,
+                    "backend": 0.0,  # pyav opaque
+                }
                 return patched
             else:
                 # Subprocess mode: feed frames, drain bytes.
                 if self._ffmpeg_proc is None:
                     self._start_ffmpeg()
                     # No init was emitted in encode_init (shouldn't reach here).
+                t_feed = _time.monotonic()
                 self._ffmpeg_feed_frames(frame_list)
+                feed_elapsed = _time.monotonic() - t_feed
+                t_drain = _time.monotonic()
                 data = self._ffmpeg_drain_bytes(wait_bytes=64, timeout=5.0)
+                drain_elapsed = _time.monotonic() - t_drain
                 # Prepend any deferred tail from priming (only on first call).
                 tail = getattr(self, "_ffmpeg_tail_prefix", b"")
                 if tail:
@@ -427,6 +441,11 @@ class FragmentEncoder:
                     self._ffmpeg_tail_prefix = b""
                 # ffmpeg subprocess writes a single fragment per keyframe with
                 # correct DTS continuation, so no tfdt patching needed.
+                self.last_encode_timing = {
+                    "total": _time.monotonic() - t_total,
+                    "feed": feed_elapsed,
+                    "drain": drain_elapsed,
+                }
                 return data
 
     def fragments(self, frame_iter: Iterable[np.ndarray], frames_per_fragment: int) -> Iterator[bytes]:
