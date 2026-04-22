@@ -484,7 +484,7 @@ milestones:
     completed: null
     estimated_weeks: 2
     tasks_total: 6
-    tasks_completed: 3
+    tasks_completed: 4
     tasks:
       - id: task-39
         title: 540p proxy generation + proxy-backed compositor read path
@@ -518,11 +518,11 @@ milestones:
       - id: task-42
         title: Render-state tracking + snapshot/WS-delta API
         file: agent/tasks/milestone-12-nle-preview-pipeline/task-42-render-state-tracking.md
-        status: not_started
+        status: completed
         estimated_hours: 8
-        started: null
-        completed_date: null
-        actual_hours: null
+        started: 2026-04-22T22:45:00Z
+        completed_date: 2026-04-22T22:55:00Z
+        actual_hours: 0.2
         dependencies:
           - task-40
           - task-41

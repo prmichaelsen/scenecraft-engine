@@ -341,6 +341,16 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     "fragment_cache": global_fragment_cache.stats(),
                 })
 
+            # GET /api/projects/:name/render-state — per-bucket render
+            # state for the timeline render-state UI bar.
+            m = re.match(r"^/api/projects/([^/]+)/render-state$", path)
+            if m:
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None:
+                    return
+                from scenecraft.render.render_state import snapshot_for_worker
+                return self._json_response(snapshot_for_worker(project_dir))
+
             # GET /api/projects/:name/render-frame?t=<seconds>[&quality=<1-100>]
             m = re.match(r"^/api/projects/([^/]+)/render-frame$", path)
             if m:
@@ -1081,7 +1091,7 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 track_id = body.pop("id", None)
                 if not track_id: return self._error(400, "BAD_REQUEST", "Missing 'id'")
                 field_map = {"blendMode": "blend_mode", "baseOpacity": "base_opacity", "chromaKey": "chroma_key"}
-                mapped = {field_map.get(k, k): v for k, v in body.items() if field_map.get(k, k) in ("name", "blend_mode", "base_opacity", "enabled", "z_order", "chroma_key", "hidden")}
+                mapped = {field_map.get(k, k): v for k, v in body.items() if field_map.get(k, k) in ("name", "blend_mode", "base_opacity", "enabled", "z_order", "chroma_key", "hidden", "solo")}
                 _log(f"tracks/update: {track_id} {mapped}")
                 db_update_track(project_dir, track_id, **mapped)
                 return self._json_response({"success": True})
