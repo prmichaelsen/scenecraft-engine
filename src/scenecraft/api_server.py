@@ -8371,6 +8371,14 @@ def run_server(host: str = "0.0.0.0", port: int = 8890, work_dir: str | None = N
     _ws_mod.folder_watcher = FolderWatcher(wd)
     start_ws_server(host, ws_port, work_dir=wd)
 
+    # Plugin host — static registry for MVP. Task 102 will uncomment the
+    # plugin import below to activate the isolate-vocals plugin.
+    from scenecraft.plugin_host import PluginHost  # noqa: F401
+    # TODO(task-102): uncomment once scenecraft.plugins.isolate_vocals exists
+    # from scenecraft.plugins import isolate_vocals
+    # PluginHost.register(isolate_vocals)
+    _log(f"  Plugins: {len(PluginHost._registered)} registered, {len(PluginHost._operations)} operations")
+
     # Folder watches are lazy — activated when frontend opens a project and calls watch-folder,
     # NOT restored on server boot. This avoids inotify overhead for projects not being viewed.
 
