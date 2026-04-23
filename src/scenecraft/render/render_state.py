@@ -145,16 +145,29 @@ def build_snapshot(
     from scenecraft.render.fragment_cache import global_fragment_cache
 
     queued: set[float] = background_queue_t0s or set()
+    # Overlap-based cached detection: the worker stores fragments at the
+    # actual playhead (advances by frames/fps), which drifts off the
+    # display grid at non-integer fps (e.g. 23.976 → 2.002s per fragment).
+    # Exact-key lookup would miss every fragment after the first. Snap to
+    # overlap: a display bucket is cached if ANY cached fragment's span
+    # overlaps it.
+    cached_spans_ms = global_fragment_cache.cached_spans_for_gen(
+        project_dir, encoder_generation,
+    )
     out: list[BucketEntry] = []
     t = 0.0
-    # Allow a half-bucket slop so the last bucket lands when duration
-    # isn't an exact multiple of fragment_seconds.
     eps = fragment_seconds / 2
     while t < duration_seconds + eps:
         t_end = min(t + fragment_seconds, duration_seconds)
         if t >= duration_seconds:
             break
-        if global_fragment_cache.get(project_dir, t, encoder_generation) is not None:
+        t_ms = int(round(t * 1000))
+        t_end_ms = int(round(t_end * 1000))
+        is_cached = any(
+            s_t1 > t_ms and s_t0 < t_end_ms
+            for s_t0, s_t1 in cached_spans_ms
+        )
+        if is_cached:
             state: BucketState = "cached"
         elif t in queued:
             state = "rendering"

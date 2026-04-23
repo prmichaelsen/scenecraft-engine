@@ -224,6 +224,26 @@ class FragmentCache:
 
     # ── Introspection ─────────────────────────────────────────────────────
 
+    def cached_spans_for_gen(
+        self,
+        project_dir: Path,
+        encoder_generation: int,
+    ) -> list[tuple[int, int]]:
+        """Return ``[(t0_ms, t1_ms), ...]`` for every cached fragment in
+        (project, gen). Used by render_state.build_snapshot to mark
+        display buckets as cached even when fragment t0 doesn't land on
+        the display grid (happens at non-integer fps — e.g. 23.976fps
+        advances by 2.002s per fragment).
+        """
+        prefix = str(project_dir)
+        gen = int(encoder_generation)
+        with self._lock:
+            return [
+                (k[1], k[1] + entry.duration_ms)
+                for k, entry in self._store.items()
+                if k[0] == prefix and k[2] == gen
+            ]
+
     def stats(self) -> dict:
         with self._lock:
             total = self.hits + self.misses
