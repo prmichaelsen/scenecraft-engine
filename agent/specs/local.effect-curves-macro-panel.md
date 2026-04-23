@@ -1,10 +1,10 @@
 # Spec: Effect Curves + Macro Panel + Touch-Record
 
 **Namespace**: local
-**Version**: 1.0.0
+**Version**: 1.0.1
 **Created**: 2026-04-23
 **Last Updated**: 2026-04-23
-**Status**: Draft — Awaiting Proofing
+**Status**: Ready for Implementation
 
 ---
 
@@ -15,10 +15,19 @@
 
 ## Scope
 
+### Cross-Repo Split
+
+This spec is the **cross-repo contract**. Implementation crosses two repos:
+
+- **scenecraft-engine** (this repo) owns: SQLite schema + migrations (R1-R5, R52), HTTP endpoints (R51, Interfaces), POST validation (R_V1 below), cascade delete semantics.
+- **scenecraft** (frontend repo) owns: WebAudio graph construction (R7, R11-R19), Macro Panel UI (R28-R34), InlineCurveEditor (R37-R42), touch-record state machine (R20-R27), copy-paste automation (R43-R47), frequency-label preset data file (R48-R49 client-side constants).
+
+Both sides must adhere to the same Requirements + Tests contract. UI-structure requirements (R28-R34, R41, R42) are primarily verified on the frontend side; persistence + HTTP requirements are primarily verified on the engine side.
+
 ### In-Scope
 
 - Audio effect chains per track (ordered, enable/disable, add/remove/reorder)
-- 15 effect types across 6 categories (Dynamics, EQ, Spatial, Time-based, Modulation, Distortion)
+- 17 effect types across 6 categories (Dynamics, EQ, Spatial, Time-based, Modulation, Distortion)
 - Project-scoped send buses (Reverb, Delay, Echo), user-configurable count
 - Per-`(effect, param)` curve automation using existing `CurvePoint` format
 - Macro Panel UI with grid + list layouts, per-knob arm/enable/visible controls
@@ -44,6 +53,8 @@
 - Interactive Tutorial Panel (separate spike)
 - Per-clip effect chains (per-track only)
 - Unifying volume curves with the new system
+- Choice of pitch-shift library (`soundtouch-js` / `phaze` / custom) — decided when the feature ships, not in M13
+- Tutorial auto-advance detection (lives with the separate Tutorial Panel spike)
 
 ---
 
@@ -52,18 +63,28 @@
 ### Data Model
 
 - **R1**: SQLite `track_effects` table stores ordered effect chain per audio track with columns `id`, `track_id`, `effect_type`, `order_index`, `enabled`, `static_params`, `created_at`.
-- **R2**: SQLite `effect_curves` table stores one row per `(effect_id, param_name)`, with JSON `points` array of `[time_seconds, value_normalized_0_to_1]`, `interpolation` enum, `visible` flag.
+- **R2**: SQLite `effect_curves` table stores one row per `(effect_id, param_name)`, with JSON `points` array of `[time_seconds, value_normalized_0_to_1]`, `interpolation` enum, `visible` flag. A `UNIQUE(effect_id, param_name)` constraint prevents duplicate curves for the same param; attempts to insert a second curve on the same pair MUST fail at the SQL layer before reaching application code.
 - **R3**: SQLite `project_send_buses` table stores the per-project bus list with `id`, `bus_type`, `label`, `order_index`, `static_params`.
 - **R4**: SQLite `track_sends` table stores per-track send levels with `(track_id, bus_id)` primary key.
-- **R5**: SQLite `project_frequency_labels` table stores per-project custom EQ labels: `id`, `label`, `freq_min_hz`, `freq_max_hz`.
+- **R5**: SQLite `project_frequency_labels` table stores per-project custom EQ labels: `id`, `label`, `freq_min_hz`, `freq_max_hz`. The table lives in the per-project `project.db` (NOT `server.db`); project-scope is enforced by DB location, not an explicit FK. Deleting or relocating the project's `.scenecraft/` directory discards its custom labels by construction.
 - **R6**: Curve point values are stored normalized to `[0, 1]`; conversion to native units (Hz, dB, ratio, etc.) is computed at runtime via per-param mappers (linear/log/db/hz scales).
 
 ### Effect Registry
 
 - **R7**: A single source-of-truth `EffectTypeSpec` registry lists all 15 v1 effect types, each with: `type`, `label`, `category`, `params[]` (with `animatable: bool`, `range`, `scale`, `default`, optional `labelPresets`), and a `build(ctx, staticParams) -> EffectNode` factory returning `{input, output, setParam, dispose}`.
 - **R8**: Supported effect types in v1: `compressor`, `gate`, `limiter`, `eq_band`, `highpass`, `lowpass`, `pan`, `stereo_width`, `reverb_send`, `delay_send`, `echo_send`, `tremolo`, `auto_pan`, `chorus`, `flanger`, `phaser`, `drive`.
-- **R9**: Every effect's animatable params are ALL of its user-facing params except: `character` (on `drive`), `bus_id` (on sends), `rate` (on `tremolo`/`auto_pan`/`chorus`/`flanger`/`phaser`), and IR-choice (on reverb buses).
+- **R9**: Every effect's animatable params are ALL of its user-facing params except: `character` (on `drive`), `bus_id` (on sends), `rate` (on `tremolo`/`auto_pan`/`chorus`/`flanger`/`phaser`), and IR-choice (on reverb buses). Attempts to create an `effect_curves` row for a non-animatable param MUST fail with HTTP 400 and a clear error naming the param. Animatability is a property of `EffectParamSpec.animatable`; the server consults the registry to validate POSTs.
 - **R10**: `eq_band` provides a `labelPresets` list drawn from spectrum-band set (8 entries) + instrument-preset set (11 entries), each with `{label, value_hz, hzRange?}`.
+
+- **R8a** (synthetic effect_type for send animation): `__send` is a reserved internal `effect_type` string used ONLY to animate per-bus send levels via the `effect_curves` table. It is NOT registered in the `EffectTypeSpec` registry (R7), has NO `build()` factory, and MUST be rejected by the POST `/track-effects` endpoint (only real effect types are instantiable). Send-level curves reference `__send` as their `effect_type` with `param_name = bus_id`; the mixer has a special path for these curves that binds them to the `track → bus` GainNode instead of an EffectNode. Any other use of `__send` is a defect.
+
+- **R_V1** (POST validation — engine-side): Endpoints MUST validate inputs before writing:
+  - `POST /track-effects` rejects with HTTP 400 if `effect_type` is not in R8's enumerated list (R8a's `__send` is rejected here explicitly).
+  - `POST /effect-curves` rejects with HTTP 404 if the referenced `effect_id` does not exist.
+  - `POST /effect-curves/:id` rejects with HTTP 404 if `:id` does not exist.
+  - `POST /track-sends` rejects with HTTP 404 if `track_id` or `bus_id` does not exist.
+  - `POST /track-effects/:id` with an `order_index` colliding with an existing sibling effect MUST atomically swap (server assigns a conflict-free layout in one transaction); it MUST NOT leave two effects sharing an order_index.
+  - DELETE of a non-existent `track_effects` row is an idempotent no-op (HTTP 200 with empty body), not a 404.
 
 ### Audio Graph
 
@@ -102,6 +123,10 @@
 - **R34**: Knob displays its current value in native units (e.g., "+3 dB", "8000 Hz", "0.7") above or below the widget depending on available space.
 - **R35**: When a param's curve has `visible=1` (eye on), that curve renders inline on the track's timeline as a polyline with diamond keyframes at each curve point.
 - **R36**: Panel state (view-mode, grid size slider, scroll position) is NOT persisted between sessions; it resets on mount.
+
+- **R36a** (Bus sub-panel): The Macro Panel exposes a dedicated "Buses" sub-panel reachable from the panel header. The sub-panel lists the project's `project_send_buses` rows and supports: add bus (picks `bus_type` + default `static_params`), remove bus (except protected defaults if any), rename bus, edit static params (IR choice for reverb, time/feedback for delay, time/tone for echo), reorder buses (drag). Each CRUD action is one POST + one undo unit.
+
+- **R29a** (Undo during active recording): If the user triggers undo (Ctrl+Z) while a knob is in `recording` state, the in-flight gesture MUST first commit (same behavior as releasing the mouse — spec R22), and THEN the undo executes against the just-committed state. Net effect: Ctrl+Z mid-record reverts the gesture the user was in the middle of making. The knob stays `armed`. The alternative (discard the in-flight gesture silently) is explicitly forbidden because users expect Ctrl+Z to be reversible — discarded gestures would be invisible to redo.
 
 ### Inline Timeline Curves
 
@@ -305,7 +330,8 @@ DELETE /api/projects/:name/frequency-labels/:id
 - [ ] Inline timeline curves render when eye-toggle is on, hide when off, and allow full keyframe editing (drag, multi-select, double-click delete, right-click easing cycle).
 - [ ] Multi-select + Ctrl+C/V copies automation keyframes from one track's verse-1 to another track's verse-2 with correct `trackDelta` + time offset.
 - [ ] Undo reverts the most recent record pass (or static knob change) to the curve state immediately before that action.
-- [ ] 6 IR files ship with the app; ConvolverNode reverb works with any of them.
+- [ ] 6 IR files ship with the app; a filesystem check confirms `src/scenecraft/assets/impulse_responses/{room-small,room-large,hall,plate,spring,chamber}.wav` all exist and combined gzipped bundle ≤ 200 KB (R53); ConvolverNode reverb works with any of them.
+- [ ] Static params (R9 exception list: `character`, `bus_id`, `rate`, IR-choice) cannot be animated — POST to `/effect-curves` for any of them returns HTTP 400.
 - [ ] Effect chain + curves persist across scenecraft restarts.
 - [ ] Macro Panel grid ↔ list view toggles without losing track selection.
 - [ ] Grid-size slider continuously scales tile dimensions between 48px and 200px.
@@ -469,6 +495,158 @@ The core behavior contract: happy path, common bad paths, primary positive and n
 **Then** (assertions):
 - **curve-restored**: the curve's `points` array matches exactly what it contained before the record pass began
 - **events-emitted**: a `mixer.curve-scheduled` event fires with the pre-pass points
+
+#### Test: effect-curves-unique-constraint (covers R2)
+
+**Given**: Effect E1 has an existing curve for `param_name='cutoff'`
+
+**When**: An out-of-band direct SQL INSERT attempts a second row with `(effect_id=E1, param_name='cutoff', points=[...])`
+
+**Then** (assertions):
+- **sql-error**: SQLite raises a UNIQUE constraint violation (integrity error)
+- **db-row-count**: `effect_curves` still contains exactly one row for `(E1, 'cutoff')`
+- **app-upsert-unaffected**: the normal POST path (which should UPSERT via `INSERT OR REPLACE` or equivalent) continues to work correctly for app-layer updates — raw duplicate INSERTs are blocked at the SQL layer
+
+#### Test: recording-samples-at-33hz-target (covers R23)
+
+**Given**: User is recording on an armed knob with `audioCtx.currentTime` advancing at realtime rate; the record loop runs for 3.00 seconds of playback
+
+**When**: Recording commits
+
+**Then** (assertions):
+- **sample-count-in-range**: the pre-simplification raw buffer contains between 80 and 110 samples (3s × 33Hz = 99 samples; ±30% tolerance for rAF jitter and frame-rate variance)
+- **min-rate-enforced**: no 100ms+ gap between consecutive samples (asserts the ≥30Hz floor even under frame jitter)
+- **rAF-driven**: the loop's tick source is `requestAnimationFrame`, not `setInterval` — verifiable by mocking rAF and counting invocations
+
+#### Test: track-sends-row-per-track-per-bus (covers R4)
+
+**Given**: A project with 4 default buses (Plate, Hall, Delay, Echo)
+
+**When**: A second audio track is added to the project
+
+**Then** (assertions):
+- **db-rows-present**: `track_sends` contains exactly 4 new rows for the new track, one per bus, each with `level=0`
+- **pk-composite**: the `(track_id, bus_id)` primary key is enforced — a second INSERT with the same pair fails at the SQL layer
+- **cascade-on-track-delete**: deleting the audio track cascades to remove its 4 `track_sends` rows
+
+#### Test: interpolation-mode-schedules-correct-audioparam-call (covers R19)
+
+**Given**: Three identical curves on three different effect params, with `interpolation='bezier'`, `'linear'`, and `'step'` respectively; each curve has points `[(0, 0), (1, 1)]`
+
+**When**: The mixer schedules the curves at project load
+
+**Then** (assertions):
+- **bezier-uses-setValueCurveAtTime**: the bezier-interpolated param received a `setValueCurveAtTime(Float32Array, startTime, duration)` call with a densely-sampled Float32Array
+- **linear-uses-linearRampToValueAtTime**: the linear-interpolated param received a `setValueAtTime(0, t0)` + `linearRampToValueAtTime(1, t1)` sequence (no Float32Array)
+- **step-uses-setValueAtTime-only**: the step-interpolated param received only `setValueAtTime(0, t0)` + `setValueAtTime(1, t1)` calls (no ramps, no curves)
+
+#### Test: custom-ir-from-pool-file (covers R54)
+
+**Given**: A pool segment containing a WAV file that the user wants as a custom IR; a reverb bus exists with the default `plate.wav` IR
+
+**When**: User updates the bus's `static_params.ir_path` to point at the pool segment's file path
+
+**Then** (assertions):
+- **db-static-params-updated**: `project_send_buses.static_params.ir_path` now references the pool segment's path
+- **convolver-reloaded**: the bus's ConvolverNode has the new buffer loaded (verified via a `mixer.ir-changed {bus_id}` event OR by sampling the reverb tail and checking it differs from plate.wav)
+- **plate-default-not-deleted**: the shipped `plate.wav` IR asset on disk is untouched
+
+#### Test: animating-static-param-rejected (covers R9, R8a, R_V1, negative)
+
+**Given**: A `drive` effect exists on track T1 (its `character` param is static)
+
+**When**:
+- (a) User POSTs to `/effect-curves` with `{effect_id: drive.id, param_name: 'character', points: [...]}`
+- (b) User POSTs to `/effect-curves` with `{effect_id: __send_synthetic, param_name: 'wet', ...}` referencing a non-existent effect_id
+- (c) User POSTs to `/track-effects` with `{effect_type: '__send', ...}`
+
+**Then** (assertions):
+- **http-400-a**: (a) returns HTTP 400 with an error naming the static param `character`
+- **http-404-b**: (b) returns HTTP 404 because the referenced `effect_id` doesn't exist
+- **http-400-c**: (c) returns HTTP 400 because `__send` is synthetic and not in the R8 registry
+- **no-db-row-created**: `effect_curves` and `track_effects` gain zero new rows across all three attempts
+
+#### Test: unknown-effect-type-rejected (covers R_V1)
+
+**Given**: A valid track T1
+
+**When**: POST `/track-effects` with `{track_id: T1, effect_type: 'timewarp', ...}` (not in R8)
+
+**Then** (assertions):
+- **http-400**: 400 with error message naming the unknown type
+- **no-db-row**: `track_effects` unchanged
+- **no-chain-rebuild**: no `mixer.chain-rebuilt` event fires
+
+#### Test: delete-nonexistent-effect-idempotent (covers R_V1)
+
+**Given**: No `track_effects` row with id `'nope-123'` exists
+
+**When**: DELETE `/track-effects/nope-123`
+
+**Then** (assertions):
+- **http-200**: response is HTTP 200 with empty body (not 404 — delete is idempotent)
+- **no-error-logged**: no error-level log entry fires
+
+#### Test: order-index-collision-resolved-atomically (covers R_V1, R14)
+
+**Given**: Track T1 with effects E1 (order=0), E2 (order=1), E3 (order=2)
+
+**When**: Client POSTs `/track-effects/E3` with `{order_index: 0}` (wants E3 at position 0)
+
+**Then** (assertions):
+- **final-orders-unique**: after the request, all three effects have distinct `order_index` values (no duplicates)
+- **e3-first**: E3.order_index = 0; E1 and E2 shifted to 1 and 2
+- **single-transaction**: the reorder happens in one SQL transaction (intermediate-state reads never see two effects at order 0)
+- **chain-rebuild-once**: exactly ONE `mixer.chain-rebuilt` event fires
+
+#### Test: undo-during-recording-commits-then-reverts (covers R29a)
+
+**Given**: User is mid-record on knob K1 of effect E1's param P1 with 40 samples buffered; E1 had pre-existing curve state C0 before the gesture started
+
+**When**: User presses Ctrl+Z while the mousedown is still held
+
+**Then** (assertions):
+- **gesture-commits-first**: the in-flight gesture's samples flush to the DB (bezier-fit + POST), producing curve state C1
+- **then-undo-reverts**: the undo pops C1 off the stack and restores C0
+- **two-undo-entries-stack-to-one-visible**: post-undo stack shows only C0 as latest; redo (Ctrl+Y) replays the gesture to C1
+- **knob-stays-armed**: arm state transitions from recording → armed (not idle)
+- **silent-discard-forbidden**: no code path discards gesture samples silently
+
+#### Test: bus-subpanel-crud (covers R36a)
+
+**Given**: The Macro Panel is open on a track; the Buses sub-panel is closed
+
+**When**: User clicks a "Buses" button in the panel header
+
+**Then** (assertions):
+- **subpanel-opens**: the Buses sub-panel renders
+- **lists-current-buses**: the sub-panel lists all rows from `project_send_buses`, ordered by `order_index`
+- **add-bus-posts**: clicking "Add Reverb Bus" POSTs to `/send-buses` and the new row appears
+- **rename-persists**: editing a label POSTs to `/send-buses/:id` and survives a reload
+- **remove-bus-cascades**: removing a bus cascades to remove `track_sends` rows for that bus and removes its associated `__send` curves
+- **each-action-one-undo**: each CRUD action produces exactly one undo unit
+
+#### Test: macro-panel-grid-list-toggle (covers R30)
+
+**Given**: The panel is mounted in grid mode with the `cutoff` knob visible
+
+**When**: User clicks the grid↔list toggle
+
+**Then** (assertions):
+- **layout-switches**: the DOM transitions from a grid container to a list (`<table>` or similar) layout
+- **same-knobs-listed**: all knobs previously visible in grid mode are present as table rows in list mode
+- **selection-preserved**: `selectedAudioTrackId` in EditorStateContext is unchanged across the toggle
+
+#### Test: macro-panel-size-slider-scales-tiles (covers R31)
+
+**Given**: The panel is in grid mode; slider at default ~50% (tile ~120px)
+
+**When**: User drags the slider to maximum
+
+**Then** (assertions):
+- **tiles-scale**: all rendered tiles have a computed width between 180px and 200px (per R31's 48–200px range)
+- **reflows-correctly**: the grid column count adjusts; no tile clips
+- **min-end**: dragging to minimum produces tiles between 48px and 60px
 
 #### Test: persists-across-restart (covers R51, R52)
 
@@ -714,15 +892,30 @@ Boundaries, unusual inputs, concurrency, idempotency, ordering, time-dependent b
 
 ---
 
+## UI-Structure Test Strategy
+
+Scenecraft has no frontend test harness today (per project memory). UI-structure requirements (R28-R36a, R37-R42) are verified with a layered approach:
+
+- **Logic-level requirements** (R30 grid↔list toggle, R31 size-slider scaling, R36 ephemerality, R36a bus sub-panel CRUD, R37-R40 inline editor drag / multi-select / delete / interpolation cycle, R43-R47 copy-paste, R29a undo-during-record): covered by the Tests section above. These are observable from DOM inspection + state-change assertions; vitest + happy-dom (or similar) is sufficient.
+- **Visual-structure requirements** (R32 tile contents, R33 270-315° knob sweep, R34 numeric-unit formatting, R41 stacked-curve rendering with ~50% alpha, R42 deterministic color palette): deferred to **manual + PR-review verification** until the project adopts visual-regression tooling (Storybook snapshots, Percy, or similar). Acknowledged gap; low regression risk since these are render-once-correctly-and-leave-alone concerns.
+- **Real-audio requirements** (send-level audibility, reverb character, send animation producing audible fade): partially covered via event assertions (mixer.* events); full audio correctness verified during implementation by ear.
+
+Implementers installing vitest per this project's "No frontend tests yet" memory note MUST ship the logic-level tests listed above; visual-structure items may ship with a manual-verification checklist instead.
+
+---
+
 ## Open Questions
 
 1. **Maximum bus count per project**: is there a cap on how many send buses a project can have? (e.g., 8 reverb + 4 delay + 4 echo = 16 total). Current design says "user-configurable"; implementation may need a hard ceiling to keep the audio graph bounded. **Captured in edge test `bus-count-limits-enforced`.**
-2. **Pitch-shift for short clips via external lib**: which library? `soundtouch-js` vs `phaze` vs custom. Decision affects bundle size and licensing.
-3. **Effect reordering via drag-and-drop**: required in v1 or deferred? Current design implies yes via `order_index` POST, but UI drag-reorder is unspecified.
-4. **CPU budget / benchmark**: what's the acceptable max CPU on the reference machine (16-core) for 20 tracks × 4 effects × active automation? Design says "4-8% estimated, benchmark during implementation."
-5. **Concurrency model on the mixer**: is the WebAudio graph accessed from a single main thread only, or does the audio-render thread ever touch our state? Confirm single-thread assumption in design implementation review. **Captured in edge test `graph-rebuild-during-recording-commits-and-reschedules` (bounded glitch acceptance).**
-6. **Effect visibility across user tabs**: if the same project is open in two browser tabs, do curve edits sync live (via existing WS) or are conflicts accepted? Likely inherits existing behavior; confirm during implementation.
-7. **Auto-advance of tutorials**: how the agent detects user completing a tutorial step — separate clarification (Tutorial Panel is a non-goal for M13).
+2. **Effect reordering via drag-and-drop**: required in v1 or deferred? Current design implies yes via `order_index` POST, but UI drag-reorder is unspecified.
+3. **CPU budget / benchmark**: what's the acceptable max CPU on the reference machine (16-core) for 20 tracks × 4 effects × active automation? Design says "4-8% estimated, benchmark during implementation."
+4. **Effect visibility across user tabs**: if the same project is open in two browser tabs, do curve edits sync live (via existing WS) or are conflicts accepted? Likely inherits existing behavior; confirm during implementation.
+
+### Resolved / reclassified
+
+- ~~Pitch-shift library choice~~ → moved to Non-Goals (decide when the feature ships, not M13).
+- ~~Tutorial auto-advance~~ → moved to Non-Goals (lives with the separate Tutorial Panel spike).
+- ~~Single-thread mixer assumption~~ → demoted to an implementation review item (not a design decision). Confirm during code review that no code path touches the WebAudio graph from an AudioWorklet thread. The `graph-rebuild-during-recording-commits-and-reschedules` test covers the bounded-glitch acceptance already.
 
 ---
 
