@@ -558,37 +558,79 @@ def _resolve_source_for_read(
     seg: dict,
     project_dir: "Path | None",
     prefer_proxy: bool,
-) -> str:
-    """Decide which file to decode from for a base-track segment.
+    t_in_source: float,
+) -> tuple[str, float]:
+    """Decide which file to decode from, and what time-offset within it
+    the seek must subtract.
 
-    When `prefer_proxy=True` and a fresh 540p proxy exists for the
-    segment's source, return the proxy path — cuts decode CPU ~4x.
-    Otherwise return the original source, and if `prefer_proxy=True` but
-    no proxy exists, kick off background proxy generation so the NEXT
-    playback session (or later fragment) can use it.
+    Returns `(file_path, t_file_offset)` where:
+    - `file_path` is the absolute file path to open with cv2.VideoCapture.
+    - `t_file_offset` is the source-time at which THAT file begins. For
+      the original source or a single-file proxy this is always 0.0.
+      For a chunked proxy chunk it's the chunk's `start` on the source
+      timeline — callers compute `idx_in_file = int((t_in_source - offset) * fps)`.
 
-    Scrub / export paths pass `prefer_proxy=False` and always get the
-    original.
+    `t_in_source` is the absolute time within the ORIGINAL source that
+    the caller wants to read (0..source_duration). For chunked proxies we
+    use it to pick the containing chunk; for single-file paths it's
+    ignored by the resolver (the caller already has idx_in_source = idx_in_file).
+
+    Mode ladder (tried in order):
+    1. `prefer_proxy=False` or no `project_dir` → original source, offset 0.
+    2. Chunked proxy ready (manifest.json exists) → chunk file + chunk.start.
+       Biggest win for long sources: the chunk is tiny so the first keyframe
+       near `t_in_source` is found fast.
+    3. Single-file proxy ready → single proxy path, offset 0.
+    4. Neither ready → original source, offset 0; kicks off background
+       generation (mode='auto' picks single vs chunked by duration).
     """
     source = seg["source"]
     if not prefer_proxy or project_dir is None:
-        return source
+        return (source, 0.0)
     try:
         from scenecraft.render.proxy_generator import (
-            proxy_path_for, proxy_exists, ProxyCoordinator,
+            proxy_path_for, proxy_exists,
+            chunked_proxy_manifest, chunk_for_time,
+            ProxyCoordinator,
         )
     except ImportError:
-        return source
+        return (source, 0.0)
+
+    # Prefer chunked proxy when available — even small wins per-frame
+    # (smaller file → faster seek, better page cache) add up across
+    # 16-thread playback + scrub bursts.
+    manifest = chunked_proxy_manifest(project_dir, source)
+    if manifest is not None:
+        mapped = chunk_for_time(manifest, t_in_source)
+        if mapped is not None:
+            chunk_idx, _t_within_chunk = mapped
+            chunk = manifest.chunks[chunk_idx]
+            chunk_path = (
+                _proxy_chunks_dir(project_dir, source) / chunk.file
+            )
+            if chunk_path.exists():
+                return (str(chunk_path), chunk.start)
+
     if proxy_exists(project_dir, source):
         pp = proxy_path_for(project_dir, source)
         if pp is not None:
-            return str(pp)
-    # Proxy missing — kick off background gen and return original for now.
+            return (str(pp), 0.0)
+
+    # No proxy ready yet — kick off background gen (auto picks mode by
+    # duration) and serve the original for this frame.
     try:
-        ProxyCoordinator.instance().ensure_proxy(project_dir, source)
+        ProxyCoordinator.instance().ensure_proxy(project_dir, source, mode="auto")
     except Exception:
         pass
-    return source
+    return (source, 0.0)
+
+
+def _proxy_chunks_dir(project_dir: "Path", source_path: str) -> "Path":
+    """Thin wrapper that avoids a circular import at module load time."""
+    from scenecraft.render.proxy_generator import chunked_proxy_dir_for
+    pd = chunked_proxy_dir_for(project_dir, source_path)
+    assert pd is not None, "caller must have verified manifest; dir must exist"
+    return pd
 
 
 def _get_frame_at(
@@ -640,7 +682,22 @@ def _get_frame_at(
         _ensure_loaded(seg_idx, segments, loaded_segs, w, h, preview)
         return seg["_frames"][idx]
 
-    effective_source = _resolve_source_for_read(seg, project_dir, prefer_proxy)
+    # Resolve the file to decode from and any source-time offset the
+    # chosen file begins at (non-zero only for chunked-proxy chunks).
+    src_fps = float(seg.get("_fps_source") or 0.0)
+    t_in_source = (idx / src_fps) if src_fps > 0 else 0.0
+    effective_source, t_file_offset = _resolve_source_for_read(
+        seg, project_dir, prefer_proxy, t_in_source
+    )
+
+    # Frame index within the chosen file. For non-chunked (offset=0) this
+    # equals the source-frame-index, preserving the task-39 behavior
+    # exactly. For chunked proxies we subtract the chunk's starting
+    # frame count so the seek lands at the right frame inside the chunk.
+    if t_file_offset > 0.0 and src_fps > 0:
+        idx_in_file = max(0, int(round((t_in_source - t_file_offset) * src_fps)))
+    else:
+        idx_in_file = idx
 
     def _fit(frame):
         if frame is None:
@@ -658,7 +715,7 @@ def _get_frame_at(
     if scrub:
         cap = cv2.VideoCapture(effective_source)
         try:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx_in_file)
             ret, frame = cap.read()
             return _fit(frame if ret else None)
         finally:
@@ -666,9 +723,9 @@ def _get_frame_at(
 
     if stream_caps is not None:
         # Key the cache by (seg_idx, effective_source) so that switching
-        # from original to proxy (e.g. background gen finished since the
-        # previous fragment) transparently opens a new cap instead of
-        # reading from a now-stale handle.
+        # between proxy variants (single-file → chunked chunk A → chunked
+        # chunk B as the playhead advances) transparently opens a new
+        # cap instead of reading from a now-stale handle.
         cache_key = (seg_idx, effective_source)
         entry = stream_caps.get(cache_key)
         if entry is None:
@@ -676,10 +733,10 @@ def _get_frame_at(
             stream_caps[cache_key] = entry
         cap = entry["cap"]
         cursor = entry["cursor"]
-        if idx != cursor + 1:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        if idx_in_file != cursor + 1:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx_in_file)
         ret, frame = cap.read()
-        entry["cursor"] = idx if ret else cursor
+        entry["cursor"] = idx_in_file if ret else cursor
         return _fit(frame if ret else None)
 
     _ensure_loaded(seg_idx, segments, loaded_segs, w, h, preview)
@@ -706,6 +763,12 @@ def _prime_segments(segments: list[dict], w: int, h: int, preview: bool) -> None
         else:
             cap = cv2.VideoCapture(seg["source"])
             seg["_n"] = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            # Source fps is needed by the chunked-proxy path to map
+            # source-frame-index ↔ source-time ↔ chunk-local-frame-index.
+            # Falls back to 0 if unreadable; chunked path treats <=0 as
+            # "can't use chunks, fall through to single-file/original".
+            src_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            seg["_fps_source"] = src_fps if src_fps > 0 else 0.0
             cap.release()
             seg["_frames"] = None
             seg["_loaded"] = False
