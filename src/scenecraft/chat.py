@@ -170,6 +170,16 @@ Tools available:
     tables. Returns a run_id. Results are cached by (segment, analyzer_version,
     params_hash); re-calling with the same inputs returns the cached run
     without re-running librosa. Pass force_rerun=True to overwrite.
+  • add_audio_effect — append (or insert at a given order_index) a new effect
+    on an audio track's chain. effect_type must be one of the 17 known types
+    (compressor, gate, limiter, eq_band, highpass, lowpass, pan, stereo_width,
+    reverb_send, delay_send, echo_send, tremolo, auto_pan, chorus, flanger,
+    phaser, drive). Optional static_params dict seeds parameter defaults.
+    Inserting at an occupied index shifts later effects by +1.
+  • update_effect_param_curve — replace (upsert) an automation curve on a
+    track effect's parameter. First point time must be 0, times strictly
+    increasing, min 2 points. Duplicate (effect_id, param_name) updates in
+    place. interpolation: bezier | linear | step.
 
 After generation completes, use `assign_keyframe_image` / `assign_pool_video` to
 pick one of the new candidates (coming in task-54).
@@ -808,6 +818,100 @@ GENERATE_DSP_TOOL: dict = {
     },
 }
 
+# Known effect types from the frontend registry (scenecraft/src/lib/audio-effect-types.ts).
+# Backend has no Python-side registry; keep in sync with the frontend tuple.
+_KNOWN_EFFECT_TYPES: tuple[str, ...] = (
+    "compressor",
+    "gate",
+    "limiter",
+    "eq_band",
+    "highpass",
+    "lowpass",
+    "pan",
+    "stereo_width",
+    "reverb_send",
+    "delay_send",
+    "echo_send",
+    "tremolo",
+    "auto_pan",
+    "chorus",
+    "flanger",
+    "phaser",
+    "drive",
+)
+
+ADD_AUDIO_EFFECT_TOOL: dict = {
+    "name": "add_audio_effect",
+    "description": (
+        "Append (or insert) a new effect on an audio track's effect chain. "
+        "effect_type MUST be one of the 17 known types from the frontend registry: "
+        "compressor, gate, limiter, eq_band, highpass, lowpass, pan, stereo_width, "
+        "reverb_send, delay_send, echo_send, tremolo, auto_pan, chorus, flanger, "
+        "phaser, drive. static_params is a dict of parameter defaults (e.g. "
+        "{\"threshold\": -12, \"ratio\": 4}); shape is not validated backend-side — "
+        "the frontend registry owns the per-type param list. When order_index is "
+        "omitted the new effect is appended (max(existing)+1, or 0 on an empty chain). "
+        "When order_index is provided and already taken, existing effects at >= that "
+        "index are shifted by +1 in the same undo group. Wrapped in an undo group."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "track_id":      {"type": "string", "description": "audio_tracks.id owning the new effect."},
+            "effect_type":   {"type": "string", "description": "One of the 17 known effect types (see description)."},
+            "static_params": {"type": "object", "description": "Parameter defaults dict. Optional."},
+            "order_index":   {"type": "integer", "description": "Position in the chain. Omit to append."},
+            "enabled":       {"type": "boolean", "default": True, "description": "Whether the effect is enabled."},
+        },
+        "required": ["track_id", "effect_type"],
+    },
+}
+
+UPDATE_EFFECT_PARAM_CURVE_TOOL: dict = {
+    "name": "update_effect_param_curve",
+    "description": (
+        "Replace (upsert) an automation curve on a track effect's parameter. "
+        "param_name is any string (e.g. 'threshold', 'ratio', 'gain'); the backend "
+        "does not cross-check it against the frontend-registered param list — that "
+        "validation lives on the frontend. points is a list of [time, value] pairs "
+        "(or a JSON string thereof). First time MUST be 0.0, times must be strictly "
+        "increasing, minimum 2 points, all numbers finite. interpolation is one of "
+        "'bezier' | 'linear' | 'step' (persisted). visible controls whether the curve "
+        "renders inline in the timeline. Duplicate (effect_id, param_name) updates "
+        "in place (UPSERT). Wrapped in an undo group."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "effect_id":  {"type": "string", "description": "track_effects.id owning the curve."},
+            "param_name": {"type": "string", "description": "Name of the parameter being automated."},
+            "points": {
+                "description": "Array of [time, value] pairs, or a JSON string of the same.",
+                "oneOf": [
+                    {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "items": {"type": "number"},
+                            "minItems": 2,
+                            "maxItems": 2,
+                        },
+                        "minItems": 2,
+                    },
+                    {"type": "string"},
+                ],
+            },
+            "interpolation": {
+                "type": "string",
+                "enum": ["bezier", "linear", "step"],
+                "default": "bezier",
+            },
+            "visible": {"type": "boolean", "default": False, "description": "Render the curve inline in timeline."},
+        },
+        "required": ["effect_id", "param_name", "points"],
+    },
+}
+
 TOOLS: list[dict] = [
     SQL_QUERY_TOOL,
     UPDATE_KEYFRAME_PROMPT_TOOL,
@@ -834,6 +938,8 @@ TOOLS: list[dict] = [
     ADD_AUDIO_CLIP_TOOL,
     UPDATE_VOLUME_CURVE_TOOL,
     GENERATE_DSP_TOOL,
+    ADD_AUDIO_EFFECT_TOOL,
+    UPDATE_EFFECT_PARAM_CURVE_TOOL,
 ]
 
 
@@ -1630,6 +1736,183 @@ def _exec_update_volume_curve(project_dir: Path, input_data: dict) -> dict:
         "(audio_tracks/audio_clips have no interpolation column)."
     )
     return result
+
+
+def _exec_add_audio_effect(project_dir: Path, input_data: dict) -> dict:
+    """Append or insert a new track_effect on an audio track's chain.
+
+    Validates effect_type against the known-17 tuple, validates track_id
+    against audio_tracks, and shifts existing effects when inserting at an
+    occupied order_index. Wrapped in a single undo group.
+    """
+    from scenecraft.db import (
+        add_track_effect as db_add_track_effect,
+        get_audio_tracks as db_get_audio_tracks,
+        list_track_effects as db_list_track_effects,
+        update_track_effect as db_update_track_effect,
+        undo_begin,
+    )
+
+    track_id = input_data.get("track_id")
+    if not track_id or not isinstance(track_id, str):
+        return {"error": "track_id is required and must be a string"}
+
+    effect_type = input_data.get("effect_type")
+    if not effect_type or not isinstance(effect_type, str):
+        return {"error": "effect_type is required and must be a string"}
+    if effect_type not in _KNOWN_EFFECT_TYPES:
+        return {
+            "error": (
+                f"unknown effect_type: {effect_type}, "
+                f"valid: {list(_KNOWN_EFFECT_TYPES)}"
+            )
+        }
+
+    static_params = input_data.get("static_params")
+    if static_params is not None and not isinstance(static_params, dict):
+        return {"error": "static_params must be a dict when provided"}
+
+    enabled = bool(input_data.get("enabled", True))
+
+    # Validate track exists before starting an undo group.
+    if not any(t["id"] == track_id for t in db_get_audio_tracks(project_dir)):
+        return {"error": f"track not found: {track_id}"}
+
+    existing = db_list_track_effects(project_dir, track_id)
+    requested_index = input_data.get("order_index")
+    if requested_index is None:
+        order_index = max((e.order_index for e in existing), default=-1) + 1
+        to_shift: list = []
+    else:
+        try:
+            order_index = int(requested_index)
+        except (TypeError, ValueError):
+            return {"error": "order_index must be an integer when provided"}
+        if order_index < 0:
+            return {"error": "order_index must be >= 0"}
+        to_shift = [e for e in existing if e.order_index >= order_index]
+
+    undo_begin(
+        project_dir,
+        f"Chat: add {effect_type} to track {track_id}",
+    )
+    # Shift any conflicting effects up by 1 (descending so we never collide
+    # with ourselves during the loop).
+    for eff in sorted(to_shift, key=lambda e: e.order_index, reverse=True):
+        db_update_track_effect(
+            project_dir, eff.id, order_index=eff.order_index + 1
+        )
+
+    created = db_add_track_effect(
+        project_dir,
+        track_id=track_id,
+        effect_type=effect_type,
+        static_params=static_params,
+        order_index=order_index,
+        enabled=enabled,
+    )
+    return {
+        "effect_id": created.id,
+        "track_id": created.track_id,
+        "effect_type": created.effect_type,
+        "order_index": created.order_index,
+    }
+
+
+def _exec_update_effect_param_curve(project_dir: Path, input_data: dict) -> dict:
+    """Upsert an effect_curves row for (effect_id, param_name).
+
+    Uses the same point-validation rules as _exec_update_volume_curve.
+    """
+    import json as _json
+    import math as _math
+    from scenecraft.db import (
+        get_track_effect as db_get_track_effect,
+        upsert_effect_curve as db_upsert_effect_curve,
+        undo_begin,
+    )
+
+    effect_id = input_data.get("effect_id")
+    if not effect_id or not isinstance(effect_id, str):
+        return {"error": "effect_id is required and must be a string"}
+
+    param_name = input_data.get("param_name")
+    if not param_name or not isinstance(param_name, str):
+        return {"error": "param_name is required and must be a string"}
+
+    interpolation = input_data.get("interpolation", "bezier")
+    if interpolation not in ("bezier", "linear", "step"):
+        return {"error": "interpolation must be one of 'bezier', 'linear', 'step'"}
+
+    visible = bool(input_data.get("visible", False))
+
+    raw_points = input_data.get("points")
+    if raw_points is None:
+        return {"error": "points is required"}
+    if isinstance(raw_points, str):
+        try:
+            points = _json.loads(raw_points)
+        except (ValueError, TypeError) as exc:
+            return {"error": f"points JSON string is not valid JSON: {exc}"}
+    else:
+        points = raw_points
+
+    if not isinstance(points, list):
+        return {"error": "points must be a list of [time, value] pairs"}
+    if len(points) < 2:
+        return {"error": "effect param curve requires at least 2 points"}
+
+    cleaned: list[list[float]] = []
+    prev_t: float | None = None
+    for idx, pt in enumerate(points):
+        if not isinstance(pt, (list, tuple)) or len(pt) != 2:
+            return {"error": f"point at index {idx} must be a [time, value] pair"}
+        try:
+            t = float(pt[0])
+            v = float(pt[1])
+        except (TypeError, ValueError):
+            return {"error": f"point at index {idx} must have numeric [time, value]"}
+        if not (_math.isfinite(t) and _math.isfinite(v)):
+            return {"error": f"point at index {idx} has non-finite value"}
+        if idx == 0 and t != 0.0:
+            return {"error": "first point time must be 0.0"}
+        if prev_t is not None and t <= prev_t:
+            return {
+                "error": (
+                    f"point times must be strictly increasing; "
+                    f"got {t} after {prev_t} at index {idx}"
+                )
+            }
+        cleaned.append([t, v])
+        prev_t = t
+
+    # Validate effect exists before starting an undo group.
+    effect = db_get_track_effect(project_dir, effect_id)
+    if effect is None:
+        return {"error": f"effect not found: {effect_id}"}
+
+    undo_group_id = undo_begin(
+        project_dir,
+        f"Chat: update {param_name} curve on effect {effect_id}",
+    )
+    curve = db_upsert_effect_curve(
+        project_dir,
+        effect_id=effect_id,
+        param_name=param_name,
+        points=cleaned,
+        interpolation=interpolation,
+        visible=visible,
+    )
+    return {
+        "ok": True,
+        "effect_curve_id": curve.id,
+        "effect_id": effect_id,
+        "param_name": param_name,
+        "points_written": len(cleaned),
+        "undo_group_id": undo_group_id,
+    }
+
+
 _DSP_KNOWN_ANALYSES: frozenset[str] = frozenset({
     "rms", "onsets", "vocal_presence", "tempo", "spectral_centroid",
 })
@@ -2412,6 +2695,12 @@ async def _execute_tool(
         result = _exec_update_volume_curve(project_dir, input_data)
     if name == "generate_dsp":
         result = _exec_generate_dsp(project_dir, input_data)
+        return result, "error" in result
+    if name == "add_audio_effect":
+        result = _exec_add_audio_effect(project_dir, input_data)
+        return result, "error" in result
+    if name == "update_effect_param_curve":
+        result = _exec_update_effect_param_curve(project_dir, input_data)
         return result, "error" in result
     if name == "update_keyframe":
         result = _exec_update_keyframe(project_dir, input_data)
