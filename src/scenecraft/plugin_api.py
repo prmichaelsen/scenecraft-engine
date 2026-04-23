@@ -41,6 +41,8 @@ from scenecraft.db import (
     get_music_generations_for_entity,
     get_music_generation_tracks,
     set_pool_segment_context,
+    # Shared candidate-junction helper (tr-side) — needed by M16 + future plugins
+    add_tr_candidate,
 )
 
 # --- Job infrastructure ---------------------------------------------------
@@ -79,6 +81,7 @@ __all__ = [
     "get_music_generations_for_entity",
     "get_music_generation_tracks",
     "set_pool_segment_context",
+    "add_tr_candidate",
     "record_spend",
     "list_spend",
     "call_service",
