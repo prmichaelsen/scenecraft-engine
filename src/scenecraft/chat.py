@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sqlite3
@@ -139,7 +140,7 @@ Tools available:
   • update_curve — replace a transition's color/opacity curve points.
   • update_transform_curve — replace a transition's transform X/Y/Z curve points.
   • split_transition — divide a transition at a time point, inserting a new keyframe.
-  • assign_keyframe_image — mark a candidate variant (v{N}.png) as selected.
+  • assign_keyframe_image — mark a candidate variant (v{{N}}.png) as selected.
   • assign_pool_video — mark a pool_segment as selected for a transition slot (the
     segment must already be a candidate via tr_candidates).
   • checkpoint(name?) — create a non-destructive restore point (snapshots project.db).
@@ -947,39 +948,33 @@ def _humanize_tool_name(name: str) -> str:
     return f"{head} · {rest}" if rest else head
 
 
-async def _recv_elicitation_response(ws: ServerConnection, elicitation_id: str, timeout: float = 300) -> str:
-    """Block until an elicitation_response with matching id arrives.
+async def _recv_elicitation_response(
+    waiters: dict[str, asyncio.Future],
+    elicitation_id: str,
+    timeout: float = 300,
+) -> str:
+    """Block until the matching elicitation_response arrives.
 
-    Returns the action ("accept" or "decline"). On timeout, returns "decline".
-    Other incoming messages during the wait (ping, stray message) are handled
-    minimally so they don't derail the flow.
+    Uses a futures dict populated by the single ws reader in
+    `handle_chat_connection`. Returns the action ("accept" or "decline");
+    anything else — including a timeout or ws close while waiting — is
+    treated as a decline so the caller can proceed safely.
     """
-    import asyncio
-    import websockets
-
-    deadline = asyncio.get_event_loop().time() + timeout
-    while True:
-        remaining = deadline - asyncio.get_event_loop().time()
-        if remaining <= 0:
-            _log(f"elicitation {elicitation_id}: timeout, auto-declining")
-            return "decline"
-        try:
-            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
-        except asyncio.TimeoutError:
-            return "decline"
-        except websockets.exceptions.ConnectionClosed:
-            return "decline"
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        t = data.get("type")
-        if t == "elicitation_response" and data.get("id") == elicitation_id:
-            action = data.get("action")
-            return "accept" if action == "accept" else "decline"
-        if t == "ping":
-            await ws.send(json.dumps({"type": "pong"}))
-        # Ignore other message types while awaiting a response.
+    loop = asyncio.get_event_loop()
+    fut: asyncio.Future = loop.create_future()
+    waiters[elicitation_id] = fut
+    try:
+        action = await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.TimeoutError:
+        _log(f"elicitation {elicitation_id}: timeout, auto-declining")
+        return "decline"
+    except asyncio.CancelledError:
+        # Propagate so the surrounding stream task can clean up and persist
+        # its partial content. Don't swallow.
+        raise
+    finally:
+        waiters.pop(elicitation_id, None)
+    return "accept" if action == "accept" else "decline"
 
 
 def _readonly_authorizer(action, arg1, arg2, db_name, trigger_name):  # noqa: ANN001
@@ -1913,13 +1908,46 @@ async def handle_chat_connection(ws: ServerConnection, project_dir: Path, projec
 
     _log(f"Chat connected: project={project_name} user={user_id}")
 
-    # Best-effort connect to OAuth-backed MCP services. If the user hasn't
-    # authorized Remember yet, the chat still works without it.
+    # Best-effort connect to OAuth-backed MCP services. Fire-and-forget so a
+    # missing / expired / unreachable remember token (or any other MCP
+    # provider hiccup) cannot block the chat's ws loop from starting. The
+    # background task's success just makes those tools available on the
+    # NEXT _stream_response call; until then bridge.all_tools() returns []
+    # and the built-in tool set is used.
     bridge = MCPBridge()
-    try:
-        await bridge.connect("remember", user_id=user_id)
-    except Exception as e:
-        _log(f"bridge.connect(remember) raised: {e}")
+
+    async def _bg_connect_service(service: str):
+        try:
+            await bridge.connect(service, user_id=user_id)
+        except Exception as exc:
+            _log(f"bridge.connect({service}) raised: {exc}")
+
+    asyncio.create_task(_bg_connect_service("remember"))
+
+    # Tracks the in-flight streaming task so a new user message can halt it
+    # mid-generation. _stream_response persists its partial content on
+    # asyncio.CancelledError before re-raising, so the cancellation here is
+    # safe to wait on without losing data.
+    current_stream: asyncio.Task | None = None
+
+    # Single-reader ws pattern: this loop is the only consumer of incoming
+    # frames. Elicitation responses from the user are routed to the waiting
+    # stream task through futures in this dict (keyed by elicitation id) so
+    # we don't need concurrent `ws.recv()` calls.
+    elicitation_waiters: dict[str, asyncio.Future] = {}
+
+    async def _halt_current_stream() -> None:
+        nonlocal current_stream
+        t = current_stream
+        if t is None or t.done():
+            return
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            _log(f"halted stream raised: {exc}")
 
     try:
         async for raw in ws:
@@ -1937,9 +1965,36 @@ async def handle_chat_connection(ws: ServerConnection, project_dir: Path, projec
                 if not content:
                     continue
 
+                # Halt any in-flight generation and flush its partial content
+                # to the DB before accepting the next user message. Rapid-fire
+                # sends fall through this path every time.
+                await _halt_current_stream()
+
                 user_msg = _add_message(project_dir, user_id, "user", content, images)
                 await ws.send(json.dumps({"type": "message", "message": user_msg}))
-                await _stream_response(ws, project_dir, project_name, user_id, bridge)
+                # Stream in a task so subsequent frames (including the next
+                # "message") can be read by this loop while generation runs.
+                current_stream = asyncio.create_task(
+                    _stream_response(
+                        ws, project_dir, project_name, user_id, bridge,
+                        elicitation_waiters,
+                    )
+                )
+
+            elif msg_type == "elicitation_response":
+                # Resolve the waiting stream task's future with the user's
+                # accept/decline decision. Ignore responses that no longer
+                # have a matching waiter (stream was cancelled, timed out,
+                # etc. — safe to drop).
+                elic_id = data.get("id")
+                fut = elicitation_waiters.pop(elic_id, None) if elic_id else None
+                if fut is not None and not fut.done():
+                    fut.set_result(data.get("action", "decline"))
+
+            elif msg_type == "stop":
+                # Explicit client-initiated halt (e.g. a Stop button) — same
+                # persistence semantics as a new-message interruption.
+                await _halt_current_stream()
 
             elif msg_type == "ping":
                 await ws.send(json.dumps({"type": "pong"}))
@@ -1947,6 +2002,9 @@ async def handle_chat_connection(ws: ServerConnection, project_dir: Path, projec
     except Exception as e:
         _log(f"Chat error: {e}")
     finally:
+        # Socket is going away — halt any in-flight stream so its partial
+        # text is persisted before we tear down the bridge.
+        await _halt_current_stream()
         try:
             await bridge.close()
         except Exception as e:
@@ -1954,7 +2012,14 @@ async def handle_chat_connection(ws: ServerConnection, project_dir: Path, projec
         _log(f"Chat disconnected: project={project_name} user={user_id}")
 
 
-async def _stream_response(ws: ServerConnection, project_dir: Path, project_name: str, user_id: str, bridge):
+async def _stream_response(
+    ws: ServerConnection,
+    project_dir: Path,
+    project_name: str,
+    user_id: str,
+    bridge,
+    elicitation_waiters: dict[str, asyncio.Future],
+):
     """Call Claude with streaming + tool calling; stream events over the WebSocket."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -1982,9 +2047,17 @@ async def _stream_response(ws: ServerConnection, project_dir: Path, project_name
     all_blocks: list[dict] = []
     tool_calls_log: list[dict] = []
     announced_tool_ids: set[str] = set()
+    # Rolling buffer of text deltas for the current streaming turn. Reset at
+    # the start of each outer iteration and cleared again after `final`
+    # materializes (at which point the authoritative text lives in
+    # final.content). On asyncio.CancelledError (user sent a new message
+    # mid-generation) this buffer is flushed into all_blocks before the
+    # partial is persisted.
+    streamed_text_this_turn = ""
 
     try:
         for _ in range(10):  # cap at 10 tool iterations per user message
+            streamed_text_this_turn = ""
             async with client.messages.stream(
                 model="claude-sonnet-4-20250514",
                 max_tokens=4096,
@@ -2008,9 +2081,14 @@ async def _stream_response(ws: ServerConnection, project_dir: Path, project_name
                     elif etype == "content_block_delta":
                         delta = getattr(event, "delta", None)
                         if delta is not None and getattr(delta, "type", None) == "text_delta":
+                            streamed_text_this_turn += delta.text
                             await ws.send(json.dumps({"type": "chunk", "content": delta.text}))
 
                 final = await stream.get_final_message()
+                # final.content is the authoritative source of truth for this
+                # turn's text; clear the running buffer so we don't double-append
+                # on a subsequent cancellation in a later iteration.
+                streamed_text_this_turn = ""
 
             # Accumulate this turn's blocks and extract tool uses
             turn_tool_uses: list[dict] = []
@@ -2050,7 +2128,7 @@ async def _stream_response(ws: ServerConnection, project_dir: Path, project_name
                             "summary_items": summary_items,
                         },
                     }))
-                    action = await _recv_elicitation_response(ws, elic_id)
+                    action = await _recv_elicitation_response(elicitation_waiters, elic_id)
                     if action != "accept":
                         cancel_result = {"error": "cancelled by user"}
                         await ws.send(json.dumps({
@@ -2138,6 +2216,55 @@ async def _stream_response(ws: ServerConnection, project_dir: Path, project_name
             assistant_msg["tool_calls"] = tool_calls_log
         await ws.send(json.dumps({"type": "message", "message": assistant_msg}, default=str))
         await ws.send(json.dumps({"type": "complete"}))
+
+    except asyncio.CancelledError:
+        # User sent a new message mid-generation. Persist whatever the
+        # assistant streamed so far (as an interrupted turn) and propagate
+        # the cancellation so the caller can start the next stream.
+        if streamed_text_this_turn:
+            all_blocks.append({"type": "text", "text": streamed_text_this_turn})
+        if all_blocks or tool_calls_log:
+            has_non_text = any(b.get("type") != "text" for b in all_blocks)
+            if has_non_text:
+                persisted_content = json.dumps(all_blocks)
+            else:
+                persisted_content = "".join(
+                    b.get("text", "") for b in all_blocks if b.get("type") == "text"
+                )
+            try:
+                assistant_msg = _add_message(
+                    project_dir,
+                    user_id,
+                    "assistant",
+                    persisted_content,
+                    tool_calls=tool_calls_log or None,
+                )
+                if has_non_text:
+                    assistant_msg["content"] = all_blocks
+                if tool_calls_log:
+                    assistant_msg["tool_calls"] = tool_calls_log
+                assistant_msg["interrupted"] = True
+                try:
+                    await ws.send(json.dumps(
+                        {"type": "message", "message": assistant_msg},
+                        default=str,
+                    ))
+                except Exception:
+                    pass
+            except Exception as exc:
+                _log(f"Failed to persist partial assistant message: {exc}")
+        try:
+            await ws.send(json.dumps({"type": "halted", "reason": "interrupted_by_user"}))
+        except Exception:
+            pass
+        try:
+            await ws.send(json.dumps({"type": "complete"}))
+        except Exception:
+            pass
+        # Re-raise so the caller knows we stopped intentionally; the outer
+        # handler uses this to drive the "cancel current stream, start new"
+        # transition without treating it as an error.
+        raise
 
     except anthropic.APIError as e:
         _log(f"Claude API error: {e}")

@@ -1276,6 +1276,17 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                                        "Pool segment is not audio")
                 duration = float(seg.get("durationSeconds") or 0)
                 clip_id = generate_id("audio_clip")
+                # Seed label from the pool segment so the clip has a readable
+                # name in the timeline without the user having to rename it.
+                seed_label = (
+                    seg.get("label")
+                    or seg.get("originalFilename")
+                    or ""
+                )
+                # Strip trailing extension from filename-seeded labels so the
+                # displayed name looks natural (e.g. "01_kick" not "01_kick.wav").
+                if seed_label and "." in seed_label and not seg.get("label"):
+                    seed_label = seed_label.rsplit(".", 1)[0]
                 clip = {
                     "id": clip_id,
                     "track_id": track_id,
@@ -1286,6 +1297,7 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     "volume_curve": None,
                     "muted": False,
                     "remap": {"method": "linear", "target_duration": 0},
+                    "label": seed_label or None,
                 }
                 db_add_audio_clip(project_dir, clip)
                 _log(f"audio-clips/add-from-pool: {m.group(1)} -> {clip_id} on {track_id} ({seg['poolPath']}, {duration:.2f}s)")
@@ -1302,7 +1314,7 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 clip_id = body.pop("id", None)
                 if not clip_id: return self._error(400, "BAD_REQUEST", "Missing 'id'")
                 field_map = {"trackId": "track_id", "sourcePath": "source_path", "startTime": "start_time", "endTime": "end_time", "sourceOffset": "source_offset", "volumeCurve": "volume_curve"}
-                mapped = {field_map.get(k, k): v for k, v in body.items() if field_map.get(k, k) in ("track_id", "source_path", "start_time", "end_time", "source_offset", "volume_curve", "muted", "remap")}
+                mapped = {field_map.get(k, k): v for k, v in body.items() if field_map.get(k, k) in ("track_id", "source_path", "start_time", "end_time", "source_offset", "volume_curve", "muted", "remap", "label")}
                 _log(f"audio-clips/update: {clip_id} {mapped}")
                 db_update_audio_clip(project_dir, clip_id, **mapped)
                 return self._json_response({"success": True})

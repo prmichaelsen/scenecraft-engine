@@ -91,8 +91,17 @@ class MCPBridge:
         stack = AsyncExitStack()
         try:
             headers = {"Authorization": f"Bearer {access_token}"}
-            read, write = await stack.enter_async_context(sse_client(url, headers=headers))
-            session = await stack.enter_async_context(ClientSession(read, write))
+            # Bound the SSE handshake itself — some upstream brokers will
+            # hold the connection open when the credential is rejected,
+            # which would otherwise stall the chat handler indefinitely.
+            read, write = await asyncio.wait_for(
+                stack.enter_async_context(sse_client(url, headers=headers)),
+                timeout=10,
+            )
+            session = await asyncio.wait_for(
+                stack.enter_async_context(ClientSession(read, write)),
+                timeout=10,
+            )
             await asyncio.wait_for(session.initialize(), timeout=15)
 
             list_result = await asyncio.wait_for(session.list_tools(), timeout=15)

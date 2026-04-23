@@ -326,6 +326,7 @@ def _ensure_schema(conn: sqlite3.Connection):
             volume_curve TEXT NOT NULL DEFAULT '[[0,0],[1,0]]',
             muted INTEGER NOT NULL DEFAULT 0,
             remap TEXT NOT NULL DEFAULT '{"method":"linear","target_duration":0}',
+            label TEXT,
             deleted_at TEXT
         );
 
@@ -695,6 +696,10 @@ def _ensure_schema(conn: sqlite3.Connection):
     ac_cols = {row[1] for row in conn.execute("PRAGMA table_info(audio_clips)").fetchall()}
     if "selected" not in ac_cols:
         conn.execute("ALTER TABLE audio_clips ADD COLUMN selected TEXT")
+    # User-editable display label. NULL falls back to a basename derived
+    # from source_path on the frontend.
+    if "label" not in ac_cols:
+        conn.execute("ALTER TABLE audio_clips ADD COLUMN label TEXT")
 
     # M13 + M16: pool_segments gains variant_kind, derived_from, and
     # context_entity_{type,id} columns.
@@ -2706,6 +2711,7 @@ def get_audio_clips(project_dir: Path, track_id: str | None = None) -> list[dict
             "muted": bool(r["muted"]),
             "remap": json.loads(r["remap"]) if r["remap"] else {"method": "linear", "target_duration": 0},
             "selected": r["selected"],
+            "label": r["label"],
             # Derived fields (computed from linked transition at query time; not stored)
             "playback_rate": rate,
             "effective_source_offset": eff_off,
@@ -2727,13 +2733,14 @@ def add_audio_clip(project_dir: Path, clip: dict):
     else:
         vc_str = json.dumps(vc)
     conn.execute(
-        """INSERT INTO audio_clips (id, track_id, source_path, start_time, end_time, source_offset, volume_curve, muted, remap)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO audio_clips (id, track_id, source_path, start_time, end_time, source_offset, volume_curve, muted, remap, label)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (clip["id"], clip["track_id"], clip.get("source_path", ""),
          clip.get("start_time", 0), clip.get("end_time", 0),
          clip.get("source_offset", 0), vc_str,
          1 if clip.get("muted", False) else 0,
-         json.dumps(clip.get("remap", {"method": "linear", "target_duration": 0}))),
+         json.dumps(clip.get("remap", {"method": "linear", "target_duration": 0})),
+         clip.get("label")),
     )
     conn.commit()
 
