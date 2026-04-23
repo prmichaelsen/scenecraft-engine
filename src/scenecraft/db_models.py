@@ -139,6 +139,47 @@ class AudioDescriptionScalar:
     confidence: float | None = None
 
 
+# ── M15: cached master-bus mix analysis ─────────────────────────────
+
+@dataclass
+class MixAnalysisRun:
+    id: str
+    mix_graph_hash: str     # SHA-256 hex of canonical mix-graph serialization
+    start_time_s: float
+    end_time_s: float
+    sample_rate: int
+    analyzer_version: str
+    analyses: list[str] = field(default_factory=list)  # deserialized from analyses_json
+    rendered_path: str | None = None   # pool/mixes/{hash}.wav; None while rendering
+    created_at: str = ""
+
+
+@dataclass
+class MixDatapoint:
+    run_id: str
+    data_type: str          # 'rms' | 'short_term_lufs' | 'spectral_centroid' | ...
+    time_s: float
+    value: float
+    extra: dict[str, Any] | None = None  # deserialized from extra_json
+
+
+@dataclass
+class MixSection:
+    run_id: str
+    start_s: float
+    end_s: float
+    section_type: str       # 'clipping_event' | 'silence' | ...
+    label: str | None = None
+    confidence: float | None = None
+
+
+@dataclass
+class MixScalar:
+    run_id: str
+    metric: str             # 'peak_db' | 'true_peak_db' | 'lufs_integrated' | ...
+    value: float
+
+
 __all__ = [
     "CurvePoint",
     "TrackEffect",
@@ -153,4 +194,8 @@ __all__ = [
     "AudioDescriptionRun",
     "AudioDescription",
     "AudioDescriptionScalar",
+    "MixAnalysisRun",
+    "MixDatapoint",
+    "MixSection",
+    "MixScalar",
 ]
