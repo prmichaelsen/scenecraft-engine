@@ -509,6 +509,99 @@ def _ensure_schema(conn: sqlite3.Connection):
             freq_min_hz REAL NOT NULL,
             freq_max_hz REAL NOT NULL
         );
+
+        -- Phase 3: cached librosa analysis (quantitative / ground-truth).
+        -- Cache key: (source_segment_id, analyzer_version, params_hash).
+        -- Source segments are immutable in this codebase so the cache is
+        -- stable across timeline edits; clip trim changes don't invalidate.
+        CREATE TABLE IF NOT EXISTS dsp_analysis_runs (
+            id TEXT PRIMARY KEY,
+            source_segment_id TEXT NOT NULL REFERENCES pool_segments(id) ON DELETE CASCADE,
+            analyzer_version TEXT NOT NULL,
+            params_hash TEXT NOT NULL,
+            analyses_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(source_segment_id, analyzer_version, params_hash)
+        );
+        CREATE INDEX IF NOT EXISTS idx_dsp_runs_source
+            ON dsp_analysis_runs(source_segment_id);
+
+        -- Time-series datapoints that fit (time, value). Covers onsets, RMS
+        -- envelope, spectral centroid/rolloff/flux, ZCR, pitch estimate.
+        -- extra_json for the rare case a single REAL isn't enough.
+        CREATE TABLE IF NOT EXISTS dsp_datapoints (
+            run_id TEXT NOT NULL REFERENCES dsp_analysis_runs(id) ON DELETE CASCADE,
+            data_type TEXT NOT NULL,
+            time_s REAL NOT NULL,
+            value REAL NOT NULL,
+            extra_json TEXT,
+            PRIMARY KEY (run_id, data_type, time_s)
+        );
+        CREATE INDEX IF NOT EXISTS idx_dsp_datapoints_type_time
+            ON dsp_datapoints(run_id, data_type, time_s);
+
+        -- Time-ranged regions. E.g. vocal_presence ranges, drops, silence.
+        CREATE TABLE IF NOT EXISTS dsp_sections (
+            run_id TEXT NOT NULL REFERENCES dsp_analysis_runs(id) ON DELETE CASCADE,
+            start_s REAL NOT NULL,
+            end_s REAL NOT NULL,
+            section_type TEXT NOT NULL,
+            label TEXT,
+            confidence REAL,
+            PRIMARY KEY (run_id, start_s, section_type)
+        );
+        CREATE INDEX IF NOT EXISTS idx_dsp_sections_type_start
+            ON dsp_sections(run_id, section_type, start_s);
+
+        -- Global scalars for the run: tempo_bpm, peak_db, global_rms, etc.
+        CREATE TABLE IF NOT EXISTS dsp_scalars (
+            run_id TEXT NOT NULL REFERENCES dsp_analysis_runs(id) ON DELETE CASCADE,
+            metric TEXT NOT NULL,
+            value REAL NOT NULL,
+            PRIMARY KEY (run_id, metric)
+        );
+
+        -- Phase 3: cached LLM semantic descriptions (qualitative / vibes).
+        -- Cache key: (source_segment_id, model, prompt_version). Prompt
+        -- iteration produces new runs; old runs persist for A/B comparison.
+        CREATE TABLE IF NOT EXISTS audio_description_runs (
+            id TEXT PRIMARY KEY,
+            source_segment_id TEXT NOT NULL REFERENCES pool_segments(id) ON DELETE CASCADE,
+            model TEXT NOT NULL,
+            prompt_version TEXT NOT NULL,
+            chunk_size_s REAL NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(source_segment_id, model, prompt_version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_audio_desc_runs_source
+            ON audio_description_runs(source_segment_id);
+
+        -- Time-ranged structured properties: mood, section_type, energy,
+        -- vocal_style, genre, instrumentation, etc.
+        CREATE TABLE IF NOT EXISTS audio_descriptions (
+            run_id TEXT NOT NULL REFERENCES audio_description_runs(id) ON DELETE CASCADE,
+            start_s REAL NOT NULL,
+            end_s REAL NOT NULL,
+            property TEXT NOT NULL,
+            value_text TEXT,
+            value_num REAL,
+            confidence REAL,
+            raw_json TEXT,
+            PRIMARY KEY (run_id, start_s, property)
+        );
+        CREATE INDEX IF NOT EXISTS idx_audio_descriptions_property_time
+            ON audio_descriptions(run_id, property, start_s);
+
+        -- Segment-global qualitative properties: key, global_genre,
+        -- vocal_gender, global_mood, etc.
+        CREATE TABLE IF NOT EXISTS audio_description_scalars (
+            run_id TEXT NOT NULL REFERENCES audio_description_runs(id) ON DELETE CASCADE,
+            property TEXT NOT NULL,
+            value_text TEXT,
+            value_num REAL,
+            confidence REAL,
+            PRIMARY KEY (run_id, property)
+        );
     """)
 
     # ── Undo system ──
