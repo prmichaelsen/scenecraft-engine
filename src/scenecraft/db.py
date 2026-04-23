@@ -13,6 +13,7 @@ import time as _time
 import uuid
 from pathlib import Path
 from contextlib import contextmanager
+from typing import Any
 
 
 def generate_id(prefix: str) -> str:
@@ -92,6 +93,44 @@ def transaction(project_dir: Path):
     except Exception:
         conn.rollback()
         raise
+
+
+# ── M13 task-45: default send-bus fixtures ──────────────────────────
+# Spec §Behavior "Configuring Send Buses": 2 reverb (Plate, Hall), 1 delay,
+# 1 echo, in that order. Static-param payloads are JSON-serialized and mirror
+# the `EffectTypeSpec` defaults the frontend mixer consults when it builds the
+# per-bus WebAudio node (ConvolverNode for reverb, DelayNode for delay/echo).
+# IR assets themselves ship in T47; here we only reference them by filename.
+_DEFAULT_SEND_BUSES: tuple[dict, ...] = (
+    {"bus_type": "reverb", "label": "Plate",
+     "static_params": {"ir": "plate.wav"}},
+    {"bus_type": "reverb", "label": "Hall",
+     "static_params": {"ir": "hall.wav"}},
+    {"bus_type": "delay", "label": "Delay",
+     "static_params": {"time_division": "1/4", "feedback": 0.35}},
+    {"bus_type": "echo", "label": "Echo",
+     "static_params": {"time_ms": 120.0, "feedback": 0.0, "tone": 0.5}},
+)
+
+
+def _seed_default_send_buses(conn: sqlite3.Connection) -> list[str]:
+    """INSERT the 4 default send buses into an empty project_send_buses table.
+
+    Returns the list of generated bus IDs in order_index order. Called from
+    `_ensure_schema` when the table is empty (fresh project OR migration of a
+    pre-M13 project). Callers outside schema bootstrap should generally not
+    invoke this directly.
+    """
+    ids: list[str] = []
+    for i, bus in enumerate(_DEFAULT_SEND_BUSES):
+        bus_id = generate_id("bus")
+        conn.execute(
+            "INSERT INTO project_send_buses (id, bus_type, label, order_index, static_params) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (bus_id, bus["bus_type"], bus["label"], i, json.dumps(bus["static_params"])),
+        )
+        ids.append(bus_id)
+    return ids
 
 
 def _ensure_schema(conn: sqlite3.Connection):
@@ -416,6 +455,59 @@ def _ensure_schema(conn: sqlite3.Connection):
             name TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
         );
+
+        -- M13 task-45: effect-curves + macro-panel schema (spec R1-R5).
+        -- CORE tables (not plugin-owned; no __ prefix). Per-project scope is
+        -- enforced by the project.db location, not an explicit project_id FK.
+        CREATE TABLE IF NOT EXISTS track_effects (
+            id TEXT PRIMARY KEY,
+            track_id TEXT NOT NULL REFERENCES audio_tracks(id) ON DELETE CASCADE,
+            effect_type TEXT NOT NULL,
+            order_index INTEGER NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            static_params TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS track_effects_track_order
+            ON track_effects(track_id, order_index);
+
+        CREATE TABLE IF NOT EXISTS effect_curves (
+            id TEXT PRIMARY KEY,
+            effect_id TEXT NOT NULL REFERENCES track_effects(id) ON DELETE CASCADE,
+            param_name TEXT NOT NULL,
+            points TEXT NOT NULL,
+            interpolation TEXT NOT NULL DEFAULT 'bezier',
+            visible INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(effect_id, param_name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_effect_curves_effect
+            ON effect_curves(effect_id);
+
+        CREATE TABLE IF NOT EXISTS project_send_buses (
+            id TEXT PRIMARY KEY,
+            bus_type TEXT NOT NULL,
+            label TEXT NOT NULL,
+            order_index INTEGER NOT NULL,
+            static_params TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_send_buses_order
+            ON project_send_buses(order_index);
+
+        CREATE TABLE IF NOT EXISTS track_sends (
+            track_id TEXT NOT NULL REFERENCES audio_tracks(id) ON DELETE CASCADE,
+            bus_id TEXT NOT NULL REFERENCES project_send_buses(id) ON DELETE CASCADE,
+            level REAL NOT NULL DEFAULT 0.0,
+            PRIMARY KEY (track_id, bus_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_track_sends_bus
+            ON track_sends(bus_id);
+
+        CREATE TABLE IF NOT EXISTS project_frequency_labels (
+            id TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            freq_min_hz REAL NOT NULL,
+            freq_max_hz REAL NOT NULL
+        );
     """)
 
     # ── Undo system ──
@@ -628,7 +720,7 @@ def _ensure_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE pool_segments ADD COLUMN context_entity_id TEXT")
 
     # ── Undo triggers (AFTER all migrations so PRAGMA table_info sees all columns) ──
-    _undo_tracked_tables = ["keyframes", "transitions", "suppressions", "effects", "tracks", "transition_effects", "markers", "audio_tracks", "audio_clips", "audio_isolations"]
+    _undo_tracked_tables = ["keyframes", "transitions", "suppressions", "effects", "tracks", "transition_effects", "markers", "audio_tracks", "audio_clips", "audio_isolations", "track_effects", "effect_curves", "project_send_buses", "project_frequency_labels"]
     for table in _undo_tracked_tables:
         cols_info = conn.execute(f"PRAGMA table_info({table})").fetchall()
         col_names = [row[1] for row in cols_info]
@@ -682,6 +774,70 @@ def _ensure_schema(conn: sqlite3.Connection):
         "|| quote(OLD.isolation_id) || ',' || quote(OLD.pool_segment_id) || ',' || quote(OLD.stem_type) || ')' "
         "FROM undo_state WHERE key='current_group'; END;"
     )
+
+    # ── M13 task-45: composite-PK undo triggers for track_sends ──
+    # track_sends has a composite PK (track_id, bus_id); mirror the isolation_stems
+    # pattern. The auto-seed trigger below runs OUTSIDE the undo_state gate so
+    # that default-bus rows inserted on audio_track create are NOT themselves
+    # recorded as a separate undo unit — they ride along with the parent insert.
+    conn.execute("DROP TRIGGER IF EXISTS track_sends_insert_undo")
+    conn.execute("DROP TRIGGER IF EXISTS track_sends_update_undo")
+    conn.execute("DROP TRIGGER IF EXISTS track_sends_delete_undo")
+    conn.execute(
+        "CREATE TRIGGER track_sends_insert_undo AFTER INSERT ON track_sends "
+        "WHEN (SELECT value FROM undo_state WHERE key='active') = 1 "
+        "BEGIN INSERT INTO undo_log (undo_group, sql_text) "
+        "SELECT value, 'DELETE FROM track_sends WHERE track_id=' || quote(NEW.track_id) "
+        "|| ' AND bus_id=' || quote(NEW.bus_id) "
+        "FROM undo_state WHERE key='current_group'; END;"
+    )
+    conn.execute(
+        "CREATE TRIGGER track_sends_update_undo AFTER UPDATE ON track_sends "
+        "WHEN (SELECT value FROM undo_state WHERE key='active') = 1 "
+        "BEGIN INSERT INTO undo_log (undo_group, sql_text) "
+        "SELECT value, 'UPDATE track_sends SET track_id=' || quote(OLD.track_id) "
+        "|| ',bus_id=' || quote(OLD.bus_id) "
+        "|| ',level=' || quote(OLD.level) "
+        "|| ' WHERE track_id=' || quote(OLD.track_id) "
+        "|| ' AND bus_id=' || quote(OLD.bus_id) "
+        "FROM undo_state WHERE key='current_group'; END;"
+    )
+    conn.execute(
+        "CREATE TRIGGER track_sends_delete_undo AFTER DELETE ON track_sends "
+        "WHEN (SELECT value FROM undo_state WHERE key='active') = 1 "
+        "BEGIN INSERT INTO undo_log (undo_group, sql_text) "
+        "SELECT value, 'INSERT INTO track_sends (track_id, bus_id, level) VALUES (' "
+        "|| quote(OLD.track_id) || ',' || quote(OLD.bus_id) || ',' || quote(OLD.level) || ')' "
+        "FROM undo_state WHERE key='current_group'; END;"
+    )
+
+    # ── M13 task-45: auto-insert track_sends rows on audio_track INSERT ──
+    # Per spec R4 + test `track-sends-row-per-track-per-bus`: every new audio
+    # track must get a level=0 send row for each existing bus automatically.
+    # Enforced via SQL trigger so no call-site can forget.
+    conn.execute("DROP TRIGGER IF EXISTS audio_tracks_seed_sends")
+    conn.execute(
+        "CREATE TRIGGER audio_tracks_seed_sends AFTER INSERT ON audio_tracks "
+        "BEGIN "
+        "INSERT OR IGNORE INTO track_sends (track_id, bus_id, level) "
+        "SELECT NEW.id, id, 0.0 FROM project_send_buses; "
+        "END;"
+    )
+
+    # ── M13 task-45: seed default send buses on migration + new-project ──
+    # Per spec §Behavior "Configuring Send Buses" + test
+    # `send-bus-defaults-on-new-project`: 2 reverb (Plate, Hall) + 1 delay +
+    # 1 echo, in that order_index. Idempotent: only seeds if the table is
+    # empty, so re-runs on an existing migrated DB are no-ops.
+    existing_bus_count = conn.execute("SELECT COUNT(*) FROM project_send_buses").fetchone()[0]
+    if existing_bus_count == 0:
+        _seed_default_send_buses(conn)
+        # For any audio_tracks that already existed before this migration,
+        # backfill track_sends rows to the just-seeded buses.
+        conn.execute(
+            "INSERT OR IGNORE INTO track_sends (track_id, bus_id, level) "
+            "SELECT t.id, b.id, 0.0 FROM audio_tracks t CROSS JOIN project_send_buses b"
+        )
 
     # Commit all DDL + seed inserts. Without this, the connection holds an open
     # transaction that blocks writes from other threads (e.g., background workers,
@@ -2835,4 +2991,436 @@ def set_pool_segment_context(
             "UPDATE pool_segments SET context_entity_type = ?, context_entity_id = ? WHERE id = ?",
             (context_entity_type, context_entity_id, pool_segment_id),
         )
+    conn.commit()
+
+
+# ── M13 task-45: track_effects + effect_curves + buses + labels ──────────
+# Spec: local.effect-curves-macro-panel.md, R1-R5. These are CORE helpers
+# (no plugin prefix); the frontend mixer + HTTP endpoints in api_server.py
+# call them directly. Return shapes use `db_models.py` dataclasses — see
+# that module for the TS-parity field names.
+
+from scenecraft.db_models import (
+    TrackEffect as _TrackEffect,
+    EffectCurve as _EffectCurve,
+    SendBus as _SendBus,
+    TrackSend as _TrackSend,
+    FrequencyLabel as _FrequencyLabel,
+)
+
+
+def _row_to_track_effect(row: sqlite3.Row) -> _TrackEffect:
+    sp = row["static_params"]
+    return _TrackEffect(
+        id=row["id"],
+        track_id=row["track_id"],
+        effect_type=row["effect_type"],
+        order_index=row["order_index"],
+        enabled=bool(row["enabled"]),
+        static_params=json.loads(sp) if sp else {},
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_effect_curve(row: sqlite3.Row) -> _EffectCurve:
+    pts = row["points"]
+    return _EffectCurve(
+        id=row["id"],
+        effect_id=row["effect_id"],
+        param_name=row["param_name"],
+        points=json.loads(pts) if pts else [],
+        interpolation=row["interpolation"],
+        visible=bool(row["visible"]),
+    )
+
+
+def _row_to_send_bus(row: sqlite3.Row) -> _SendBus:
+    sp = row["static_params"]
+    return _SendBus(
+        id=row["id"],
+        bus_type=row["bus_type"],
+        label=row["label"],
+        order_index=row["order_index"],
+        static_params=json.loads(sp) if sp else {},
+    )
+
+
+def _row_to_track_send(row: sqlite3.Row) -> _TrackSend:
+    return _TrackSend(
+        track_id=row["track_id"],
+        bus_id=row["bus_id"],
+        level=float(row["level"]),
+    )
+
+
+def _row_to_frequency_label(row: sqlite3.Row) -> _FrequencyLabel:
+    return _FrequencyLabel(
+        id=row["id"],
+        label=row["label"],
+        freq_min_hz=float(row["freq_min_hz"]),
+        freq_max_hz=float(row["freq_max_hz"]),
+    )
+
+
+# ── track_effects ─────────────────────────────────────────────────────────
+
+def add_track_effect(
+    project_dir: Path,
+    *,
+    track_id: str,
+    effect_type: str,
+    static_params: dict | None = None,
+    order_index: int | None = None,
+    enabled: bool = True,
+) -> _TrackEffect:
+    """Insert a new track_effects row. Generates an id, defaults
+    ``order_index`` to max(existing)+1 when not provided, and returns the
+    hydrated TrackEffect dataclass. Does NOT validate ``effect_type`` against
+    the registry — that's the HTTP endpoint's job (spec R_V1)."""
+    conn = get_db(project_dir)
+    eff_id = generate_id("eff")
+    sp_json = json.dumps(static_params or {})
+    if order_index is None:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(order_index), -1) + 1 FROM track_effects WHERE track_id = ?",
+            (track_id,),
+        ).fetchone()
+        order_index = int(row[0])
+    conn.execute(
+        "INSERT INTO track_effects (id, track_id, effect_type, order_index, enabled, static_params, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (eff_id, track_id, effect_type, order_index, 1 if enabled else 0, sp_json, _now_iso()),
+    )
+    conn.commit()
+    return get_track_effect(project_dir, eff_id)  # type: ignore[return-value]
+
+
+def get_track_effect(project_dir: Path, effect_id: str) -> _TrackEffect | None:
+    conn = get_db(project_dir)
+    row = conn.execute(
+        "SELECT * FROM track_effects WHERE id = ?", (effect_id,)
+    ).fetchone()
+    return _row_to_track_effect(row) if row else None
+
+
+def list_track_effects(project_dir: Path, track_id: str) -> list[_TrackEffect]:
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        "SELECT * FROM track_effects WHERE track_id = ? ORDER BY order_index",
+        (track_id,),
+    ).fetchall()
+    return [_row_to_track_effect(r) for r in rows]
+
+
+def update_track_effect(project_dir: Path, effect_id: str, **fields) -> None:
+    """Partial UPDATE. Accepts any of: order_index, enabled, static_params."""
+    if not fields:
+        return
+    conn = get_db(project_dir)
+    sets: list[str] = []
+    values: list[Any] = []
+    for key, val in fields.items():
+        if key == "enabled":
+            val = 1 if val else 0
+        elif key == "static_params" and not isinstance(val, str):
+            val = json.dumps(val)
+        sets.append(f"{key} = ?")
+        values.append(val)
+    values.append(effect_id)
+    conn.execute(f"UPDATE track_effects SET {', '.join(sets)} WHERE id = ?", values)
+    conn.commit()
+
+
+def delete_track_effect(project_dir: Path, effect_id: str) -> None:
+    """DELETE a track_effect. ON DELETE CASCADE removes associated effect_curves.
+    Idempotent: deleting a non-existent id is a no-op (spec R_V1)."""
+    conn = get_db(project_dir)
+    conn.execute("DELETE FROM track_effects WHERE id = ?", (effect_id,))
+    conn.commit()
+
+
+# ── effect_curves ─────────────────────────────────────────────────────────
+
+def add_effect_curve(
+    project_dir: Path,
+    *,
+    effect_id: str,
+    param_name: str,
+    points: list | None = None,
+    interpolation: str = "bezier",
+    visible: bool = False,
+) -> _EffectCurve:
+    """Straight INSERT — raises sqlite3.IntegrityError on duplicate
+    (effect_id, param_name). Use ``upsert_effect_curve`` for UPSERT semantics."""
+    conn = get_db(project_dir)
+    curve_id = generate_id("curve")
+    pts_json = json.dumps(points or [])
+    conn.execute(
+        "INSERT INTO effect_curves (id, effect_id, param_name, points, interpolation, visible) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (curve_id, effect_id, param_name, pts_json, interpolation, 1 if visible else 0),
+    )
+    conn.commit()
+    return get_effect_curve(project_dir, curve_id)  # type: ignore[return-value]
+
+
+def get_effect_curve(project_dir: Path, curve_id: str) -> _EffectCurve | None:
+    conn = get_db(project_dir)
+    row = conn.execute(
+        "SELECT * FROM effect_curves WHERE id = ?", (curve_id,)
+    ).fetchone()
+    return _row_to_effect_curve(row) if row else None
+
+
+def list_curves_for_effect(project_dir: Path, effect_id: str) -> list[_EffectCurve]:
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        "SELECT * FROM effect_curves WHERE effect_id = ? ORDER BY param_name",
+        (effect_id,),
+    ).fetchall()
+    return [_row_to_effect_curve(r) for r in rows]
+
+
+def upsert_effect_curve(
+    project_dir: Path,
+    *,
+    effect_id: str,
+    param_name: str,
+    points: list | None = None,
+    interpolation: str = "bezier",
+    visible: bool = False,
+) -> _EffectCurve:
+    """Insert or update the single row for (effect_id, param_name).
+
+    Spec R2: the UNIQUE(effect_id, param_name) constraint means the
+    application path for updating an existing curve must UPSERT rather than
+    re-INSERT. A raw duplicate INSERT attempt still fails at the SQL layer —
+    that's the required failure mode for the `effect-curves-unique-constraint`
+    test. This helper uses ``ON CONFLICT ... DO UPDATE`` so the row's ``id``
+    stays stable across updates (important for clients that cache by id).
+    """
+    conn = get_db(project_dir)
+    pts_json = json.dumps(points or [])
+    curve_id = generate_id("curve")
+    conn.execute(
+        "INSERT INTO effect_curves (id, effect_id, param_name, points, interpolation, visible) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(effect_id, param_name) DO UPDATE SET "
+        "points = excluded.points, interpolation = excluded.interpolation, "
+        "visible = excluded.visible",
+        (curve_id, effect_id, param_name, pts_json, interpolation, 1 if visible else 0),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM effect_curves WHERE effect_id = ? AND param_name = ?",
+        (effect_id, param_name),
+    ).fetchone()
+    assert row is not None, "upsert should always yield a row"
+    return _row_to_effect_curve(row)
+
+
+def update_effect_curve(project_dir: Path, curve_id: str, **fields) -> None:
+    if not fields:
+        return
+    conn = get_db(project_dir)
+    sets: list[str] = []
+    values: list[Any] = []
+    for key, val in fields.items():
+        if key == "visible":
+            val = 1 if val else 0
+        elif key == "points" and not isinstance(val, str):
+            val = json.dumps(val)
+        sets.append(f"{key} = ?")
+        values.append(val)
+    values.append(curve_id)
+    conn.execute(f"UPDATE effect_curves SET {', '.join(sets)} WHERE id = ?", values)
+    conn.commit()
+
+
+def delete_effect_curve(project_dir: Path, curve_id: str) -> None:
+    conn = get_db(project_dir)
+    conn.execute("DELETE FROM effect_curves WHERE id = ?", (curve_id,))
+    conn.commit()
+
+
+# ── project_send_buses ────────────────────────────────────────────────────
+
+def add_send_bus(
+    project_dir: Path,
+    *,
+    bus_type: str,
+    label: str,
+    static_params: dict | None = None,
+    order_index: int | None = None,
+) -> _SendBus:
+    conn = get_db(project_dir)
+    bus_id = generate_id("bus")
+    sp_json = json.dumps(static_params or {})
+    if order_index is None:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(order_index), -1) + 1 FROM project_send_buses"
+        ).fetchone()
+        order_index = int(row[0])
+    conn.execute(
+        "INSERT INTO project_send_buses (id, bus_type, label, order_index, static_params) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (bus_id, bus_type, label, order_index, sp_json),
+    )
+    conn.commit()
+    return get_send_bus(project_dir, bus_id)  # type: ignore[return-value]
+
+
+def get_send_bus(project_dir: Path, bus_id: str) -> _SendBus | None:
+    conn = get_db(project_dir)
+    row = conn.execute(
+        "SELECT * FROM project_send_buses WHERE id = ?", (bus_id,)
+    ).fetchone()
+    return _row_to_send_bus(row) if row else None
+
+
+def list_send_buses(project_dir: Path) -> list[_SendBus]:
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        "SELECT * FROM project_send_buses ORDER BY order_index"
+    ).fetchall()
+    return [_row_to_send_bus(r) for r in rows]
+
+
+def update_send_bus(project_dir: Path, bus_id: str, **fields) -> None:
+    if not fields:
+        return
+    conn = get_db(project_dir)
+    sets: list[str] = []
+    values: list[Any] = []
+    for key, val in fields.items():
+        if key == "static_params" and not isinstance(val, str):
+            val = json.dumps(val)
+        sets.append(f"{key} = ?")
+        values.append(val)
+    values.append(bus_id)
+    conn.execute(f"UPDATE project_send_buses SET {', '.join(sets)} WHERE id = ?", values)
+    conn.commit()
+
+
+def delete_send_bus(project_dir: Path, bus_id: str) -> None:
+    """DELETE a bus. ON DELETE CASCADE removes its track_sends rows."""
+    conn = get_db(project_dir)
+    conn.execute("DELETE FROM project_send_buses WHERE id = ?", (bus_id,))
+    conn.commit()
+
+
+# ── track_sends ───────────────────────────────────────────────────────────
+
+def list_track_sends(
+    project_dir: Path,
+    track_id: str | None = None,
+    bus_id: str | None = None,
+) -> list[_TrackSend]:
+    """List track_sends rows; optionally filter by track_id and/or bus_id."""
+    conn = get_db(project_dir)
+    clauses: list[str] = []
+    params: list[Any] = []
+    if track_id is not None:
+        clauses.append("track_id = ?")
+        params.append(track_id)
+    if bus_id is not None:
+        clauses.append("bus_id = ?")
+        params.append(bus_id)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = conn.execute(
+        f"SELECT * FROM track_sends {where} ORDER BY track_id, bus_id", params
+    ).fetchall()
+    return [_row_to_track_send(r) for r in rows]
+
+
+def get_track_send(
+    project_dir: Path, track_id: str, bus_id: str
+) -> _TrackSend | None:
+    conn = get_db(project_dir)
+    row = conn.execute(
+        "SELECT * FROM track_sends WHERE track_id = ? AND bus_id = ?",
+        (track_id, bus_id),
+    ).fetchone()
+    return _row_to_track_send(row) if row else None
+
+
+def upsert_track_send(
+    project_dir: Path, *, track_id: str, bus_id: str, level: float,
+) -> _TrackSend:
+    """Insert or update a track_sends row. Composite PK (track_id, bus_id)."""
+    conn = get_db(project_dir)
+    conn.execute(
+        "INSERT INTO track_sends (track_id, bus_id, level) VALUES (?, ?, ?) "
+        "ON CONFLICT(track_id, bus_id) DO UPDATE SET level = excluded.level",
+        (track_id, bus_id, float(level)),
+    )
+    conn.commit()
+    return _TrackSend(track_id=track_id, bus_id=bus_id, level=float(level))
+
+
+def delete_track_send(project_dir: Path, track_id: str, bus_id: str) -> None:
+    conn = get_db(project_dir)
+    conn.execute(
+        "DELETE FROM track_sends WHERE track_id = ? AND bus_id = ?",
+        (track_id, bus_id),
+    )
+    conn.commit()
+
+
+# ── project_frequency_labels ──────────────────────────────────────────────
+
+def add_frequency_label(
+    project_dir: Path, *, label: str, freq_min_hz: float, freq_max_hz: float,
+) -> _FrequencyLabel:
+    conn = get_db(project_dir)
+    lbl_id = generate_id("freq")
+    conn.execute(
+        "INSERT INTO project_frequency_labels (id, label, freq_min_hz, freq_max_hz) "
+        "VALUES (?, ?, ?, ?)",
+        (lbl_id, label, float(freq_min_hz), float(freq_max_hz)),
+    )
+    conn.commit()
+    return _FrequencyLabel(
+        id=lbl_id, label=label,
+        freq_min_hz=float(freq_min_hz), freq_max_hz=float(freq_max_hz),
+    )
+
+
+def get_frequency_label(project_dir: Path, label_id: str) -> _FrequencyLabel | None:
+    conn = get_db(project_dir)
+    row = conn.execute(
+        "SELECT * FROM project_frequency_labels WHERE id = ?", (label_id,)
+    ).fetchone()
+    return _row_to_frequency_label(row) if row else None
+
+
+def list_frequency_labels(project_dir: Path) -> list[_FrequencyLabel]:
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        "SELECT * FROM project_frequency_labels ORDER BY freq_min_hz"
+    ).fetchall()
+    return [_row_to_frequency_label(r) for r in rows]
+
+
+def update_frequency_label(
+    project_dir: Path, label_id: str, **fields
+) -> None:
+    if not fields:
+        return
+    conn = get_db(project_dir)
+    sets: list[str] = []
+    values: list[Any] = []
+    for key, val in fields.items():
+        sets.append(f"{key} = ?")
+        values.append(val)
+    values.append(label_id)
+    conn.execute(
+        f"UPDATE project_frequency_labels SET {', '.join(sets)} WHERE id = ?", values
+    )
+    conn.commit()
+
+
+def delete_frequency_label(project_dir: Path, label_id: str) -> None:
+    conn = get_db(project_dir)
+    conn.execute("DELETE FROM project_frequency_labels WHERE id = ?", (label_id,))
     conn.commit()
