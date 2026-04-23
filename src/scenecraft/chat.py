@@ -186,6 +186,13 @@ Tools available:
     are cached by (segment, model, prompt_version); re-calling with the same
     inputs returns the cached run without re-invoking Gemini. Pass
     force_rerun=True to overwrite.
+  • apply_mix_plan — run an ordered list of audio mix operations as ONE
+    atomic undo group so the whole auto-mix pass can be undone in a single
+    click. Each operation names a child op (add_audio_track, add_audio_clip,
+    update_volume_curve, add_audio_effect, update_effect_param_curve) and its
+    args. IDs must be known up-front (no cross-op id resolution). Partial
+    failures are tolerated: failed ops are recorded in `errors`, remaining ops
+    continue. generate_dsp is NOT a mix op — call it before composing the plan.
 
 After generation completes, use `assign_keyframe_image` / `assign_pool_video` to
 pick one of the new candidates (coming in task-54).
@@ -975,6 +982,75 @@ GENERATE_DESCRIPTIONS_TOOL: dict = {
     },
 }
 
+APPLY_MIX_PLAN_TOOL: dict = {
+    "name": "apply_mix_plan",
+    "description": (
+        "Apply an ordered list of audio mix operations as ONE atomic undo group. "
+        "Designed for sub-LLM auto-mix / auto-master flows that produce multi-"
+        "step plans (add an effect, set an automation curve, duck a track, "
+        "etc.) — wrapping the whole plan in a single undo group means the user "
+        "can revert the entire auto-mix pass with one click, rather than "
+        "undoing 10 fragments. "
+        "\n\nEach item in `operations` has an `op` (one of 'add_audio_track', "
+        "'add_audio_clip', 'update_volume_curve', 'add_audio_effect', "
+        "'update_effect_param_curve') and an `args` dict matching the inputs "
+        "of the equivalent chat tool. "
+        "\n\nIDs must be known ahead of time — this tool does NOT resolve the "
+        "track_id returned from an earlier add_audio_track within the same "
+        "plan. If you need to chain ops that depend on each other's ids, call "
+        "the first one in a separate chat turn, read its result, then call "
+        "apply_mix_plan with the concrete id. "
+        "\n\nPartial-failure policy: if an op fails mid-plan, its error is "
+        "logged in `errors` and the remaining ops continue. The undo group "
+        "still wraps every successfully-applied op so the user can revert a "
+        "partial mix cleanly. "
+        "\n\ngenerate_dsp is NOT a mix operation — run it BEFORE composing the "
+        "plan. Passing op='generate_dsp' returns an explicit error for that "
+        "item."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "description": {
+                "type": "string",
+                "description": (
+                    "Human-readable name of the plan. Appears as the undo "
+                    "group's description so the user sees 'Undo: Chat: mix "
+                    "plan — {description}'."
+                ),
+            },
+            "operations": {
+                "type": "array",
+                "description": "Ordered list of audio operations to apply.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "op": {
+                            "type": "string",
+                            "enum": [
+                                "add_audio_track",
+                                "add_audio_clip",
+                                "update_volume_curve",
+                                "add_audio_effect",
+                                "update_effect_param_curve",
+                            ],
+                        },
+                        "args": {
+                            "type": "object",
+                            "description": (
+                                "Inputs that would go into the equivalent "
+                                "chat tool of the same name."
+                            ),
+                        },
+                    },
+                    "required": ["op", "args"],
+                },
+            },
+        },
+        "required": ["description", "operations"],
+    },
+}
+
 
 TOOLS: list[dict] = [
     SQL_QUERY_TOOL,
@@ -1005,6 +1081,7 @@ TOOLS: list[dict] = [
     ADD_AUDIO_EFFECT_TOOL,
     UPDATE_EFFECT_PARAM_CURVE_TOOL,
     GENERATE_DESCRIPTIONS_TOOL,
+    APPLY_MIX_PLAN_TOOL,
 ]
 
 
@@ -2376,6 +2453,464 @@ def _exec_generate_descriptions(project_dir: Path, input_data: dict) -> dict:
     }
 
 
+# ── apply_mix_plan ────────────────────────────────────────────────────────
+
+
+_MIX_PLAN_OPS: frozenset[str] = frozenset({
+    "add_audio_track",
+    "add_audio_clip",
+    "update_volume_curve",
+    "add_audio_effect",
+    "update_effect_param_curve",
+})
+
+
+def _mix_plan_add_audio_track(project_dir: Path, args: dict) -> dict:
+    """Inline copy of _exec_add_audio_track without undo_begin.
+
+    The outer _exec_apply_mix_plan opened the single undo group; child ops
+    must NOT open their own.
+    """
+    import json as _json
+    from scenecraft.db import (
+        add_audio_track as db_add_audio_track,
+        get_audio_tracks as db_get_audio_tracks,
+        generate_id,
+    )
+    name = args.get("name")
+    muted = bool(args.get("muted", False))
+    try:
+        volume = float(args.get("volume", 1.0))
+    except (TypeError, ValueError):
+        return {"error": "volume must be a number"}
+    if volume < 0.0 or volume > 2.0:
+        return {"error": "volume must be between 0.0 and 2.0"}
+
+    existing = db_get_audio_tracks(project_dir)
+    track_id = generate_id("audio_track")
+    display_order = max((t["display_order"] for t in existing), default=-1) + 1
+    if not name:
+        name = f"Audio Track {len(existing) + 1}"
+    volume_curve = _json.dumps([[0, volume], [1, volume]])
+
+    db_add_audio_track(project_dir, {
+        "id": track_id,
+        "name": name,
+        "display_order": display_order,
+        "hidden": False,
+        "muted": muted,
+        "solo": False,
+        "volume_curve": volume_curve,
+    })
+    return {
+        "track_id": track_id,
+        "name": name,
+        "display_order": display_order,
+        "muted": muted,
+        "volume": volume,
+    }
+
+
+def _mix_plan_add_audio_clip(project_dir: Path, args: dict) -> dict:
+    """Inline copy of _exec_add_audio_clip without undo_begin."""
+    from scenecraft.db import (
+        add_audio_clip as db_add_audio_clip,
+        get_pool_segment, get_audio_tracks as db_get_audio_tracks,
+        generate_id,
+    )
+    track_id = args.get("track_id")
+    source_segment_id = args.get("source_segment_id")
+    if not track_id or not isinstance(track_id, str):
+        return {"error": "missing track_id"}
+    if not source_segment_id or not isinstance(source_segment_id, str):
+        return {"error": "missing source_segment_id (pool_segments.id)"}
+
+    tracks = db_get_audio_tracks(project_dir)
+    if not any(t["id"] == track_id for t in tracks):
+        return {"error": f"audio track not found: {track_id}"}
+
+    seg = get_pool_segment(project_dir, source_segment_id)
+    if seg is None:
+        return {"error": f"pool_segment not found: {source_segment_id}"}
+    source_path = seg.get("poolPath") or seg.get("pool_path")
+    if not source_path:
+        return {"error": f"pool_segment {source_segment_id} has no pool_path"}
+
+    try:
+        start_time = float(args["start_time"])
+    except (KeyError, TypeError, ValueError):
+        return {"error": "start_time is required and must be a number"}
+
+    trim_in = args.get("trim_in")
+    if trim_in is not None:
+        try:
+            source_offset = float(trim_in)
+        except (TypeError, ValueError):
+            return {"error": "trim_in must be a number"}
+    else:
+        try:
+            source_offset = float(args.get("source_offset", 0.0))
+        except (TypeError, ValueError):
+            return {"error": "source_offset must be a number"}
+    if source_offset < 0:
+        return {"error": "trim_in / source_offset must be >= 0"}
+
+    trim_out = args.get("trim_out")
+    end_time_in = args.get("end_time")
+    if trim_out is not None:
+        try:
+            trim_out_f = float(trim_out)
+        except (TypeError, ValueError):
+            return {"error": "trim_out must be a number"}
+        if trim_out_f <= source_offset:
+            return {"error": f"trim_out ({trim_out_f}) must be greater than trim_in ({source_offset})"}
+        end_time = start_time + (trim_out_f - source_offset)
+    elif end_time_in is not None:
+        try:
+            end_time = float(end_time_in)
+        except (TypeError, ValueError):
+            return {"error": "end_time must be a number"}
+    else:
+        duration = seg.get("durationSeconds") or seg.get("duration_seconds")
+        if duration is None:
+            return {
+                "error": (
+                    f"cannot auto-compute end_time: pool_segment {source_segment_id} "
+                    "has no duration_seconds; pass end_time or trim_out explicitly."
+                )
+            }
+        end_time = start_time + (float(duration) - source_offset)
+
+    if end_time <= start_time:
+        return {"error": f"end_time ({end_time}) must be greater than start_time ({start_time})"}
+
+    label = args.get("label")
+    if not label:
+        seed = seg.get("label") or seg.get("originalFilename") or seg.get("original_filename")
+        if seed and "." in seed and not seg.get("label"):
+            seed = seed.rsplit(".", 1)[0]
+        label = seed or None
+
+    volume_curve = args.get("volume_curve", "[[0,1],[1,1]]")
+
+    clip_id = generate_id("audio_clip")
+    db_add_audio_clip(project_dir, {
+        "id": clip_id,
+        "track_id": track_id,
+        "source_path": source_path,
+        "start_time": start_time,
+        "end_time": end_time,
+        "source_offset": source_offset,
+        "volume_curve": volume_curve,
+        "muted": False,
+        "remap": {"method": "linear", "target_duration": 0},
+        "label": label,
+    })
+    return {
+        "audio_clip_id": clip_id,
+        "track_id": track_id,
+        "source_segment_id": source_segment_id,
+        "source_path": source_path,
+        "start_time": start_time,
+        "end_time": end_time,
+        "source_offset": source_offset,
+        "label": label,
+    }
+
+
+def _mix_plan_update_volume_curve(project_dir: Path, args: dict) -> dict:
+    """Inline copy of _exec_update_volume_curve without undo_begin."""
+    import json as _json
+    import math
+    from scenecraft.db import (
+        update_audio_track as db_update_audio_track,
+        update_audio_clip as db_update_audio_clip,
+        get_audio_tracks as db_get_audio_tracks,
+        get_audio_clips as db_get_audio_clips,
+    )
+    target_type = args.get("target_type")
+    if target_type not in ("track", "clip"):
+        return {"error": "target_type must be 'track' or 'clip'"}
+
+    target_id = args.get("target_id")
+    if not target_id or not isinstance(target_id, str):
+        return {"error": "target_id is required and must be a string"}
+
+    interpolation = args.get("interpolation", "bezier")
+    if interpolation not in ("bezier", "linear", "step"):
+        return {"error": "interpolation must be one of 'bezier', 'linear', 'step'"}
+
+    raw_points = args.get("points")
+    if raw_points is None:
+        return {"error": "points is required"}
+    if isinstance(raw_points, str):
+        try:
+            points = _json.loads(raw_points)
+        except (ValueError, TypeError) as exc:
+            return {"error": f"points JSON string is not valid JSON: {exc}"}
+    else:
+        points = raw_points
+
+    if not isinstance(points, list):
+        return {"error": "points must be a list of [time, value] pairs"}
+    if len(points) < 2:
+        return {"error": "volume curve requires at least 2 points"}
+
+    cleaned: list[list[float]] = []
+    prev_t: float | None = None
+    for idx, pt in enumerate(points):
+        if not isinstance(pt, (list, tuple)) or len(pt) != 2:
+            return {"error": f"point at index {idx} must be a [time, value] pair"}
+        try:
+            t = float(pt[0])
+            v = float(pt[1])
+        except (TypeError, ValueError):
+            return {"error": f"point at index {idx} must have numeric [time, value]"}
+        if not (math.isfinite(t) and math.isfinite(v)):
+            return {"error": f"point at index {idx} has non-finite value"}
+        if idx == 0 and t != 0.0:
+            return {"error": "first point time must be 0.0"}
+        if prev_t is not None and t <= prev_t:
+            return {
+                "error": (
+                    f"point times must be strictly increasing; "
+                    f"got {t} after {prev_t} at index {idx}"
+                )
+            }
+        cleaned.append([t, v])
+        prev_t = t
+
+    if target_type == "track":
+        if not any(t["id"] == target_id for t in db_get_audio_tracks(project_dir)):
+            return {"error": f"track not found: {target_id}"}
+    else:
+        if not any(c["id"] == target_id for c in db_get_audio_clips(project_dir)):
+            return {"error": f"clip not found: {target_id}"}
+
+    volume_curve_json = _json.dumps(cleaned)
+    if target_type == "track":
+        db_update_audio_track(project_dir, target_id, volume_curve=volume_curve_json)
+    else:
+        db_update_audio_clip(project_dir, target_id, volume_curve=volume_curve_json)
+
+    return {
+        "ok": True,
+        "target_type": target_type,
+        "target_id": target_id,
+        "points_written": len(cleaned),
+    }
+
+
+def _mix_plan_add_audio_effect(project_dir: Path, args: dict) -> dict:
+    """Thin wrapper over db.add_track_effect.
+
+    Expected args: track_id, effect_type, optionally static_params (dict),
+    order_index (int), enabled (bool). Returns {effect_id, track_id,
+    effect_type, order_index}.
+    """
+    try:
+        from scenecraft.db import add_track_effect as db_add_track_effect
+    except ImportError:
+        return {"skipped": "add_audio_effect not yet implemented on main"}
+
+    track_id = args.get("track_id")
+    effect_type = args.get("effect_type")
+    if not track_id or not isinstance(track_id, str):
+        return {"error": "missing track_id"}
+    if not effect_type or not isinstance(effect_type, str):
+        return {"error": "missing effect_type"}
+
+    static_params = args.get("static_params")
+    if static_params is not None and not isinstance(static_params, dict):
+        return {"error": "static_params must be an object/dict"}
+
+    order_index = args.get("order_index")
+    if order_index is not None:
+        try:
+            order_index = int(order_index)
+        except (TypeError, ValueError):
+            return {"error": "order_index must be an integer"}
+
+    enabled = bool(args.get("enabled", True))
+
+    try:
+        effect = db_add_track_effect(
+            project_dir,
+            track_id=track_id,
+            effect_type=effect_type,
+            static_params=static_params,
+            order_index=order_index,
+            enabled=enabled,
+        )
+    except Exception as exc:
+        return {"error": f"add_track_effect failed: {exc}"}
+
+    return {
+        "effect_id": getattr(effect, "id", None),
+        "track_id": track_id,
+        "effect_type": effect_type,
+        "order_index": getattr(effect, "order_index", order_index),
+    }
+
+
+def _mix_plan_update_effect_param_curve(project_dir: Path, args: dict) -> dict:
+    """Thin wrapper over db.upsert_effect_curve.
+
+    Expected args: effect_id, param_name, points (list of [t,v]), optionally
+    interpolation ('bezier'|'linear'|'step'), visible (bool).
+    """
+    try:
+        from scenecraft.db import upsert_effect_curve as db_upsert_effect_curve
+    except ImportError:
+        return {"skipped": "update_effect_param_curve not yet implemented on main"}
+
+    effect_id = args.get("effect_id")
+    param_name = args.get("param_name")
+    if not effect_id or not isinstance(effect_id, str):
+        return {"error": "missing effect_id"}
+    if not param_name or not isinstance(param_name, str):
+        return {"error": "missing param_name"}
+
+    raw_points = args.get("points")
+    if raw_points is None:
+        return {"error": "points is required"}
+    if isinstance(raw_points, str):
+        try:
+            points = json.loads(raw_points)
+        except (ValueError, TypeError) as exc:
+            return {"error": f"points JSON string is not valid JSON: {exc}"}
+    else:
+        points = raw_points
+    if not isinstance(points, list):
+        return {"error": "points must be a list of [time, value] pairs"}
+
+    interpolation = args.get("interpolation", "bezier")
+    if interpolation not in ("bezier", "linear", "step"):
+        return {"error": "interpolation must be one of 'bezier', 'linear', 'step'"}
+
+    visible = bool(args.get("visible", False))
+
+    try:
+        curve = db_upsert_effect_curve(
+            project_dir,
+            effect_id=effect_id,
+            param_name=param_name,
+            points=points,
+            interpolation=interpolation,
+            visible=visible,
+        )
+    except Exception as exc:
+        return {"error": f"upsert_effect_curve failed: {exc}"}
+
+    return {
+        "ok": True,
+        "curve_id": getattr(curve, "id", None),
+        "effect_id": effect_id,
+        "param_name": param_name,
+        "points_written": len(points),
+    }
+
+
+def _exec_apply_mix_plan(project_dir: Path, input_data: dict) -> dict:
+    """Apply an ordered list of audio mix operations as ONE atomic undo group.
+
+    See ``APPLY_MIX_PLAN_TOOL`` for the full contract. Key invariants:
+    - Exactly ONE call to ``undo_begin`` per invocation (even if 0 ops).
+    - Partial-failure tolerant: failed ops are collected in ``errors`` and
+      the remaining ops continue. The undo group still wraps everything
+      successfully applied.
+    - No cross-op id resolution. Returns from earlier ops are NOT substituted
+      into later ops' args — the caller must know ids up-front.
+    - generate_dsp is explicitly rejected per-op (it's an analysis primitive,
+      not a mutation).
+    """
+    from scenecraft.db import undo_begin
+
+    description = input_data.get("description")
+    if not description or not isinstance(description, str):
+        return {"error": "description is required and must be a string"}
+
+    operations = input_data.get("operations")
+    if operations is None:
+        return {"error": "operations is required"}
+    if not isinstance(operations, list):
+        return {"error": "operations must be a list"}
+
+    undo_group_id = undo_begin(project_dir, f"Chat: mix plan — {description}")
+
+    applied = 0
+    skipped = 0
+    results: list[dict] = []
+    errors: list[str] = []
+
+    for idx, op_entry in enumerate(operations):
+        if not isinstance(op_entry, dict):
+            err = f"op #{idx}: entry must be an object with 'op' and 'args'"
+            errors.append(err)
+            skipped += 1
+            results.append({"error": err})
+            continue
+        op_name = op_entry.get("op")
+        args = op_entry.get("args") or {}
+        if not isinstance(args, dict):
+            err = f"op #{idx}: 'args' must be an object"
+            errors.append(err)
+            skipped += 1
+            results.append({"error": err})
+            continue
+
+        if op_name == "generate_dsp":
+            err = (
+                f"op #{idx}: generate_dsp is not a mix operation; "
+                "call it before composing the plan"
+            )
+            errors.append(err)
+            skipped += 1
+            results.append({"error": err})
+            continue
+
+        if op_name not in _MIX_PLAN_OPS:
+            err = f"op #{idx}: unknown op: {op_name!r}"
+            errors.append(err)
+            skipped += 1
+            results.append({"error": err})
+            continue
+
+        try:
+            if op_name == "add_audio_track":
+                res = _mix_plan_add_audio_track(project_dir, args)
+            elif op_name == "add_audio_clip":
+                res = _mix_plan_add_audio_clip(project_dir, args)
+            elif op_name == "update_volume_curve":
+                res = _mix_plan_update_volume_curve(project_dir, args)
+            elif op_name == "add_audio_effect":
+                res = _mix_plan_add_audio_effect(project_dir, args)
+            elif op_name == "update_effect_param_curve":
+                res = _mix_plan_update_effect_param_curve(project_dir, args)
+            else:  # pragma: no cover — _MIX_PLAN_OPS gate above
+                res = {"error": f"unhandled op: {op_name}"}
+        except Exception as exc:  # pragma: no cover — defensive
+            res = {"error": f"op {op_name} raised: {exc}"}
+
+        if "error" in res:
+            errors.append(f"op #{idx} ({op_name}): {res['error']}")
+            skipped += 1
+        elif "skipped" in res:
+            errors.append(f"op #{idx} ({op_name}): {res['skipped']}")
+            skipped += 1
+        else:
+            applied += 1
+        results.append(res)
+
+    return {
+        "applied": applied,
+        "skipped": skipped,
+        "undo_group_id": undo_group_id,
+        "results": results,
+        "errors": errors,
+    }
+
+
 def _exec_update_keyframe(project_dir: Path, input_data: dict) -> dict:
     from scenecraft.db import get_keyframe, update_keyframe, undo_begin
     kf_id = input_data.get("keyframe_id")
@@ -2951,6 +3486,7 @@ async def _execute_tool(
         return result, "error" in result
     if name == "update_volume_curve":
         result = _exec_update_volume_curve(project_dir, input_data)
+        return result, "error" in result
     if name == "generate_dsp":
         result = _exec_generate_dsp(project_dir, input_data)
         return result, "error" in result
@@ -2959,8 +3495,12 @@ async def _execute_tool(
         return result, "error" in result
     if name == "update_effect_param_curve":
         result = _exec_update_effect_param_curve(project_dir, input_data)
+        return result, "error" in result
     if name == "generate_descriptions":
         result = _exec_generate_descriptions(project_dir, input_data)
+        return result, "error" in result
+    if name == "apply_mix_plan":
+        result = _exec_apply_mix_plan(project_dir, input_data)
         return result, "error" in result
     if name == "update_keyframe":
         result = _exec_update_keyframe(project_dir, input_data)
