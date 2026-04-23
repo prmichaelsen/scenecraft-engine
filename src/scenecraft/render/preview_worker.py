@@ -237,12 +237,13 @@ class RenderWorker:
             self._thread = threading.Thread(target=self._render_loop, daemon=True)
             self._thread.start()
         self._playing.set()
-        # Kick background renderer — populates fragment cache around the
-        # playhead so replay is free and near-future playback starts
-        # from cache.
-        self._background_renderer.start()
-        self._background_renderer.update_playhead(self._playhead_t)
-        self._background_renderer.prime_around_playhead(radius_s=20.0)
+        # DISABLED: background renderer shares the ffmpeg encoder with the
+        # main loop, which corrupts the fMP4 byte stream — appendBuffer on
+        # the client silently stalls (updating=true, no updateend, buffered=0).
+        # Re-enable once the bg renderer has its own encoder + cache namespace.
+        # self._background_renderer.start()
+        # self._background_renderer.update_playhead(self._playhead_t)
+        # self._background_renderer.prime_around_playhead(radius_s=20.0)
 
     def seek(self, t: float) -> None:
         """Flush pending fragments past the current playhead, resume rendering from t.
@@ -259,10 +260,10 @@ class RenderWorker:
             self._drain_queue()
         self._last_activity_ts = time.monotonic()
         self._playing.set()
-        # Reprioritize background work around the new playhead so we
-        # catch up quickly in the likely direction of playback.
-        self._background_renderer.update_playhead(self._playhead_t)
-        self._background_renderer.prime_around_playhead(radius_s=20.0)
+        # DISABLED: see note in play(). Bg renderer must not touch the shared
+        # encoder until it gets its own.
+        # self._background_renderer.update_playhead(self._playhead_t)
+        # self._background_renderer.prime_around_playhead(radius_s=20.0)
 
     def pause(self) -> None:
         """Stop rendering. Queued fragments remain available."""
