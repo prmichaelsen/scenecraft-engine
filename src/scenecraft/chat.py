@@ -186,6 +186,14 @@ Tools available:
     are cached by (segment, model, prompt_version); re-calling with the same
     inputs returns the cached run without re-invoking Gemini. Pass
     force_rerun=True to overwrite.
+  • analyze_master_bus — render the current project's mix through the
+    frontend's OfflineAudioContext (requires playback paused), then run
+    librosa + pyloudnorm on the resulting WAV to produce master-bus metrics
+    (peak_db, true_peak_db, rms, lufs_integrated, clipping events,
+    spectral_centroid, dynamic_range). Cached by (mix_graph_hash,
+    start_time_s, end_time_s, sample_rate, analyzer_version); re-calling with
+    the same mix graph returns the cached run. Pass force_rerun=True to
+    overwrite. Non-destructive.
   • apply_mix_plan — run an ordered list of audio mix operations as ONE
     atomic undo group so the whole auto-mix pass can be undone in a single
     click. Each operation names a child op (add_audio_track, add_audio_clip,
@@ -1052,6 +1060,77 @@ APPLY_MIX_PLAN_TOOL: dict = {
 }
 
 
+ANALYZE_MASTER_BUS_TOOL: dict = {
+    "name": "analyze_master_bus",
+    "description": (
+        "Render the project's full mix (all audio_tracks + clips + effects + "
+        "automation) to a single WAV via the frontend's OfflineAudioContext, "
+        "then run librosa + pyloudnorm on the rendered buffer to produce "
+        "master-bus metrics. Supported analyses: "
+        "'peak' (sample-domain peak in dBFS), "
+        "'true_peak' (4x-oversampled peak in dBTP), "
+        "'rms' (amplitude envelope as datapoints with data_type='rms'), "
+        "'lufs' (integrated ITU-R BS.1770 loudness as a scalar), "
+        "'clipping_detect' (consecutive-sample runs where |y|>=0.99, merged "
+        "within 10ms — one mix_section row per event), "
+        "'spectral_centroid' (brightness over time, downsampled to ~10Hz), "
+        "'dynamic_range' (peak_db - lufs_integrated as a simple proxy). "
+        "Results are cached by (mix_graph_hash, start_time_s, end_time_s, "
+        "sample_rate, analyzer_version) — calling again with the same mix "
+        "returns the cached run. Pass force_rerun=True to discard the cached "
+        "run and recompute. Requires playback to be paused on the frontend "
+        "(the mix is rendered offline and must not collide with live "
+        "playback). Non-destructive: analysis runs are write-once cached "
+        "artifacts, no undo required."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "start_time_s": {
+                "type": "number",
+                "default": 0.0,
+                "description": "Start of the render window in seconds.",
+            },
+            "end_time_s": {
+                "type": ["number", "null"],
+                "default": None,
+                "description": (
+                    "End of the render window in seconds. Omit (or null) to "
+                    "render through the last audio_clip's end_time."
+                ),
+            },
+            "sample_rate": {
+                "type": "integer",
+                "default": 48000,
+                "description": "Target render sample rate (Hz).",
+            },
+            "analyses": {
+                "type": "array",
+                "items": {"type": "string"},
+                "default": [
+                    "peak", "true_peak", "rms", "lufs",
+                    "clipping_detect", "spectral_centroid", "dynamic_range",
+                ],
+                "description": (
+                    "Which analyses to run. Any of 'peak', 'true_peak', "
+                    "'rms', 'lufs', 'clipping_detect', 'spectral_centroid', "
+                    "'dynamic_range'. Unknown names are skipped."
+                ),
+            },
+            "force_rerun": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "If true, delete any existing run matching the cache "
+                    "key and recompute. Default false (return the cached run)."
+                ),
+            },
+        },
+        "required": [],
+    },
+}
+
+
 TOOLS: list[dict] = [
     SQL_QUERY_TOOL,
     UPDATE_KEYFRAME_PROMPT_TOOL,
@@ -1082,6 +1161,7 @@ TOOLS: list[dict] = [
     UPDATE_EFFECT_PARAM_CURVE_TOOL,
     GENERATE_DESCRIPTIONS_TOOL,
     APPLY_MIX_PLAN_TOOL,
+    ANALYZE_MASTER_BUS_TOOL,
 ]
 
 
@@ -1119,6 +1199,12 @@ _DESTRUCTIVE_TOOL_ALLOWLIST: frozenset[str] = frozenset({
     # generate_descriptions runs Gemini once per chunk and caches structured
     # output. Cacheable, non-destructive — no confirmation gate needed.
     "generate_descriptions",
+    # analyze_master_bus runs librosa + pyloudnorm on a rendered mix WAV and
+    # writes a write-once cache row. Nothing destructive, nothing expensive
+    # (the only real cost is the frontend's OfflineAudioContext render, which
+    # happens regardless of this gate). Allowlisted defensively in case the
+    # destructive-pattern list grows an "analyze_" entry later.
+    "analyze_master_bus",
 })
 
 
@@ -2260,6 +2346,431 @@ def _exec_generate_dsp(project_dir: Path, input_data: dict) -> dict:
         "datapoint_count": datapoint_count,
         "section_count": section_count,
         "scalars": scalars,
+    }
+
+
+# ── analyze_master_bus (M15 — master-bus metrics on rendered mix) ──────────
+
+
+_MIX_KNOWN_ANALYSES: frozenset[str] = frozenset({
+    "peak", "true_peak", "rms", "lufs",
+    "clipping_detect", "spectral_centroid", "dynamic_range",
+})
+
+_MIX_DEFAULT_ANALYSES: tuple[str, ...] = (
+    "peak", "true_peak", "rms", "lufs",
+    "clipping_detect", "spectral_centroid", "dynamic_range",
+)
+
+# Hop length used for RMS + spectral-centroid framing. Matches the dsp family
+# for consistency; downsampled in-function before we persist.
+_MIX_HOP_LENGTH: int = 512
+
+# |y| >= this threshold counts as a clipping sample. Just under 1.0 so floating
+# -point rounding on near-full-scale samples still registers.
+_CLIPPING_THRESHOLD: float = 0.99
+
+# Clipping runs separated by fewer than this many seconds are merged into one
+# event (10ms — tighter than a human perceives as distinct ticks).
+_CLIPPING_MERGE_GAP_S: float = 0.010
+
+
+def _mix_load_wav(path: Path) -> tuple[Any, int]:
+    """Load a WAV file as (y, sample_rate). y is always ``float64``; mono is
+    shape ``(N,)``, multichannel is ``(N, C)`` — matching soundfile's default.
+    """
+    import soundfile as _sf
+    y, sr = _sf.read(str(path), always_2d=False)
+    return y, int(sr)
+
+
+def _mix_to_mono(y: Any) -> Any:
+    """Return a mono float64 view of ``y`` for analyses that want one channel.
+
+    Averages channels for stereo/multichannel input. Leaves mono unchanged."""
+    import numpy as _np
+    arr = _np.asarray(y, dtype=_np.float64)
+    if arr.ndim == 1:
+        return arr
+    return arr.mean(axis=1)
+
+
+def _mix_peak_db(y: Any) -> float:
+    """Sample-domain peak in dBFS. Returns -inf for all-zero audio."""
+    import numpy as _np
+    arr = _np.asarray(y, dtype=_np.float64)
+    if arr.size == 0:
+        return float("-inf")
+    peak = float(_np.max(_np.abs(arr)))
+    if peak <= 0.0:
+        return float("-inf")
+    return 20.0 * _np.log10(peak)
+
+
+def _mix_true_peak_db(y: Any, sr: int) -> float:
+    """True-peak in dBTP via 4x oversampling with librosa.resample."""
+    import librosa as _librosa
+    import numpy as _np
+    mono = _mix_to_mono(y)
+    if mono.size == 0:
+        return float("-inf")
+    # 4x oversample. Use soxr_hq (scipy-backed, ships with the librosa pin
+    # in this project); "kaiser_best" requires optional ``resampy``.
+    up = _librosa.resample(mono, orig_sr=sr, target_sr=sr * 4, res_type="soxr_hq")
+    peak = float(_np.max(_np.abs(up))) if up.size else 0.0
+    if peak <= 0.0:
+        return float("-inf")
+    return 20.0 * _np.log10(peak)
+
+
+def _mix_lufs(y: Any, sr: int) -> float:
+    """Integrated ITU-R BS.1770 loudness. Returns -inf on blocks too short."""
+    import pyloudnorm as _pl
+    import numpy as _np
+    arr = _np.asarray(y, dtype=_np.float64)
+    meter = _pl.Meter(sr)
+    try:
+        return float(meter.integrated_loudness(arr))
+    except ValueError:
+        # Happens when the buffer is shorter than the 400ms block size.
+        return float("-inf")
+
+
+def _mix_clipping_events(y: Any, sr: int) -> list[tuple[float, float]]:
+    """Return (start_s, end_s) tuples where |y| >= threshold. Adjacent runs
+    within ``_CLIPPING_MERGE_GAP_S`` are merged."""
+    import numpy as _np
+    mono = _mix_to_mono(y)
+    if mono.size == 0:
+        return []
+    mask = _np.abs(mono) >= _CLIPPING_THRESHOLD
+    if not mask.any():
+        return []
+    # Find contiguous True runs via diff on an int view.
+    intm = mask.astype(_np.int8)
+    # Pad with 0 to catch boundary transitions cleanly.
+    padded = _np.concatenate([[0], intm, [0]])
+    diff = _np.diff(padded)
+    starts = _np.where(diff == 1)[0]
+    ends = _np.where(diff == -1)[0]  # exclusive end index in original
+    raw: list[tuple[int, int]] = list(zip(starts.tolist(), ends.tolist()))
+    if not raw:
+        return []
+    # Merge across gaps < _CLIPPING_MERGE_GAP_S
+    merge_gap = int(round(_CLIPPING_MERGE_GAP_S * sr))
+    merged: list[tuple[int, int]] = [raw[0]]
+    for s, e in raw[1:]:
+        ps, pe = merged[-1]
+        if s - pe <= merge_gap:
+            merged[-1] = (ps, e)
+        else:
+            merged.append((s, e))
+    return [(s / sr, e / sr) for s, e in merged]
+
+
+def _mix_rms_envelope(y: Any, sr: int) -> list[tuple[float, float]]:
+    """Compute an RMS envelope, returning (time_s, rms) pairs."""
+    import librosa as _librosa
+    import numpy as _np
+    mono = _mix_to_mono(y)
+    if mono.size == 0:
+        return []
+    rms = _librosa.feature.rms(y=mono.astype(_np.float32), hop_length=_MIX_HOP_LENGTH)[0]
+    frames_per_sec = sr / _MIX_HOP_LENGTH
+    return [(float(i / frames_per_sec), float(v)) for i, v in enumerate(rms)]
+
+
+def _mix_spectral_centroid(y: Any, sr: int, target_hz: float = 10.0) -> list[tuple[float, float]]:
+    """Spectral centroid downsampled to ~target_hz datapoints per second."""
+    import librosa as _librosa
+    import numpy as _np
+    mono = _mix_to_mono(y)
+    if mono.size == 0:
+        return []
+    centroid = _librosa.feature.spectral_centroid(
+        y=mono.astype(_np.float32), sr=sr, hop_length=_MIX_HOP_LENGTH,
+    )[0]
+    frames_per_sec = sr / _MIX_HOP_LENGTH
+    step = max(1, int(frames_per_sec / max(target_hz, 0.1)))
+    out: list[tuple[float, float]] = []
+    for i in range(0, len(centroid), step):
+        out.append((float(i / frames_per_sec), float(centroid[i])))
+    return out
+
+
+def _resolve_mix_end_time(project_dir: Path) -> float:
+    """Return MAX(end_time) across non-deleted audio_clips, or 0.0 if empty."""
+    from scenecraft.db import get_db
+    conn = get_db(project_dir)
+    row = conn.execute(
+        "SELECT MAX(end_time) FROM audio_clips WHERE deleted_at IS NULL",
+    ).fetchone()
+    if row is None or row[0] is None:
+        return 0.0
+    return float(row[0])
+
+
+def _exec_analyze_master_bus(project_dir: Path, input_data: dict) -> dict:
+    """Analyze the rendered master mix and cache the results.
+
+    Workflow (MVP — frontend round-trip stubbed):
+      1. Resolve ``end_time_s`` (None → MAX(audio_clips.end_time)).
+      2. Compute ``mix_graph_hash`` (stubbed on this branch).
+      3. Cache lookup by (hash, window, sr, analyzer_version); return cached
+         run unless ``force_rerun``.
+      4. Create a run row with ``rendered_path=None``.
+      5. Locate the rendered mix WAV at
+         ``<project_dir>/pool/mixes/<mix_graph_hash>.wav``. On this branch the
+         frontend round-trip does not yet exist — tests place the WAV
+         directly; a real chat request would emit a ``mix_render_request`` WS
+         message and await an upload handler (see task-7).
+      6. Run each requested analysis (unknown names silently skipped).
+      7. Persist datapoints / sections / scalars; update rendered_path.
+      8. Return the run summary.
+
+    Never raises for invalid inputs — returns ``{"error": ...}`` instead.
+    """
+    # ── Parse inputs ────────────────────────────────────────────────
+    start_time_s = input_data.get("start_time_s", 0.0)
+    try:
+        start_time_s = float(start_time_s)
+    except (TypeError, ValueError):
+        return {"error": "start_time_s must be a number"}
+    if start_time_s < 0:
+        return {"error": "start_time_s must be >= 0"}
+
+    end_time_s_raw = input_data.get("end_time_s")
+    end_time_s: float | None
+    if end_time_s_raw is None:
+        end_time_s = None
+    else:
+        try:
+            end_time_s = float(end_time_s_raw)
+        except (TypeError, ValueError):
+            return {"error": "end_time_s must be a number or null"}
+
+    sample_rate = input_data.get("sample_rate", 48000)
+    try:
+        sample_rate = int(sample_rate)
+    except (TypeError, ValueError):
+        return {"error": "sample_rate must be an integer"}
+    if sample_rate <= 0:
+        return {"error": "sample_rate must be > 0"}
+
+    raw_analyses = input_data.get("analyses")
+    if raw_analyses is None:
+        analyses = list(_MIX_DEFAULT_ANALYSES)
+    elif not isinstance(raw_analyses, list):
+        return {"error": "analyses must be a list of strings"}
+    else:
+        analyses = [str(a) for a in raw_analyses]
+
+    force_rerun = bool(input_data.get("force_rerun", False))
+
+    # ── Resolve end_time_s ──────────────────────────────────────────
+    if end_time_s is None:
+        end_time_s = _resolve_mix_end_time(project_dir)
+    if end_time_s <= start_time_s:
+        return {
+            "error": (
+                f"end_time_s ({end_time_s}) must be greater than start_time_s "
+                f"({start_time_s}); project may have no audio_clips"
+            ),
+        }
+
+    # ── Compute mix_graph_hash (STUB on this branch) ────────────────
+    from scenecraft.mix_graph_hash import compute_mix_graph_hash
+    mix_graph_hash = compute_mix_graph_hash(project_dir)
+
+    # ── Load cache helpers (STUB on this branch) ────────────────────
+    from scenecraft.db_mix_cache import (
+        bulk_insert_mix_datapoints,
+        bulk_insert_mix_sections,
+        create_mix_run,
+        delete_mix_run,
+        get_mix_run,
+        get_mix_scalars,
+        query_mix_sections,
+        set_mix_scalars,
+        update_mix_run_rendered_path,
+    )
+
+    import librosa as _librosa
+    analyzer_version = f"mix-librosa-{_librosa.__version__}"
+
+    # ── Cache hit? ──────────────────────────────────────────────────
+    existing = get_mix_run(
+        project_dir, mix_graph_hash, start_time_s, end_time_s, sample_rate, analyzer_version,
+    )
+    if existing is not None and not force_rerun:
+        clips = query_mix_sections(project_dir, existing.id, "clipping_event")
+        return {
+            "run_id": existing.id,
+            "cached": True,
+            "mix_graph_hash": mix_graph_hash,
+            "start_time_s": existing.start_time_s,
+            "end_time_s": existing.end_time_s,
+            "rendered_path": existing.rendered_path,
+            "scalars": get_mix_scalars(project_dir, existing.id),
+            "clipping_events": len(clips),
+            "analyses_written": list(existing.analyses),
+        }
+    if existing is not None and force_rerun:
+        delete_mix_run(project_dir, existing.id)
+
+    # ── Locate the rendered WAV ─────────────────────────────────────
+    mixes_dir = Path(project_dir) / "pool" / "mixes"
+    rendered_rel = f"pool/mixes/{mix_graph_hash}.wav"
+    rendered_abs = mixes_dir / f"{mix_graph_hash}.wav"
+    # TODO(M15 task-7): when the frontend WS round-trip lands, emit a
+    # ``mix_render_request`` message here, await an ``asyncio.Event`` keyed by
+    # run_id, and time out after 60s. For now we expect the WAV to already be
+    # on disk (test fixture or a manually-triggered frontend render).
+    if not rendered_abs.exists():
+        return {
+            "error": (
+                f"rendered mix WAV not found at {rendered_abs}. The frontend "
+                f"OfflineAudioContext round-trip is not wired on this branch; "
+                f"place the rendered WAV at pool/mixes/<mix_graph_hash>.wav "
+                f"or wait for task-7 to ship the WS round-trip."
+            ),
+            "mix_graph_hash": mix_graph_hash,
+            "expected_rendered_path": rendered_rel,
+        }
+
+    # ── Load audio ──────────────────────────────────────────────────
+    try:
+        y, sr = _mix_load_wav(rendered_abs)
+    except Exception as e:
+        return {"error": f"failed to read mix WAV {rendered_abs}: {e}"}
+    if sr != sample_rate:
+        # Mismatch between requested sample_rate (cache key) and on-disk rate
+        # would falsify the cache — treat it as a render-contract error.
+        return {
+            "error": (
+                f"rendered WAV sample rate ({sr}) does not match requested "
+                f"sample_rate ({sample_rate}); re-render or adjust the call"
+            ),
+        }
+
+    # ── Create run row ──────────────────────────────────────────────
+    now = datetime.now(timezone.utc).isoformat()
+    # We create the row before running analyses so downstream cache probes can
+    # see an in-flight row; on failure we delete it below.
+    run = create_mix_run(
+        project_dir,
+        mix_graph_hash=mix_graph_hash,
+        start_s=start_time_s,
+        end_s=end_time_s,
+        sample_rate=sample_rate,
+        analyzer_version=analyzer_version,
+        analyses=analyses,
+        rendered_path=None,
+        created_at=now,
+    )
+
+    # ── Run analyses ────────────────────────────────────────────────
+    analyses_written: list[str] = []
+    datapoints: list[tuple[str, float, float, dict[str, Any] | None]] = []
+    sections: list[tuple[float, float, str, str | None, float | None]] = []
+    scalars: dict[str, float] = {}
+    clipping_events_count = 0
+
+    # Cache peak + lufs across analyses so "dynamic_range" can reuse them.
+    peak_db_val: float | None = None
+    lufs_val: float | None = None
+
+    try:
+        for analysis in analyses:
+            if analysis not in _MIX_KNOWN_ANALYSES:
+                continue  # silently skip unknown
+
+            if analysis == "peak":
+                peak_db_val = _mix_peak_db(y)
+                scalars["peak_db"] = peak_db_val
+                analyses_written.append("peak")
+
+            elif analysis == "true_peak":
+                try:
+                    scalars["true_peak_db"] = _mix_true_peak_db(y, sr)
+                    analyses_written.append("true_peak")
+                except Exception as e:
+                    _log(f"true_peak analysis failed: {e}")
+
+            elif analysis == "rms":
+                env = _mix_rms_envelope(y, sr)
+                for t, v in env:
+                    datapoints.append(("rms", t, v, None))
+                analyses_written.append("rms")
+
+            elif analysis == "lufs":
+                try:
+                    lufs_val = _mix_lufs(y, sr)
+                    scalars["lufs_integrated"] = lufs_val
+                    analyses_written.append("lufs")
+                except Exception as e:
+                    _log(f"lufs analysis failed: {e}")
+
+            elif analysis == "clipping_detect":
+                events = _mix_clipping_events(y, sr)
+                for s_s, e_s in events:
+                    sections.append((float(s_s), float(e_s), "clipping_event", None, None))
+                scalars["clip_count"] = float(len(events))
+                clipping_events_count = len(events)
+                analyses_written.append("clipping_detect")
+
+            elif analysis == "spectral_centroid":
+                try:
+                    pts = _mix_spectral_centroid(y, sr, target_hz=10.0)
+                    for t, v in pts:
+                        datapoints.append(("spectral_centroid", t, v, None))
+                    analyses_written.append("spectral_centroid")
+                except Exception as e:
+                    _log(f"spectral_centroid analysis failed: {e}")
+
+            elif analysis == "dynamic_range":
+                # Cheap proxy: peak_db - lufs_integrated. Compute missing
+                # inputs on demand so dynamic_range works even when not paired
+                # with its siblings in `analyses`.
+                if peak_db_val is None:
+                    peak_db_val = _mix_peak_db(y)
+                if lufs_val is None:
+                    try:
+                        lufs_val = _mix_lufs(y, sr)
+                    except Exception:
+                        lufs_val = float("-inf")
+                if peak_db_val == float("-inf") or lufs_val == float("-inf"):
+                    # Silence or too-short buffer → skip the scalar rather
+                    # than persist a garbage inf value.
+                    pass
+                else:
+                    scalars["dynamic_range_db"] = float(peak_db_val - lufs_val)
+                    analyses_written.append("dynamic_range")
+    except Exception as e:
+        # Any unexpected explosion: clean up the empty run row so we don't
+        # leave a half-written cache entry behind.
+        delete_mix_run(project_dir, run.id)
+        return {"error": f"analysis failed: {e}"}
+
+    # ── Persist ─────────────────────────────────────────────────────
+    if datapoints:
+        bulk_insert_mix_datapoints(project_dir, run.id, datapoints)
+    if sections:
+        bulk_insert_mix_sections(project_dir, run.id, sections)
+    if scalars:
+        set_mix_scalars(project_dir, run.id, scalars)
+    update_mix_run_rendered_path(project_dir, run.id, rendered_rel)
+
+    return {
+        "run_id": run.id,
+        "cached": False,
+        "mix_graph_hash": mix_graph_hash,
+        "start_time_s": start_time_s,
+        "end_time_s": end_time_s,
+        "rendered_path": rendered_rel,
+        "scalars": scalars,
+        "clipping_events": clipping_events_count,
+        "analyses_written": analyses_written,
     }
 
 
@@ -3498,6 +4009,9 @@ async def _execute_tool(
         return result, "error" in result
     if name == "generate_descriptions":
         result = _exec_generate_descriptions(project_dir, input_data)
+        return result, "error" in result
+    if name == "analyze_master_bus":
+        result = _exec_analyze_master_bus(project_dir, input_data)
         return result, "error" in result
     if name == "apply_mix_plan":
         result = _exec_apply_mix_plan(project_dir, input_data)
