@@ -159,6 +159,9 @@ Tools available:
     (DFN3 + residual). Returns a new audio_isolations run id with stem
     pool_segment ids. Works on audio_clip (MVP) or transition (planned). Slow
     (~realtime CPU). User-confirmed.
+  • add_audio_track — create a new, empty audio track (auto name + display_order).
+  • add_audio_clip — place a pool_segment on an audio track; end_time auto-computed
+    from the segment's duration when omitted.
 
 After generation completes, use `assign_keyframe_image` / `assign_pool_video` to
 pick one of the new candidates (coming in task-54).
@@ -655,6 +658,55 @@ ISOLATE_VOCALS_TOOL: dict = {
     },
 }
 
+ADD_AUDIO_TRACK_TOOL: dict = {
+    "name": "add_audio_track",
+    "description": (
+        "Create a new, empty audio track on the timeline. Auto-generated id and "
+        "display_order (appended to end). Name auto-generated if omitted. Wrapped "
+        "in an undo group. Returns the new track_id so you can place clips on it."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name":   {"type": "string", "description": "Display name. Auto-generated if omitted."},
+            "muted":  {"type": "boolean", "default": False},
+            "volume": {
+                "type": "number", "default": 1.0, "minimum": 0.0, "maximum": 2.0,
+                "description": "Initial static volume (0..2). Becomes a constant volume_curve.",
+            },
+        },
+        "required": [],
+    },
+}
+
+ADD_AUDIO_CLIP_TOOL: dict = {
+    "name": "add_audio_clip",
+    "description": (
+        "Place a pool_segment (by id) on an audio track at a timeline position. "
+        "Trim into the source via trim_in/trim_out (preferred) OR "
+        "source_offset/end_time (lower-level). When trim is provided: "
+        "source_offset = trim_in, end_time = start_time + (trim_out - trim_in). "
+        "If no trim/end is given, the clip plays the full source from source_offset. "
+        "Wrapped in an undo group. Returns the new audio_clip_id. "
+        "Use sql_query on pool_segments to find the source id first."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "track_id":          {"type": "string", "description": "Destination audio_tracks.id. Use add_audio_track first if none exists."},
+            "source_segment_id": {"type": "string", "description": "pool_segments.id (the uuid) of the audio source."},
+            "start_time":        {"type": "number", "description": "Timeline start in seconds. Required."},
+            "trim_in":           {"type": "number", "description": "Preferred: where in the source the clip starts playing (seconds). Equivalent to source_offset."},
+            "trim_out":          {"type": "number", "description": "Preferred: where in the source the clip stops playing (seconds). Sets end_time = start_time + (trim_out - trim_in)."},
+            "source_offset":     {"type": "number", "default": 0.0, "description": "Lower-level alias for trim_in. Ignored if trim_in is provided."},
+            "end_time":          {"type": "number", "description": "Lower-level timeline end in seconds. Ignored if trim_out is provided. Auto-computed from source duration when omitted."},
+            "volume_curve":      {"type": "string", "default": "[[0,1],[1,1]]", "description": "JSON curve points string. Default full volume."},
+            "label":             {"type": "string", "description": "Optional display label. Seeded from pool segment label if omitted."},
+        },
+        "required": ["track_id", "source_segment_id", "start_time"],
+    },
+}
+
 TOOLS: list[dict] = [
     SQL_QUERY_TOOL,
     UPDATE_KEYFRAME_PROMPT_TOOL,
@@ -677,6 +729,8 @@ TOOLS: list[dict] = [
     GENERATE_KEYFRAME_CANDIDATES_TOOL,
     GENERATE_TRANSITION_CANDIDATES_TOOL,
     ISOLATE_VOCALS_TOOL,
+    ADD_AUDIO_TRACK_TOOL,
+    ADD_AUDIO_CLIP_TOOL,
 ]
 
 
@@ -1201,6 +1255,160 @@ def _exec_add_keyframe(project_dir: Path, input_data: dict) -> dict:
         "track_id": created.get("track_id", track_id),
         "section": created.get("section", section),
         "label": created.get("label", label),
+    }
+
+
+def _exec_add_audio_track(project_dir: Path, input_data: dict) -> dict:
+    import json
+    from scenecraft.db import (
+        add_audio_track as db_add_audio_track,
+        get_audio_tracks as db_get_audio_tracks,
+        generate_id, undo_begin,
+    )
+    name = input_data.get("name")
+    muted = bool(input_data.get("muted", False))
+    try:
+        volume = float(input_data.get("volume", 1.0))
+    except (TypeError, ValueError):
+        return {"error": "volume must be a number"}
+    if volume < 0.0 or volume > 2.0:
+        return {"error": "volume must be between 0.0 and 2.0"}
+
+    existing = db_get_audio_tracks(project_dir)
+    track_id = generate_id("audio_track")
+    display_order = max((t["display_order"] for t in existing), default=-1) + 1
+    if not name:
+        name = f"Audio Track {len(existing) + 1}"
+    volume_curve = json.dumps([[0, volume], [1, volume]])
+
+    undo_begin(project_dir, f"Chat: add audio track {track_id}")
+    db_add_audio_track(project_dir, {
+        "id": track_id,
+        "name": name,
+        "display_order": display_order,
+        "hidden": False,
+        "muted": muted,
+        "solo": False,
+        "volume_curve": volume_curve,
+    })
+    return {
+        "track_id": track_id,
+        "name": name,
+        "display_order": display_order,
+        "muted": muted,
+        "volume": volume,
+    }
+
+
+def _exec_add_audio_clip(project_dir: Path, input_data: dict) -> dict:
+    from scenecraft.db import (
+        add_audio_clip as db_add_audio_clip,
+        get_pool_segment, get_audio_tracks as db_get_audio_tracks,
+        generate_id, undo_begin,
+    )
+    track_id = input_data.get("track_id")
+    source_segment_id = input_data.get("source_segment_id")
+    if not track_id or not isinstance(track_id, str):
+        return {"error": "missing track_id"}
+    if not source_segment_id or not isinstance(source_segment_id, str):
+        return {"error": "missing source_segment_id (pool_segments.id)"}
+
+    # Validate track exists
+    tracks = db_get_audio_tracks(project_dir)
+    if not any(t["id"] == track_id for t in tracks):
+        return {"error": f"audio track not found: {track_id}"}
+
+    # Resolve pool segment by id. Its pool_path becomes audio_clips.source_path.
+    seg = get_pool_segment(project_dir, source_segment_id)
+    if seg is None:
+        return {"error": f"pool_segment not found: {source_segment_id}"}
+    source_path = seg.get("poolPath") or seg.get("pool_path")
+    if not source_path:
+        return {"error": f"pool_segment {source_segment_id} has no pool_path"}
+
+    try:
+        start_time = float(input_data["start_time"])
+    except (KeyError, TypeError, ValueError):
+        return {"error": "start_time is required and must be a number"}
+
+    # Resolve trim_in / source_offset — trim_in wins if provided
+    trim_in = input_data.get("trim_in")
+    if trim_in is not None:
+        try:
+            source_offset = float(trim_in)
+        except (TypeError, ValueError):
+            return {"error": "trim_in must be a number"}
+    else:
+        try:
+            source_offset = float(input_data.get("source_offset", 0.0))
+        except (TypeError, ValueError):
+            return {"error": "source_offset must be a number"}
+    if source_offset < 0:
+        return {"error": "trim_in / source_offset must be >= 0"}
+
+    # Resolve end_time — trim_out wins, else explicit end_time, else auto from duration
+    trim_out = input_data.get("trim_out")
+    end_time_in = input_data.get("end_time")
+    if trim_out is not None:
+        try:
+            trim_out_f = float(trim_out)
+        except (TypeError, ValueError):
+            return {"error": "trim_out must be a number"}
+        if trim_out_f <= source_offset:
+            return {"error": f"trim_out ({trim_out_f}) must be greater than trim_in ({source_offset})"}
+        end_time = start_time + (trim_out_f - source_offset)
+    elif end_time_in is not None:
+        try:
+            end_time = float(end_time_in)
+        except (TypeError, ValueError):
+            return {"error": "end_time must be a number"}
+    else:
+        duration = seg.get("durationSeconds") or seg.get("duration_seconds")
+        if duration is None:
+            return {
+                "error": (
+                    f"cannot auto-compute end_time: pool_segment {source_segment_id} "
+                    "has no duration_seconds; pass end_time or trim_out explicitly."
+                )
+            }
+        end_time = start_time + (float(duration) - source_offset)
+
+    if end_time <= start_time:
+        return {"error": f"end_time ({end_time}) must be greater than start_time ({start_time})"}
+
+    # Seed label from pool segment if none provided
+    label = input_data.get("label")
+    if not label:
+        seed = seg.get("label") or seg.get("originalFilename") or seg.get("original_filename")
+        if seed and "." in seed and not seg.get("label"):
+            seed = seed.rsplit(".", 1)[0]
+        label = seed or None
+
+    volume_curve = input_data.get("volume_curve", "[[0,1],[1,1]]")
+
+    clip_id = generate_id("audio_clip")
+    undo_begin(project_dir, f"Chat: add audio clip {clip_id} to track {track_id}")
+    db_add_audio_clip(project_dir, {
+        "id": clip_id,
+        "track_id": track_id,
+        "source_path": source_path,
+        "start_time": start_time,
+        "end_time": end_time,
+        "source_offset": source_offset,
+        "volume_curve": volume_curve,
+        "muted": False,
+        "remap": {"method": "linear", "target_duration": 0},
+        "label": label,
+    })
+    return {
+        "audio_clip_id": clip_id,
+        "track_id": track_id,
+        "source_segment_id": source_segment_id,
+        "source_path": source_path,
+        "start_time": start_time,
+        "end_time": end_time,
+        "source_offset": source_offset,
+        "label": label,
     }
 
 
@@ -1770,6 +1978,12 @@ async def _execute_tool(
         return result, "error" in result
     if name == "add_keyframe":
         result = _exec_add_keyframe(project_dir, input_data)
+        return result, "error" in result
+    if name == "add_audio_track":
+        result = _exec_add_audio_track(project_dir, input_data)
+        return result, "error" in result
+    if name == "add_audio_clip":
+        result = _exec_add_audio_clip(project_dir, input_data)
         return result, "error" in result
     if name == "update_keyframe":
         result = _exec_update_keyframe(project_dir, input_data)
