@@ -11,7 +11,13 @@
 
 Today scenecraft's audio pipeline has per-track + per-clip volume curves — and nothing else. This milestone extends that into a full mixing surface: each track hosts an ordered chain of effects (compressor, EQ, filter, delay, reverb send, chorus, flanger, phaser, tremolo, pan, drive, …); every animatable parameter can be automated with a curve; a new Macro Panel surfaces those parameters as knobs; users arm knobs and record curves live while the project plays.
 
-Everything is pinned by [spec local.effect-curves-macro-panel](../specs/local.effect-curves-macro-panel.md) (54 requirements, 29 named tests). Source design: [local.effect-curves-macro-panel](../design/local.effect-curves-macro-panel.md). Decision record: clarification-7 (gitignored).
+Everything is pinned by [spec local.effect-curves-macro-panel](../specs/local.effect-curves-macro-panel.md) (**58 requirements, 46 named tests**, proofed 2026-04-23 — Ready for Implementation). Source design: [local.effect-curves-macro-panel](../design/local.effect-curves-macro-panel.md). Decision record: clarification-7 (gitignored).
+
+**Cross-repo scope split** (from spec §Scope > Cross-Repo Split):
+- **scenecraft-engine** (this repo) owns: SQLite schema + migrations (R1-R5, R52), HTTP endpoints + POST validation (R_V1), cascade delete semantics. Tasks 45, 46 (registry data model), 52.
+- **scenecraft** (frontend) owns: WebAudio graph (R7, R11-R19), Macro Panel UI + Bus sub-panel (R28-R36a), InlineCurveEditor (R37-R42), touch-record state machine (R20-R29a), copy-paste automation (R43-R47), frequency-label preset constants (R48-R49 client data). Tasks 47, 48, 49, 50, 51, 53, 54, 55, 56.
+
+Both repos must satisfy the same spec contract; tasks in this milestone enumerate each side's share of the work.
 
 ---
 

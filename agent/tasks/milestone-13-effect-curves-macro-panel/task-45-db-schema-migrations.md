@@ -66,6 +66,10 @@ CREATE TABLE project_frequency_labels (
 );
 ```
 
+**DB location (spec R5)**: `project_frequency_labels` and all other tables in this milestone live in the per-project `project.db` (NOT `server.db`). Project-scope is enforced by DB location, not by an explicit project_id FK. Deleting the project's `.scenecraft/` directory discards its custom labels by construction. No cross-project label leakage is possible.
+
+**UNIQUE constraint (spec R2)**: the `UNIQUE(effect_id, param_name)` on `effect_curves` is enforced by SQLite at the integrity-check layer. Application code should INSERT via `INSERT OR REPLACE` (or equivalent UPSERT) when updating an existing curve, and a raw duplicate INSERT attempt MUST fail at the SQL layer — that failure mode is an explicit test (spec test `effect-curves-unique-constraint`).
+
 ### 2. Default bus seeding
 
 On migration apply for existing projects AND on new-project creation: seed `project_send_buses` with defaults:

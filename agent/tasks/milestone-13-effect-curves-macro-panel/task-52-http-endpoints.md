@@ -43,14 +43,28 @@ Add handlers in `src/scenecraft/api/effect_curves.py` (or split across `api/trac
 - `POST /api/projects/:name/frequency-labels` — create `{label, freq_min_hz, freq_max_hz}`
 - `DELETE /api/projects/:name/frequency-labels/:id` — delete
 
-### 2. Validation
+### 2. Validation (consolidated per spec R_V1)
 
-- `points` array: clamp values to [0, 1]; sort by time ascending; dedupe exact-time duplicates (keep last)
-- `interpolation`: one of `bezier`, `linear`, `step`
-- `bus_type`: one of `reverb`, `delay`, `echo`
-- `effect_type`: must be in the registry (hardcoded list of 17 type strings — mirrors frontend registry)
+Validate inputs BEFORE writing. Each failure returns a specific HTTP status with an error body naming the offending field.
 
-On clamp, log a warning; still return 200 (per spec test `curve-point-values-out-of-range-clamped`).
+**Input shape validation:**
+- `points` array: clamp values to [0, 1]; sort by time ascending; dedupe exact-time duplicates (keep last). Clamping is NOT an error — return 200 with a warning-level log (spec test `curve-point-values-out-of-range-clamped`).
+- `interpolation`: one of `bezier`, `linear`, `step`.
+- `bus_type`: one of `reverb`, `delay`, `echo`.
+- `effect_type`: must be in the R8 registry (17 real types). `__send` is **rejected** at this endpoint with HTTP 400 per R8a — it's a reserved synthetic type usable only via `effect_curves`.
+
+**Reference integrity (R_V1):**
+- `POST /track-effects` with unknown `effect_type` → HTTP 400 (spec test `unknown-effect-type-rejected`).
+- `POST /effect-curves` with non-existent `effect_id` → HTTP 404 (spec test `animating-static-param-rejected` case b).
+- `POST /effect-curves/:id` with non-existent `:id` → HTTP 404.
+- `POST /track-sends` with non-existent `track_id` or `bus_id` → HTTP 404.
+- `POST /effect-curves` for a non-animatable param (e.g. `character` on drive, `bus_id` on send, `rate` on modulation LFOs, IR-choice on reverb) → HTTP 400 with an error message naming the static param (spec R9 strengthened, test `animating-static-param-rejected` case a).
+
+**Idempotent delete (R_V1):**
+- DELETE on a non-existent `track_effects` (or curve / bus / label) is HTTP 200 with empty body, NOT 404 (spec test `delete-nonexistent-effect-idempotent`).
+
+**Order-index collision (R_V1 + R14):**
+- `POST /track-effects/:id` with an `order_index` value already held by another effect on the same track triggers an **atomic swap**: the server rewrites all three effects' order_index values within a single SQLite transaction so the final state has no duplicates. The `mixer.chain-rebuilt` event fires exactly once per POST (spec test `order-index-collision-resolved-atomically`). Implementations MUST NOT leave two effects sharing an order_index between statements.
 
 ### 3. Cache invalidation hooks
 
@@ -81,11 +95,18 @@ Follow the existing `postUpdateAudioClip` / `postUpdateAudioTrack` signature pat
 
 `tests/test_effect_curves_api.py`:
 - POST a track-effect, verify DB row + returned JSON
-- POST a curve with out-of-range points, verify clamped + warning logged
-- DELETE track-effect cascades to curves
+- POST a curve with out-of-range points, verify clamped + warning logged (spec test `curve-point-values-out-of-range-clamped`)
+- DELETE track-effect cascades to curves (spec test `orphan-curve-cleaned-on-effect-delete`)
 - Invalidation called with correct ranges (mock `invalidate_frames_for_mutation`)
 - Listing effects for a track returns them in `order_index` order
-- Invalid `effect_type` returns 400
+- **R_V1 coverage** (new, per proofing pass):
+  - Invalid `effect_type` returns 400 (spec test `unknown-effect-type-rejected`)
+  - `__send` POSTed to `/track-effects` returns 400 (R8a)
+  - POST `/effect-curves` for non-existent `effect_id` → 404 (spec test `animating-static-param-rejected` case b)
+  - POST `/effect-curves` for a static param → 400 naming the param (spec test `animating-static-param-rejected` case a)
+  - DELETE on non-existent id → 200 empty body, not 404 (spec test `delete-nonexistent-effect-idempotent`)
+  - `order_index` collision → atomic swap in one transaction, exactly one `mixer.chain-rebuilt` event (spec test `order-index-collision-resolved-atomically`)
+  - `UNIQUE(effect_id, param_name)` violation: raw duplicate INSERT fails at SQL layer (spec test `effect-curves-unique-constraint`)
 
 ---
 

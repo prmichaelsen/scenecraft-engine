@@ -157,6 +157,21 @@ Use the existing scenecraft undo/redo machinery. Each commit (record pass OR dir
 
 ---
 
+## Undo during active recording (spec R29a — new per proofing pass)
+
+If the user triggers Ctrl+Z while a knob is in the `recording` state, the implementation MUST:
+
+1. **Commit the in-flight gesture first** — same path as mouseup / playback-stop: flush the sample buffer, bezier-fit, POST, push one undo unit with the committed curve state.
+2. **Then execute the undo** — pops that just-committed state off the stack, restoring the pre-gesture curve state.
+3. **Knob stays `armed`** — state transitions `recording → armed`, not `recording → idle`.
+4. **Redo (Ctrl+Y) replays the gesture** — since the commit is a normal undo unit, redo restores the committed curve.
+
+**Forbidden**: silently discarding gesture samples on undo-during-record. Users expect every gesture to be reversible; a silent discard would be invisible to redo and confusing. The commit-then-revert pattern preserves the reversibility contract (spec test `undo-during-recording-commits-then-reverts`).
+
+**Sampling rate floor** (spec R23 clarified): target 33 Hz via rAF; the ≥30 Hz floor means no consecutive samples may be more than ~100ms apart even under frame jitter. Mock rAF in tests to assert sample-count falls within 80-110 for a 3-second gesture (spec test `recording-samples-at-33hz-target`).
+
+---
+
 ## Verification
 
 - [ ] Arming a knob + playing + dragging produces an audible swept curve
@@ -166,6 +181,8 @@ Use the existing scenecraft undo/redo machinery. Each commit (record pass OR dir
 - [ ] Stop during recording commits partial gesture
 - [ ] Disable effect mid-record commits
 - [ ] Bezier simplification reduces 30+ raw samples to ≤10 on smooth curves
+- [ ] **Ctrl+Z mid-record commits gesture, then reverts** (spec R29a, test `undo-during-recording-commits-then-reverts`)
+- [ ] **Sampling rate ≥30 Hz, target 33 Hz** (spec R23, test `recording-samples-at-33hz-target`)
 - [ ] Tests pass
 
 ---

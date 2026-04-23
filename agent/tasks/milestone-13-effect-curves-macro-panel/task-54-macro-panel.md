@@ -180,10 +180,48 @@ When selected track has no effects: show "+ Add Effect" dropdown with a large ca
 - [ ] Power button enables/disables effect (audibly)
 - [ ] Eye icon shows/hides inline timeline curve
 - [ ] Value readout updates during playback
-- [ ] Grid-size slider resizes tiles smoothly
+- [ ] Grid-size slider resizes tiles smoothly (spec test `macro-panel-size-slider-scales-tiles`)
+- [ ] Grid ↔ list toggle preserves track selection (spec test `macro-panel-grid-list-toggle`)
 - [ ] List mode displays all params as table rows
 - [ ] Remove-effect button confirms then deletes
+- [ ] **Bus sub-panel** (spec R36a): add / remove / rename / edit-static-params / reorder buses work; each action is one POST + one undo unit (spec test `bus-subpanel-crud`)
 - [ ] Tests pass
+
+---
+
+## Bus sub-panel (spec R36a — new per proofing pass)
+
+The Macro Panel exposes a dedicated **Buses** sub-panel reachable from the panel header button. Behavior:
+
+- Lists rows from `project_send_buses`, ordered by `order_index`
+- **Add bus**: picker for `bus_type` (reverb / delay / echo) + default `static_params` → POST `/send-buses`
+- **Remove bus**: confirm dialog → DELETE `/send-buses/:id` (cascades to `track_sends` + clears `__send` curves)
+- **Rename bus**: inline edit → POST `/send-buses/:id` with new `label`
+- **Edit static params**: expand row for reverb IR dropdown (with custom-from-pool option per spec R54), delay time/feedback, echo time/tone
+- **Reorder**: drag-and-drop or up/down arrows → POST `/send-buses/:id` with new `order_index` (server handles collision atomically per R_V1)
+
+Each of these is exactly one POST + one undo unit (spec R25 + R36a). Reuse the sub-panel container pattern from any existing expandable sub-panel in the editor.
+
+---
+
+## UI-Structure Test Strategy (per spec)
+
+Per spec §UI-Structure Test Strategy, this task ships two tiers of verification:
+
+**Logic-level tests** (required): vitest + happy-dom covering:
+- `macro-panel-grid-list-toggle` (R30)
+- `macro-panel-size-slider-scales-tiles` (R31)
+- `bus-subpanel-crud` (R36a)
+- Panel state ephemerality on remount (R36 — spec test `panel-layout-state-not-persisted`)
+
+**Visual-structure items** (manual + PR-review verification until visual-regression tooling lands):
+- R32 knob tile contents (arm + enable + eye + knob layout)
+- R33 knob widget 270-315° sweep angle
+- R34 native-unit numeric readout formatting
+- R41 stacked-curve ~50% alpha overlap
+- R42 deterministic color palette by (effect_type, param_name)
+
+Include a manual-verification checklist in the PR description for the visual items; don't block merge on them lacking tests.
 
 ---
 
@@ -193,3 +231,4 @@ When selected track has no effects: show "+ Add Effect" dropdown with a large ca
 - `<Knob>` component reuse: if any other UI in the codebase needs a knob, generalize this now; otherwise keep it local.
 - Drag-reorder: use an existing lib if one's already in the codebase (check `package.json`), else keep it simple (up/down arrow buttons on each effect header).
 - Precision drag: `shift+drag` should give finer control; test that this feels right in practice.
+- Per project memory, scenecraft has no frontend tests yet; install vitest + happy-dom as part of this task for the logic-level tests above.
