@@ -2248,6 +2248,12 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             if m:
                 return self._handle_m13_effect_curve_create(m.group(1))
 
+            # Batch update MUST be matched before the single-id route so that
+            # `/effect-curves/batch` doesn't get interpreted as curve_id='batch'.
+            m = re.match(r"^/api/projects/([^/]+)/effect-curves/batch$", path)
+            if m:
+                return self._handle_m13_effect_curve_batch_update(m.group(1))
+
             m = re.match(r"^/api/projects/([^/]+)/effect-curves/([^/]+)$", path)
             if m:
                 return self._handle_m13_effect_curve_update(m.group(1), m.group(2))
@@ -9678,6 +9684,96 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             _log(f"effect-curves/update: {project_name} id={curve_id} fields={list(fields.keys())}")
             self._m13_invalidate_curve_range(project_dir, updated.points)
             return self._json_response(self._m13_curve_as_json(updated))
+
+        # ---- POST /effect-curves/batch ----------------------------------
+        #
+        # M13 task-56: multi-curve update inside a single undo group so
+        # copy-paste-across-tracks collapses to ONE undo unit (spec R47 +
+        # test `simultaneous-copy-paste-across-10-tracks`).
+        #
+        # Body:
+        #   { description: str?, updates: [{ curve_id, points?,
+        #     interpolation?, visible? }, ...] }
+        # Returns:
+        #   { success: True, updated: [curve_id, ...] }
+        # Behaviour:
+        #   - undo_begin(description) ONCE before looping updates → all
+        #     row-level triggers fire into the same undo_group.
+        #   - Missing curves are reported in the response but do NOT 404 the
+        #     whole batch (keeps the paste partial-success compatible with
+        #     the frontend's R46 mismatch filter).
+
+        def _handle_m13_effect_curve_batch_update(self, project_name: str):
+            body = self._read_json_body()
+            if body is None:
+                return
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+
+            updates = body.get("updates") or []
+            if not isinstance(updates, list):
+                return self._error(400, "BAD_REQUEST", "'updates' must be a list")
+            description = body.get("description") or f"Batch update {len(updates)} curves"
+
+            from scenecraft.db import (
+                get_effect_curve, update_effect_curve, undo_begin,
+            )
+
+            updated: list[str] = []
+            missing: list[str] = []
+            touched_points: list = []
+
+            undo_begin(project_dir, description)
+
+            for u in updates:
+                if not isinstance(u, dict):
+                    continue
+                curve_id = u.get("curve_id") or u.get("curveId")
+                if not curve_id:
+                    continue
+                existing = get_effect_curve(project_dir, curve_id)
+                if existing is None:
+                    missing.append(curve_id)
+                    continue
+
+                fields: dict = {}
+                if "points" in u:
+                    clamped = self._m13_clamp_points(
+                        u["points"], existing.effect_id, existing.param_name,
+                    )
+                    fields["points"] = clamped
+                    touched_points.extend(clamped)
+                if "interpolation" in u:
+                    interp = u["interpolation"]
+                    if interp not in ("bezier", "linear", "step"):
+                        return self._error(
+                            400, "BAD_REQUEST",
+                            f"Invalid interpolation '{interp}' (expected bezier|linear|step)",
+                        )
+                    fields["interpolation"] = interp
+                if "visible" in u:
+                    fields["visible"] = bool(u["visible"])
+
+                if fields:
+                    try:
+                        update_effect_curve(project_dir, curve_id, **fields)
+                    except Exception as e:
+                        return self._error(500, "INTERNAL_ERROR", str(e))
+                    updated.append(curve_id)
+
+            _log(
+                f"effect-curves/batch: {project_name} updated={len(updated)} "
+                f"missing={len(missing)} desc={description!r}"
+            )
+            if touched_points:
+                self._m13_invalidate_curve_range(project_dir, touched_points)
+
+            return self._json_response({
+                "success": True,
+                "updated": updated,
+                "missing": missing,
+            })
 
         # ---- DELETE /effect-curves/:id ----------------------------------
 
