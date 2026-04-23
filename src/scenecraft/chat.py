@@ -180,6 +180,12 @@ Tools available:
     track effect's parameter. First point time must be 0, times strictly
     increasing, min 2 points. Duplicate (effect_id, param_name) updates in
     place. interpolation: bezier | linear | step.
+  • generate_descriptions — run Gemini over chunks of a pool_segment's audio
+    and cache structured semantic labels (section_type, mood, energy,
+    vocal_style, instrumentation) in the audio_description* tables. Results
+    are cached by (segment, model, prompt_version); re-calling with the same
+    inputs returns the cached run without re-invoking Gemini. Pass
+    force_rerun=True to overwrite.
 
 After generation completes, use `assign_keyframe_image` / `assign_pool_video` to
 pick one of the new candidates (coming in task-54).
@@ -912,6 +918,64 @@ UPDATE_EFFECT_PARAM_CURVE_TOOL: dict = {
     },
 }
 
+GENERATE_DESCRIPTIONS_TOOL: dict = {
+    "name": "generate_descriptions",
+    "description": (
+        "Run Gemini over chunks of a pool_segment's audio and cache the "
+        "structured semantic labels (section_type, mood, energy, vocal_style, "
+        "instrumentation) in the audio_description* tables. Results are "
+        "cached by (source_segment_id, model, prompt_version); re-calling "
+        "with the same inputs returns the cached run without re-invoking "
+        "Gemini. Pass force_rerun=True to discard the cached run and recompute. "
+        "Non-destructive: description runs are write-once cached artifacts, "
+        "no undo required."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "source_segment_id": {
+                "type": "string",
+                "description": "pool_segments.id of the audio to analyze.",
+            },
+            "model": {
+                "type": "string",
+                "default": "gemini-2.5-pro",
+                "description": (
+                    "Gemini model identifier used for chunk description. "
+                    "Part of the cache key — changing it produces a new run."
+                ),
+            },
+            "chunk_size_s": {
+                "type": "number",
+                "default": 30.0,
+                "description": (
+                    "Chunk duration in seconds for audio slicing before "
+                    "sending to Gemini."
+                ),
+            },
+            "prompt_version": {
+                "type": "string",
+                "default": "v1",
+                "description": (
+                    "Prompt template version. Part of the cache key so "
+                    "iterating on the prompt produces a new run instead of "
+                    "overwriting historical analysis."
+                ),
+            },
+            "force_rerun": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "If true, delete any existing run matching the cache "
+                    "key and recompute. Default false (return the cached run)."
+                ),
+            },
+        },
+        "required": ["source_segment_id"],
+    },
+}
+
+
 TOOLS: list[dict] = [
     SQL_QUERY_TOOL,
     UPDATE_KEYFRAME_PROMPT_TOOL,
@@ -940,6 +1004,7 @@ TOOLS: list[dict] = [
     GENERATE_DSP_TOOL,
     ADD_AUDIO_EFFECT_TOOL,
     UPDATE_EFFECT_PARAM_CURVE_TOOL,
+    GENERATE_DESCRIPTIONS_TOOL,
 ]
 
 
@@ -974,6 +1039,9 @@ _DESTRUCTIVE_TOOL_ALLOWLIST: frozenset[str] = frozenset({
     # neither DB-destructive nor slow/expensive in the generate_/isolate_
     # sense, so the "generate_" substring pattern must not gate it.
     "generate_dsp",
+    # generate_descriptions runs Gemini once per chunk and caches structured
+    # output. Cacheable, non-destructive — no confirmation gate needed.
+    "generate_descriptions",
 })
 
 
@@ -2118,6 +2186,196 @@ def _exec_generate_dsp(project_dir: Path, input_data: dict) -> dict:
     }
 
 
+# ── generate_descriptions (Phase 3 — structured LLM audio analysis) ────────
+
+
+_DESCRIPTION_PROPERTIES: tuple[str, ...] = (
+    "section_type",
+    "mood",
+    "energy",
+    "vocal_style",
+    "instrumentation",
+)
+
+
+def _rows_from_description(
+    desc: dict,
+    start_s: float,
+    end_s: float,
+) -> list[tuple[float, float, str, str | None, float | None, float | None, dict[str, Any] | None]]:
+    """Convert a structured Gemini description dict to per-property rows.
+
+    Returned tuples are ``(start_s, end_s, property, value_text, value_num,
+    confidence, raw)`` — matching ``bulk_insert_audio_descriptions``.
+
+    Missing / invalid fields are skipped silently; the goal is best-effort
+    persistence of whatever the LLM returned.
+    """
+    rows: list[tuple[float, float, str, str | None, float | None, float | None, dict[str, Any] | None]] = []
+
+    section_type = desc.get("section_type")
+    if isinstance(section_type, str) and section_type:
+        rows.append((start_s, end_s, "section_type", section_type, None, None, None))
+
+    mood = desc.get("mood")
+    if isinstance(mood, str) and mood:
+        rows.append((start_s, end_s, "mood", mood, None, None, None))
+
+    energy = desc.get("energy")
+    if isinstance(energy, (int, float)):
+        energy_val = float(energy)
+        # Clamp to [0, 1] defensively — the model may drift.
+        energy_val = max(0.0, min(1.0, energy_val))
+        rows.append((start_s, end_s, "energy", None, energy_val, None, None))
+
+    vocal_style = desc.get("vocal_style")
+    if isinstance(vocal_style, str) and vocal_style:
+        rows.append((start_s, end_s, "vocal_style", vocal_style, None, None, None))
+    # If vocal_style is explicitly null/None, we still record it so queries can
+    # distinguish "instrumental" from "not analyzed".
+    elif vocal_style is None and "vocal_style" in desc:
+        rows.append((start_s, end_s, "vocal_style", None, None, None, None))
+
+    instrumentation = desc.get("instrumentation")
+    if isinstance(instrumentation, list):
+        # Summarize as a comma-joined string for value_text; keep the raw list
+        # in raw_json so callers can reconstruct the array.
+        instruments = [str(x) for x in instrumentation if isinstance(x, str) and x]
+        if instruments:
+            rows.append((
+                start_s, end_s, "instrumentation",
+                ",".join(instruments), None, None,
+                {"instruments": instruments},
+            ))
+
+    notes = desc.get("notes")
+    if isinstance(notes, str) and notes.strip():
+        rows.append((start_s, end_s, "notes", notes, None, None, None))
+
+    return rows
+
+
+def _exec_generate_descriptions(project_dir: Path, input_data: dict) -> dict:
+    """Run Gemini chunk-description over a pool_segment and cache results.
+
+    Returns a dict describing the run (new or cached). Never raises for
+    invalid inputs — returns ``{"error": ...}`` instead.
+    """
+    source_segment_id = input_data.get("source_segment_id")
+    if not source_segment_id or not isinstance(source_segment_id, str):
+        return {"error": "missing source_segment_id"}
+
+    model = str(input_data.get("model") or "gemini-2.5-pro")
+    chunk_size_s = float(input_data.get("chunk_size_s") or 30.0)
+    prompt_version = str(input_data.get("prompt_version") or "v1")
+    force_rerun = bool(input_data.get("force_rerun", False))
+
+    # Resolve the pool segment and its on-disk file.
+    from scenecraft.db import get_pool_segment
+    seg = get_pool_segment(project_dir, source_segment_id)
+    if seg is None:
+        return {"error": f"pool_segment not found: {source_segment_id}"}
+    pool_path = seg.get("poolPath") or seg.get("pool_path")
+    if not pool_path:
+        return {"error": f"pool_segment {source_segment_id} has no pool_path"}
+    abs_path = (Path(project_dir) / pool_path).resolve()
+    if not abs_path.exists():
+        return {"error": f"source file not found: {abs_path}"}
+
+    from scenecraft.db_analysis_cache import (
+        bulk_insert_audio_descriptions,
+        create_audio_description_run,
+        delete_audio_description_run,
+        get_audio_description_run,
+        query_audio_descriptions,
+    )
+
+    # Cache-hit path: return the existing run (unless forcing rerun).
+    existing = get_audio_description_run(
+        project_dir, source_segment_id, model, prompt_version,
+    )
+    if existing is not None and not force_rerun:
+        stored = query_audio_descriptions(project_dir, existing.id)
+        # Count distinct (start_s, end_s) pairs → chunks that produced any row.
+        chunks_seen = len({(d.start_s, d.end_s) for d in stored})
+        return {
+            "run_id": existing.id,
+            "cached": True,
+            "source_segment_id": source_segment_id,
+            "chunks_analyzed": chunks_seen,
+            "chunks_failed": 0,
+            "descriptions_written": len(stored),
+        }
+
+    # Forced rerun: clear the old row so the UNIQUE cache key is available.
+    if existing is not None and force_rerun:
+        delete_audio_description_run(project_dir, existing.id)
+
+    from scenecraft.audio_intelligence import (
+        _chunk_audio_for_gemini,
+        _gemini_describe_chunk_structured,
+    )
+
+    try:
+        chunks = _chunk_audio_for_gemini(str(abs_path), chunk_duration=chunk_size_s)
+    except Exception as e:
+        return {"error": f"failed to chunk audio: {e}"}
+
+    chunks_analyzed = 0
+    chunks_failed = 0
+    all_rows: list[tuple[float, float, str, str | None, float | None, float | None, dict[str, Any] | None]] = []
+
+    for chunk in chunks:
+        desc = _gemini_describe_chunk_structured(
+            chunk["path"],
+            float(chunk["start_time"]),
+            float(chunk["end_time"]),
+            model=model,
+            prompt_version=prompt_version,
+        )
+        if desc is None:
+            chunks_failed += 1
+            continue
+        rows = _rows_from_description(
+            desc, float(chunk["start_time"]), float(chunk["end_time"]),
+        )
+        if rows:
+            chunks_analyzed += 1
+            all_rows.extend(rows)
+        else:
+            # Gemini returned a dict, but nothing recognisable inside it.
+            chunks_failed += 1
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Create the run row *after* analyses, so failures don't leave an empty
+    # row behind. Matches generate_dsp's behaviour.
+    run = create_audio_description_run(
+        project_dir,
+        source_segment_id=source_segment_id,
+        model=model,
+        prompt_version=prompt_version,
+        chunk_size_s=chunk_size_s,
+        created_at=now,
+    )
+
+    descriptions_written = 0
+    if all_rows:
+        descriptions_written = bulk_insert_audio_descriptions(
+            project_dir, run.id, all_rows,
+        )
+
+    return {
+        "run_id": run.id,
+        "cached": False,
+        "source_segment_id": source_segment_id,
+        "chunks_analyzed": chunks_analyzed,
+        "chunks_failed": chunks_failed,
+        "descriptions_written": descriptions_written,
+    }
+
+
 def _exec_update_keyframe(project_dir: Path, input_data: dict) -> dict:
     from scenecraft.db import get_keyframe, update_keyframe, undo_begin
     kf_id = input_data.get("keyframe_id")
@@ -2701,6 +2959,8 @@ async def _execute_tool(
         return result, "error" in result
     if name == "update_effect_param_curve":
         result = _exec_update_effect_param_curve(project_dir, input_data)
+    if name == "generate_descriptions":
+        result = _exec_generate_descriptions(project_dir, input_data)
         return result, "error" in result
     if name == "update_keyframe":
         result = _exec_update_keyframe(project_dir, input_data)
