@@ -1320,6 +1320,126 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 db_delete_audio_clip(project_dir, del_id)
                 return self._json_response({"success": True})
 
+            # POST /api/projects/:name/audio-clips/batch-ops
+            # Apply a list of audio_clip mutations inside one undo group.
+            # Used by the stem-drag handler (M11 task-104b) so a single drop
+            # that trims + splits + inserts clips is one Ctrl+Z away from
+            # being reverted.
+            #
+            # Body: { label: str, ops: [...] }
+            # Supported op shapes:
+            #   { op: "trim",   id, start_time?, end_time?, source_offset? }
+            #   { op: "split",  id, at, new_id, source_offset_right? }
+            #   { op: "delete", id }
+            #   { op: "insert", clip: { id, track_id, source_path, start_time, end_time, source_offset? } }
+            m = re.match(r"^/api/projects/([^/]+)/audio-clips/batch-ops$", path)
+            if m:
+                body = self._read_json_body()
+                if body is None: return
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                label = body.get("label") or "audio clip batch op"
+                ops = body.get("ops") or []
+                if not isinstance(ops, list) or not ops:
+                    return self._error(400, "BAD_REQUEST", "ops must be a non-empty list")
+
+                from scenecraft.db import (
+                    add_audio_clip as _db_add_clip,
+                    update_audio_clip as _db_update_clip,
+                    delete_audio_clip as _db_delete_clip,
+                    get_audio_clips as _db_get_clips,
+                    undo_begin,
+                )
+
+                # Validate all ops before mutating anything — partial writes
+                # would leave the undo group in a weird state.
+                valid_kinds = {"trim", "split", "delete", "insert"}
+                for i, op in enumerate(ops):
+                    if not isinstance(op, dict):
+                        return self._error(400, "BAD_REQUEST", f"ops[{i}] must be an object")
+                    kind = op.get("op")
+                    if kind not in valid_kinds:
+                        return self._error(400, "BAD_REQUEST", f"ops[{i}]: unknown op '{kind}'")
+                    if kind in ("trim", "split", "delete") and not op.get("id"):
+                        return self._error(400, "BAD_REQUEST", f"ops[{i}]: '{kind}' requires id")
+                    if kind == "split":
+                        if "at" not in op or "new_id" not in op:
+                            return self._error(400, "BAD_REQUEST", f"ops[{i}]: 'split' requires at + new_id")
+                    if kind == "insert":
+                        clip = op.get("clip")
+                        if not isinstance(clip, dict):
+                            return self._error(400, "BAD_REQUEST", f"ops[{i}]: 'insert' requires clip object")
+                        for key in ("id", "track_id", "source_path", "start_time", "end_time"):
+                            if clip.get(key) is None:
+                                return self._error(400, "BAD_REQUEST", f"ops[{i}]: insert.clip missing {key}")
+
+                # Single undo group wraps the whole batch.
+                undo_begin(project_dir, label)
+                _log(f"audio-clips/batch-ops: {len(ops)} op(s), label={label!r}")
+
+                # Cache current clips for split ops that need the original row.
+                _clips_cache: dict[str, dict] = {}
+                def _resolve_clip(cid: str) -> dict | None:
+                    if cid not in _clips_cache:
+                        _clips_cache.clear()
+                        for c in _db_get_clips(project_dir):
+                            _clips_cache[c["id"]] = c
+                    return _clips_cache.get(cid)
+
+                for op in ops:
+                    kind = op["op"]
+                    if kind == "trim":
+                        fields = {}
+                        if "start_time" in op and op["start_time"] is not None:
+                            fields["start_time"] = float(op["start_time"])
+                        if "end_time" in op and op["end_time"] is not None:
+                            fields["end_time"] = float(op["end_time"])
+                        if "source_offset" in op and op["source_offset"] is not None:
+                            fields["source_offset"] = float(op["source_offset"])
+                        if fields:
+                            _db_update_clip(project_dir, op["id"], **fields)
+                            _clips_cache.clear()
+                    elif kind == "delete":
+                        _db_delete_clip(project_dir, op["id"])
+                        _clips_cache.clear()
+                    elif kind == "insert":
+                        clip = dict(op["clip"])
+                        _db_add_clip(project_dir, clip)
+                        _clips_cache.clear()
+                    elif kind == "split":
+                        original = _resolve_clip(op["id"])
+                        if not original:
+                            _log(f"  skip split: clip {op['id']} not found")
+                            continue
+                        at = float(op["at"])
+                        orig_start = float(original["start_time"])
+                        orig_end = float(original["end_time"])
+                        orig_src_offset = float(original.get("source_offset", 0))
+                        if at <= orig_start or at >= orig_end:
+                            _log(f"  skip split {op['id']} at {at}: outside clip span")
+                            continue
+                        # Left half stays in place; trim end_time down to `at`.
+                        _db_update_clip(project_dir, op["id"], end_time=at)
+                        # Right half is a new row starting at `at`.
+                        right_src_offset = op.get("source_offset_right")
+                        if right_src_offset is None:
+                            right_src_offset = orig_src_offset + (at - orig_start)
+                        new_clip = {
+                            "id": op["new_id"],
+                            "track_id": original["track_id"],
+                            "source_path": original.get("source_path", ""),
+                            "start_time": at,
+                            "end_time": orig_end,
+                            "source_offset": float(right_src_offset),
+                            "volume_curve": original.get("volume_curve"),
+                            "muted": bool(original.get("muted", False)),
+                            "remap": original.get("remap", {"method": "linear", "target_duration": 0}),
+                        }
+                        _db_add_clip(project_dir, new_clip)
+                        _clips_cache.clear()
+
+                return self._json_response({"success": True, "ops_applied": len(ops)})
+
             # POST /api/projects/:name/audio-clips/align-detect — waveform-
             # sync cross-correlation (see agent/... or audio/align.py docstring).
             m = re.match(r"^/api/projects/([^/]+)/audio-clips/align-detect$", path)
@@ -3953,6 +4073,31 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     update_fields["from"] = new_from_kf_id
                     update_fields["to"] = new_to_kf_id
                     update_transition(project_dir, tr_id, **update_fields)
+
+                    # Linked-audio shift for the boundary-kf path. When from_kf
+                    # is interior, resolve_new_kf's update_keyframe() fires
+                    # _propagate_linked_audio_on_from_kf_shift automatically. But
+                    # when from_kf is boundary (shared with a non-moved sibling),
+                    # a fresh kf is inserted and the old kf's timestamp never
+                    # changes — so the link-propagation never runs. Catch that
+                    # case explicitly here.
+                    if abs(time_delta_f) > 1e-9 and new_from_kf_id != from_kf["id"]:
+                        from scenecraft.db import (
+                            get_audio_clip_links_for_transition as _get_links,
+                            get_db as _get_db,
+                        )
+                        links = _get_links(project_dir, tr_id)
+                        if links:
+                            clip_ids = [lk["audio_clip_id"] for lk in links]
+                            placeholders = ",".join("?" for _ in clip_ids)
+                            conn = _get_db(project_dir)
+                            conn.execute(
+                                f"UPDATE audio_clips "
+                                f"SET start_time = start_time + ?, end_time = end_time + ? "
+                                f"WHERE id IN ({placeholders}) AND deleted_at IS NULL",
+                                [time_delta_f, time_delta_f, *clip_ids],
+                            )
+                            conn.commit()
 
                     # Stash new kf ids for overlap resolution below
                     entry["new_from_kf_id"] = new_from_kf_id
