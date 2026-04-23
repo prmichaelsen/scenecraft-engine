@@ -937,6 +937,14 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             if m:
                 return self._handle_pool_upload(m.group(1))
 
+            # POST /api/projects/:name/mix-render-upload — frontend-rendered mix WAV
+            # (OfflineAudioContext) uploaded for analysis. Content-addressable: the
+            # file is stored at pool/mixes/<mix_graph_hash>.wav so repeat uploads of
+            # the same mix are idempotent.
+            m = re.match(r"^/api/projects/([^/]+)/mix-render-upload$", path)
+            if m:
+                return self._handle_mix_render_upload(m.group(1))
+
             # POST /api/projects/:name/pool/rename — update a pool segment's label
             m = re.match(r"^/api/projects/([^/]+)/pool/rename$", path)
             if m:
@@ -4893,6 +4901,174 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     "originalFilepath": original_filepath or None,
                     "durationSeconds": dur,
                 })
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self._error(500, "INTERNAL_ERROR", str(e))
+
+        def _handle_mix_render_upload(self, project_name: str):
+            """POST /api/projects/:name/mix-render-upload — store a frontend-rendered
+            mix WAV at pool/mixes/<mix_graph_hash>.wav so the analyze_master_bus tool
+            can read it back.
+
+            Multipart form fields:
+              audio:           binary WAV (24-bit PCM preferred, 16-bit accepted)
+              mix_graph_hash:  64-char hex SHA-256 computed by the client
+              start_time_s:    float
+              end_time_s:      float
+              sample_rate:     int
+              channels:        int (1 or 2)
+
+            The hash is content-addressable — the same mix_graph always produces the
+            same hash, so repeat uploads overwrite the same file (safely, since bytes
+            must match). We verify the WAV's duration matches end-start within 100ms
+            to catch partial uploads before they poison the cache, and we cross-check
+            sample_rate / channels against the WAV header. On any validation failure
+            after bytes were written, the file is deleted.
+            """
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+
+            try:
+                content_type = self.headers.get('Content-Type', '')
+                if 'multipart/form-data' not in content_type:
+                    return self._error(400, "BAD_REQUEST", "Expected multipart/form-data")
+
+                content_length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(content_length)
+
+                boundary = content_type.split('boundary=')[-1].encode()
+                parts = body.split(b'--' + boundary)
+                audio_data: bytes | None = None
+                mix_graph_hash: str | None = None
+                start_time_s: str | None = None
+                end_time_s: str | None = None
+                sample_rate_str: str | None = None
+                channels_str: str | None = None
+
+                for part in parts:
+                    if b'Content-Disposition' not in part:
+                        continue
+                    header_end = part.find(b'\r\n\r\n')
+                    if header_end < 0:
+                        continue
+                    header = part[:header_end].decode('utf-8', errors='replace')
+                    payload = part[header_end + 4:]
+                    if payload.endswith(b'\r\n'):
+                        payload = payload[:-2]
+
+                    if 'name="audio"' in header:
+                        audio_data = payload
+                    elif 'name="mix_graph_hash"' in header:
+                        mix_graph_hash = payload.decode('utf-8', errors='replace').strip()
+                    elif 'name="start_time_s"' in header:
+                        start_time_s = payload.decode('utf-8', errors='replace').strip()
+                    elif 'name="end_time_s"' in header:
+                        end_time_s = payload.decode('utf-8', errors='replace').strip()
+                    elif 'name="sample_rate"' in header:
+                        sample_rate_str = payload.decode('utf-8', errors='replace').strip()
+                    elif 'name="channels"' in header:
+                        channels_str = payload.decode('utf-8', errors='replace').strip()
+
+                # Validate required fields
+                if audio_data is None or len(audio_data) == 0:
+                    return self._error(400, "BAD_REQUEST", "Missing 'audio' file")
+                if not mix_graph_hash:
+                    return self._error(400, "BAD_REQUEST", "Missing 'mix_graph_hash'")
+                if start_time_s is None:
+                    return self._error(400, "BAD_REQUEST", "Missing 'start_time_s'")
+                if end_time_s is None:
+                    return self._error(400, "BAD_REQUEST", "Missing 'end_time_s'")
+                if sample_rate_str is None:
+                    return self._error(400, "BAD_REQUEST", "Missing 'sample_rate'")
+                if channels_str is None:
+                    return self._error(400, "BAD_REQUEST", "Missing 'channels'")
+
+                # Hash must be exactly 64 hex chars
+                if len(mix_graph_hash) != 64 or not all(c in "0123456789abcdefABCDEF" for c in mix_graph_hash):
+                    return self._error(400, "BAD_REQUEST", "mix_graph_hash must be 64 hex chars")
+
+                try:
+                    start_time_f = float(start_time_s)
+                    end_time_f = float(end_time_s)
+                    sample_rate_i = int(sample_rate_str)
+                    channels_i = int(channels_str)
+                except ValueError as ve:
+                    return self._error(400, "BAD_REQUEST", f"Invalid numeric field: {ve}")
+
+                if channels_i not in (1, 2):
+                    return self._error(400, "BAD_REQUEST", f"channels must be 1 or 2, got {channels_i}")
+                if sample_rate_i <= 0:
+                    return self._error(400, "BAD_REQUEST", f"sample_rate must be positive, got {sample_rate_i}")
+                if end_time_f <= start_time_f:
+                    return self._error(400, "BAD_REQUEST", "end_time_s must be > start_time_s")
+
+                expected_duration = end_time_f - start_time_f
+
+                # Write to pool/mixes/<hash>.wav (create dir on first upload)
+                mixes_dir = project_dir / "pool" / "mixes"
+                mixes_dir.mkdir(parents=True, exist_ok=True)
+                rel_path = f"pool/mixes/{mix_graph_hash}.wav"
+                dest = project_dir / rel_path
+                dest.write_bytes(audio_data)
+
+                # Validate WAV header + duration; on mismatch delete the file so the
+                # cache never holds a corrupt artifact.
+                try:
+                    import wave
+                    with wave.open(str(dest), 'rb') as wf:
+                        wav_channels = wf.getnchannels()
+                        wav_sample_rate = wf.getframerate()
+                        wav_frames = wf.getnframes()
+                        wav_sample_width = wf.getsampwidth()
+                    wav_duration = wav_frames / float(wav_sample_rate) if wav_sample_rate > 0 else 0.0
+                except Exception as we:
+                    try:
+                        dest.unlink()
+                    except Exception:
+                        pass
+                    return self._error(400, "BAD_REQUEST", f"Invalid WAV file: {we}")
+
+                if wav_channels != channels_i:
+                    try:
+                        dest.unlink()
+                    except Exception:
+                        pass
+                    return self._error(400, "BAD_REQUEST",
+                        f"channels mismatch: form says {channels_i}, WAV header says {wav_channels}")
+
+                if wav_sample_rate != sample_rate_i:
+                    try:
+                        dest.unlink()
+                    except Exception:
+                        pass
+                    return self._error(400, "BAD_REQUEST",
+                        f"sample_rate mismatch: form says {sample_rate_i}, WAV header says {wav_sample_rate}")
+
+                if abs(wav_duration - expected_duration) > 0.100:
+                    try:
+                        dest.unlink()
+                    except Exception:
+                        pass
+                    return self._error(400, "BAD_REQUEST",
+                        f"duration mismatch: WAV is {wav_duration:.3f}s but end-start={expected_duration:.3f}s (>100ms drift)")
+
+                # 16-bit and 24-bit PCM both have sample widths that make sense; we
+                # accept both per the spec. Don't fail on unusual widths — the
+                # analyzer reads via librosa which handles any valid PCM width.
+
+                bytes_written = dest.stat().st_size
+                _log(f"mix-render-upload: {project_name} {mix_graph_hash[:12]}… "
+                     f"({bytes_written // 1024}KB, {wav_duration:.2f}s, {wav_sample_rate}Hz, {wav_channels}ch)")
+
+                return self._json_response({
+                    "rendered_path": rel_path,
+                    "bytes": bytes_written,
+                    "channels": wav_channels,
+                    "sample_rate": wav_sample_rate,
+                    "duration_s": wav_duration,
+                }, status=201)
             except Exception as e:
                 import traceback
                 traceback.print_exc()
