@@ -1173,3 +1173,98 @@ class TestMoveTransitionsCopyMode:
             t = get_transition(project_dir, new_id)
             assert t is not None
             assert t["deleted_at"] is None
+
+
+# ── Linked-audio propagation ──────────────────────────────────────────
+
+
+def _seed_audio_clip_linked_to_tr(project_dir, *, clip_id: str, tr_id: str,
+                                  start: float, end: float):
+    """Create an audio track, a clip on it, and a link row to `tr_id`."""
+    from scenecraft.db import (
+        add_audio_track, add_audio_clip, add_audio_clip_link,
+    )
+    add_audio_track(project_dir, {
+        "id": "atrack_1", "name": "Audio 1", "display_order": 0,
+    })
+    add_audio_clip(project_dir, {
+        "id": clip_id, "track_id": "atrack_1",
+        "source_path": "pool/audio.wav",
+        "start_time": start, "end_time": end, "source_offset": 0,
+    })
+    add_audio_clip_link(project_dir, clip_id, tr_id, offset=0.0)
+
+
+class TestMoveTransitionsLinkedAudio:
+    def test_dragged_tr_shifts_linked_audio_clip(self, project_env):
+        """Regression: dragging a transition with shared-boundary kfs must still
+        shift its linked audio clip. The boundary path in resolve_new_kf
+        creates a fresh kf so update_keyframe's propagation never runs —
+        the handler must shift the clip explicitly.
+        """
+        project_dir = project_env["project_dir"]
+        _seed_three_clip_track(project_dir)  # tr_001/002/003 share boundary kfs
+        # Clip sits under tr_002 (kf_002 @ 0:15 → kf_003 @ 0:20)
+        _seed_audio_clip_linked_to_tr(
+            project_dir, clip_id="audio_clip_01", tr_id="tr_002",
+            start=15.0, end=20.0,
+        )
+
+        status, body = api(project_env, "POST",
+            f"/api/projects/{project_env['project_name']}/move-transitions",
+            {"mode": "move", "trackDelta": 0, "timeDeltaSeconds": 3.0,
+             "transitionIds": ["tr_002"]})
+        assert status == 200, body
+
+        # Linked clip must have followed the transition by +3s.
+        from scenecraft.db import get_audio_clips
+        clips = {c["id"]: c for c in get_audio_clips(project_dir)}
+        assert "audio_clip_01" in clips
+        clip = clips["audio_clip_01"]
+        assert abs(clip["start_time"] - 18.0) < 1e-4, \
+            f"start_time should be 18.0, got {clip['start_time']}"
+        assert abs(clip["end_time"] - 23.0) < 1e-4, \
+            f"end_time should be 23.0, got {clip['end_time']}"
+
+    def test_linked_audio_not_double_shifted_on_interior_kf_path(self, project_env):
+        """Interior-kf path already shifts clips via update_keyframe's
+        propagation. The handler's explicit shift must not fire in that case."""
+        project_dir = project_env["project_dir"]
+        # Isolated transition — kfs are NOT shared with anything else, so both
+        # from and to are interior.
+        add_keyframe(project_dir, {
+            "id": "kf_solo_a", "timestamp": "0:10.00", "section": "",
+            "source": "", "prompt": "", "selected": None, "candidates": [],
+            "track_id": "track_1",
+        })
+        add_keyframe(project_dir, {
+            "id": "kf_solo_b", "timestamp": "0:15.00", "section": "",
+            "source": "", "prompt": "", "selected": None, "candidates": [],
+            "track_id": "track_1",
+        })
+        add_transition(project_dir, {
+            "id": "tr_solo", "from": "kf_solo_a", "to": "kf_solo_b",
+            "duration_seconds": 5, "slots": 1, "action": "",
+            "use_global_prompt": False, "selected": None,
+            "remap": {"method": "linear", "target_duration": 5},
+            "track_id": "track_1",
+        })
+        _seed_audio_clip_linked_to_tr(
+            project_dir, clip_id="audio_clip_solo", tr_id="tr_solo",
+            start=10.0, end=15.0,
+        )
+
+        status, body = api(project_env, "POST",
+            f"/api/projects/{project_env['project_name']}/move-transitions",
+            {"mode": "move", "trackDelta": 0, "timeDeltaSeconds": 2.5,
+             "transitionIds": ["tr_solo"]})
+        assert status == 200, body
+
+        from scenecraft.db import get_audio_clips
+        clips = {c["id"]: c for c in get_audio_clips(project_dir)}
+        clip = clips["audio_clip_solo"]
+        # Shifted exactly once by +2.5, not +5.
+        assert abs(clip["start_time"] - 12.5) < 1e-4, \
+            f"start_time should be 12.5 (single shift), got {clip['start_time']}"
+        assert abs(clip["end_time"] - 17.5) < 1e-4, \
+            f"end_time should be 17.5 (single shift), got {clip['end_time']}"
