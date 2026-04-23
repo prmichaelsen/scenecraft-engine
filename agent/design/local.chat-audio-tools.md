@@ -1,8 +1,9 @@
 # Chat-Agent Audio Authoring Tools
 
-**Concept**: Expose write-path tools to the embedded chat agent so it can create audio tracks, audio clips, effects, and automation curves via the existing chat tool pattern.
+**Concept**: Expose write-path tools to the embedded chat agent so it can create audio tracks, audio clips, effects, automation curves, and run cached librosa + LLM analysis to drive auto-duck / auto-mix / auto-master flows.
 **Created**: 2026-04-23
-**Status**: Proposal
+**Last Updated**: 2026-04-23
+**Status**: Proposal (Phase 1 shipped; Phase 2 unblocked after M13 completion; Phase 3 net-new)
 
 ---
 
@@ -10,7 +11,7 @@
 
 The embedded SceneCraft chat agent can currently **read** audio state (pool segments, existing tracks, existing clips) via its tool surface, but it cannot **write** any audio state onto the timeline. When a user asks the agent to "lay down these four vocal takes as a new track" or "add a compressor to the lead vocal," the agent can describe what needs to happen but cannot do it.
 
-This design specifies five chat tools that close that gap, sequenced across two phases pinned to milestone readiness. All five tools reuse the existing DB functions and the existing chat tool pattern — no DB schema changes, no new undo plumbing.
+This design specifies three phases of chat tools that close that gap. Phase 1 ships authoring primitives (tracks + clips). Phase 2 ships effect/curve mutations. Phase 3 ships a cached-analysis pipeline (librosa + LLM) that powers auto-duck, auto-mix, and auto-master workflows. All Phase 1–2 tools reuse existing DB functions and the existing chat tool pattern. Phase 3 adds new DB tables for caching analysis output.
 
 ---
 
@@ -25,23 +26,34 @@ This design specifies five chat tools that close that gap, sequenced across two 
 
 ## Solution
 
-**Expose five chat tools, split into two phases**:
+**Three phases**:
 
-### Phase 1 — Ship now (unblocks the current agent request)
+### Phase 1 — SHIPPED 2026-04-23
 1. `add_audio_track` — create an empty track
 2. `add_audio_clip` — place a pool_segment on a track with timing
 
-### Phase 2 — After M13 tasks 45 & 46 land (effect_curves table + effect registry)
-3. `add_audio_effect` — append an effect to a track's chain
-4. `update_volume_curve` — replace the inline volume curve on a track or clip
-5. `update_effect_param_curve` — upsert an automation curve on an effect parameter
+### Phase 2 — ALL UNBLOCKED (M13 complete 2026-04-23)
+3. `update_volume_curve` — replace the inline volume curve on a track or clip (no M13 dep; inline column)
+4. `update_effect_param_curve` — upsert an automation curve on an effect parameter (uses M13 `effect_curves` table)
+5. `add_audio_effect` — append an effect to a track's chain (uses M13 `track_effects` + effect registry)
+
+### Phase 3 — Cached analysis pipeline (new DB tables)
+6. `generate_dsp` — run librosa analysis on a pool_segment, persist results in `dsp_*` tables
+7. `generate_descriptions` — run LLM analysis (Gemini) on a pool_segment, persist structured properties in `audio_description*` tables
+8. `analyze_audio_track` / `analyze_audio_clip` — high-level composite: resolves to pool_segments, calls generate_dsp + generate_descriptions, returns summary
+9. `apply_mix_plan` — batch-apply effect + curve + volume updates in one undo group (for agent-generated mix plans)
 
 **Core design choices**:
-- **Primitives, not compound operations.** Reject `add_audio_clip_to_new_track` convenience tools. Each tool maps to exactly one DB mutation and one undo group, so undo/redo behaves predictably.
-- **Thin wrappers over existing DB functions.** `db.add_audio_track()` (db.py:2547) and `db.add_audio_clip()` (db.py:2726) already exist; the chat tools are ~15-line executors that resolve defaults, wrap in `undo_begin()`, and delegate.
-- **Auto-compute `end_time`** from `pool_segments.duration_seconds` when the agent omits it — same data contract the GUI relies on. Error cleanly if the source row has null duration rather than silently defaulting to a bogus value.
-- **Defer effect/curve tools until the registry exists** (M13 task 46) so the chat tool schema can enumerate valid effect types instead of hardcoding a list that drifts.
-- **Two separate curve tools, not one overloaded `update_curves`**, because volume curves live inline on `audio_tracks.volume_curve` / `audio_clips.volume_curve` (single column) while effect param curves live in the separate M13 `effect_curves` table.
+- **Primitives, not compound operations** (Phase 1–2). Each tool maps to exactly one DB mutation and one undo group.
+- **Thin wrappers over existing DB functions** where possible. Phase 1 & 2 tools reuse `db.add_audio_track`, `db.add_audio_clip`, `db.upsert_effect_curve`, `db.add_track_effect`, etc.
+- **Auto-compute `end_time`** from `pool_segments.duration_seconds` when the agent omits it.
+- **Two separate curve tools, not one overloaded `update_curves`**, because volume curves live inline on `audio_tracks.volume_curve` / `audio_clips.volume_curve` (single column) while effect param curves live in the M13 `effect_curves` table.
+- **Cached analysis, not on-demand recompute** (Phase 3). `librosa.analyze_audio` on a 3-minute vocal takes ~2–5s. Cache results keyed by `(source_segment_id, analyzer_version, params_hash)` so the agent pays that cost once per source, reuses across chat turns, and can run `sql_query` over the structured datapoints.
+- **DSP (quantitative) ≠ descriptions (qualitative)** — two separate table families:
+  - `dsp_*`: numerical librosa output (onsets, RMS envelope, spectral features, BPM, sections-by-transient-detection). Trust it. Agent queries it for exact time/value facts.
+  - `audio_description*`: LLM-emitted structured properties (mood, genre, vocal style, section-by-semantic-meaning, energy). The agent's "vibes layer."
+  - Do not ask the LLM for things librosa does accurately (tempo, onsets). Do not ask librosa for things it can't do (mood, genre).
+- **`apply_mix_plan` is the only non-primitive**, by design. Sub-LLM auto-mix flows produce a multi-step plan (add 3 effects, set 5 curves, adjust 2 volumes). Composing this as 10 separate undo groups is hostile; one batched group per plan is the right shape.
 
 ---
 
@@ -147,9 +159,9 @@ def _exec_add_audio_clip(project_dir, input_data):
 
 Both tools require one helper lookup: `get_pool_segment_by_path(project_dir, pool_path)`. If that helper doesn't already exist, add it to db.py as a thin SELECT.
 
-### Phase 2 tools (deferred)
+### Phase 2 tools (all unblocked 2026-04-23 — M13 complete)
 
-Sketches — final signatures depend on M13 task 46's effect registry shape:
+Final signatures; all three can ship in one PR:
 
 ```python
 # Tool 3: add_audio_effect  (sequenced after M13 task 46)
@@ -180,9 +192,145 @@ update_effect_param_curve(
 # → UPSERT into effect_curves WHERE (effect_id, param_name)
 ```
 
----
+### Phase 3 — Cached analysis pipeline (auto-duck / auto-mix / auto-master)
 
-## Benefits
+New SQLite tables in per-project `project.db`, mirroring the M13 pattern (no global state, scoped by DB location).
+
+**Schema (7 new tables, 2 table families)**:
+
+```sql
+-- Family 1: DSP (librosa, quantitative)
+
+CREATE TABLE dsp_analysis_runs (
+  id                TEXT PRIMARY KEY,
+  source_segment_id TEXT NOT NULL REFERENCES pool_segments(id) ON DELETE CASCADE,
+  analyzer_version  TEXT NOT NULL,        -- e.g. "librosa-0.10.2"
+  params_hash       TEXT NOT NULL,        -- hash of analysis params (sr, hop_length, etc.)
+  analyses_json     TEXT NOT NULL,        -- which analyses were run: ["onsets","rms","spectral_centroid",...]
+  created_at        TEXT NOT NULL,
+  UNIQUE(source_segment_id, analyzer_version, params_hash)  -- cache key
+);
+
+-- EAV-ish for time-series datapoints that all fit (time, value)
+CREATE TABLE dsp_datapoints (
+  run_id      TEXT NOT NULL REFERENCES dsp_analysis_runs(id) ON DELETE CASCADE,
+  data_type   TEXT NOT NULL,      -- 'onset' | 'rms' | 'spectral_centroid' | 'zcr' | ...
+  time_s      REAL NOT NULL,
+  value       REAL NOT NULL,
+  extra_json  TEXT,               -- only when a single REAL isn't enough (rare)
+  PRIMARY KEY (run_id, data_type, time_s)
+);
+CREATE INDEX dsp_datapoints_type_time ON dsp_datapoints(run_id, data_type, time_s);
+
+-- Time-ranged regions (sections-by-transient, vocal-presence ranges, etc.)
+CREATE TABLE dsp_sections (
+  run_id       TEXT NOT NULL REFERENCES dsp_analysis_runs(id) ON DELETE CASCADE,
+  start_s      REAL NOT NULL,
+  end_s        REAL NOT NULL,
+  section_type TEXT NOT NULL,     -- 'drop' | 'vocal_presence' | 'silence' | ...
+  label        TEXT,
+  confidence   REAL,
+  PRIMARY KEY (run_id, start_s, section_type)
+);
+
+-- Scalars (tempo_bpm, peak_db, global_rms, etc.)
+CREATE TABLE dsp_scalars (
+  run_id   TEXT NOT NULL REFERENCES dsp_analysis_runs(id) ON DELETE CASCADE,
+  metric   TEXT NOT NULL,         -- 'tempo_bpm' | 'global_rms' | 'peak_db' | ...
+  value    REAL NOT NULL,
+  PRIMARY KEY (run_id, metric)
+);
+
+-- Family 2: LLM descriptions (qualitative, semantic)
+
+CREATE TABLE audio_description_runs (
+  id                TEXT PRIMARY KEY,
+  source_segment_id TEXT NOT NULL REFERENCES pool_segments(id) ON DELETE CASCADE,
+  model             TEXT NOT NULL,        -- 'gemini-2.5-pro', 'claude-opus-4-7', ...
+  prompt_version    TEXT NOT NULL,        -- so prompt iterations produce new runs
+  chunk_size_s      REAL NOT NULL,
+  created_at        TEXT NOT NULL,
+  UNIQUE(source_segment_id, model, prompt_version)
+);
+
+CREATE TABLE audio_descriptions (
+  run_id      TEXT NOT NULL REFERENCES audio_description_runs(id) ON DELETE CASCADE,
+  start_s     REAL NOT NULL,
+  end_s       REAL NOT NULL,
+  property    TEXT NOT NULL,      -- 'section_type' | 'mood' | 'energy' | 'vocal_style' | 'genre' | ...
+  value_text  TEXT,
+  value_num   REAL,
+  confidence  REAL,
+  raw_json    TEXT,
+  PRIMARY KEY (run_id, start_s, property)
+);
+CREATE INDEX audio_descriptions_property_time ON audio_descriptions(run_id, property, start_s);
+
+CREATE TABLE audio_description_scalars (
+  run_id     TEXT NOT NULL REFERENCES audio_description_runs(id) ON DELETE CASCADE,
+  property   TEXT NOT NULL,       -- 'key' | 'global_genre' | 'vocal_gender' | ...
+  value_text TEXT,
+  value_num  REAL,
+  confidence REAL,
+  PRIMARY KEY (run_id, property)
+);
+```
+
+**Cache semantics**:
+- Source segments are immutable in this codebase (new audio → new pool_segment). Cache is stable across timeline edits.
+- Cache key for DSP: `(source_segment_id, analyzer_version, params_hash)`. Upgrading librosa changes `analyzer_version` → new run, old run persists until source_segment is deleted.
+- Cache key for descriptions: `(source_segment_id, model, prompt_version)`. Prompt iteration produces new runs — A/B-able.
+- Clip trim changes don't invalidate; the agent filters datapoints by `time_s BETWEEN trim_in AND trim_out`.
+
+**Sizing**: RMS envelope @50ms window × 3-min vocal = 3600 rows. ~10 analyses per segment × 100 segments = ~3.6M rows. SQLite fine with the proposed indexes.
+
+**Chat tools (Phase 3)**:
+
+```python
+# Tool 6: generate_dsp
+generate_dsp(
+    source_segment_id: str,
+    analyses: list[str] = ["onsets", "rms", "spectral_centroid", "sections", "tempo"],
+    force_rerun: bool = False,   # default: return existing run_id if cache hit
+) -> {"run_id": str, "cached": bool, "summary": {...}}
+
+# Tool 7: generate_descriptions
+generate_descriptions(
+    source_segment_id: str,
+    model: str = "gemini-2.5-pro",
+    properties: list[str] = ["section_type", "mood", "energy", "vocal_style", "instrumentation"],
+    force_rerun: bool = False,
+) -> {"run_id": str, "cached": bool, "properties_written": int}
+
+# Tool 8: analyze_audio_track / analyze_audio_clip (convenience composites)
+analyze_audio_track(
+    track_id: str,
+    dsp: bool = True,
+    descriptions: bool = False,   # off by default — descriptions cost money
+) -> {"clips": [{"clip_id": ..., "dsp_run_id": ..., "description_run_id": ...}]}
+
+analyze_audio_clip(
+    audio_clip_id: str,
+    dsp: bool = True,
+    descriptions: bool = False,
+) -> {"clip_id": ..., "dsp_run_id": ..., "description_run_id": ...}
+
+# Tool 9: apply_mix_plan (batch-apply agent-generated mix decisions)
+apply_mix_plan(
+    description: str,              # "auto-duck pass on music when vocal present"
+    operations: list[dict],        # ordered list of {"op": "add_effect"|"set_volume_curve"|..., ...}
+) -> {"applied": int, "skipped": int, "undo_group_id": str}
+# All operations in one undo group. Partial failure aborts all.
+```
+
+**Auto-duck demo flow** (the minimum viable end-to-end):
+1. Agent calls `generate_dsp(source_segment_id=<vocal_seg>, analyses=["rms","sections"])` → cached on re-run.
+2. Agent queries via `sql_query`: `SELECT start_s, end_s FROM dsp_sections WHERE run_id=? AND section_type='vocal_presence'`.
+3. Agent generates a duck curve: points that drop to ~0.3 during vocal ranges, ramp back to 1.0 with short transitions.
+4. Agent calls `update_volume_curve(target_type='track', target_id=<music_track>, points_json=<duck curve>)`.
+5. Done. User plays back → vocal ducks music automatically.
+
+Auto-mix and auto-master are the same scaffolding with more steps: `generate_dsp` + `generate_descriptions` → sub-LLM produces a mix plan → `apply_mix_plan` applies it atomically.
 
 - **Unblocks the agent's authoring surface.** Once Phase 1 lands, the chat agent can assemble tracks from pool segments end-to-end in one turn.
 - **Undo parity with GUI edits.** Trigger-based undo-log (db.py:728–747) auto-captures the mutations; the only work in the tool is `undo_begin()` wrapping.
@@ -246,8 +394,10 @@ No migration needed — purely additive. No table changes, no data backfill. Exi
 | Decision | Choice | Rationale |
 |---|---|---|
 | Phase 1 vs Phase 2 split | Ship `add_audio_track` + `add_audio_clip` now; defer effect/curve tools | Current agent request only needs Phase 1; Phase 2 needs M13 registry to ship safely |
-| Ship before M13 effect registry? | No for effect/curve tools | Would require rewrite once M13 lands |
+| Ship before M13 effect registry? | Moot — M13 shipped 2026-04-23 | Phase 2 is fully unblocked |
 | Block M14 (rotoscope) on this? | No | Independent surface |
+| Phase 3 analysis pipeline | Cached DB tables, not on-demand | Librosa costs ~2-5s per vocal; caching avoids repaying per chat turn. Also enables sub-LLM mix flows via sql_query over structured data. |
+| DSP vs description split | Two separate table families | Librosa = facts; LLM = vibes. Don't mix storage; don't ask LLM for BPM. |
 
 ### Data model
 
