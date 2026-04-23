@@ -684,7 +684,7 @@ milestones:
           - task-54
 
 documentation:
-  design_documents: 7
+  design_documents: 8
   milestone_documents: 13
   pattern_documents: 0
   task_documents: 55
@@ -695,6 +695,12 @@ progress:
   overall: 82
 
 recent_work:
+  - date: 2026-04-23
+    description: "Chat-agent audio authoring tools Phase 1 shipped. chat.py: add_audio_track (auto id/display_order/name, initial volume -> constant volume_curve, one undo group) + add_audio_clip (source by pool_segments.id uuid, start_time required, trim_in/trim_out preferred with source_offset/end_time as lower-level alternates, end_time auto-computed from pool_segments.duration_seconds when omitted, label seeded from pool segment). Both wrap in undo_begin — trigger-based undo-log captures inverse SQL automatically. No DB schema changes; reuses existing db.add_audio_track/add_audio_clip/get_pool_segment/get_audio_tracks/generate_id."
+  - date: 2026-04-23
+    description: "Design/local.chat-audio-tools.md created — two-phase plan for chat-agent audio write-path. Phase 1 (tracks+clips) shipped same day. Phase 2 revised post-design: update_volume_curve can ship NOW (inline column, no M13 dep); update_effect_param_curve waits on M13 task 45; add_audio_effect waits on tasks 45+46 (registry for effect_type enum). Primitives-only (no compound ops) for undo granularity."
+  - date: 2026-04-23
+    description: "Clarification-8 (AI rotoscope plugin / M14 scoping) ~95% complete. Decisions locked: SAM2 single-subject + refinement + box-prompt MVP; matte-only default with opt-in clip-mask layer effect (per-frame editable contours + feather + grow + invert); temporal alignment via DTW-along-contour-arclength IN MVP; per-frame override semantics; multi-backend inference (local + shared_worker + cloud_api P1, all configurable); hard-GPU requirement (no CPU fallback); candidate pattern (no auto-apply); net-new alpha_source compositor plumbing (~2-3 days prereq); independent of M13; M14 = next up; revised estimate 3-4 weeks. Spike-first (2-day SAM2 quality validation) accepted."
   - date: 2026-04-23
     description: "M13 planned — Effect Curves + Macro Panel + Touch-Record. 12 tasks (45-56) spanning DB schema, effect registry (15 types across 6 P0 categories: Dynamics/EQ/Spatial/Time/Modulation/Distortion), audio graph + send buses + IR assets, curve scheduling, effect implementations (split by category), HTTP endpoints, inline curve editor extraction, MacroPanel UI (grid+list, knobs), touch-record state machine, P2 copy-paste automation. Source: clarification-7 → design → spec (54 requirements, 29 named tests). ~2 weeks, ~70 dev hours."
   - date: 2026-04-23
@@ -721,13 +727,12 @@ recent_work:
     description: "M9 complete — Wan2.1 + FILM pipeline. wan.py, film.py, wan_pipeline.py, --engine wan/--preview flags, AI plan wan_denoise/transition_frames."
 
 next_steps:
-  - "Task 34: implement MSE playback (RenderWorker + PyAV fMP4 encoder + /preview-stream WS)"
-  - "Task 35: frontend <PreviewViewport> + MSE hook + scrub queue"
-  - "Task 36: delete WebGL BeatEffectPreview + frame-cache.ts"
-  - "Unassigned task-31: split api_server.py into per-domain modules (prereq for preview streaming)"
-  - "Unassigned task-37: unified WebSocket protocol (follow-up to M11 34/35 — replaces per-feature WS lifecycle with one socket + typed envelopes)"
+  - "M13: begin implementation — task-45 (DB schema migrations) + task-46 (effect registry) unblock everything downstream including chat-audio Phase 2b/2c"
+  - "M14 (AI Rotoscope Plugin): complete @acp.clarification-address on the remaining ~5% of clarification-8, then @acp.design-create --from-clar → @acp.spec --from-design → @acp.plan. 2-day SAM2 spike before locking the plan."
+  - "Chat-audio Phase 2a (shippable now, no blockers): update_volume_curve (inline column), analyze_audio_track / analyze_audio_clip (librosa — analyzer.py + audio_intelligence.py already do the work; need chat tool bindings), apply_mix_plan (batch wrapper). Unlocks auto-duck / auto-mix / auto-master flows."
+  - "Verify M11 task-35 (<PreviewViewport>) + task-36 (WebGL removal) actual state — session notes suggest task-35 was completed but progress.yaml still lists not_started. If done, mark completed; if task-36 landed alongside M12, close out M11."
+  - "Unassigned task-37: unified WebSocket protocol (replaces per-feature WS lifecycle with one socket + typed envelopes)"
   - "Unassigned task-38: range-based preview frame cache invalidation + client-side bitmap cache (depends on 37 for push)"
-  - "M12: NLE-style preview rendering — proxies + fragment cache + background render + render-state bar (depends on 37, 38)"
 
 notes:
   - "M1-M3, M5-M12 tracked (38/40 tasks if M11+M12 complete)"
