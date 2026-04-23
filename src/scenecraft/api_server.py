@@ -419,6 +419,43 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     t["clips"] = get_audio_clips(project_dir, t["id"])
                 return self._json_response({"audioTracks": tracks})
 
+            # GET /api/projects/:name/track-effects?track_id=X — list effects
+            # on an audio track (with their curves inlined) so the Macro Panel
+            # can render per-effect knob groups in one round-trip.
+            m = re.match(r"^/api/projects/([^/]+)/track-effects$", path)
+            if m:
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None:
+                    return
+                from urllib.parse import parse_qs
+                qs = parse_qs(parsed.query)
+                track_id = (qs.get("track_id") or qs.get("trackId") or [None])[0]
+                if not track_id:
+                    return self._error(400, "BAD_REQUEST",
+                                       "Missing 'track_id' query param")
+                from scenecraft.db import list_track_effects, list_curves_for_effect
+                effects = list_track_effects(project_dir, track_id)
+                payload = []
+                for eff in effects:
+                    d = self._m13_effect_as_json(eff)
+                    d["curves"] = [
+                        self._m13_curve_as_json(c)
+                        for c in list_curves_for_effect(project_dir, eff.id)
+                    ]
+                    payload.append(d)
+                return self._json_response({"effects": payload})
+
+            # GET /api/projects/:name/send-buses — list every send bus (reverb/
+            # delay/echo) on this project, ordered by order_index.
+            m = re.match(r"^/api/projects/([^/]+)/send-buses$", path)
+            if m:
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None:
+                    return
+                from scenecraft.db import list_send_buses
+                buses = [self._m13_bus_as_json(b) for b in list_send_buses(project_dir)]
+                return self._json_response({"buses": buses})
+
             # GET /api/projects/:name/audio-clips
             m = re.match(r"^/api/projects/([^/]+)/audio-clips$", path)
             if m:
