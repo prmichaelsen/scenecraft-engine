@@ -4,7 +4,7 @@
 **Spec**: [local.effect-curves-macro-panel](../../specs/local.effect-curves-macro-panel.md) — R51, R52 + every HTTP endpoint in §Interfaces / Data Shapes
 **Estimated Time**: 4 hours
 **Dependencies**: T45 (schema + DB helpers)
-**Status**: Not Started
+**Status**: Backend Complete (frontend client in task-52b)
 **Repository**: `scenecraft-engine` (backend) + `scenecraft` (frontend client)
 
 ---
