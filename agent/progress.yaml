@@ -548,11 +548,146 @@ milestones:
         dependencies:
           - task-39
 
+  - id: M13
+    title: Effect Curves + Macro Panel + Touch-Record
+    file: agent/milestones/milestone-13-effect-curves-macro-panel.md
+    status: not_started
+    started: null
+    completed: null
+    estimated_weeks: 2
+    tasks_total: 12
+    tasks_completed: 0
+    tasks:
+      - id: task-45
+        title: DB schema + migration for effect curves tables
+        file: agent/tasks/milestone-13-effect-curves-macro-panel/task-45-db-schema-migrations.md
+        status: not_started
+        estimated_hours: 2
+        started: null
+        completed_date: null
+        actual_hours: null
+        dependencies: []
+      - id: task-46
+        title: Effect type registry + param metadata + frequency labels
+        file: agent/tasks/milestone-13-effect-curves-macro-panel/task-46-effect-type-registry.md
+        status: not_started
+        estimated_hours: 3
+        started: null
+        completed_date: null
+        actual_hours: null
+        dependencies: []
+      - id: task-47
+        title: Audio graph runtime + send buses + IR assets
+        file: agent/tasks/milestone-13-effect-curves-macro-panel/task-47-audio-graph-buses-ir.md
+        status: not_started
+        estimated_hours: 6
+        started: null
+        completed_date: null
+        actual_hours: null
+        dependencies:
+          - task-45
+          - task-46
+      - id: task-48
+        title: Curve → AudioParam scheduling engine
+        file: agent/tasks/milestone-13-effect-curves-macro-panel/task-48-curve-scheduling.md
+        status: not_started
+        estimated_hours: 4
+        started: null
+        completed_date: null
+        actual_hours: null
+        dependencies:
+          - task-47
+      - id: task-49
+        title: Dynamics + EQ effect implementations
+        file: agent/tasks/milestone-13-effect-curves-macro-panel/task-49-effects-dynamics-eq.md
+        status: not_started
+        estimated_hours: 4
+        started: null
+        completed_date: null
+        actual_hours: null
+        dependencies:
+          - task-46
+          - task-47
+      - id: task-50
+        title: Spatial + send effect implementations
+        file: agent/tasks/milestone-13-effect-curves-macro-panel/task-50-effects-spatial-send.md
+        status: not_started
+        estimated_hours: 4
+        started: null
+        completed_date: null
+        actual_hours: null
+        dependencies:
+          - task-46
+          - task-47
+      - id: task-51
+        title: Modulation + distortion effect implementations
+        file: agent/tasks/milestone-13-effect-curves-macro-panel/task-51-effects-modulation-drive.md
+        status: not_started
+        estimated_hours: 6
+        started: null
+        completed_date: null
+        actual_hours: null
+        dependencies:
+          - task-46
+          - task-47
+      - id: task-52
+        title: HTTP endpoints for effect curves + cache invalidation
+        file: agent/tasks/milestone-13-effect-curves-macro-panel/task-52-http-endpoints.md
+        status: not_started
+        estimated_hours: 4
+        started: null
+        completed_date: null
+        actual_hours: null
+        dependencies:
+          - task-45
+      - id: task-53
+        title: Extract InlineCurveEditor + audio inline curves
+        file: agent/tasks/milestone-13-effect-curves-macro-panel/task-53-inline-curve-editor.md
+        status: not_started
+        estimated_hours: 8
+        started: null
+        completed_date: null
+        actual_hours: null
+        dependencies: []
+      - id: task-54
+        title: MacroPanel component — grid + list, knobs, arm/enable/visible
+        file: agent/tasks/milestone-13-effect-curves-macro-panel/task-54-macro-panel.md
+        status: not_started
+        estimated_hours: 10
+        started: null
+        completed_date: null
+        actual_hours: null
+        dependencies:
+          - task-46
+          - task-53
+      - id: task-55
+        title: Touch-record state machine + sampling + bezier-fit
+        file: agent/tasks/milestone-13-effect-curves-macro-panel/task-55-touch-record.md
+        status: not_started
+        estimated_hours: 6
+        started: null
+        completed_date: null
+        actual_hours: null
+        dependencies:
+          - task-48
+          - task-54
+      - id: task-56
+        title: Multi-select + trackDelta copy-paste of automation keyframes (P2)
+        file: agent/tasks/milestone-13-effect-curves-macro-panel/task-56-copy-paste-automation.md
+        status: not_started
+        estimated_hours: 4
+        started: null
+        completed_date: null
+        actual_hours: null
+        dependencies:
+          - task-53
+          - task-54
+
 documentation:
-  design_documents: 6
-  milestone_documents: 12
+  design_documents: 7
+  milestone_documents: 13
   pattern_documents: 0
-  task_documents: 43
+  task_documents: 55
 
 progress:
   planning: 100
@@ -560,6 +695,8 @@ progress:
   overall: 82
 
 recent_work:
+  - date: 2026-04-23
+    description: "M13 planned — Effect Curves + Macro Panel + Touch-Record. 12 tasks (45-56) spanning DB schema, effect registry (15 types across 6 P0 categories: Dynamics/EQ/Spatial/Time/Modulation/Distortion), audio graph + send buses + IR assets, curve scheduling, effect implementations (split by category), HTTP endpoints, inline curve editor extraction, MacroPanel UI (grid+list, knobs), touch-record state machine, P2 copy-paste automation. Source: clarification-7 → design → spec (54 requirements, 29 named tests). ~2 weeks, ~70 dev hours."
   - date: 2026-04-23
     description: "M12 COMPLETE — NLE-style preview rendering pipeline shipped. 6/6 tasks done (39 proxies, 40 fragment cache, 41 background renderer, 42 render-state tracking, 43 Timeline state-bar UI, 44 chunked proxies). Preview model shifted from 'render realtime from source' to 'proxies + background cache + render-state bar'. Stutter eliminated at 1080p."
   - date: 2026-04-22
@@ -597,6 +734,7 @@ notes:
   - "M4 (Resolve integration) deferred"
   - "M11 task IDs 32-36 (30/31/37/38 are unassigned one-offs in agent/tasks/unassigned/)"
   - "M12 task IDs 39-44; 37 (unified WS) is a prereq for task-43's live UI push; task-44 (chunked proxies) extends task-39"
+  - "M13 task IDs 45-56 (12 tasks); source: clarification-7 → design/local.effect-curves-macro-panel.md → specs/local.effect-curves-macro-panel.md (54 requirements, 29 tests)"
   - "Wan2.1 requires 24GB+ VRAM (cloud GPU)"
   - "FILM runs between ALL clip boundaries (intra-section smoothing + inter-section style morphing)"
   - "FILM falls back to ffmpeg minterpolate if torch not available"
