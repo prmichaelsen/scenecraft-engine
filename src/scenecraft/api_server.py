@@ -2231,6 +2231,43 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             if m:
                 return self._handle_section_settings(m.group(1))
 
+            # ── M13 task-52: effect-curves + macro-panel HTTP endpoints ─────
+            # Spec local.effect-curves-macro-panel.md §Interfaces, R_V1.
+            # 11 endpoints (5 POST-create, 4 POST-update, delete is handled in do_DELETE).
+            # See self._handle_m13_* methods for implementations.
+
+            m = re.match(r"^/api/projects/([^/]+)/track-effects$", path)
+            if m:
+                return self._handle_m13_track_effect_create(m.group(1))
+
+            m = re.match(r"^/api/projects/([^/]+)/track-effects/([^/]+)$", path)
+            if m:
+                return self._handle_m13_track_effect_update(m.group(1), m.group(2))
+
+            m = re.match(r"^/api/projects/([^/]+)/effect-curves$", path)
+            if m:
+                return self._handle_m13_effect_curve_create(m.group(1))
+
+            m = re.match(r"^/api/projects/([^/]+)/effect-curves/([^/]+)$", path)
+            if m:
+                return self._handle_m13_effect_curve_update(m.group(1), m.group(2))
+
+            m = re.match(r"^/api/projects/([^/]+)/send-buses$", path)
+            if m:
+                return self._handle_m13_send_bus_create(m.group(1))
+
+            m = re.match(r"^/api/projects/([^/]+)/send-buses/([^/]+)$", path)
+            if m:
+                return self._handle_m13_send_bus_update(m.group(1), m.group(2))
+
+            m = re.match(r"^/api/projects/([^/]+)/track-sends$", path)
+            if m:
+                return self._handle_m13_track_send_upsert(m.group(1))
+
+            m = re.match(r"^/api/projects/([^/]+)/frequency-labels$", path)
+            if m:
+                return self._handle_m13_frequency_label_create(m.group(1))
+
             # Plugin-registered POST routes (fallback — after all built-in routes).
             m = re.match(r"^/api/projects/([^/]+)/plugins/[^/]+/", path)
             if m:
@@ -2278,6 +2315,34 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             self.send_response(204)
             self._cors_headers()
             self.end_headers()
+
+        def do_DELETE(self):
+            if not self._authenticate():
+                return
+            parsed = urlparse(self.path)
+            path = unquote(parsed.path)
+
+            # ── M13 task-52: idempotent deletes (spec R_V1) ──────────
+            # DELETE on a non-existent id MUST return 200 empty body, not
+            # 404 — see spec test `delete-nonexistent-effect-idempotent`.
+
+            m = re.match(r"^/api/projects/([^/]+)/track-effects/([^/]+)$", path)
+            if m:
+                return self._handle_m13_track_effect_delete(m.group(1), m.group(2))
+
+            m = re.match(r"^/api/projects/([^/]+)/effect-curves/([^/]+)$", path)
+            if m:
+                return self._handle_m13_effect_curve_delete(m.group(1), m.group(2))
+
+            m = re.match(r"^/api/projects/([^/]+)/send-buses/([^/]+)$", path)
+            if m:
+                return self._handle_m13_send_bus_delete(m.group(1), m.group(2))
+
+            m = re.match(r"^/api/projects/([^/]+)/frequency-labels/([^/]+)$", path)
+            if m:
+                return self._handle_m13_frequency_label_delete(m.group(1), m.group(2))
+
+            self._error(404, "NOT_FOUND", f"No route: DELETE {path}")
 
         # ── Handlers ─────────────────────────────────────────────
 
@@ -9165,6 +9230,665 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             except Exception as e:
                 _log(f"  suggest-keyframe-prompts error: {e}")
                 self._error(500, "INTERNAL_ERROR", str(e))
+
+        # ── M13 task-52: effect-curves + macro-panel handlers ────────────
+        # Spec local.effect-curves-macro-panel.md R_V1 + §Interfaces.
+        # All 13 endpoints (9 POST, 4 DELETE) delegate to scenecraft.db helpers
+        # and call invalidate_frames_for_mutation after each successful write.
+        # Mixer events (`mixer.chain-rebuilt`) are broadcast via ws_server.job_manager.
+
+        def _m13_invalidate_track_range(self, project_dir: Path, track_id: str):
+            """Invalidate preview caches across the full time-range of all
+            clips on a track. Used by track-effect + track-send mutations per
+            the spec's cache-invalidation table. Never raises."""
+            try:
+                from scenecraft.db import get_audio_clips
+                from scenecraft.render.cache_invalidation import invalidate_frames_for_mutation
+                clips = get_audio_clips(project_dir, track_id=track_id)
+                if not clips:
+                    return
+                t_start = min(float(c.get("start_time") or c.get("startTime") or 0) for c in clips)
+                t_end = max(float(c.get("end_time") or c.get("endTime") or 0) for c in clips)
+                if t_end > t_start:
+                    invalidate_frames_for_mutation(project_dir, [(t_start, t_end)])
+            except Exception as e:
+                _log(f"  m13-invalidate-track warning: {e}")
+
+        def _m13_invalidate_curve_range(self, project_dir: Path, points: list):
+            """Invalidate [min_point_time, max_point_time] (+ 0.5s margin)."""
+            try:
+                from scenecraft.render.cache_invalidation import invalidate_frames_for_mutation
+                if not points:
+                    return
+                times = []
+                for p in points:
+                    if isinstance(p, (list, tuple)) and len(p) >= 1:
+                        try:
+                            times.append(float(p[0]))
+                        except (TypeError, ValueError):
+                            continue
+                if not times:
+                    return
+                t_start = max(0.0, min(times) - 0.5)
+                t_end = max(times) + 0.5
+                invalidate_frames_for_mutation(project_dir, [(t_start, t_end)])
+            except Exception as e:
+                _log(f"  m13-invalidate-curve warning: {e}")
+
+        def _m13_invalidate_project_wide(self, project_dir: Path):
+            """Wholesale project invalidation — for bus mutations (affect every
+            track that has a send to the bus)."""
+            try:
+                from scenecraft.render.cache_invalidation import invalidate_frames_for_mutation
+                invalidate_frames_for_mutation(project_dir, None)
+            except Exception as e:
+                _log(f"  m13-invalidate-project warning: {e}")
+
+        def _m13_broadcast_chain_rebuilt(self, track_id: str):
+            """Emit the `mixer.chain-rebuilt` event via WebSocket broadcast.
+            Spec §Behavior: fires exactly once per track-effect add/remove/
+            reorder/enable-toggle. Swallows broadcast errors (dev may have no
+            WS server running)."""
+            try:
+                from scenecraft.ws_server import job_manager
+                job_manager._broadcast({
+                    "type": "mixer.chain-rebuilt",
+                    "track_id": track_id,
+                })
+            except Exception:
+                pass
+
+        def _m13_effect_as_json(self, eff) -> dict:
+            return {
+                "id": eff.id,
+                "track_id": eff.track_id,
+                "effect_type": eff.effect_type,
+                "order_index": eff.order_index,
+                "enabled": bool(eff.enabled),
+                "static_params": eff.static_params,
+                "created_at": eff.created_at,
+            }
+
+        def _m13_curve_as_json(self, curve) -> dict:
+            return {
+                "id": curve.id,
+                "effect_id": curve.effect_id,
+                "param_name": curve.param_name,
+                "points": curve.points,
+                "interpolation": curve.interpolation,
+                "visible": bool(curve.visible),
+            }
+
+        def _m13_bus_as_json(self, bus) -> dict:
+            return {
+                "id": bus.id,
+                "bus_type": bus.bus_type,
+                "label": bus.label,
+                "order_index": bus.order_index,
+                "static_params": bus.static_params,
+            }
+
+        def _m13_send_as_json(self, send) -> dict:
+            return {
+                "track_id": send.track_id,
+                "bus_id": send.bus_id,
+                "level": send.level,
+            }
+
+        def _m13_label_as_json(self, lbl) -> dict:
+            return {
+                "id": lbl.id,
+                "label": lbl.label,
+                "freq_min_hz": lbl.freq_min_hz,
+                "freq_max_hz": lbl.freq_max_hz,
+            }
+
+        def _m13_clamp_points(
+            self, points: list, effect_id: str, param_name: str,
+        ) -> list:
+            """Clamp all point values to [0, 1] (R6/R17). Clamping is NOT an
+            error — return the fixed list + log a warning per spec test
+            `curve-point-values-out-of-range-clamped`."""
+            if not isinstance(points, list):
+                return []
+            clamped = []
+            any_clamped = False
+            for p in points:
+                if not isinstance(p, (list, tuple)) or len(p) < 2:
+                    continue
+                try:
+                    t = float(p[0])
+                    v = float(p[1])
+                except (TypeError, ValueError):
+                    continue
+                if v < 0.0:
+                    v = 0.0
+                    any_clamped = True
+                elif v > 1.0:
+                    v = 1.0
+                    any_clamped = True
+                clamped.append([t, v])
+            if any_clamped:
+                _log(
+                    f"  effect-curves: clamped out-of-range points to [0,1] "
+                    f"for effect_id={effect_id} param_name={param_name}",
+                    level="warning",
+                )
+            return clamped
+
+        # ---- POST /track-effects ----------------------------------------
+
+        def _handle_m13_track_effect_create(self, project_name: str):
+            body = self._read_json_body()
+            if body is None:
+                return
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+            track_id = body.get("track_id") or body.get("trackId")
+            effect_type = body.get("effect_type") or body.get("effectType")
+            static_params = body.get("static_params") or body.get("staticParams") or {}
+            order_index = body.get("order_index", body.get("orderIndex"))
+
+            if not track_id:
+                return self._error(400, "BAD_REQUEST", "Missing 'track_id'")
+            if not effect_type:
+                return self._error(400, "BAD_REQUEST", "Missing 'effect_type'")
+
+            from scenecraft.audio_effect_registry import (
+                is_valid_effect_type, SEND_SYNTHETIC_EFFECT_TYPE,
+            )
+            # R8a: reject synthetic __send — it's only valid on effect_curves.
+            if effect_type == SEND_SYNTHETIC_EFFECT_TYPE:
+                return self._error(
+                    400, "BAD_REQUEST",
+                    f"'{SEND_SYNTHETIC_EFFECT_TYPE}' is reserved for effect_curves "
+                    f"(per-bus send animation) — not instantiable as a track effect",
+                )
+            # R_V1: reject unknown effect types.
+            if not is_valid_effect_type(effect_type):
+                return self._error(
+                    400, "BAD_REQUEST",
+                    f"Unknown effect_type: '{effect_type}'",
+                )
+
+            from scenecraft.db import add_track_effect, get_audio_tracks
+            # Reference-integrity check on track_id.
+            tracks = {t["id"] for t in get_audio_tracks(project_dir)}
+            if track_id not in tracks:
+                return self._error(404, "NOT_FOUND", f"Audio track not found: {track_id}")
+
+            try:
+                eff = add_track_effect(
+                    project_dir,
+                    track_id=track_id,
+                    effect_type=effect_type,
+                    static_params=static_params,
+                    order_index=order_index,
+                )
+            except Exception as e:
+                return self._error(500, "INTERNAL_ERROR", str(e))
+
+            _log(f"track-effects/create: {project_name} track={track_id} type={effect_type} id={eff.id}")
+            self._m13_invalidate_track_range(project_dir, track_id)
+            self._m13_broadcast_chain_rebuilt(track_id)
+            return self._json_response(self._m13_effect_as_json(eff))
+
+        # ---- POST /track-effects/:id ------------------------------------
+
+        def _handle_m13_track_effect_update(self, project_name: str, effect_id: str):
+            body = self._read_json_body()
+            if body is None:
+                return
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+
+            from scenecraft.db import (
+                get_db, get_track_effect, update_track_effect,
+            )
+            existing = get_track_effect(project_dir, effect_id)
+            if existing is None:
+                return self._error(404, "NOT_FOUND", f"Effect not found: {effect_id}")
+
+            fields: dict = {}
+            if "order_index" in body or "orderIndex" in body:
+                fields["order_index"] = int(body.get("order_index", body.get("orderIndex")))
+            if "enabled" in body:
+                fields["enabled"] = bool(body["enabled"])
+            if "static_params" in body or "staticParams" in body:
+                fields["static_params"] = body.get("static_params", body.get("staticParams"))
+
+            # R_V1 + R14: order_index collision → atomic swap in ONE txn.
+            if "order_index" in fields:
+                new_idx = fields["order_index"]
+                conn = get_db(project_dir)
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    # Get siblings on the same track, excluding self.
+                    siblings = conn.execute(
+                        "SELECT id, order_index FROM track_effects "
+                        "WHERE track_id = ? AND id != ? ORDER BY order_index",
+                        (existing.track_id, effect_id),
+                    ).fetchall()
+                    # Build a target layout: insert self at new_idx, shift others.
+                    ordered_siblings = [dict(r) for r in siblings]
+                    # Rebuild the final ordering: siblings sorted by their
+                    # current order_index, then self inserted at new_idx.
+                    # Final list of (id, order_index) tuples with unique indices.
+                    final_sequence: list[str] = []
+                    insert_pos = max(0, min(new_idx, len(ordered_siblings)))
+                    for i, s in enumerate(ordered_siblings):
+                        if i == insert_pos:
+                            final_sequence.append(effect_id)
+                        final_sequence.append(s["id"])
+                    if insert_pos >= len(ordered_siblings):
+                        final_sequence.append(effect_id)
+                    # Two-phase update to avoid intermediate UNIQUE collisions
+                    # if there's ever a (track_id, order_index) index added —
+                    # there isn't today, but SQLite is happy either way.
+                    # Phase 1: shift everyone to negative range.
+                    for i, eid in enumerate(final_sequence):
+                        conn.execute(
+                            "UPDATE track_effects SET order_index = ? WHERE id = ?",
+                            (-(i + 1), eid),
+                        )
+                    # Phase 2: assign final positive positions.
+                    for i, eid in enumerate(final_sequence):
+                        conn.execute(
+                            "UPDATE track_effects SET order_index = ? WHERE id = ?",
+                            (i, eid),
+                        )
+                    # Apply remaining non-order_index fields to this effect.
+                    remaining = {k: v for k, v in fields.items() if k != "order_index"}
+                    if remaining:
+                        sets: list[str] = []
+                        values: list = []
+                        for key, val in remaining.items():
+                            if key == "enabled":
+                                val = 1 if val else 0
+                            elif key == "static_params" and not isinstance(val, str):
+                                val = json.dumps(val)
+                            sets.append(f"{key} = ?")
+                            values.append(val)
+                        values.append(effect_id)
+                        conn.execute(
+                            f"UPDATE track_effects SET {', '.join(sets)} WHERE id = ?",
+                            values,
+                        )
+                    conn.commit()
+                except Exception as e:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    return self._error(500, "INTERNAL_ERROR", f"order-index swap failed: {e}")
+            elif fields:
+                try:
+                    update_track_effect(project_dir, effect_id, **fields)
+                except Exception as e:
+                    return self._error(500, "INTERNAL_ERROR", str(e))
+
+            updated = get_track_effect(project_dir, effect_id)
+            assert updated is not None
+            _log(f"track-effects/update: {project_name} id={effect_id} fields={list(fields.keys())}")
+            self._m13_invalidate_track_range(project_dir, updated.track_id)
+            # Fire chain-rebuilt EXACTLY ONCE per request (per spec test
+            # `order-index-collision-resolved-atomically`).
+            self._m13_broadcast_chain_rebuilt(updated.track_id)
+            return self._json_response(self._m13_effect_as_json(updated))
+
+        # ---- DELETE /track-effects/:id ----------------------------------
+
+        def _handle_m13_track_effect_delete(self, project_name: str, effect_id: str):
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+            from scenecraft.db import get_track_effect, delete_track_effect
+            existing = get_track_effect(project_dir, effect_id)
+            # R_V1: DELETE on non-existent id is idempotent (200 empty body).
+            if existing is None:
+                _log(f"track-effects/delete: {project_name} id={effect_id} (not found — idempotent)")
+                return self._json_response({})
+
+            track_id = existing.track_id
+            try:
+                delete_track_effect(project_dir, effect_id)
+            except Exception as e:
+                return self._error(500, "INTERNAL_ERROR", str(e))
+            _log(f"track-effects/delete: {project_name} id={effect_id}")
+            self._m13_invalidate_track_range(project_dir, track_id)
+            self._m13_broadcast_chain_rebuilt(track_id)
+            return self._json_response({})
+
+        # ---- POST /effect-curves ----------------------------------------
+
+        def _handle_m13_effect_curve_create(self, project_name: str):
+            body = self._read_json_body()
+            if body is None:
+                return
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+            effect_id = body.get("effect_id") or body.get("effectId")
+            param_name = body.get("param_name") or body.get("paramName")
+            points = body.get("points") or []
+            interpolation = body.get("interpolation", "bezier")
+            visible = bool(body.get("visible", False))
+
+            if not effect_id:
+                return self._error(400, "BAD_REQUEST", "Missing 'effect_id'")
+            if not param_name:
+                return self._error(400, "BAD_REQUEST", "Missing 'param_name'")
+            if interpolation not in ("bezier", "linear", "step"):
+                return self._error(
+                    400, "BAD_REQUEST",
+                    f"Invalid interpolation '{interpolation}' (expected bezier|linear|step)",
+                )
+
+            from scenecraft.db import get_track_effect, upsert_effect_curve
+            from scenecraft.audio_effect_registry import (
+                is_param_animatable, SEND_SYNTHETIC_EFFECT_TYPE,
+            )
+
+            eff = get_track_effect(project_dir, effect_id)
+            # R_V1: non-existent effect_id → 404.
+            if eff is None:
+                return self._error(404, "NOT_FOUND", f"Effect not found: {effect_id}")
+
+            # R9 strengthened: reject non-animatable params.
+            # (SEND_SYNTHETIC_EFFECT_TYPE is never stored in track_effects —
+            # R8a — so send curves take a different plugin-layer path that
+            # isn't POST /effect-curves. This endpoint rejects static params
+            # on real effects.)
+            animatable = is_param_animatable(eff.effect_type, param_name)
+            if animatable is None:
+                return self._error(
+                    400, "BAD_REQUEST",
+                    f"Unknown param '{param_name}' for effect_type '{eff.effect_type}'",
+                )
+            if not animatable:
+                return self._error(
+                    400, "BAD_REQUEST",
+                    f"Param '{param_name}' on '{eff.effect_type}' is static — not animatable",
+                )
+
+            # R6/R17: clamp out-of-range points to [0, 1] with a warning.
+            clamped_points = self._m13_clamp_points(points, effect_id, param_name)
+
+            try:
+                curve = upsert_effect_curve(
+                    project_dir,
+                    effect_id=effect_id,
+                    param_name=param_name,
+                    points=clamped_points,
+                    interpolation=interpolation,
+                    visible=visible,
+                )
+            except Exception as e:
+                return self._error(500, "INTERNAL_ERROR", str(e))
+
+            _log(f"effect-curves/create: {project_name} effect={effect_id} param={param_name} "
+                 f"points={len(clamped_points)}")
+            self._m13_invalidate_curve_range(project_dir, clamped_points)
+            return self._json_response(self._m13_curve_as_json(curve))
+
+        # ---- POST /effect-curves/:id ------------------------------------
+
+        def _handle_m13_effect_curve_update(self, project_name: str, curve_id: str):
+            body = self._read_json_body()
+            if body is None:
+                return
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+
+            from scenecraft.db import (
+                get_effect_curve, update_effect_curve,
+            )
+            existing = get_effect_curve(project_dir, curve_id)
+            if existing is None:
+                return self._error(404, "NOT_FOUND", f"Curve not found: {curve_id}")
+
+            fields: dict = {}
+            if "points" in body:
+                clamped = self._m13_clamp_points(
+                    body["points"], existing.effect_id, existing.param_name,
+                )
+                fields["points"] = clamped
+            if "interpolation" in body:
+                interp = body["interpolation"]
+                if interp not in ("bezier", "linear", "step"):
+                    return self._error(
+                        400, "BAD_REQUEST",
+                        f"Invalid interpolation '{interp}' (expected bezier|linear|step)",
+                    )
+                fields["interpolation"] = interp
+            if "visible" in body:
+                fields["visible"] = bool(body["visible"])
+
+            if fields:
+                try:
+                    update_effect_curve(project_dir, curve_id, **fields)
+                except Exception as e:
+                    return self._error(500, "INTERNAL_ERROR", str(e))
+
+            updated = get_effect_curve(project_dir, curve_id)
+            assert updated is not None
+            _log(f"effect-curves/update: {project_name} id={curve_id} fields={list(fields.keys())}")
+            self._m13_invalidate_curve_range(project_dir, updated.points)
+            return self._json_response(self._m13_curve_as_json(updated))
+
+        # ---- DELETE /effect-curves/:id ----------------------------------
+
+        def _handle_m13_effect_curve_delete(self, project_name: str, curve_id: str):
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+            from scenecraft.db import get_effect_curve, delete_effect_curve
+            existing = get_effect_curve(project_dir, curve_id)
+            if existing is None:
+                _log(f"effect-curves/delete: {project_name} id={curve_id} (not found — idempotent)")
+                return self._json_response({})
+            old_points = existing.points
+            try:
+                delete_effect_curve(project_dir, curve_id)
+            except Exception as e:
+                return self._error(500, "INTERNAL_ERROR", str(e))
+            _log(f"effect-curves/delete: {project_name} id={curve_id}")
+            self._m13_invalidate_curve_range(project_dir, old_points)
+            return self._json_response({})
+
+        # ---- POST /send-buses -------------------------------------------
+
+        def _handle_m13_send_bus_create(self, project_name: str):
+            body = self._read_json_body()
+            if body is None:
+                return
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+            bus_type = body.get("bus_type") or body.get("busType")
+            label = body.get("label")
+            static_params = body.get("static_params") or body.get("staticParams") or {}
+            order_index = body.get("order_index", body.get("orderIndex"))
+
+            if bus_type not in ("reverb", "delay", "echo"):
+                return self._error(
+                    400, "BAD_REQUEST",
+                    f"Invalid bus_type '{bus_type}' (expected reverb|delay|echo)",
+                )
+            if not label:
+                return self._error(400, "BAD_REQUEST", "Missing 'label'")
+
+            from scenecraft.db import add_send_bus
+            try:
+                bus = add_send_bus(
+                    project_dir,
+                    bus_type=bus_type,
+                    label=label,
+                    static_params=static_params,
+                    order_index=order_index,
+                )
+            except Exception as e:
+                return self._error(500, "INTERNAL_ERROR", str(e))
+            _log(f"send-buses/create: {project_name} type={bus_type} label={label} id={bus.id}")
+            self._m13_invalidate_project_wide(project_dir)
+            return self._json_response(self._m13_bus_as_json(bus))
+
+        # ---- POST /send-buses/:id ---------------------------------------
+
+        def _handle_m13_send_bus_update(self, project_name: str, bus_id: str):
+            body = self._read_json_body()
+            if body is None:
+                return
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+
+            from scenecraft.db import get_send_bus, update_send_bus
+            existing = get_send_bus(project_dir, bus_id)
+            if existing is None:
+                return self._error(404, "NOT_FOUND", f"Bus not found: {bus_id}")
+
+            fields: dict = {}
+            if "label" in body:
+                fields["label"] = str(body["label"])
+            if "order_index" in body or "orderIndex" in body:
+                fields["order_index"] = int(body.get("order_index", body.get("orderIndex")))
+            if "static_params" in body or "staticParams" in body:
+                fields["static_params"] = body.get("static_params", body.get("staticParams"))
+
+            if fields:
+                try:
+                    update_send_bus(project_dir, bus_id, **fields)
+                except Exception as e:
+                    return self._error(500, "INTERNAL_ERROR", str(e))
+
+            updated = get_send_bus(project_dir, bus_id)
+            assert updated is not None
+            _log(f"send-buses/update: {project_name} id={bus_id} fields={list(fields.keys())}")
+            self._m13_invalidate_project_wide(project_dir)
+            return self._json_response(self._m13_bus_as_json(updated))
+
+        # ---- DELETE /send-buses/:id -------------------------------------
+
+        def _handle_m13_send_bus_delete(self, project_name: str, bus_id: str):
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+            from scenecraft.db import get_send_bus, delete_send_bus
+            existing = get_send_bus(project_dir, bus_id)
+            if existing is None:
+                _log(f"send-buses/delete: {project_name} id={bus_id} (not found — idempotent)")
+                return self._json_response({})
+            try:
+                delete_send_bus(project_dir, bus_id)
+            except Exception as e:
+                return self._error(500, "INTERNAL_ERROR", str(e))
+            _log(f"send-buses/delete: {project_name} id={bus_id}")
+            self._m13_invalidate_project_wide(project_dir)
+            return self._json_response({})
+
+        # ---- POST /track-sends (upsert) ---------------------------------
+
+        def _handle_m13_track_send_upsert(self, project_name: str):
+            body = self._read_json_body()
+            if body is None:
+                return
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+            track_id = body.get("track_id") or body.get("trackId")
+            bus_id = body.get("bus_id") or body.get("busId")
+            level = body.get("level")
+
+            if not track_id:
+                return self._error(400, "BAD_REQUEST", "Missing 'track_id'")
+            if not bus_id:
+                return self._error(400, "BAD_REQUEST", "Missing 'bus_id'")
+            if level is None:
+                return self._error(400, "BAD_REQUEST", "Missing 'level'")
+            try:
+                level = float(level)
+            except (TypeError, ValueError):
+                return self._error(400, "BAD_REQUEST", "Invalid 'level' — must be a number")
+
+            from scenecraft.db import get_audio_tracks, get_send_bus, upsert_track_send
+
+            tracks = {t["id"] for t in get_audio_tracks(project_dir)}
+            if track_id not in tracks:
+                return self._error(404, "NOT_FOUND", f"Audio track not found: {track_id}")
+            if get_send_bus(project_dir, bus_id) is None:
+                return self._error(404, "NOT_FOUND", f"Send bus not found: {bus_id}")
+
+            try:
+                send = upsert_track_send(
+                    project_dir, track_id=track_id, bus_id=bus_id, level=level,
+                )
+            except Exception as e:
+                return self._error(500, "INTERNAL_ERROR", str(e))
+            _log(f"track-sends/upsert: {project_name} track={track_id} bus={bus_id} level={level}")
+            self._m13_invalidate_track_range(project_dir, track_id)
+            return self._json_response(self._m13_send_as_json(send))
+
+        # ---- POST /frequency-labels -------------------------------------
+
+        def _handle_m13_frequency_label_create(self, project_name: str):
+            body = self._read_json_body()
+            if body is None:
+                return
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+            label = body.get("label")
+            freq_min_hz = body.get("freq_min_hz", body.get("freqMinHz"))
+            freq_max_hz = body.get("freq_max_hz", body.get("freqMaxHz"))
+
+            if not label:
+                return self._error(400, "BAD_REQUEST", "Missing 'label'")
+            if freq_min_hz is None or freq_max_hz is None:
+                return self._error(400, "BAD_REQUEST", "Missing 'freq_min_hz' / 'freq_max_hz'")
+            try:
+                freq_min_hz = float(freq_min_hz)
+                freq_max_hz = float(freq_max_hz)
+            except (TypeError, ValueError):
+                return self._error(400, "BAD_REQUEST", "freq_* must be numbers")
+            if freq_min_hz < 0 or freq_max_hz < 0 or freq_max_hz < freq_min_hz:
+                return self._error(
+                    400, "BAD_REQUEST",
+                    "freq_max_hz must be >= freq_min_hz >= 0",
+                )
+
+            from scenecraft.db import add_frequency_label
+            try:
+                lbl = add_frequency_label(
+                    project_dir, label=label,
+                    freq_min_hz=freq_min_hz, freq_max_hz=freq_max_hz,
+                )
+            except Exception as e:
+                return self._error(500, "INTERNAL_ERROR", str(e))
+            _log(f"frequency-labels/create: {project_name} label={label!r} range=[{freq_min_hz},{freq_max_hz}]")
+            # Labels are metadata — no cache invalidation (per task doc §3).
+            return self._json_response(self._m13_label_as_json(lbl))
+
+        # ---- DELETE /frequency-labels/:id -------------------------------
+
+        def _handle_m13_frequency_label_delete(self, project_name: str, label_id: str):
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+            from scenecraft.db import get_frequency_label, delete_frequency_label
+            existing = get_frequency_label(project_dir, label_id)
+            if existing is None:
+                _log(f"frequency-labels/delete: {project_name} id={label_id} (not found — idempotent)")
+                return self._json_response({})
+            try:
+                delete_frequency_label(project_dir, label_id)
+            except Exception as e:
+                return self._error(500, "INTERNAL_ERROR", str(e))
+            _log(f"frequency-labels/delete: {project_name} id={label_id}")
+            return self._json_response({})
 
         def log_message(self, format, *args):
             # Quiet default logging — we use _log() for important events
