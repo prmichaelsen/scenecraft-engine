@@ -407,6 +407,120 @@ Be EXHAUSTIVE with timestamps. More events = better visual sync. We will cross-r
     return response.text
 
 
+# ─── Phase 3: structured semantic description (for generate_descriptions) ───
+
+DESCRIBE_CHUNK_PROMPT_VERSIONS = {
+    # Keep older versions around so rewinding prompt_version works.
+    "v1": (
+        "You are a professional music producer analyzing an audio clip. "
+        "Listen to the provided audio chunk and return a STRICT JSON object "
+        "(no markdown, no commentary) with exactly these fields:\n"
+        "{\n"
+        '  "section_type": one of "intro" | "verse" | "chorus" | "bridge" | '
+        '"drop" | "outro" | "breakdown" | "build_up" | "instrumental" | '
+        '"silence" | "other",\n'
+        '  "mood": a short free-form adjective or phrase (e.g. "dark", '
+        '"uplifting", "aggressive", "reflective"),\n'
+        '  "energy": a float between 0.0 and 1.0 (0 = silence/ambient, '
+        '1 = maximum intensity),\n'
+        '  "vocal_style": one of "spoken" | "sung" | "rapped" | "harmonized" | '
+        'null (use null if the chunk is instrumental),\n'
+        '  "instrumentation": an array of short strings identifying prominent '
+        'instruments/voices (e.g. ["acoustic_guitar", "male_vocals", '
+        '"drum_kit"]),\n'
+        '  "notes": a short free-form string for anything else worth '
+        'mentioning (may be empty)\n'
+        "}\n"
+        "Return ONLY the JSON object — no code fences, no prose."
+    ),
+}
+
+
+def _gemini_describe_chunk_structured(
+    chunk_path: str,
+    start_time: float,
+    end_time: float,
+    *,
+    model: str = "gemini-2.5-pro",
+    prompt_version: str = "v1",
+) -> dict | None:
+    """Send ``chunk_path`` to Gemini and return a structured description dict.
+
+    Returns ``None`` on Gemini errors, JSON-parse failures, or if the API key
+    is unset. The caller treats ``None`` as a skipped chunk.
+
+    The returned dict is the raw JSON parsed from Gemini's response. Callers
+    should validate individual fields before persisting.
+    """
+    import os
+
+    prompt_body = DESCRIBE_CHUNK_PROMPT_VERSIONS.get(prompt_version)
+    if prompt_body is None:
+        _log(f"    unknown prompt_version: {prompt_version}")
+        return None
+
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        _log("    GOOGLE_API_KEY not set — skipping chunk")
+        return None
+
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as e:
+        _log(f"    google-genai not installed: {e}")
+        return None
+
+    try:
+        with open(chunk_path, "rb") as f:
+            audio_bytes = f.read()
+    except OSError as e:
+        _log(f"    failed to read chunk {chunk_path}: {e}")
+        return None
+
+    preamble = (
+        f"This is an audio chunk covering {start_time:.1f}s to {end_time:.1f}s "
+        f"of a longer track.\n\n"
+    )
+    prompt = preamble + prompt_body
+
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=model,
+            contents=[
+                types.Content(parts=[
+                    types.Part.from_bytes(data=audio_bytes, mime_type="audio/mpeg"),
+                    types.Part.from_text(text=prompt),
+                ]),
+            ],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+            ),
+        )
+    except Exception as e:
+        # Rate limits, timeouts, auth failures, etc. — all are chunk-skipped.
+        _log(f"    Gemini call failed ({type(e).__name__}): {e}")
+        return None
+
+    text = getattr(response, "text", None)
+    if not text:
+        _log("    Gemini returned empty response")
+        return None
+
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, TypeError) as e:
+        _log(f"    Gemini returned non-JSON output ({e}): {text[:200]!r}")
+        return None
+
+    if not isinstance(data, dict):
+        _log(f"    Gemini JSON is not an object: {type(data).__name__}")
+        return None
+
+    return data
+
+
 def extract_layer2(audio_path: str, chunk_duration: float = 30.0,
                     descriptions_md: str | None = None) -> list[dict]:
     """Run Layer 2 — Gemini audio listening OR load from cached descriptions.md.
