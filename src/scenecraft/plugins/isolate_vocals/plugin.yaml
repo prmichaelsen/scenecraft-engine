@@ -1,18 +1,26 @@
-name: isolate-vocals
+name: isolate_vocals
 version: 0.2.0
 displayName: "Isolate Vocals"
 description: "Separate a voice-over-noise audio source into vocal and background stems using DeepFilterNet3."
 publisher: scenecraft
 license: MIT
 
+# Convention:
+#   • Internal ids (operation id, activation events, context-menu refs) use
+#     dot notation — ``{plugin}.{member}`` — which is fine for non-Claude
+#     identifiers.
+#   • Chat tool names (surfaced across the Claude API boundary) use double
+#     underscore because Claude's tool-name regex forbids dots. So the chat
+#     tool for this plugin's one operation is ``isolate_vocals__run``.
+
 activationEvents:
-  - onCommand:isolate-vocals.run
+  - onCommand:isolate_vocals.run
   - onContextMenu:audio_clip
   - onContextMenu:transition
 
 contributes:
   operations:
-    - id: isolate-vocals.run
+    - id: isolate_vocals.run
       label: "Isolate vocals"
       entityTypes: [audio_clip, transition]
       handler: "backend:isolate_vocals.run"
@@ -24,13 +32,13 @@ contributes:
   contextMenus:
     - entityType: audio_clip
       items:
-        - operation: isolate-vocals.run
+        - operation: isolate_vocals.run
           label: "Isolate vocals…"
           icon: wave
-          reveals: panel:audio-isolations
+          reveals: panel:audio_isolations
     - entityType: transition
       items:
-        - operation: isolate-vocals.run
+        - operation: isolate_vocals.run
           label: "Isolate vocals from audio track…"
           icon: wave
-          reveals: panel:audio-isolations
+          reveals: panel:audio_isolations

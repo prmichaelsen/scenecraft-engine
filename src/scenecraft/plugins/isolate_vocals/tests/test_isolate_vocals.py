@@ -1,4 +1,4 @@
-"""Tests for the M11 task-102 isolate-vocals plugin.
+"""Tests for the M11 task-102 isolate_vocals plugin.
 
 Uses a mock DFN3 in place of the real model — ``model.denoise_wav`` is
 monkeypatched to a function that writes a silent WAV of the same duration.
@@ -161,7 +161,7 @@ def test_run_audio_clip_happy_path(project, audio_clip, mock_dfn3):
         seg = get_pool_segment(project, s["pool_segment_id"])
         assert seg is not None
         assert seg["kind"] == "generated"
-        assert seg["createdBy"] == "isolate-vocals"
+        assert seg["createdBy"] == "isolate_vocals"
 
     # job result payload
     assert job.result["isolation_id"] == isolation_id
@@ -272,7 +272,7 @@ def test_handle_rest_dispatches_to_run(project, audio_clip, mock_dfn3):
     from scenecraft.plugins.isolate_vocals import handle_rest
 
     r = handle_rest(
-        "/api/projects/iso_project/plugins/isolate-vocals/run",
+        "/api/projects/iso_project/plugins/isolate_vocals/run",
         project,
         "iso_project",
         {"entity_type": "audio_clip", "entity_id": audio_clip, "range_mode": "full"},

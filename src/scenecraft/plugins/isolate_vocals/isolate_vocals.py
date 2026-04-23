@@ -1,4 +1,4 @@
-"""isolate-vocals: DFN3 vocal extraction + numpy residual → background.
+"""isolate_vocals: DFN3 vocal extraction + numpy residual → background.
 
 The handler ``run()`` kicks off a worker thread that:
 
@@ -11,9 +11,9 @@ The handler ``run()`` kicks off a worker thread that:
 
 Called from two surfaces:
 
-* ``POST /api/projects/:name/plugins/isolate-vocals/run`` — via
+* ``POST /api/projects/:name/plugins/isolate_vocals/run`` — via
   ``PluginHost.dispatch_rest`` (``handle_rest`` wrapper).
-* ``chat.py::_execute_tool`` — via ``PluginHost.get_operation("isolate-vocals.run")``
+* ``chat.py::_execute_tool`` — via ``PluginHost.get_operation("isolate_vocals.run")``
   then ``op.handler(entity_type, entity_id, context)`` (see task 105).
 """
 
@@ -82,7 +82,7 @@ def run(entity_type: str, entity_id: str, context: dict) -> dict:
             "entityType": entity_type,
             "entityId": entity_id,
             "project": project_name,
-            "plugin": "isolate-vocals",
+            "plugin": "isolate_vocals",
         },
     )
 
@@ -134,11 +134,11 @@ def run(entity_type: str, entity_id: str, context: dict) -> dict:
                 pool_path=f"pool/segments/{vocal_seg_id}.wav",
                 duration=dur,
                 byte_size=vocal_size,
-                created_by="isolate-vocals",
+                created_by="isolate_vocals",
                 created_at=now_iso,
-                label=f"isolate-vocals · {_STEM_VOCAL}",
+                label=f"isolate_vocals · {_STEM_VOCAL}",
                 generation_params={
-                    "plugin": "isolate-vocals",
+                    "plugin": "isolate_vocals",
                     "model": "deepfilternet3",
                     "stem_type": _STEM_VOCAL,
                     "isolation_id": isolation_id,
@@ -155,11 +155,11 @@ def run(entity_type: str, entity_id: str, context: dict) -> dict:
                 pool_path=f"pool/segments/{bg_seg_id}.wav",
                 duration=dur,
                 byte_size=bg_size,
-                created_by="isolate-vocals",
+                created_by="isolate_vocals",
                 created_at=now_iso,
-                label=f"isolate-vocals · {_STEM_BACKGROUND}",
+                label=f"isolate_vocals · {_STEM_BACKGROUND}",
                 generation_params={
-                    "plugin": "isolate-vocals",
+                    "plugin": "isolate_vocals",
                     "model": "deepfilternet3",
                     "stem_type": _STEM_BACKGROUND,
                     "isolation_id": isolation_id,
@@ -202,7 +202,7 @@ def run(entity_type: str, entity_id: str, context: dict) -> dict:
             import sys
             import traceback
 
-            print(f"[isolate-vocals] failed: {e}", file=sys.stderr)
+            print(f"[isolate_vocals] failed: {e}", file=sys.stderr)
             traceback.print_exc()
             try:
                 plugin_api.update_audio_isolation_status(
@@ -219,7 +219,7 @@ def run(entity_type: str, entity_id: str, context: dict) -> dict:
 def handle_rest(
     path: str, project_dir: Path, project_name: str, body: dict | None
 ) -> dict:
-    """POST /api/projects/:name/plugins/isolate-vocals/run.
+    """POST /api/projects/:name/plugins/isolate_vocals/run.
 
     Thin wrapper: unpack the JSON body, dispatch to ``run``. Returns whatever
     ``run`` returns. ``api_server.py`` wraps this via ``PluginHost.dispatch_rest``.

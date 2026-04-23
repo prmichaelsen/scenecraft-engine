@@ -112,13 +112,13 @@ def test_dispatch_rest_matches_and_invokes_handler():
         captured["kwargs"] = kwargs
         return {"routed": path}
 
-    PluginHost._rest_routes[r"^/api/plugins/isolate-vocals/.*$"] = handler
+    PluginHost._rest_routes[r"^/api/plugins/isolate_vocals/.*$"] = handler
 
     result = PluginHost.dispatch_rest(
-        "/api/plugins/isolate-vocals/run", "arg1", extra="ok"
+        "/api/plugins/isolate_vocals/run", "arg1", extra="ok"
     )
-    assert result == {"routed": "/api/plugins/isolate-vocals/run"}
-    assert captured["path"] == "/api/plugins/isolate-vocals/run"
+    assert result == {"routed": "/api/plugins/isolate_vocals/run"}
+    assert captured["path"] == "/api/plugins/isolate_vocals/run"
     assert captured["args"] == ("arg1",)
     assert captured["kwargs"] == {"extra": "ok"}
 

@@ -17,7 +17,19 @@
       "Bash(.venv/bin/python3 -c \"import cv2; print\\(cv2.__version__\\)\")",
       "Bash(.venv/bin/python3 *)",
       "Bash(git merge worktree-agent-a99fdbe7 --no-ff -m 'merge: M11 task-34 — MSE playback \\(FragmentEncoder, RenderWorker, RenderCoordinator, /ws/preview-stream\\) *)",
-      "Bash(./node_modules/.bin/tsc --noEmit)"
+      "Bash(./node_modules/.bin/tsc --noEmit)",
+      "Bash(.venv/bin/python3.14 -c \"from scenecraft.render.proxy_generator import ProxyCoordinator, proxy_path_for, generate_proxy, proxy_exists; print\\('ok'\\)\")",
+      "Bash(.venv/bin/python3.14 -c ' *)",
+      "Bash(.venv/bin/python3.14 -m pytest tests/test_proxy_generator.py -v)",
+      "Bash(.venv/bin/python3.14 -m pytest tests/ -x --ignore=tests/test_preview_stream.py -q)",
+      "Bash(.venv/bin/python3.14 -m pytest tests/ --ignore=tests/test_preview_stream.py -q)",
+      "Bash(.venv/bin/python3.14 -m pytest tests/test_render_frame_endpoint.py tests/test_proxy_generator.py -v)",
+      "Bash(git add *)",
+      "Bash(.venv/bin/python3.14 -m pytest tests/test_render_state.py -v)",
+      "Bash(.venv/bin/python3.14 -c \"from scenecraft.interactive_console import start_if_tty; print\\('ok'\\)\")",
+      "Bash(.venv/bin/python3.14 -c \"from scenecraft.interactive_console import start_if_tty, _ensure_cooked_mode; print\\('ok'\\)\")",
+      "Bash(.venv/bin/python3.14 -c \"from scenecraft.interactive_console import start_if_tty, _PromptAwareStream; print\\('ok'\\)\")",
+      "Bash(.venv/bin/python3.14 -c \"from scenecraft.interactive_console import _PromptAwareStream; print\\('ok'\\)\")"
     ]
   }
 }

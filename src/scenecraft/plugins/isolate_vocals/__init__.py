@@ -1,9 +1,16 @@
-"""isolate-vocals plugin: DFN3 + residual multi-stem audio isolation.
+"""isolate_vocals plugin: DFN3 + residual multi-stem audio isolation.
 
-This plugin contributes a single operation, ``isolate-vocals.run``, which
+This plugin contributes a single operation, ``isolate_vocals.run``, which
 separates a voice-over-noise audio source into ``vocal`` + ``background`` stems.
 Both stems land as new ``pool_segments`` rows linked under one
 ``audio_isolations`` run via the ``isolation_stems`` junction.
+
+Naming conventions:
+  • Internal ids (operation id, activation events) use dot notation —
+    ``{plugin}.{member}``.
+  • The chat-tool surface requires ``{plugin}__{member}`` (double-underscore)
+    because Claude's tool-name regex disallows dots. ``chat.py`` exposes this
+    operation as ``isolate_vocals__run``.
 
 Activation is driven by ``PluginHost.register(isolate_vocals)`` at server
 startup in ``api_server.run_server``.
@@ -25,14 +32,14 @@ def activate(plugin_api) -> None:
     """
     PluginHost.register_operation(
         OperationDef(
-            id="isolate-vocals.run",
+            id="isolate_vocals.run",
             label="Isolate vocals",
             entity_types=["audio_clip", "transition"],
             handler=impl.run,
         )
     )
     plugin_api.register_rest_endpoint(
-        r"^/api/projects/[^/]+/plugins/isolate-vocals/run$",
+        r"^/api/projects/[^/]+/plugins/isolate_vocals/run$",
         impl.handle_rest,
     )
 

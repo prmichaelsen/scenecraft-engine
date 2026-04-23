@@ -1,4 +1,4 @@
-# isolate-vocals plugin
+# isolate_vocals plugin
 
 First-party scenecraft plugin that separates a voice-over-noise audio source
 into `vocal` + `background` stems using DeepFilterNet3 + a time-domain residual.
@@ -21,7 +21,7 @@ Three surfaces, all landing on the same `run()` handler:
 
 - **AudioIsolationsPanel** (frontend) — primary UX. Select an audio clip,
   click Run, watch progress in the panel.
-- **REST**: `POST /api/projects/:name/plugins/isolate-vocals/run` with
+- **REST**: `POST /api/projects/:name/plugins/isolate_vocals/run` with
   `{entity_type, entity_id, range_mode, trim_in?, trim_out?}`.
 - **Chat tool** `isolate_vocals` — requires user confirmation via the
   destructive-tool elicitation flow.
