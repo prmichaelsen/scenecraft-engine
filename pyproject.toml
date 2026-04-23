@@ -19,6 +19,8 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "av>=12.0.0",
     "websockets>=12.0",
+    # M15 analyze_master_bus — ITU-R BS.1770 loudness metering.
+    "pyloudnorm>=0.1.0",
 ]
 
 [project.optional-dependencies]
