@@ -353,6 +353,49 @@ def _ensure_schema(conn: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_isolation_stems_segment
             ON isolation_stems(pool_segment_id);
 
+        -- M16 music generation: plugin-owned tables under the __ prefix
+        -- convention (see spec local.music-generation-plugin.md, R7/R8/R11).
+        -- Auth FKs on created_by etc. are deferred per 2026-04-23 dev directive;
+        -- values default to '' until auth milestone ships.
+        CREATE TABLE IF NOT EXISTS generate_music__generations (
+            id TEXT PRIMARY KEY,
+            action TEXT NOT NULL CHECK (action IN ('auto', 'custom')),
+            model TEXT NOT NULL,
+            style TEXT,
+            lyrics TEXT,
+            title TEXT,
+            instrumental INTEGER NOT NULL CHECK (instrumental IN (0, 1)),
+            gender TEXT,
+            singer_id TEXT,
+            task_ids_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+            error TEXT,
+            entity_type TEXT CHECK (entity_type IN ('audio_clip', 'transition') OR entity_type IS NULL),
+            entity_id TEXT,
+            reused_from TEXT REFERENCES generate_music__generations(id),
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_gm_gen_entity
+            ON generate_music__generations(entity_type, entity_id);
+        CREATE INDEX IF NOT EXISTS idx_gm_gen_status
+            ON generate_music__generations(status);
+        CREATE INDEX IF NOT EXISTS idx_gm_gen_created
+            ON generate_music__generations(created_at);
+
+        CREATE TABLE IF NOT EXISTS generate_music__tracks (
+            generation_id TEXT NOT NULL REFERENCES generate_music__generations(id),
+            pool_segment_id TEXT NOT NULL REFERENCES pool_segments(id),
+            musicful_task_id TEXT NOT NULL,
+            song_title TEXT,
+            duration_seconds REAL,
+            cover_url TEXT,
+            created_by TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (generation_id, pool_segment_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_gm_tracks_pool
+            ON generate_music__tracks(pool_segment_id);
+
         CREATE TABLE IF NOT EXISTS sections (
             id TEXT PRIMARY KEY,
             label TEXT NOT NULL DEFAULT '',
@@ -560,6 +603,29 @@ def _ensure_schema(conn: sqlite3.Connection):
     ac_cols = {row[1] for row in conn.execute("PRAGMA table_info(audio_clips)").fetchall()}
     if "selected" not in ac_cols:
         conn.execute("ALTER TABLE audio_clips ADD COLUMN selected TEXT")
+
+    # M13 + M16: pool_segments gains variant_kind, derived_from, and
+    # context_entity_{type,id} columns.
+    # - variant_kind: canonical flag for derived variants (M13 'lipsync',
+    #   M16 'music'; future 'denoise' etc.). Candidates-tab filters to
+    #   variant_kind IS NULL.
+    # - derived_from: typed FK to another pool_segment for true content
+    #   derivation (M13 lipsync case — output depends on source candidate's
+    #   video). NOT used by M16 music gen.
+    # - context_entity_{type,id}: polymorphic weak-context-provenance ref
+    #   for M16 music gen (entity selected at generation time; independent
+    #   of source content). See spec Q2.2 Option Y.
+    ps_cols = {row[1] for row in conn.execute("PRAGMA table_info(pool_segments)").fetchall()}
+    if "variant_kind" not in ps_cols:
+        conn.execute("ALTER TABLE pool_segments ADD COLUMN variant_kind TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pool_segments_variant_kind ON pool_segments(variant_kind) WHERE variant_kind IS NOT NULL")
+    if "derived_from" not in ps_cols:
+        conn.execute("ALTER TABLE pool_segments ADD COLUMN derived_from TEXT REFERENCES pool_segments(id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pool_segments_derived_from ON pool_segments(derived_from) WHERE derived_from IS NOT NULL")
+    if "context_entity_type" not in ps_cols:
+        conn.execute("ALTER TABLE pool_segments ADD COLUMN context_entity_type TEXT")
+    if "context_entity_id" not in ps_cols:
+        conn.execute("ALTER TABLE pool_segments ADD COLUMN context_entity_id TEXT")
 
     # ── Undo triggers (AFTER all migrations so PRAGMA table_info sees all columns) ──
     _undo_tracked_tables = ["keyframes", "transitions", "suppressions", "effects", "tracks", "transition_effects", "markers", "audio_tracks", "audio_clips", "audio_isolations"]
@@ -2601,4 +2667,172 @@ def update_audio_clip_link_offset(project_dir: Path, audio_clip_id: str, transit
         "UPDATE audio_clip_links SET offset = ? WHERE audio_clip_id = ? AND transition_id = ?",
         (offset, audio_clip_id, transition_id),
     )
+    conn.commit()
+
+
+# ── M16 music generation helpers ──────────────────────────────────────────
+
+def add_music_generation(
+    project_dir: Path,
+    *,
+    generation_id: str,
+    action: str,
+    model: str,
+    instrumental: int,
+    style: str | None = None,
+    lyrics: str | None = None,
+    title: str | None = None,
+    gender: str | None = None,
+    singer_id: str | None = None,
+    entity_type: str | None = None,
+    entity_id: str | None = None,
+    reused_from: str | None = None,
+    created_by: str = "plugin:generate-music",
+    status: str = "pending",
+    task_ids: list[str] | None = None,
+) -> str:
+    """Insert a new music_generations row. Returns the id."""
+    from datetime import datetime, timezone
+    conn = get_db(project_dir)
+    conn.execute(
+        """INSERT INTO generate_music__generations (
+            id, action, model, style, lyrics, title, instrumental, gender,
+            singer_id, task_ids_json, status, entity_type, entity_id,
+            reused_from, created_by, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            generation_id, action, model, style, lyrics, title, instrumental,
+            gender, singer_id, json.dumps(task_ids or []), status, entity_type,
+            entity_id, reused_from, created_by,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    conn.commit()
+    return generation_id
+
+
+def update_music_generation_status(
+    project_dir: Path,
+    generation_id: str,
+    status: str,
+    *,
+    error: str | None = None,
+    task_ids: list[str] | None = None,
+) -> None:
+    conn = get_db(project_dir)
+    if task_ids is not None:
+        conn.execute(
+            "UPDATE generate_music__generations SET status = ?, error = ?, task_ids_json = ? WHERE id = ?",
+            (status, error, json.dumps(task_ids), generation_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE generate_music__generations SET status = ?, error = ? WHERE id = ?",
+            (status, error, generation_id),
+        )
+    conn.commit()
+
+
+def add_generation_track(
+    project_dir: Path,
+    *,
+    generation_id: str,
+    pool_segment_id: str,
+    musicful_task_id: str,
+    song_title: str | None = None,
+    duration_seconds: float | None = None,
+    cover_url: str | None = None,
+    created_by: str = "plugin:generate-music",
+) -> None:
+    conn = get_db(project_dir)
+    conn.execute(
+        """INSERT INTO generate_music__tracks (
+            generation_id, pool_segment_id, musicful_task_id, song_title,
+            duration_seconds, cover_url, created_by
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (generation_id, pool_segment_id, musicful_task_id, song_title,
+         duration_seconds, cover_url, created_by),
+    )
+    conn.commit()
+
+
+def get_music_generation(project_dir: Path, generation_id: str) -> dict | None:
+    conn = get_db(project_dir)
+    row = conn.execute(
+        "SELECT * FROM generate_music__generations WHERE id = ?",
+        (generation_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_music_generations_for_entity(
+    project_dir: Path,
+    *,
+    entity_type: str | None = None,
+    entity_id: str | None = None,
+    limit: int = 200,
+) -> list[dict]:
+    """List music generations with their tracks joined. Filters by entity
+    when both entity_type and entity_id are provided; otherwise returns all."""
+    conn = get_db(project_dir)
+    if entity_type and entity_id:
+        gen_rows = conn.execute(
+            "SELECT * FROM generate_music__generations WHERE entity_type = ? AND entity_id = ? ORDER BY created_at DESC LIMIT ?",
+            (entity_type, entity_id, limit),
+        ).fetchall()
+    else:
+        gen_rows = conn.execute(
+            "SELECT * FROM generate_music__generations ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    generations = []
+    for g in gen_rows:
+        tracks = conn.execute(
+            """SELECT t.*, p.pool_path, p.duration_seconds AS pool_duration
+               FROM generate_music__tracks t
+               JOIN pool_segments p ON p.id = t.pool_segment_id
+               WHERE t.generation_id = ?""",
+            (g["id"],),
+        ).fetchall()
+        gd = dict(g)
+        gd["task_ids"] = json.loads(g["task_ids_json"] or "[]")
+        gd["tracks"] = [dict(t) for t in tracks]
+        generations.append(gd)
+    return generations
+
+
+def get_music_generation_tracks(project_dir: Path, generation_id: str) -> list[dict]:
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        "SELECT * FROM generate_music__tracks WHERE generation_id = ?",
+        (generation_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── M16 pool_segments context helpers ────────────────────────────────────
+
+def set_pool_segment_context(
+    project_dir: Path,
+    pool_segment_id: str,
+    *,
+    context_entity_type: str | None,
+    context_entity_id: str | None,
+    variant_kind: str | None = None,
+) -> None:
+    """Stamp a pool_segment with M16's weak-context-provenance fields.
+    Per spec R10/R40: variant_kind='music' drives UI coloring; context_entity_*
+    records where/why the segment was generated. Independent of derived_from
+    (which stays M13's typed pool_segment FK)."""
+    conn = get_db(project_dir)
+    if variant_kind is not None:
+        conn.execute(
+            "UPDATE pool_segments SET context_entity_type = ?, context_entity_id = ?, variant_kind = ? WHERE id = ?",
+            (context_entity_type, context_entity_id, variant_kind, pool_segment_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE pool_segments SET context_entity_type = ?, context_entity_id = ? WHERE id = ?",
+            (context_entity_type, context_entity_id, pool_segment_id),
+        )
     conn.commit()
