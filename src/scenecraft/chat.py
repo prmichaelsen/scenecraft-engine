@@ -165,6 +165,11 @@ Tools available:
   • update_volume_curve — replace the volume_curve on an audio track or audio
     clip with a new list of [time, value] points. Times must start at 0 and be
     strictly increasing. Min 2 points. Wrapped in an undo group.
+  • generate_dsp — run librosa analyses (onsets, rms, vocal_presence, tempo,
+    spectral_centroid) on a pool_segment and cache the results in the dsp_*
+    tables. Returns a run_id. Results are cached by (segment, analyzer_version,
+    params_hash); re-calling with the same inputs returns the cached run
+    without re-running librosa. Pass force_rerun=True to overwrite.
 
 After generation completes, use `assign_keyframe_image` / `assign_pool_video` to
 pick one of the new candidates (coming in task-54).
@@ -755,6 +760,54 @@ UPDATE_VOLUME_CURVE_TOOL: dict = {
     },
 }
 
+GENERATE_DSP_TOOL: dict = {
+    "name": "generate_dsp",
+    "description": (
+        "Run librosa analyses on a pool_segment's on-disk audio and cache the "
+        "results in the dsp_* tables. Supported analyses: "
+        "'rms' (amplitude envelope as time-series datapoints), "
+        "'onsets' (transient events with strength), "
+        "'vocal_presence' (time-ranged sections above an RMS threshold — the "
+        "key primitive for auto-duck/sidechain targeting), "
+        "'tempo' (global BPM as a scalar), "
+        "'spectral_centroid' (brightness over time as datapoints). "
+        "Results are cached by (source_segment_id, analyzer_version, params_hash) "
+        "— calling again with the same analyses returns the cached run. "
+        "Pass force_rerun=True to discard the cached run and recompute. "
+        "Unknown analysis names are silently skipped (not an error). "
+        "Non-destructive: analysis runs are write-once cached artifacts, no "
+        "undo required."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "source_segment_id": {
+                "type": "string",
+                "description": "pool_segments.id of the audio to analyze.",
+            },
+            "analyses": {
+                "type": "array",
+                "items": {"type": "string"},
+                "default": ["onsets", "rms", "vocal_presence", "tempo"],
+                "description": (
+                    "Which analyses to run. Any of 'onsets', 'rms', "
+                    "'vocal_presence', 'tempo', 'spectral_centroid'. "
+                    "Unknown names are skipped."
+                ),
+            },
+            "force_rerun": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "If true, delete any existing run matching the cache key "
+                    "and recompute. Default false (return the cached run)."
+                ),
+            },
+        },
+        "required": ["source_segment_id"],
+    },
+}
+
 TOOLS: list[dict] = [
     SQL_QUERY_TOOL,
     UPDATE_KEYFRAME_PROMPT_TOOL,
@@ -780,6 +833,7 @@ TOOLS: list[dict] = [
     ADD_AUDIO_TRACK_TOOL,
     ADD_AUDIO_CLIP_TOOL,
     UPDATE_VOLUME_CURVE_TOOL,
+    GENERATE_DSP_TOOL,
 ]
 
 
@@ -809,8 +863,18 @@ _DESTRUCTIVE_TOOL_PATTERNS: tuple[str, ...] = (
 )
 
 
+_DESTRUCTIVE_TOOL_ALLOWLIST: frozenset[str] = frozenset({
+    # generate_dsp runs librosa and writes a write-once cache row — it is
+    # neither DB-destructive nor slow/expensive in the generate_/isolate_
+    # sense, so the "generate_" substring pattern must not gate it.
+    "generate_dsp",
+})
+
+
 def _is_destructive(tool_name: str) -> bool:
     name = tool_name.lower()
+    if name in _DESTRUCTIVE_TOOL_ALLOWLIST:
+        return False
     return any(p in name for p in _DESTRUCTIVE_TOOL_PATTERNS)
 
 
@@ -1566,6 +1630,209 @@ def _exec_update_volume_curve(project_dir: Path, input_data: dict) -> dict:
         "(audio_tracks/audio_clips have no interpolation column)."
     )
     return result
+_DSP_KNOWN_ANALYSES: frozenset[str] = frozenset({
+    "rms", "onsets", "vocal_presence", "tempo", "spectral_centroid",
+})
+_DSP_SAMPLE_RATE: int = 22050
+_DSP_HOP_LENGTH: int = 512
+
+
+def _dsp_params_hash(analyses: list[str], sr: int, hop_length: int) -> str:
+    """Deterministic 16-char hash of the parameters that can change a run's
+    output. Sorted analyses so order doesn't affect the cache key."""
+    import hashlib
+    payload = json.dumps(
+        {"analyses": sorted(analyses), "sr": sr, "hop_length": hop_length},
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _exec_generate_dsp(project_dir: Path, input_data: dict) -> dict:
+    """Run librosa analyses on a pool_segment and cache results in dsp_* tables.
+
+    Returns a dict describing the run (new or cached). Never raises for
+    invalid inputs — returns ``{"error": ...}`` instead.
+    """
+    source_segment_id = input_data.get("source_segment_id")
+    if not source_segment_id or not isinstance(source_segment_id, str):
+        return {"error": "missing source_segment_id"}
+
+    raw_analyses = input_data.get("analyses")
+    if raw_analyses is None:
+        analyses = ["onsets", "rms", "vocal_presence", "tempo"]
+    elif not isinstance(raw_analyses, list):
+        return {"error": "analyses must be a list of strings"}
+    else:
+        analyses = [str(a) for a in raw_analyses]
+
+    force_rerun = bool(input_data.get("force_rerun", False))
+
+    # Resolve the pool segment and its on-disk file.
+    from scenecraft.db import get_pool_segment
+    seg = get_pool_segment(project_dir, source_segment_id)
+    if seg is None:
+        return {"error": f"pool_segment not found: {source_segment_id}"}
+    pool_path = seg.get("poolPath") or seg.get("pool_path")
+    if not pool_path:
+        return {"error": f"pool_segment {source_segment_id} has no pool_path"}
+    abs_path = (Path(project_dir) / pool_path).resolve()
+    if not abs_path.exists():
+        return {"error": f"source file not found: {abs_path}"}
+
+    import librosa as _librosa  # local import — keeps chat.py import cheap
+
+    analyzer_version = f"librosa-{_librosa.__version__}"
+    params_hash = _dsp_params_hash(analyses, _DSP_SAMPLE_RATE, _DSP_HOP_LENGTH)
+
+    from scenecraft.db_analysis_cache import (
+        bulk_insert_dsp_datapoints,
+        bulk_insert_dsp_sections,
+        create_dsp_run,
+        delete_dsp_run,
+        get_dsp_run,
+        get_dsp_scalars,
+        query_dsp_datapoints,
+        query_dsp_sections,
+        set_dsp_scalars,
+    )
+
+    # Cache-hit path: return the existing run (unless forcing rerun).
+    existing = get_dsp_run(project_dir, source_segment_id, analyzer_version, params_hash)
+    if existing is not None and not force_rerun:
+        # Count what's already stored for each known data_type/section_type.
+        dp_count = 0
+        for dt in ("rms", "onset", "spectral_centroid"):
+            dp_count += len(query_dsp_datapoints(project_dir, existing.id, dt))
+        sec_count = len(query_dsp_sections(project_dir, existing.id))
+        scalars = get_dsp_scalars(project_dir, existing.id)
+        return {
+            "run_id": existing.id,
+            "cached": True,
+            "source_segment_id": source_segment_id,
+            "analyses_written": list(existing.analyses),
+            "datapoint_count": dp_count,
+            "section_count": sec_count,
+            "scalars": scalars,
+        }
+
+    # Forced rerun: clear the old row so the UNIQUE cache key is available.
+    if existing is not None and force_rerun:
+        delete_dsp_run(project_dir, existing.id)
+
+    # Load audio once and reuse across analyses.
+    from scenecraft.analyzer import detect_presence, load_audio
+    from scenecraft.audio_intelligence import _compute_rms_envelope, _detect_onsets
+
+    try:
+        y, sr = load_audio(str(abs_path), sr=_DSP_SAMPLE_RATE)
+    except (FileNotFoundError, ValueError) as e:
+        return {"error": f"failed to load audio: {e}"}
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Track what actually ran so known-but-failed analyses can be reported.
+    analyses_written: list[str] = []
+    analyses_to_store: list[str] = []
+    datapoint_count = 0
+    section_count = 0
+    scalars: dict[str, float] = {}
+    datapoints: list[tuple[str, float, float, dict[str, Any] | None]] = []
+    sections: list[tuple[float, float, str, str | None, float | None]] = []
+
+    for analysis in analyses:
+        if analysis not in _DSP_KNOWN_ANALYSES:
+            # Unknown: skip silently (per spec).
+            continue
+
+        if analysis == "rms":
+            env = _compute_rms_envelope(y, sr, hop_length=_DSP_HOP_LENGTH)
+            for p in env:
+                datapoints.append(("rms", float(p["time"]), float(p["energy"]), None))
+            analyses_written.append("rms")
+            analyses_to_store.append("rms")
+
+        elif analysis == "onsets":
+            onsets = _detect_onsets(y, sr, hop_length=_DSP_HOP_LENGTH)
+            for o in onsets:
+                strength = float(o["strength"])
+                datapoints.append((
+                    "onset", float(o["time"]), strength, {"strength": strength},
+                ))
+            analyses_written.append("onsets")
+            analyses_to_store.append("onsets")
+
+        elif analysis == "vocal_presence":
+            regions = detect_presence(y, sr, hop_length=_DSP_HOP_LENGTH)
+            for r in regions:
+                sections.append((
+                    float(r["start_time"]), float(r["end_time"]),
+                    "vocal_presence", None, None,
+                ))
+            analyses_written.append("vocal_presence")
+            analyses_to_store.append("vocal_presence")
+
+        elif analysis == "tempo":
+            try:
+                tempo, _beats = _librosa.beat.beat_track(
+                    y=y, sr=sr, hop_length=_DSP_HOP_LENGTH,
+                )
+                # librosa may return a scalar or a 1-element array.
+                import numpy as _np
+                tempo_val = float(_np.atleast_1d(tempo)[0])
+                scalars["tempo_bpm"] = tempo_val
+                analyses_written.append("tempo")
+                analyses_to_store.append("tempo")
+            except Exception as e:
+                _log(f"tempo analysis failed: {e}")
+
+        elif analysis == "spectral_centroid":
+            try:
+                import numpy as _np
+                centroid = _librosa.feature.spectral_centroid(
+                    y=y, sr=sr, hop_length=_DSP_HOP_LENGTH,
+                )[0]
+                frames_per_sec = sr / _DSP_HOP_LENGTH
+                # Downsample to ~20 pts/sec for manageable storage.
+                step = max(1, int(frames_per_sec / 20))
+                for i in range(0, len(centroid), step):
+                    t = float(i / frames_per_sec)
+                    datapoints.append((
+                        "spectral_centroid", t, float(centroid[i]), None,
+                    ))
+                analyses_written.append("spectral_centroid")
+                analyses_to_store.append("spectral_centroid")
+            except Exception as e:
+                _log(f"spectral_centroid analysis failed: {e}")
+
+    # Create the run row *after* analyses succeed, so failures don't leave
+    # an empty row behind.
+    run = create_dsp_run(
+        project_dir,
+        source_segment_id=source_segment_id,
+        analyzer_version=analyzer_version,
+        params_hash=params_hash,
+        analyses=analyses_to_store,
+        created_at=now,
+    )
+
+    if datapoints:
+        datapoint_count = bulk_insert_dsp_datapoints(project_dir, run.id, datapoints)
+    if sections:
+        section_count = bulk_insert_dsp_sections(project_dir, run.id, sections)
+    if scalars:
+        set_dsp_scalars(project_dir, run.id, scalars)
+
+    return {
+        "run_id": run.id,
+        "cached": False,
+        "source_segment_id": source_segment_id,
+        "analyses_written": analyses_written,
+        "datapoint_count": datapoint_count,
+        "section_count": section_count,
+        "scalars": scalars,
+    }
 
 
 def _exec_update_keyframe(project_dir: Path, input_data: dict) -> dict:
@@ -2143,6 +2410,8 @@ async def _execute_tool(
         return result, "error" in result
     if name == "update_volume_curve":
         result = _exec_update_volume_curve(project_dir, input_data)
+    if name == "generate_dsp":
+        result = _exec_generate_dsp(project_dir, input_data)
         return result, "error" in result
     if name == "update_keyframe":
         result = _exec_update_keyframe(project_dir, input_data)
