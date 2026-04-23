@@ -23,12 +23,16 @@ from scenecraft.plugin_host import OperationDef, PluginHost
 from . import isolate_vocals as impl
 
 
-def activate(plugin_api) -> None:
+def activate(plugin_api, context=None) -> None:
     """Register contributions with the PluginHost + REST router.
 
-    Called once by ``PluginHost.register`` at process startup. Plugins MUST NOT
-    side-effect anything else from here — they get exactly one callback and
-    register all contributions declaratively.
+    Called once by ``PluginHost.register`` at process startup. Any
+    ``Disposable`` pushed into ``context.subscriptions`` (or returned by the
+    ``register_*`` helpers when ``context`` is passed) gets disposed on
+    plugin deactivation — VSCode's lifecycle model.
+
+    ``context`` is optional to keep legacy-signature tests compatible; in
+    normal operation the host always passes one.
     """
     PluginHost.register_operation(
         OperationDef(
@@ -36,12 +40,26 @@ def activate(plugin_api) -> None:
             label="Isolate vocals",
             entity_types=["audio_clip", "transition"],
             handler=impl.run,
-        )
+        ),
+        context=context,
     )
     plugin_api.register_rest_endpoint(
         r"^/api/projects/[^/]+/plugins/isolate_vocals/run$",
         impl.handle_rest,
+        context=context,
     )
+
+
+def deactivate(context) -> None:
+    """Optional plugin-level deactivate hook.
+
+    Most cleanup flows through ``context.subscriptions``; this is the place
+    for anything that doesn't fit the Disposable shape (one-shot finalizers,
+    log flushes, etc.). For isolate_vocals there's nothing extra — the DFN3
+    model cache is process-global and harmless to leave behind, and run
+    threads are daemon=True so they die with the process.
+    """
+    del context  # unused
 
 
 # Public re-exports — tests + REST dispatch import through here.

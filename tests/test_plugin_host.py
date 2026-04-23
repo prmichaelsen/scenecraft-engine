@@ -136,11 +136,13 @@ def test_dispatch_rest_empty_registry_returns_none():
 
 
 def test_register_calls_plugin_activate():
+    import sys
     import types
 
     captured_api = {}
 
-    fake_plugin = types.ModuleType("fake_plugin")
+    fake_plugin = types.ModuleType("fake_plugin_activate")
+    sys.modules["fake_plugin_activate"] = fake_plugin
 
     def activate(api):
         captured_api["api"] = api
@@ -153,4 +155,137 @@ def test_register_calls_plugin_activate():
     assert captured_api["api"] is not None
     assert hasattr(captured_api["api"], "extract_audio_as_wav")
     assert hasattr(captured_api["api"], "register_rest_endpoint")
-    assert "fake_plugin" in PluginHost._registered
+    assert "fake_plugin_activate" in PluginHost._registered
+
+
+# --- Dispose pattern (VSCode-style) --------------------------------------
+
+
+def test_register_operation_returns_disposable_that_removes_it():
+    op = OperationDef("d.op", "D", ["audio_clip"], lambda *_: {})
+    d = PluginHost.register_operation(op)
+    assert PluginHost.get_operation("d.op") is op
+    d.dispose()
+    assert PluginHost.get_operation("d.op") is None
+
+
+def test_register_operation_auto_pushes_to_context():
+    from scenecraft.plugin_host import PluginContext
+
+    ctx = PluginContext(name="t")
+    PluginHost.register_operation(
+        OperationDef("auto.op", "A", ["audio_clip"], lambda *_: {}),
+        context=ctx,
+    )
+    assert len(ctx.subscriptions) == 1
+    assert PluginHost.get_operation("auto.op") is not None
+
+    # Dispose through the context → registration gone
+    for d in reversed(ctx.subscriptions):
+        d.dispose()
+    assert PluginHost.get_operation("auto.op") is None
+
+
+def test_deactivate_disposes_subscriptions_in_lifo_order():
+    import sys
+    import types
+    from scenecraft import plugin_api as plugin_api_mod
+
+    order: list[str] = []
+
+    fake = types.ModuleType("fake_plugin_lifo")
+    sys.modules["fake_plugin_lifo"] = fake
+
+    def activate(api, context):
+        from scenecraft.plugin_host import make_disposable
+
+        context.subscriptions.append(make_disposable(lambda: order.append("first")))
+        context.subscriptions.append(make_disposable(lambda: order.append("second")))
+        context.subscriptions.append(make_disposable(lambda: order.append("third")))
+
+    fake.activate = activate
+
+    PluginHost.register(fake)
+    PluginHost.deactivate("fake_plugin_lifo")
+
+    assert order == ["third", "second", "first"]
+    assert "fake_plugin_lifo" not in PluginHost._registered
+
+
+def test_register_rest_endpoint_returns_disposable():
+    import sys
+    import types
+
+    fake = types.ModuleType("fake_plugin_rest")
+    sys.modules["fake_plugin_rest"] = fake
+
+    def handler(path, *a, **k):
+        return {"ok": path}
+
+    def activate(api, context):
+        api.register_rest_endpoint(r"^/api/test$", handler, context=context)
+
+    fake.activate = activate
+
+    PluginHost.register(fake)
+    # Route is dispatchable
+    assert PluginHost.dispatch_rest("/api/test") == {"ok": "/api/test"}
+
+    # Deactivate disposes the route
+    PluginHost.deactivate("fake_plugin_rest")
+    assert PluginHost.dispatch_rest("/api/test") is None
+
+
+def test_deactivate_then_register_is_idempotent():
+    """A plugin can be deactivated and re-registered cleanly — exactly what
+    a backend 'restart plugin' workflow needs."""
+    import sys
+    import types
+
+    fake = types.ModuleType("fake_plugin_reactivate")
+    sys.modules["fake_plugin_reactivate"] = fake
+
+    def activate(api, context):
+        PluginHost.register_operation(
+            OperationDef("reactivate.op", "R", ["audio_clip"], lambda *_: {}),
+            context=context,
+        )
+
+    fake.activate = activate
+
+    PluginHost.register(fake)
+    assert PluginHost.get_operation("reactivate.op") is not None
+
+    PluginHost.deactivate("fake_plugin_reactivate")
+    assert PluginHost.get_operation("reactivate.op") is None
+
+    PluginHost.register(fake)  # must not throw duplicate-id
+    assert PluginHost.get_operation("reactivate.op") is not None
+
+
+def test_plugin_deactivate_hook_called_after_subscriptions():
+    import sys
+    import types
+
+    order: list[str] = []
+    fake = types.ModuleType("fake_plugin_deactivate_hook")
+    sys.modules["fake_plugin_deactivate_hook"] = fake
+
+    def activate(api, context):
+        from scenecraft.plugin_host import make_disposable
+
+        context.subscriptions.append(
+            make_disposable(lambda: order.append("subscription"))
+        )
+
+    def deactivate(context):
+        order.append("module-deactivate")
+
+    fake.activate = activate
+    fake.deactivate = deactivate
+
+    PluginHost.register(fake)
+    PluginHost.deactivate("fake_plugin_deactivate_hook")
+
+    # Subscriptions dispose first, then the module-level hook fires.
+    assert order == ["subscription", "module-deactivate"]

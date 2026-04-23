@@ -51,7 +51,12 @@ __all__ = [
     "job_manager",
     "extract_audio_as_wav",
     "register_rest_endpoint",
+    "make_disposable",
 ]
+
+# Re-export the disposable factory so plugins can adapt arbitrary teardown
+# callables without reaching into plugin_host internals.
+from scenecraft.plugin_host import make_disposable  # noqa: E402
 
 
 def extract_audio_as_wav(
@@ -86,15 +91,28 @@ def extract_audio_as_wav(
     return out_path
 
 
-def register_rest_endpoint(path_regex: str, handler) -> None:
+def register_rest_endpoint(path_regex: str, handler, context=None):
     """Route a handler on the shared scenecraft REST server.
 
-    For MVP this populates a dict that ``api_server.py`` consults during
-    request dispatch via ``PluginHost.dispatch_rest``. The ``handler`` signature
-    is ``handler(path: str, *args, **kwargs) -> Any``; ``api_server.py`` is
-    responsible for calling it with whatever positional/keyword context the host
-    provides at dispatch time.
+    Populates a dict that ``api_server.py`` consults during request dispatch
+    via ``PluginHost.dispatch_rest``. Returns a ``Disposable`` that removes
+    the route when disposed; if ``context`` is provided (a ``PluginContext``
+    from ``activate()``), the Disposable is auto-pushed into
+    ``context.subscriptions`` so the host cleans it up on ``deactivate``.
+
+    ``handler`` signature: ``handler(path: str, *args, **kwargs) -> Any``.
+    ``api_server.py`` is responsible for calling it with whatever positional
+    and keyword context the host provides at dispatch time.
     """
     from scenecraft.plugin_host import PluginHost
 
     PluginHost._rest_routes[path_regex] = handler
+
+    def _dispose() -> None:
+        if PluginHost._rest_routes.get(path_regex) is handler:
+            del PluginHost._rest_routes[path_regex]
+
+    d = make_disposable(_dispose)
+    if context is not None:
+        context.subscriptions.append(d)
+    return d
