@@ -551,38 +551,38 @@ milestones:
   - id: M13
     title: Effect Curves + Macro Panel + Touch-Record
     file: agent/milestones/milestone-13-effect-curves-macro-panel.md
-    status: not_started
-    started: null
-    completed: null
+    status: completed
+    started: 2026-04-23
+    completed: 2026-04-23
     estimated_weeks: 2
     tasks_total: 12
-    tasks_completed: 0
+    tasks_completed: 12
     tasks:
       - id: task-45
         title: DB schema + migration for effect curves tables
         file: agent/tasks/milestone-13-effect-curves-macro-panel/task-45-db-schema-migrations.md
-        status: not_started
+        status: completed
         estimated_hours: 2
-        started: null
-        completed_date: null
+        started: 2026-04-23T00:00:00Z
+        completed_date: 2026-04-23T00:00:00Z
         actual_hours: null
         dependencies: []
       - id: task-46
         title: Effect type registry + param metadata + frequency labels
         file: agent/tasks/milestone-13-effect-curves-macro-panel/task-46-effect-type-registry.md
-        status: not_started
+        status: completed
         estimated_hours: 3
-        started: null
-        completed_date: null
+        started: 2026-04-23T00:00:00Z
+        completed_date: 2026-04-23T00:00:00Z
         actual_hours: null
         dependencies: []
       - id: task-47
         title: Audio graph runtime + send buses + IR assets
         file: agent/tasks/milestone-13-effect-curves-macro-panel/task-47-audio-graph-buses-ir.md
-        status: not_started
+        status: completed
         estimated_hours: 6
-        started: null
-        completed_date: null
+        started: 2026-04-23T00:00:00Z
+        completed_date: 2026-04-23T00:00:00Z
         actual_hours: null
         dependencies:
           - task-45
@@ -590,20 +590,20 @@ milestones:
       - id: task-48
         title: Curve → AudioParam scheduling engine
         file: agent/tasks/milestone-13-effect-curves-macro-panel/task-48-curve-scheduling.md
-        status: not_started
+        status: completed
         estimated_hours: 4
-        started: null
-        completed_date: null
+        started: 2026-04-23T00:00:00Z
+        completed_date: 2026-04-23T00:00:00Z
         actual_hours: null
         dependencies:
           - task-47
       - id: task-49
         title: Dynamics + EQ effect implementations
         file: agent/tasks/milestone-13-effect-curves-macro-panel/task-49-effects-dynamics-eq.md
-        status: not_started
+        status: completed
         estimated_hours: 4
-        started: null
-        completed_date: null
+        started: 2026-04-23T00:00:00Z
+        completed_date: 2026-04-23T00:00:00Z
         actual_hours: null
         dependencies:
           - task-46
@@ -611,10 +611,10 @@ milestones:
       - id: task-50
         title: Spatial + send effect implementations
         file: agent/tasks/milestone-13-effect-curves-macro-panel/task-50-effects-spatial-send.md
-        status: not_started
+        status: completed
         estimated_hours: 4
-        started: null
-        completed_date: null
+        started: 2026-04-23T00:00:00Z
+        completed_date: 2026-04-23T00:00:00Z
         actual_hours: null
         dependencies:
           - task-46
@@ -622,10 +622,10 @@ milestones:
       - id: task-51
         title: Modulation + distortion effect implementations
         file: agent/tasks/milestone-13-effect-curves-macro-panel/task-51-effects-modulation-drive.md
-        status: not_started
+        status: completed
         estimated_hours: 6
-        started: null
-        completed_date: null
+        started: 2026-04-23T00:00:00Z
+        completed_date: 2026-04-23T00:00:00Z
         actual_hours: null
         dependencies:
           - task-46
@@ -633,29 +633,29 @@ milestones:
       - id: task-52
         title: HTTP endpoints for effect curves + cache invalidation
         file: agent/tasks/milestone-13-effect-curves-macro-panel/task-52-http-endpoints.md
-        status: not_started
+        status: completed
         estimated_hours: 4
-        started: null
-        completed_date: null
+        started: 2026-04-23T00:00:00Z
+        completed_date: 2026-04-23T00:00:00Z
         actual_hours: null
         dependencies:
           - task-45
       - id: task-53
         title: Extract InlineCurveEditor + audio inline curves
         file: agent/tasks/milestone-13-effect-curves-macro-panel/task-53-inline-curve-editor.md
-        status: not_started
+        status: completed
         estimated_hours: 8
-        started: null
-        completed_date: null
+        started: 2026-04-23T00:00:00Z
+        completed_date: 2026-04-23T00:00:00Z
         actual_hours: null
         dependencies: []
       - id: task-54
         title: MacroPanel component — grid + list, knobs, arm/enable/visible
         file: agent/tasks/milestone-13-effect-curves-macro-panel/task-54-macro-panel.md
-        status: not_started
+        status: completed
         estimated_hours: 10
-        started: null
-        completed_date: null
+        started: 2026-04-23T00:00:00Z
+        completed_date: 2026-04-23T00:00:00Z
         actual_hours: null
         dependencies:
           - task-46
@@ -663,10 +663,10 @@ milestones:
       - id: task-55
         title: Touch-record state machine + sampling + bezier-fit
         file: agent/tasks/milestone-13-effect-curves-macro-panel/task-55-touch-record.md
-        status: not_started
+        status: completed
         estimated_hours: 6
-        started: null
-        completed_date: null
+        started: 2026-04-23T00:00:00Z
+        completed_date: 2026-04-23T00:00:00Z
         actual_hours: null
         dependencies:
           - task-48
@@ -674,10 +674,10 @@ milestones:
       - id: task-56
         title: Multi-select + trackDelta copy-paste of automation keyframes (P2)
         file: agent/tasks/milestone-13-effect-curves-macro-panel/task-56-copy-paste-automation.md
-        status: not_started
+        status: completed
         estimated_hours: 4
-        started: null
-        completed_date: null
+        started: 2026-04-23T00:00:00Z
+        completed_date: 2026-04-23T00:00:00Z
         actual_hours: null
         dependencies:
           - task-53
@@ -691,10 +691,12 @@ documentation:
 
 progress:
   planning: 100
-  implementation: 82
-  overall: 82
+  implementation: 94
+  overall: 94
 
 recent_work:
+  - date: 2026-04-23
+    description: "M13 DISCOVERED COMPLETE on main — 12/12 tasks (45-56) already merged across scenecraft-engine (45, 52, 56) and scenecraft frontend (46, 47, 48, 49, 50, 51, 53, 54, 55, 56). progress.yaml was stale; corrected. Implications: all Phase 2 chat-audio tool blockers satisfied — add_audio_effect, update_volume_curve, update_effect_param_curve can all ship now without waiting."
   - date: 2026-04-23
     description: "Chat-agent audio authoring tools Phase 1 shipped. chat.py: add_audio_track (auto id/display_order/name, initial volume -> constant volume_curve, one undo group) + add_audio_clip (source by pool_segments.id uuid, start_time required, trim_in/trim_out preferred with source_offset/end_time as lower-level alternates, end_time auto-computed from pool_segments.duration_seconds when omitted, label seeded from pool segment). Both wrap in undo_begin — trigger-based undo-log captures inverse SQL automatically. No DB schema changes; reuses existing db.add_audio_track/add_audio_clip/get_pool_segment/get_audio_tracks/generate_id."
   - date: 2026-04-23
@@ -727,12 +729,12 @@ recent_work:
     description: "M9 complete — Wan2.1 + FILM pipeline. wan.py, film.py, wan_pipeline.py, --engine wan/--preview flags, AI plan wan_denoise/transition_frames."
 
 next_steps:
-  - "M13: begin implementation — task-45 (DB schema migrations) + task-46 (effect registry) unblock everything downstream including chat-audio Phase 2b/2c"
-  - "M14 (AI Rotoscope Plugin): complete @acp.clarification-address on the remaining ~5% of clarification-8, then @acp.design-create --from-clar → @acp.spec --from-design → @acp.plan. 2-day SAM2 spike before locking the plan."
-  - "Chat-audio Phase 2a (shippable now, no blockers): update_volume_curve (inline column), analyze_audio_track / analyze_audio_clip (librosa — analyzer.py + audio_intelligence.py already do the work; need chat tool bindings), apply_mix_plan (batch wrapper). Unlocks auto-duck / auto-mix / auto-master flows."
-  - "Verify M11 task-35 (<PreviewViewport>) + task-36 (WebGL removal) actual state — session notes suggest task-35 was completed but progress.yaml still lists not_started. If done, mark completed; if task-36 landed alongside M12, close out M11."
-  - "Unassigned task-37: unified WebSocket protocol (replaces per-feature WS lifecycle with one socket + typed envelopes)"
-  - "Unassigned task-38: range-based preview frame cache invalidation + client-side bitmap cache (depends on 37 for push)"
+  - "Chat-audio Phase 2 (ALL blockers cleared — M13 is done): add_audio_effect, update_volume_curve, update_effect_param_curve. Plus auto-duck/mix/master pipeline via analyze_audio_track / analyze_audio_clip / apply_mix_plan (librosa already in deps; analyzer.py + audio_intelligence.py already do the work)."
+  - "DSP cache tables (proposed): dsp_analysis_runs + dsp_datapoints (EAV-ish) + dsp_sections + dsp_scalars. Cache librosa output by (source_segment_id, analyzer_version, params_hash). Unblocks sub-LLM auto-mix flows."
+  - "M14 (AI Rotoscope Plugin): complete @acp.clarification-address on remaining ~5% of clarification-8, then design → spec → plan. 2-day SAM2 spike before locking the plan."
+  - "Verify M11 task-35 (<PreviewViewport>) + task-36 (WebGL removal) actual state — session notes suggest task-35 was completed but progress.yaml still lists not_started. Audit with git log and update accordingly."
+  - "Unassigned task-37: unified WebSocket protocol"
+  - "Unassigned task-38: range-based preview frame cache invalidation"
 
 notes:
   - "M1-M3, M5-M12 tracked (38/40 tasks if M11+M12 complete)"
