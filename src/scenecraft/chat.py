@@ -162,6 +162,9 @@ Tools available:
   • add_audio_track — create a new, empty audio track (auto name + display_order).
   • add_audio_clip — place a pool_segment on an audio track; end_time auto-computed
     from the segment's duration when omitted.
+  • update_volume_curve — replace the volume_curve on an audio track or audio
+    clip with a new list of [time, value] points. Times must start at 0 and be
+    strictly increasing. Min 2 points. Wrapped in an undo group.
 
 After generation completes, use `assign_keyframe_image` / `assign_pool_video` to
 pick one of the new candidates (coming in task-54).
@@ -707,6 +710,51 @@ ADD_AUDIO_CLIP_TOOL: dict = {
     },
 }
 
+UPDATE_VOLUME_CURVE_TOOL: dict = {
+    "name": "update_volume_curve",
+    "description": (
+        "Replace the volume_curve on an audio track or audio clip with a new list "
+        "of [time, value] points. `target_type` is 'track' or 'clip'; `target_id` "
+        "is the matching audio_tracks.id or audio_clips.id. Points are [time, value] "
+        "pairs where time is in seconds (or 0..1 normalised — match existing curve "
+        "convention on the target). First point's time MUST be 0.0; times must be "
+        "strictly increasing; minimum 2 points. `points` may be passed as a JSON "
+        "string or a parsed list. `interpolation` is accepted ('bezier' | 'linear' "
+        "| 'step') but the current schema has no dedicated column — it is noted in "
+        "the result. Wrapped in an undo group."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "target_type": {"type": "string", "enum": ["track", "clip"]},
+            "target_id":   {"type": "string", "description": "audio_tracks.id or audio_clips.id."},
+            "points": {
+                "description": "Array of [time, value] pairs, or a JSON string of the same.",
+                "oneOf": [
+                    {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "items": {"type": "number"},
+                            "minItems": 2,
+                            "maxItems": 2,
+                        },
+                        "minItems": 2,
+                    },
+                    {"type": "string"},
+                ],
+            },
+            "interpolation": {
+                "type": "string",
+                "enum": ["bezier", "linear", "step"],
+                "default": "bezier",
+                "description": "Curve interpolation mode. Currently not persisted (no column).",
+            },
+        },
+        "required": ["target_type", "target_id", "points"],
+    },
+}
+
 TOOLS: list[dict] = [
     SQL_QUERY_TOOL,
     UPDATE_KEYFRAME_PROMPT_TOOL,
@@ -731,6 +779,7 @@ TOOLS: list[dict] = [
     ISOLATE_VOCALS_TOOL,
     ADD_AUDIO_TRACK_TOOL,
     ADD_AUDIO_CLIP_TOOL,
+    UPDATE_VOLUME_CURVE_TOOL,
 ]
 
 
@@ -1412,6 +1461,113 @@ def _exec_add_audio_clip(project_dir: Path, input_data: dict) -> dict:
     }
 
 
+def _exec_update_volume_curve(project_dir: Path, input_data: dict) -> dict:
+    """Replace volume_curve on an audio_track or audio_clip.
+
+    The underlying schema only stores the ``volume_curve`` JSON column — there is
+    no dedicated ``interpolation`` column on audio_tracks/audio_clips. We accept
+    the ``interpolation`` argument (validated to the same vocabulary as
+    EffectCurve), but note in the result that it is not persisted.
+    """
+    import json
+    import math
+    from scenecraft.db import (
+        update_audio_track as db_update_audio_track,
+        update_audio_clip as db_update_audio_clip,
+        get_audio_tracks as db_get_audio_tracks,
+        get_audio_clips as db_get_audio_clips,
+        undo_begin,
+    )
+
+    target_type = input_data.get("target_type")
+    if target_type not in ("track", "clip"):
+        return {"error": "target_type must be 'track' or 'clip'"}
+
+    target_id = input_data.get("target_id")
+    if not target_id or not isinstance(target_id, str):
+        return {"error": "target_id is required and must be a string"}
+
+    interpolation = input_data.get("interpolation", "bezier")
+    if interpolation not in ("bezier", "linear", "step"):
+        return {"error": "interpolation must be one of 'bezier', 'linear', 'step'"}
+
+    # Parse points — accept either list-of-[t,v] or a JSON string of that.
+    raw_points = input_data.get("points")
+    if raw_points is None:
+        return {"error": "points is required"}
+    if isinstance(raw_points, str):
+        try:
+            points = json.loads(raw_points)
+        except (ValueError, TypeError) as exc:
+            return {"error": f"points JSON string is not valid JSON: {exc}"}
+    else:
+        points = raw_points
+
+    if not isinstance(points, list):
+        return {"error": "points must be a list of [time, value] pairs"}
+    if len(points) < 2:
+        return {"error": "volume curve requires at least 2 points"}
+
+    # Each point must be [number, number]; times strictly increasing; first time == 0.
+    cleaned: list[list[float]] = []
+    prev_t: float | None = None
+    for idx, pt in enumerate(points):
+        if not isinstance(pt, (list, tuple)) or len(pt) != 2:
+            return {"error": f"point at index {idx} must be a [time, value] pair"}
+        try:
+            t = float(pt[0])
+            v = float(pt[1])
+        except (TypeError, ValueError):
+            return {"error": f"point at index {idx} must have numeric [time, value]"}
+        if not (math.isfinite(t) and math.isfinite(v)):
+            return {"error": f"point at index {idx} has non-finite value"}
+        if idx == 0 and t != 0.0:
+            return {"error": "first point time must be 0.0"}
+        if prev_t is not None and t <= prev_t:
+            return {
+                "error": (
+                    f"point times must be strictly increasing; "
+                    f"got {t} after {prev_t} at index {idx}"
+                )
+            }
+        cleaned.append([t, v])
+        prev_t = t
+
+    # Validate target exists before starting an undo group.
+    if target_type == "track":
+        if not any(t["id"] == target_id for t in db_get_audio_tracks(project_dir)):
+            return {"error": f"track not found: {target_id}"}
+    else:
+        if not any(c["id"] == target_id for c in db_get_audio_clips(project_dir)):
+            return {"error": f"clip not found: {target_id}"}
+
+    volume_curve_json = json.dumps(cleaned)
+
+    undo_group_id = undo_begin(
+        project_dir,
+        f"Chat: update volume_curve on {target_type} {target_id}",
+    )
+    if target_type == "track":
+        db_update_audio_track(project_dir, target_id, volume_curve=volume_curve_json)
+    else:
+        db_update_audio_clip(project_dir, target_id, volume_curve=volume_curve_json)
+
+    result: dict = {
+        "ok": True,
+        "target_type": target_type,
+        "target_id": target_id,
+        "points_written": len(cleaned),
+        "undo_group_id": undo_group_id,
+    }
+    # interpolation has no persisted column yet — surface the fact so callers
+    # aren't surprised when the value doesn't round-trip through the DB.
+    result["interpolation_note"] = (
+        f"interpolation='{interpolation}' accepted but not persisted "
+        "(audio_tracks/audio_clips have no interpolation column)."
+    )
+    return result
+
+
 def _exec_update_keyframe(project_dir: Path, input_data: dict) -> dict:
     from scenecraft.db import get_keyframe, update_keyframe, undo_begin
     kf_id = input_data.get("keyframe_id")
@@ -1984,6 +2140,9 @@ async def _execute_tool(
         return result, "error" in result
     if name == "add_audio_clip":
         result = _exec_add_audio_clip(project_dir, input_data)
+        return result, "error" in result
+    if name == "update_volume_curve":
+        result = _exec_update_volume_curve(project_dir, input_data)
         return result, "error" in result
     if name == "update_keyframe":
         result = _exec_update_keyframe(project_dir, input_data)
