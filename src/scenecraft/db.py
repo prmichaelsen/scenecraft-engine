@@ -602,6 +602,58 @@ def _ensure_schema(conn: sqlite3.Connection):
             confidence REAL,
             PRIMARY KEY (run_id, property)
         );
+
+        -- M15: cached master-bus mix analysis.
+        -- Cache key: (mix_graph_hash, start_time_s, end_time_s, sample_rate,
+        --            analyzer_version).
+        -- The mix_graph_hash captures every mix-affecting factor (tracks,
+        -- clips, effects, curves, sends). See scenecraft/mix_graph_hash.py.
+        CREATE TABLE IF NOT EXISTS mix_analysis_runs (
+            id TEXT PRIMARY KEY,
+            mix_graph_hash TEXT NOT NULL,
+            start_time_s REAL NOT NULL,
+            end_time_s REAL NOT NULL,
+            sample_rate INTEGER NOT NULL,
+            analyzer_version TEXT NOT NULL,
+            analyses_json TEXT NOT NULL,
+            rendered_path TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(mix_graph_hash, start_time_s, end_time_s, sample_rate, analyzer_version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mix_runs_hash ON mix_analysis_runs(mix_graph_hash);
+
+        -- Time-series datapoints from the analyzer: rms, short_term_lufs,
+        -- spectral_centroid, etc. Same shape as dsp_datapoints.
+        CREATE TABLE IF NOT EXISTS mix_datapoints (
+            run_id TEXT NOT NULL REFERENCES mix_analysis_runs(id) ON DELETE CASCADE,
+            data_type TEXT NOT NULL,
+            time_s REAL NOT NULL,
+            value REAL NOT NULL,
+            extra_json TEXT,
+            PRIMARY KEY (run_id, data_type, time_s)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mix_datapoints_type_time
+            ON mix_datapoints(run_id, data_type, time_s);
+
+        -- Time-ranged regions: clipping_event, silence, etc.
+        CREATE TABLE IF NOT EXISTS mix_sections (
+            run_id TEXT NOT NULL REFERENCES mix_analysis_runs(id) ON DELETE CASCADE,
+            start_s REAL NOT NULL,
+            end_s REAL NOT NULL,
+            section_type TEXT NOT NULL,
+            label TEXT,
+            confidence REAL,
+            PRIMARY KEY (run_id, start_s, section_type)
+        );
+
+        -- Global scalars: peak_db, true_peak_db, lufs_integrated,
+        -- dynamic_range, clip_count.
+        CREATE TABLE IF NOT EXISTS mix_scalars (
+            run_id TEXT NOT NULL REFERENCES mix_analysis_runs(id) ON DELETE CASCADE,
+            metric TEXT NOT NULL,
+            value REAL NOT NULL,
+            PRIMARY KEY (run_id, metric)
+        );
     """)
 
     # ── Undo system ──
