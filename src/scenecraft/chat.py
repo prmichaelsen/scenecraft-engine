@@ -154,6 +154,10 @@ Tools available:
   • generate_transition_candidates — run Veo to create N new video candidates for a
     transition (inherits ingredients/seed/prompt from the transition record; use
     update_transition first if you want to tweak them). Slow + expensive.
+  • isolate_vocals__run — separate an audio source into vocal + background stems
+    (DFN3 + residual). Returns a new audio_isolations run id with stem
+    pool_segment ids. Works on audio_clip (MVP) or transition (planned). Slow
+    (~realtime CPU). User-confirmed.
 
 After generation completes, use `assign_keyframe_image` / `assign_pool_video` to
 pick one of the new candidates (coming in task-54).
@@ -623,6 +627,33 @@ GENERATE_TRANSITION_CANDIDATES_TOOL: dict = {
     },
 }
 
+ISOLATE_VOCALS_TOOL: dict = {
+    # Convention: {plugin_name}__{tool_name}. The `isolate_vocals` plugin
+    # exposes exactly one operation; its id is `isolate_vocals.run` internally
+    # and `isolate_vocals__run` across the Claude API boundary (dots disallowed
+    # by Claude's tool-name regex).
+    "name": "isolate_vocals__run",
+    "description": (
+        "Separate a voice-over-noise audio source into vocal + background stems "
+        "using DeepFilterNet3. Accepts an audio_clip (MVP) or transition as the "
+        "source entity. Returns an audio_isolations run id with N stem "
+        "pool_segment ids. Slow (~realtime on CPU). Requires user confirmation. "
+        "Use `get_audio_clips` or sql_query on audio_clips / transitions to find "
+        "entity ids first."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "entity_type": {"type": "string", "enum": ["audio_clip", "transition"]},
+            "entity_id":   {"type": "string", "description": "ID of the source entity."},
+            "range_mode":  {"type": "string", "enum": ["full", "subset"], "default": "full"},
+            "trim_in":     {"type": "number", "description": "Required when range_mode='subset'."},
+            "trim_out":    {"type": "number", "description": "Required when range_mode='subset'."},
+        },
+        "required": ["entity_type", "entity_id"],
+    },
+}
+
 TOOLS: list[dict] = [
     SQL_QUERY_TOOL,
     UPDATE_KEYFRAME_PROMPT_TOOL,
@@ -644,6 +675,7 @@ TOOLS: list[dict] = [
     RESTORE_CHECKPOINT_TOOL,
     GENERATE_KEYFRAME_CANDIDATES_TOOL,
     GENERATE_TRANSITION_CANDIDATES_TOOL,
+    ISOLATE_VOCALS_TOOL,
 ]
 
 
@@ -667,6 +699,9 @@ _DESTRUCTIVE_TOOL_PATTERNS: tuple[str, ...] = (
     # Generation tools are not DB-destructive but cost real money and take time;
     # gate them behind the same confirmation flow.
     "generate_",
+    # Isolation runs the DFN3 model + writes stems — not destructive but
+    # expensive + long-running. Same treatment as generate_.
+    "isolate_",
 )
 
 
@@ -689,6 +724,7 @@ def _format_tool_input_summary(tool_name: str, tool_input: dict, project_dir: Pa
         "batch_delete_keyframes", "batch_delete_transitions",
         "generate_keyframe_candidates", "generate_transition_candidates",
         "restore_checkpoint",
+        "isolate_vocals__run",
     }:
         try:
             return _format_destructive_summary(tool_name, input_dict, project_dir)
@@ -816,6 +852,57 @@ def _format_destructive_summary(tool_name: str, input_dict: dict, project_dir: P
         )
         items.append(f"~{est_cost_usd:.2f} USD · ~{total * 45}-{total * 180}s")
         return f"Generate {total} video candidates for {tr_id}?", items
+
+    if tool_name == "isolate_vocals__run":
+        from scenecraft.db import get_audio_clips
+        entity_type = input_dict.get("entity_type", "audio_clip")
+        entity_id = input_dict.get("entity_id", "")
+        range_mode = input_dict.get("range_mode", "full")
+        trim_in = input_dict.get("trim_in")
+        trim_out = input_dict.get("trim_out")
+
+        label = entity_id
+        total_dur = 0.0
+        found = False
+        if entity_type == "audio_clip":
+            clip = next((c for c in get_audio_clips(project_dir) if c.get("id") == entity_id), None)
+            if clip:
+                found = True
+                start = float(clip.get("start_time", 0))
+                end = float(clip.get("end_time", 0))
+                total_dur = max(0.0, end - start)
+                src = clip.get("source_path") or ""
+                label = src.rsplit("/", 1)[-1] if src else entity_id
+        elif entity_type == "transition":
+            tr = get_transition(project_dir, entity_id)
+            if tr:
+                found = True
+                total_dur = float(tr.get("duration_seconds", 0))
+                label = tr.get("label") or f"{tr.get('from','?')} → {tr.get('to','?')}"
+
+        if not found:
+            return (
+                f"Isolate vocals on {entity_type} {entity_id}?",
+                [f"{entity_id} (NOT FOUND)"],
+            )
+
+        if range_mode == "subset":
+            active = max(0.0, (trim_out if trim_out is not None else total_dur) - (trim_in or 0.0))
+            range_line = f"range: subset {trim_in}s–{trim_out}s ({active:.1f}s)"
+        else:
+            active = total_dur
+            range_line = f"range: full ({active:.1f}s)"
+
+        eta_low = max(1, int(active * 1.0))
+        eta_high = max(2, int(active * 2.0))
+        items = [
+            f"{entity_type}: {label} ({entity_id})",
+            range_line,
+            "model: DeepFilterNet3 (CPU)",
+            "output: 2 stems — vocal + background (new pool_segments, grouped under one audio_isolations run)",
+            f"~{eta_low}-{eta_high}s to complete",
+        ]
+        return f"Isolate vocals on {entity_type} {entity_id}?", items
 
     if tool_name == "restore_checkpoint":
         from scenecraft.db import get_checkpoint as _db_get_checkpoint, get_db
@@ -1741,6 +1828,34 @@ async def _execute_tool(
             return kickoff, True
         if ws is None or tool_use_id is None:
             return {"error": "generation tools require ws context (internal error)"}, True
+        return await _await_generation_job(ws, tool_use_id, project_name or "", kickoff["job_id"])
+    if name == "isolate_vocals__run":
+        entity_type = input_data.get("entity_type", "audio_clip")
+        entity_id = input_data.get("entity_id", "")
+        if not entity_id:
+            return {"error": "missing entity_id"}, True
+        if entity_type not in ("audio_clip", "transition"):
+            return {"error": f"unsupported entity_type: {entity_type}"}, True
+        from scenecraft.plugin_host import PluginHost
+
+        op = PluginHost.get_operation("isolate_vocals.run")
+        if op is None:
+            return {"error": "isolate_vocals plugin not registered"}, True
+        kickoff = op.handler(
+            entity_type,
+            entity_id,
+            {
+                "project_dir": project_dir,
+                "project_name": project_name or "",
+                "range_mode": input_data.get("range_mode", "full"),
+                "trim_in": input_data.get("trim_in"),
+                "trim_out": input_data.get("trim_out"),
+            },
+        )
+        if "error" in kickoff:
+            return kickoff, True
+        if ws is None or tool_use_id is None:
+            return {"error": "isolate_vocals requires ws context (internal error)"}, True
         return await _await_generation_job(ws, tool_use_id, project_name or "", kickoff["job_id"])
     return {"error": f"unknown tool: {name}"}, True
 
