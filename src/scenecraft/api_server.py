@@ -1236,6 +1236,61 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 _log(f"audio-clips/add: {m.group(1)} -> {clip_id} on {clip['track_id']}")
                 return self._json_response({"success": True, "id": clip_id})
 
+            # POST /api/projects/:name/audio-clips/add-from-pool — drop an
+            # audio asset from the Bin directly onto a lane (Task 123). Creates
+            # a standalone clip (no audio_clip_links row) whose duration comes
+            # from the pool segment's duration_seconds. Accepts either
+            # poolSegmentId or poolPath to identify the source.
+            m = re.match(r"^/api/projects/([^/]+)/audio-clips/add-from-pool$", path)
+            if m:
+                body = self._read_json_body()
+                if body is None: return
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None: return
+                track_id = body.get("trackId", body.get("track_id", ""))
+                if not track_id:
+                    return self._error(400, "BAD_REQUEST", "Missing 'trackId'")
+                start_time = float(body.get("startTime", body.get("start_time", 0)) or 0)
+                pool_segment_id = body.get("poolSegmentId") or body.get("pool_segment_id")
+                pool_path = body.get("poolPath") or body.get("pool_path")
+                if not pool_segment_id and not pool_path:
+                    return self._error(400, "BAD_REQUEST",
+                                       "Provide 'poolSegmentId' or 'poolPath'")
+                from scenecraft.db import (
+                    get_pool_segment, list_pool_segments,
+                    add_audio_clip as db_add_audio_clip, generate_id,
+                )
+                seg = None
+                if pool_segment_id:
+                    seg = get_pool_segment(project_dir, pool_segment_id)
+                if seg is None and pool_path:
+                    for ps in list_pool_segments(project_dir):
+                        if ps.get("poolPath") == pool_path:
+                            seg = ps
+                            break
+                if seg is None:
+                    return self._error(404, "NOT_FOUND",
+                                       "Pool segment not found")
+                if _classify_media_type(seg["poolPath"]) != "audio":
+                    return self._error(400, "BAD_REQUEST",
+                                       "Pool segment is not audio")
+                duration = float(seg.get("durationSeconds") or 0)
+                clip_id = generate_id("audio_clip")
+                clip = {
+                    "id": clip_id,
+                    "track_id": track_id,
+                    "source_path": seg["poolPath"],
+                    "start_time": start_time,
+                    "end_time": start_time + duration,
+                    "source_offset": 0,
+                    "volume_curve": None,
+                    "muted": False,
+                    "remap": {"method": "linear", "target_duration": 0},
+                }
+                db_add_audio_clip(project_dir, clip)
+                _log(f"audio-clips/add-from-pool: {m.group(1)} -> {clip_id} on {track_id} ({seg['poolPath']}, {duration:.2f}s)")
+                return self._json_response({"success": True, "id": clip_id})
+
             # POST /api/projects/:name/audio-clips/update
             m = re.match(r"^/api/projects/([^/]+)/audio-clips/update$", path)
             if m:
