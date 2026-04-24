@@ -59,7 +59,9 @@ contributes:
             enum: [male, female, ""]
           model:
             type: string
+            enum: ["MFV2.0", "MFV1.5X", "MFV1.5", "MFV1.0"]
             default: "MFV2.0"
+            description: "Musicful model. MFV2.0 is the latest/highest quality; older models cost less."
         required: [action, style]
 
     - id: credits

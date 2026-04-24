@@ -26,6 +26,7 @@ from typing import Any
 from scenecraft import plugin_api
 from scenecraft.plugins.generate_music.client import (
     Song,
+    SUPPORTED_MUSICFUL_MODELS,
     musicful_generate,
     musicful_get_tasks,
     musicful_get_key_info,
@@ -120,6 +121,8 @@ def run(
         return {"error": "custom action with instrumental=0 requires lyrics"}
     if title and len(title) > 80:
         return {"error": "title exceeds 80 character limit"}
+    if model not in SUPPORTED_MUSICFUL_MODELS:
+        return {"error": f"model '{model}' not supported. Choose one of: {', '.join(SUPPORTED_MUSICFUL_MODELS)}"}
 
     # ── API key check (spec R53) ─────────────────────────────────────
     key_check = check_api_key()

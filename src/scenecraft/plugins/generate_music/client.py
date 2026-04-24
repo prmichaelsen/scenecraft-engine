@@ -47,11 +47,17 @@ class Song:
         )
 
 
+SUPPORTED_MUSICFUL_MODELS = ("MFV2.0", "MFV1.5X", "MFV1.5", "MFV1.0")
+
+
 def musicful_generate(payload: dict) -> list[str]:
     """POST /v1/music/generate — returns task_ids list.
 
-    Musicful's /generate endpoint accepts a discriminated `action` union and
-    returns task ids for the queued songs. Shape per spec's extracted docs.
+    Musicful wraps every response in a ``{status, message, data}`` envelope.
+    Success: ``{"status": 200, "message": "Success", "data": {"ids": [...]}}``.
+    Error:   ``{"status": 4xxxxx, "message": "...", "data": {}}``.
+    Pydantic validation errors come back in FastAPI's ``{"detail": [...]}``
+    format when a field is rejected (e.g. unknown ``mv`` value).
     """
     response = plugin_api.call_service(
         service="musicful",
@@ -61,19 +67,35 @@ def musicful_generate(payload: dict) -> list[str]:
         timeout_seconds=30.0,
     )
     body = response.body
-    # Musicful responses vary; look for task_ids / ids / tasks / etc.
-    if isinstance(body, dict):
-        for key in ("task_ids", "ids", "tasks", "data"):
-            val = body.get(key)
-            if isinstance(val, list):
-                # Coerce to strings since Musicful ids can be int or str.
-                return [str(v.get("id") if isinstance(v, dict) else v) for v in val]
-        # Single-id response
-        if "id" in body:
-            return [str(body["id"])]
-        if "task_id" in body:
-            return [str(body["task_id"])]
-    raise ValueError(f"Unexpected Musicful /generate response shape: {type(body).__name__}")
+
+    if not isinstance(body, dict):
+        raise ValueError(f"Unexpected Musicful /generate response shape: {type(body).__name__}")
+
+    # FastAPI validation error envelope
+    if "detail" in body and "status" not in body:
+        detail = body["detail"]
+        if isinstance(detail, list) and detail:
+            msgs = [d.get("msg", "") for d in detail if isinstance(d, dict)]
+            raise ValueError(f"Musicful rejected request: {'; '.join(m for m in msgs if m)}")
+        raise ValueError(f"Musicful rejected request: {detail}")
+
+    # Standard envelope — surface the server-side message on non-success
+    status = body.get("status")
+    if status is not None and status != 200:
+        message = body.get("message") or f"status={status}"
+        raise ValueError(f"Musicful error {status}: {message}")
+
+    # Success path — ids live under data (occasionally top-level in older shapes)
+    data = body.get("data") if isinstance(body.get("data"), dict) else body
+    for key in ("task_ids", "ids", "tasks"):
+        val = data.get(key) if isinstance(data, dict) else None
+        if isinstance(val, list):
+            return [str(v.get("id") if isinstance(v, dict) else v) for v in val]
+    for key in ("id", "task_id"):
+        if isinstance(data, dict) and key in data:
+            return [str(data[key])]
+
+    raise ValueError(f"Musicful /generate returned no task ids (body keys: {list(body.keys())})")
 
 
 def musicful_get_tasks(task_ids: list[str]) -> list[Song]:
@@ -90,7 +112,18 @@ def musicful_get_tasks(task_ids: list[str]) -> list[Song]:
         timeout_seconds=15.0,
     )
     body = response.body
-    raw_songs = body if isinstance(body, list) else body.get("data", []) if isinstance(body, dict) else []
+    # Mirror /generate's envelope handling
+    if isinstance(body, dict):
+        status = body.get("status")
+        if status is not None and status != 200:
+            msg = body.get("message") or f"status={status}"
+            raise ValueError(f"Musicful tasks error {status}: {msg}")
+        data = body.get("data", body)
+        raw_songs = data if isinstance(data, list) else (data.get("songs") or data.get("tasks") or []) if isinstance(data, dict) else []
+    elif isinstance(body, list):
+        raw_songs = body
+    else:
+        raw_songs = []
     songs: list[Song] = []
     for r in raw_songs:
         if not isinstance(r, dict):
