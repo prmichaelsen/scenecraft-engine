@@ -59,9 +59,25 @@ def deactivate(context) -> None:
 # project_name among other things.
 
 
+def _ctx(tool_context):
+    """Extract project_dir + project_name from the tool dispatch context.
+    project_name falls back to the directory basename if the chat
+    dispatcher didn't inject it explicitly."""
+    project_dir = tool_context["project_dir"]
+    project_name = tool_context.get("project_name") or project_dir.name
+    return project_dir, project_name
+
+
+def _notify(project_name: str, kind: str) -> None:
+    """Mirror the routes._broadcast_changed helper so tool-driven changes
+    push WS events the same way REST-driven ones do."""
+    from scenecraft.plugins.light_show.routes import _broadcast_changed
+    _broadcast_changed(project_name, kind)
+
+
 def tools_set_rig_layout(args, tool_context) -> dict:
     from scenecraft import plugin_api
-    project_dir = tool_context["project_dir"]
+    project_dir, project_name = _ctx(tool_context)
     fixtures = args.get("fixtures") or []
     if not isinstance(fixtures, list):
         return {"error": "fixtures must be a list"}
@@ -69,13 +85,14 @@ def tools_set_rig_layout(args, tool_context) -> dict:
         updated = plugin_api.upsert_light_show_fixtures(project_dir, fixtures)
     except ValueError as e:
         return {"error": str(e)}
+    _notify(project_name, "fixtures")
     return {"fixtures": updated}
 
 
 def tools_list_fixtures(args, tool_context) -> dict:
     del args
     from scenecraft import plugin_api
-    project_dir = tool_context["project_dir"]
+    project_dir, _ = _ctx(tool_context)
     fixtures = plugin_api.list_light_show_fixtures(project_dir)
     return {"fixtures": fixtures}
 
@@ -83,18 +100,20 @@ def tools_list_fixtures(args, tool_context) -> dict:
 def tools_reset_rig(args, tool_context) -> dict:
     del args
     from scenecraft import plugin_api
-    project_dir = tool_context["project_dir"]
+    project_dir, project_name = _ctx(tool_context)
     fixtures = plugin_api.reset_light_show_fixtures(project_dir)
+    _notify(project_name, "fixtures")
     return {"fixtures": fixtures}
 
 
 def tools_remove_fixtures(args, tool_context) -> dict:
     from scenecraft import plugin_api
-    project_dir = tool_context["project_dir"]
+    project_dir, project_name = _ctx(tool_context)
     ids = args.get("ids") or []
     if not isinstance(ids, list):
         return {"error": "ids must be a list"}
     fixtures = plugin_api.remove_light_show_fixtures(project_dir, [str(i) for i in ids])
+    _notify(project_name, "fixtures")
     return {"fixtures": fixtures}
 
 
@@ -104,7 +123,7 @@ def tools_set_fixture_state(args, tool_context) -> dict:
     MUST include ``id``; fields not specified stay at whatever they were
     in the existing override (or NULL / scene-driven)."""
     from scenecraft import plugin_api
-    project_dir = tool_context["project_dir"]
+    project_dir, project_name = _ctx(tool_context)
     overrides = args.get("overrides") or []
     if not isinstance(overrides, list):
         return {"error": "overrides must be a list"}
@@ -112,13 +131,14 @@ def tools_set_fixture_state(args, tool_context) -> dict:
         rows = plugin_api.set_light_show_overrides(project_dir, overrides)
     except ValueError as e:
         return {"error": str(e)}
+    _notify(project_name, "overrides")
     return {"overrides": rows}
 
 
 def tools_list_overrides(args, tool_context) -> dict:
     del args
     from scenecraft import plugin_api
-    project_dir = tool_context["project_dir"]
+    project_dir, _ = _ctx(tool_context)
     return {"overrides": plugin_api.list_light_show_overrides(project_dir)}
 
 
@@ -126,9 +146,10 @@ def tools_clear_overrides(args, tool_context) -> dict:
     """Clear overrides, restoring scene-driven channel values. If ``ids``
     is provided, only clears those fixtures; otherwise clears everything."""
     from scenecraft import plugin_api
-    project_dir = tool_context["project_dir"]
+    project_dir, project_name = _ctx(tool_context)
     ids = args.get("ids") or []
     if not isinstance(ids, list):
         return {"error": "ids must be a list"}
     rows = plugin_api.clear_light_show_overrides(project_dir, [str(i) for i in ids] or None)
+    _notify(project_name, "overrides")
     return {"overrides": rows}

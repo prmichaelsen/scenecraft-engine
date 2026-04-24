@@ -14,6 +14,27 @@ from __future__ import annotations
 from pathlib import Path
 
 
+def _broadcast_changed(project_name: str, kind: str) -> None:
+    """Push a 'light_show_changed' event to all connected WS clients.
+
+    Best-effort — never fails the enclosing mutation. Lets the panel
+    refresh immediately on chat-driven changes instead of waiting for
+    its next 2s poll tick.
+
+    ``kind`` is one of 'fixtures' or 'overrides' — the frontend may
+    choose to refetch only the relevant endpoint.
+    """
+    try:
+        from scenecraft.ws_server import job_manager
+        job_manager._broadcast({
+            "type": "light_show_changed",
+            "projectName": project_name,
+            "kind": kind,
+        })
+    except Exception:
+        pass
+
+
 def _handle_list(path: str, project_dir: Path, project_name: str, query: dict) -> dict:
     del path, project_name, query
     from scenecraft import plugin_api
@@ -21,7 +42,7 @@ def _handle_list(path: str, project_dir: Path, project_name: str, query: dict) -
 
 
 def _handle_upsert(path: str, project_dir: Path, project_name: str, body: dict) -> dict:
-    del path, project_name
+    del path
     from scenecraft import plugin_api
     body = body or {}
     fixtures = body.get("fixtures") or []
@@ -31,13 +52,16 @@ def _handle_upsert(path: str, project_dir: Path, project_name: str, body: dict) 
         updated = plugin_api.upsert_light_show_fixtures(project_dir, fixtures)
     except ValueError as e:
         return {"error": str(e)}
+    _broadcast_changed(project_name, "fixtures")
     return {"fixtures": updated}
 
 
 def _handle_reset(path: str, project_dir: Path, project_name: str, body: dict) -> dict:
-    del path, project_name, body
+    del path, body
     from scenecraft import plugin_api
-    return {"fixtures": plugin_api.reset_light_show_fixtures(project_dir)}
+    result = plugin_api.reset_light_show_fixtures(project_dir)
+    _broadcast_changed(project_name, "fixtures")
+    return {"fixtures": result}
 
 
 # --- overrides ------------------------------------------------------------
@@ -50,7 +74,7 @@ def _handle_list_overrides(path: str, project_dir: Path, project_name: str, quer
 
 
 def _handle_set_overrides(path: str, project_dir: Path, project_name: str, body: dict) -> dict:
-    del path, project_name
+    del path
     from scenecraft import plugin_api
     body = body or {}
     overrides = body.get("overrides") or []
@@ -60,17 +84,19 @@ def _handle_set_overrides(path: str, project_dir: Path, project_name: str, body:
         rows = plugin_api.set_light_show_overrides(project_dir, overrides)
     except ValueError as e:
         return {"error": str(e)}
+    _broadcast_changed(project_name, "overrides")
     return {"overrides": rows}
 
 
 def _handle_clear_overrides(path: str, project_dir: Path, project_name: str, body: dict) -> dict:
-    del path, project_name
+    del path
     from scenecraft import plugin_api
     body = body or {}
     ids = body.get("ids") or []
     if not isinstance(ids, list):
         return {"error": "ids must be a list"}
     rows = plugin_api.clear_light_show_overrides(project_dir, [str(i) for i in ids] or None)
+    _broadcast_changed(project_name, "overrides")
     return {"overrides": rows}
 
 
