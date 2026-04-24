@@ -41,6 +41,13 @@ from scenecraft.db import (
     get_music_generations_for_entity,
     get_music_generation_tracks,
     set_pool_segment_context,
+    # M18 foley generation
+    add_foley_generation,
+    update_foley_generation_status,
+    add_foley_track,
+    get_foley_generation,
+    get_foley_generations_for_entity,
+    get_foley_generation_tracks,
     # Shared candidate-junction helper (tr-side) — needed by M16 + future plugins
     add_tr_candidate,
 )
@@ -89,6 +96,13 @@ __all__ = [
     "get_music_generation",
     "get_music_generations_for_entity",
     "get_music_generation_tracks",
+    # M18 foley generation
+    "add_foley_generation",
+    "update_foley_generation_status",
+    "add_foley_track",
+    "get_foley_generation",
+    "get_foley_generations_for_entity",
+    "get_foley_generation_tracks",
     "set_pool_segment_context",
     "add_tr_candidate",
     "record_spend",
