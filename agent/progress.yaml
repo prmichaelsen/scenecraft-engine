@@ -788,26 +788,28 @@ milestones:
       - id: task-66
         title: gen_chat_tools.py — spec walk, schema derivation, deterministic emit, --check
         file: agent/tasks/milestone-16-fastapi-migration-and-tool-codegen/task-66-gen-chat-tools-script.md
-        status: not_started
+        status: cancelled
         estimated_hours: 5
-        started: null
+        started: 2026-04-24T00:00:00Z
         actual_hours: null
         dependencies:
           - task-65
+        notes: "CANCELLED — tools are aggregate dispatchers with action enums, not 1:1 route mirrors. Codegen built + tested (26 pass) but architecture assumption invalidated."
       - id: task-67
         title: Annotate 32 existing routes with x-tool / x-tool-description / x-destructive
         file: agent/tasks/milestone-16-fastapi-migration-and-tool-codegen/task-67-annotate-32-routes.md
-        status: not_started
+        status: cancelled
         estimated_hours: 3.5
-        started: null
+        started: 2026-04-24T00:00:00Z
         actual_hours: null
         dependencies:
           - task-65
           - task-66
+        notes: "CANCELLED — x-tool annotations serve no purpose without codegen consumer. 28/33 routes were annotated but work abandoned."
       - id: task-68
         title: Wire chat.py + delete 32 legacy constants + snapshot + golden + parity + CI
         file: agent/tasks/milestone-16-fastapi-migration-and-tool-codegen/task-68-wire-chat-delete-legacy-ci.md
-        status: not_started
+        status: cancelled
         estimated_hours: 5
         started: null
         actual_hours: null
@@ -815,6 +817,7 @@ milestones:
           - task-65
           - task-66
           - task-67
+        notes: "CANCELLED — no codegen to wire."
 
   - id: M17
     title: "Voice-Controlled Video Editing — Research Spike"
@@ -853,6 +856,8 @@ recent_work:
   - date: 2026-04-24
     description: "M15 fully shipped end-to-end (9 tasks) — AudioBuffer mixer migration (HTMLAudioElement → AudioBufferSourceNode) + renderMixToBuffer OfflineAudioContext primitive (fidelity 1.48e-8 max abs diff) + mix analysis schema (mix_analysis_runs, mix_datapoints, mix_sections, mix_scalars) + mix_graph_hash + mix-render-upload endpoint + analyze_master_bus chat tool (pyloudnorm + librosa, cached) + full WS render round-trip (backend emits mix_render_request, frontend renders+uploads, asyncio.Event releases the waiting coroutine) + end-to-end integration test + live-vs-offline fidelity test (max abs diff = 0 — bit-identical parity across 5 scenarios). Principle locked in memory: frontend WebAudio is audio source of truth; any mix analysis or export MUST render via OfflineAudioContext cloning the playback graph. Test coverage: 131+ tests across mix/master/analyze surfaces."
   - date: 2026-04-24
+    description: "M16 Phase B (T66-T68 tool codegen) CANCELLED. Design assumed tools map 1:1 to routes — they don't. Tools are aggregate dispatchers with action enums referencing multiple operations; schemas don't compose mechanically. Hand-authored tool dicts in chat.py are simpler, more flexible, and already work. The codegen script (T66) was built and tested (26 tests passing) but provides no value given the aggregate-tool model. T67 (route annotations) partially done (28 routes annotated) but annotations serve no purpose without the codegen consumer. Phase A (migration, T57-T64 + T65 partial) is the real win — FastAPI, Pydantic, OpenAPI docs, TestClient, proper middleware."
+  - date: 2026-04-24
     description: "M16 planned (TDD mode) — FastAPI Migration + OpenAPI-Driven Tool Codegen. 12 tasks (T57-T68) totaling ~54-72 dev hours across 2 phases. Phase A (T57-T65): port 164 routes from hand-rolled api_server.py to FastAPI/uvicorn, preserve auth/streaming/Range/CORS/plugin-catchall/structural-lock behavior, hard cut (no feature flag), WS stays independent on 8891. Phase B (T66-T68): scripts/gen_chat_tools.py reads openapi.json, filters x-tool:true operations, emits src/scenecraft/chat_tools_generated.py replacing ~1000 LOC of hand-written tool schemas in chat.py. Source: two specs shipped 2026-04-24 (local.fastapi-migration 35R/60 behavior rows; local.openapi-tool-codegen 30R/37 behavior rows). Each task lists named tests it covers — tests-first ordering. 897-test suite is the migration confidence anchor; only 11 test files touch HTTP directly."
   - date: 2026-04-24
     description: "Two specs created proofing the next milestone (2026-04-24): agent/specs/local.fastapi-migration.md (replace api_server.py with FastAPI/uvicorn, preserving 164 routes byte-for-byte; hard cut) and agent/specs/local.openapi-tool-codegen.md (scripts/gen_chat_tools.py emits chat_tools_generated.py from openapi.json x-tool annotations; replaces 32 hand-written tool dicts in chat.py). Single open decision: chat tool execution path (OQ-1) — recommendation (a) in-process + parity test, with (b) ASGI round-trip and (c) extracted service layer as alternatives. Commit: ae151a0."
@@ -890,8 +895,7 @@ recent_work:
     description: "M9 complete — Wan2.1 + FILM pipeline. wan.py, film.py, wan_pipeline.py, --engine wan/--preview flags, AI plan wan_denoise/transition_frames."
 
 next_steps:
-  - "M16 implementation — start with T57 (FastAPI scaffold + streaming spike). Tests-first per --tddmode. Spec dependencies satisfied; ~897-test suite provides migration confidence. Note: surface grew further 2026-04-24 with bounce_audio (POST /bounce-upload + GET /bounces/:id.wav) + master-bus (GET /master-bus-effects) — ~167 routes now, incorporate into the migration inventory."
-  - "Resolve M16 OQ-1 during T68 (chat tool execution path: in-process vs ASGI vs extracted service layer). Recommendation: (a) in-process + cross-execution parity test."
+  - "M16 Phase A done in worktrees (wave3 = T57-T64 integrated, T65 partial on m16-t65-cutover). Remaining: native-port ~50 legacy-proxied keyframe/transition routes from _legacy_proxy.py so api_server.py can be deleted. Phase B (T66-T68 codegen) cancelled — tools are aggregate dispatchers, not 1:1 route mirrors."
   - "Backfill M14/M15 as formal milestone docs — significant work has shipped (M15 AudioBuffer mixer, analyze_master_bus, master-bus effect chain, bounce_audio) without milestone rows in progress.yaml. Covered in recent_work entries; milestone docs remain TODO. M15 specifically spans 9 logical tasks and is the defining 'source of truth' infrastructure; worth capturing formally."
   - "M14 rotoscope plan (clarification-8) remains unimplemented — no code shipped. The commit labels 'M14' were retrospective tags for mix-graph-hash work and do NOT reflect rotoscope. Either rename the clarification's target milestone (M17+) or resolve the label collision before planning."
   - "Follow-ups flagged but not urgent: pool/mixes/ + pool/bounces/ GC policy (unbounded growth today); 24→16 TPDF dithering in encodePCMToWav; MP3/FLAC bounce formats; LRU eviction on the decode cache; send-bus integration in offline render (requires live mixer to consume TrackChain first); master-bus-effect automation via chat tools is already free via the existing update_effect_param_curve."
@@ -902,7 +906,7 @@ next_steps:
 notes:
   - "M1-M3, M5-M13 tracked. M11 still open (task-35, task-36 not started). M4 (Resolve integration) deferred."
   - "M14 + M15 work exists in git commits (mix-graph-hash, M15 mix analysis cache, analyze_master_bus chat tool, master-bus effects backend) but is NOT tracked in progress.yaml. Commit messages use per-milestone internal numbering (task 7, task 8) rather than the global scheme. Backfill is a separate concern."
-  - "M16 task IDs 57-68 (12 tasks); source: specs/local.fastapi-migration.md (35R/60 behavior rows) + specs/local.openapi-tool-codegen.md (30R/37 behavior rows). Planned in --tddmode (tests-first per task)."
+  - "M16 task IDs 57-68 (12 planned, T66-T68 cancelled). Phase A (T57-T64) done in worktrees. T65 partial. Phase B (T66-T68 codegen) cancelled — tools ≠ routes."
   - "M11 task IDs 32-36 (30/31/37/38 are unassigned one-offs in agent/tasks/unassigned/)"
   - "M12 task IDs 39-44; 37 (unified WS) is a prereq for task-43's live UI push; task-44 (chunked proxies) extends task-39"
   - "M13 task IDs 45-56 (12 tasks); source: clarification-7 → design/local.effect-curves-macro-panel.md → specs/local.effect-curves-macro-panel.md (54 requirements, 29 tests)"
