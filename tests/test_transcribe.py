@@ -263,8 +263,32 @@ def test_transcribe_clip_unknown_clip_raises(tmp_path, monkeypatch):
     from scenecraft.ai import transcriber
 
     monkeypatch.setattr(transcriber, "WhisperClient", lambda: _StubClient(_stub_transcript("fast")))
-    with pytest.raises(ValueError, match="audio_clip not found"):
+    with pytest.raises(ValueError, match="id not found in audio_clips or pool_segments"):
         transcriber.transcribe_clip(project_dir, "missing_clip")
+
+
+def test_transcribe_falls_back_to_pool_segment(tmp_path, monkeypatch):
+    """A pool_segment id without a matching audio_clip should still resolve."""
+    from scenecraft.ai import transcriber
+    from scenecraft.db import get_db
+
+    project_dir = _make_project(tmp_path)
+    # Plant a pool_segments row pointing at a disk file
+    pool_audio = project_dir / "pool" / "segments" / "seg1.wav"
+    pool_audio.parent.mkdir(parents=True)
+    pool_audio.write_bytes(b"\x00" * 64)
+    conn = get_db(project_dir)
+    conn.execute(
+        "INSERT INTO pool_segments (id, pool_path, kind, created_at) "
+        "VALUES (?, ?, 'imported', '2026-04-24T00:00:00Z')",
+        ("seg_xyz", "pool/segments/seg1.wav"),
+    )
+    conn.commit()
+
+    monkeypatch.setattr(transcriber, "WhisperClient", lambda: _StubClient(_stub_transcript("fast")))
+    r = transcriber.transcribe_clip(project_dir, "seg_xyz", model="fast")
+    assert r.cached is False
+    assert r.text == "stub transcript"
 
 
 def test_unknown_model_override_raises(tmp_path, monkeypatch):

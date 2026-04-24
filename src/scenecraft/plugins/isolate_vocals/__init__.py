@@ -18,31 +18,25 @@ startup in ``api_server.run_server``.
 
 from __future__ import annotations
 
-from scenecraft.plugin_host import OperationDef, PluginHost
+from scenecraft.plugin_host import PluginHost
 
 from . import isolate_vocals as impl
 
 
 def activate(plugin_api, context=None) -> None:
-    """Register contributions with the PluginHost + REST router.
+    """Register contributions + imperative side effects for isolate_vocals.
 
-    Called once by ``PluginHost.register`` at process startup. Any
-    ``Disposable`` pushed into ``context.subscriptions`` (or returned by the
-    ``register_*`` helpers when ``context`` is passed) gets disposed on
-    plugin deactivation — VSCode's lifecycle model.
+    The ``isolate_vocals.run`` operation is declared in ``plugin.yaml``
+    so `PluginHost.register_declared` wires it up from the manifest.
+    The REST endpoint stays imperative (no YAML schema for REST yet —
+    plugins own their own URL patterns).
 
     ``context`` is optional to keep legacy-signature tests compatible; in
     normal operation the host always passes one.
     """
-    PluginHost.register_operation(
-        OperationDef(
-            id="isolate_vocals.run",
-            label="Isolate vocals",
-            entity_types=["audio_clip", "transition"],
-            handler=impl.run,
-        ),
-        context=context,
-    )
+    import sys
+    if context is not None:
+        PluginHost.register_declared(sys.modules[__name__], context)
     plugin_api.register_rest_endpoint(
         r"^/api/projects/[^/]+/plugins/isolate_vocals/run$",
         impl.handle_rest,

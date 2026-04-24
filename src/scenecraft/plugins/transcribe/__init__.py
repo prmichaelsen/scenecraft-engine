@@ -1,19 +1,21 @@
 """Transcribe plugin — Whisper on Replicate.
 
-Registers a single MCP/chat tool `transcribe__transcribe_clip` plus an
-optional right-click operation `transcribe.run` for the audio_clip
-entity. Plugin settings (default_model, default_language,
-default_word_timestamps) are read via `transcriber.get_plugin_settings`.
+Declarative contributions (settings schema, the
+``transcribe__transcribe_clip`` MCP tool, the ``transcribe.run``
+context-menu operation) are declared in ``plugin.yaml``. The host parses
+that manifest before calling ``activate()`` and makes it available via
+``context.manifest``.
+
+This plugin uses the manifest as source of truth — ``activate()`` simply
+asks the host to wire every declared contribution via
+``PluginHost.register_declared``. Handler refs in the manifest
+(``backend:handle_transcribe_clip``) resolve against the names
+re-exported from this package root below.
 """
 
 from __future__ import annotations
 
-from scenecraft.plugin_host import (
-    MCPToolDef,
-    OperationDef,
-    PluginContext,
-    PluginHost,
-)
+from scenecraft.plugin_host import PluginContext, PluginHost
 
 from .handlers import (
     TRANSCRIBE_CLIP_INPUT_SCHEMA,
@@ -22,25 +24,30 @@ from .handlers import (
     handle_transcribe_operation,
 )
 
+# Re-exports so the manifest's ``handler: "backend:<attr>"`` refs can find
+# these at the plugin module root via getattr().
+__all__ = [
+    "TRANSCRIBE_CLIP_INPUT_SCHEMA",
+    "TRANSCRIBE_CLIP_TOOL_DESCRIPTION",
+    "handle_transcribe_clip",
+    "handle_transcribe_operation",
+]
+
 
 def activate(plugin_api, context: PluginContext) -> None:
-    """Register the plugin's contributions with the host."""
-    del plugin_api  # unused for this plugin — tool is self-contained
+    """Imperative hook — registers every contribution declared in the manifest.
 
-    tool = MCPToolDef(
-        plugin="transcribe",
-        tool_id="transcribe_clip",
-        description=TRANSCRIBE_CLIP_TOOL_DESCRIPTION,
-        input_schema=TRANSCRIBE_CLIP_INPUT_SCHEMA,
-        handler=handle_transcribe_clip,
-        destructive=False,
-    )
-    context.subscriptions.append(PluginHost.register_mcp_tool(tool, context=None))
+    All wiring is driven by ``plugin.yaml``; this plugin has no additional
+    side effects. If a plugin needed to pre-warm caches or spawn
+    background threads it would do so here alongside the
+    ``register_declared`` call.
+    """
+    del plugin_api  # unused for this plugin
+    import sys
+    PluginHost.register_declared(_this_module(), context)
 
-    op = OperationDef(
-        id="transcribe.run",
-        label="Transcribe…",
-        entity_types=["audio_clip"],
-        handler=handle_transcribe_operation,
-    )
-    context.subscriptions.append(PluginHost.register_operation(op))
+
+def _this_module():
+    """Return this package as a module object for handler resolution."""
+    import sys
+    return sys.modules[__name__]
