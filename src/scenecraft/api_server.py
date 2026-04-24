@@ -488,6 +488,62 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 clips = get_audio_clips(project_dir, track_id)
                 return self._json_response({"audioClips": clips})
 
+            # GET /api/projects/:name/plugins/transcribe/runs?clip_id=<id>
+            m = re.match(r"^/api/projects/([^/]+)/plugins/transcribe/runs$", path)
+            if m:
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None:
+                    return
+                from scenecraft.ai.transcriber import list_runs
+                clip_id = None
+                if "?" in self.path:
+                    from urllib.parse import parse_qs
+                    qs = parse_qs(parsed.query)
+                    clip_id = qs.get("clip_id", qs.get("clipId", [None]))[0]
+                try:
+                    runs = list_runs(project_dir, clip_id=clip_id or None)
+                except Exception as exc:  # noqa: BLE001
+                    return self._error(500, "INTERNAL_ERROR", str(exc))
+                return self._json_response({"runs": runs, "count": len(runs)})
+
+            # GET /api/projects/:name/plugins/transcribe/runs/:run_id
+            m = re.match(r"^/api/projects/([^/]+)/plugins/transcribe/runs/([^/]+)$", path)
+            if m:
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None:
+                    return
+                from scenecraft.ai.transcriber import get_run
+                run_id = m.group(2)
+                try:
+                    result = get_run(project_dir, run_id)
+                except Exception as exc:  # noqa: BLE001
+                    return self._error(500, "INTERNAL_ERROR", str(exc))
+                if result is None:
+                    return self._error(404, "NOT_FOUND", f"transcribe run not found: {run_id}")
+                return self._json_response({
+                    "run_id": result.run_id,
+                    "clip_id": result.clip_id,
+                    "model": result.model,
+                    "model_slug": result.model_slug,
+                    "language": result.language,
+                    "word_timestamps": result.word_timestamps,
+                    "duration_seconds": result.duration_seconds,
+                    "created_at": result.created_at,
+                    "text": result.text,
+                    "segments": [
+                        {
+                            "start": s.start,
+                            "end": s.end,
+                            "text": s.text,
+                            "words": [
+                                {"text": w.text, "start": w.start, "end": w.end, "score": w.score}
+                                for w in s.words
+                            ] if s.words else [],
+                        }
+                        for s in result.segments
+                    ],
+                })
+
             # GET /api/projects/:name/audio-clips/:id/peaks?resolution=400
             m = re.match(r"^/api/projects/([^/]+)/audio-clips/([^/]+)/peaks$", path)
             if m:
@@ -1408,6 +1464,65 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 _log(f"audio-clips/delete: {del_id}")
                 db_delete_audio_clip(project_dir, del_id)
                 return self._json_response({"success": True})
+
+            # POST /api/projects/:name/plugins/transcribe/run — create a
+            # transcription run against Whisper on Replicate. Accepts
+            # either an audio_clip id or a pool_segment id in `clip_id`;
+            # transcriber.transcribe_clip falls through to the second on
+            # miss. Body:
+            #   { clip_id, model?, language?, word_timestamps?, force_rerun? }
+            # Model enum: fast | whisperx | whisper | whisper-timestamped
+            # (omit to use the plugin's default_model setting).
+            # Synchronous — the caller waits for completion + gets the
+            # full run back, including cached=<bool> so the UI can
+            # distinguish fresh vs replayed.
+            m = re.match(r"^/api/projects/([^/]+)/plugins/transcribe/run$", path)
+            if m:
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None:
+                    return
+                body = self._read_json_body()
+                if body is None:
+                    return
+                clip_id = body.get("clip_id") or body.get("clipId")
+                if not clip_id or not isinstance(clip_id, str):
+                    return self._error(400, "BAD_REQUEST", "Missing 'clip_id'")
+                model = body.get("model")
+                language = body.get("language")
+                word_timestamps = body.get("word_timestamps", body.get("wordTimestamps"))
+                force_rerun = bool(body.get("force_rerun", body.get("forceRerun", False)))
+                from scenecraft.ai.transcriber import transcribe_clip
+                try:
+                    result = transcribe_clip(
+                        project_dir, clip_id,
+                        model=model, language=language,
+                        word_timestamps=word_timestamps,
+                        force_rerun=force_rerun,
+                    )
+                except FileNotFoundError as exc:
+                    return self._error(404, "NOT_FOUND", f"audio source missing on disk: {exc}")
+                except ValueError as exc:
+                    return self._error(400, "BAD_REQUEST", str(exc))
+                except Exception as exc:  # noqa: BLE001
+                    _log(f"transcribe/run error: {type(exc).__name__}: {exc}")
+                    return self._error(500, "INTERNAL_ERROR", str(exc))
+                _log(
+                    f"transcribe/run ok: clip={clip_id} model={result.model} "
+                    f"segments={len(result.segments)} cached={result.cached}"
+                )
+                return self._json_response({
+                    "run_id": result.run_id,
+                    "clip_id": result.clip_id,
+                    "model": result.model,
+                    "model_slug": result.model_slug,
+                    "language": result.language,
+                    "word_timestamps": result.word_timestamps,
+                    "duration_seconds": result.duration_seconds,
+                    "segment_count": len(result.segments),
+                    "text": result.text,
+                    "cached": result.cached,
+                    "created_at": result.created_at,
+                })
 
             # POST /api/projects/:name/audio-clips/batch-ops
             # Apply a list of audio_clip mutations inside one undo group.

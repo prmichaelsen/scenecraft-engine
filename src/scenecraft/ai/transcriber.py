@@ -112,6 +112,69 @@ def _find_cached_run(
     return row["id"] if row else None
 
 
+def list_runs(project_dir: Path, clip_id: str | None = None) -> list[dict]:
+    """Return a chat/REST-friendly summary of every completed run.
+
+    Lighter than loading each run with segments — callers use this to
+    pick a run id, then fetch the full one via ``get_run``. Filters by
+    ``clip_id`` when provided (matches transcribe_clip's cache-key
+    semantics — any run referencing that clip, across models).
+    """
+    from scenecraft.db import get_db
+    conn = get_db(project_dir)
+    if clip_id:
+        rows = conn.execute(
+            """SELECT id, clip_id, model, model_slug, language, word_timestamps,
+                      detected_language, duration_seconds, status, created_at,
+                      substr(text, 1, 280) AS text_preview,
+                      (SELECT COUNT(*) FROM transcribe__segments s WHERE s.run_id = r.id) AS segment_count
+               FROM transcribe__runs r
+               WHERE clip_id = ? AND status = 'completed'
+               ORDER BY created_at DESC""",
+            (clip_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT id, clip_id, model, model_slug, language, word_timestamps,
+                      detected_language, duration_seconds, status, created_at,
+                      substr(text, 1, 280) AS text_preview,
+                      (SELECT COUNT(*) FROM transcribe__segments s WHERE s.run_id = r.id) AS segment_count
+               FROM transcribe__runs r
+               WHERE status = 'completed'
+               ORDER BY created_at DESC
+               LIMIT 200""",
+        ).fetchall()
+    return [
+        {
+            "run_id": r["id"],
+            "clip_id": r["clip_id"],
+            "model": r["model"],
+            "model_slug": r["model_slug"],
+            "language_requested": r["language"],
+            "detected_language": r["detected_language"],
+            "word_timestamps": bool(r["word_timestamps"]),
+            "duration_seconds": r["duration_seconds"],
+            "segment_count": r["segment_count"],
+            "text_preview": r["text_preview"] or "",
+            "status": r["status"],
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
+
+
+def get_run(project_dir: Path, run_id: str) -> TranscribeRunResult | None:
+    """Fetch a full run with segments, or None if the id doesn't exist."""
+    from scenecraft.db import get_db
+    conn = get_db(project_dir)
+    row = conn.execute(
+        "SELECT 1 FROM transcribe__runs WHERE id = ?", (run_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _load_run(project_dir, run_id)
+
+
 def _load_run(project_dir: Path, run_id: str) -> TranscribeRunResult:
     from scenecraft.db import get_db
     conn = get_db(project_dir)

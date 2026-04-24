@@ -108,6 +108,94 @@ def handle_transcribe_clip(args: dict, context: dict) -> dict:
     }
 
 
+LIST_TRANSCRIPTIONS_TOOL_DESCRIPTION = (
+    "List completed transcription runs for the current project. Optionally "
+    "filter by clip_id to see every run against one audio source (e.g., to "
+    "compare different Whisper model outputs). Returns a lightweight summary "
+    "per run — call `transcribe__get_transcription` for the full text + "
+    "segments of a specific run."
+)
+
+LIST_TRANSCRIPTIONS_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "clip_id": {
+            "type": "string",
+            "description": "Optional: limit results to runs of this audio_clip or pool_segment id.",
+        },
+    },
+    "required": [],
+}
+
+
+GET_TRANSCRIPTION_TOOL_DESCRIPTION = (
+    "Fetch one transcription run by run_id, including every segment with its "
+    "start/end times, text, and (if word_timestamps was on at run time) "
+    "per-word timing. Use this after `transcribe__transcribe_clip` or "
+    "`transcribe__list_transcriptions` to read back full content for "
+    "summarisation, lyric extraction, timeline alignment, etc."
+)
+
+GET_TRANSCRIPTION_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "run_id": {
+            "type": "string",
+            "description": "ID of a transcribe__runs row (returned by transcribe_clip / list_transcriptions).",
+        },
+    },
+    "required": ["run_id"],
+}
+
+
+def handle_list_transcriptions(args: dict, context: dict) -> dict:
+    """Chat-tool path — lightweight browse of completed runs."""
+    project_dir: Path = context["project_dir"]
+    clip_id = args.get("clip_id")
+    try:
+        runs = transcriber.list_runs(project_dir, clip_id=clip_id if clip_id else None)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"runs": runs, "count": len(runs)}
+
+
+def handle_get_transcription(args: dict, context: dict) -> dict:
+    """Chat-tool path — read one run with all its segments."""
+    project_dir: Path = context["project_dir"]
+    run_id = args.get("run_id")
+    if not run_id or not isinstance(run_id, str):
+        return {"error": "run_id is required and must be a string"}
+    try:
+        result = transcriber.get_run(project_dir, run_id)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    if result is None:
+        return {"error": f"transcribe run not found: {run_id}"}
+    return {
+        "run_id": result.run_id,
+        "clip_id": result.clip_id,
+        "model": result.model,
+        "model_slug": result.model_slug,
+        "language": result.language,
+        "word_timestamps": result.word_timestamps,
+        "duration_seconds": result.duration_seconds,
+        "created_at": result.created_at,
+        "text": result.text,
+        "segments": [
+            {
+                "start": s.start,
+                "end": s.end,
+                "text": s.text,
+                "words": [
+                    {"text": w.text, "start": w.start, "end": w.end, "score": w.score}
+                    for w in s.words
+                ] if s.words else [],
+            }
+            for s in result.segments
+        ],
+    }
+
+
 def handle_transcribe_operation(entity_type: str, entity_id: str, op_context: dict) -> dict:
     """Right-click-menu path. Reuses the same entry point.
 

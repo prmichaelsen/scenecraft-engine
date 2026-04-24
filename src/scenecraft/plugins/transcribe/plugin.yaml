@@ -61,6 +61,41 @@ contributes:
             description: "Skip the cache and run fresh even if a matching run exists."
         required: [clip_id]
 
+    - id: list_transcriptions
+      # Claude sees this as `transcribe__list_transcriptions`.
+      description: >
+        List completed transcription runs for the current project. Optional
+        clip_id filter narrows to one audio source across every model that
+        was used. Returns compact summaries (run_id, model, duration,
+        preview, segment count); call `transcribe__get_transcription` for
+        the full text + segments of a specific run.
+      destructive: false
+      handler: "backend:handle_list_transcriptions"
+      input_schema:
+        type: object
+        properties:
+          clip_id:
+            type: string
+            description: "Optional: limit results to runs against this audio_clip / pool_segment id."
+        required: []
+
+    - id: get_transcription
+      # Claude sees this as `transcribe__get_transcription`.
+      description: >
+        Fetch one transcription run by run_id with every segment (and
+        per-word timing when the run was created with word_timestamps on).
+        Used after transcribe_clip / list_transcriptions to read full
+        content for summarisation, lyric extraction, timeline alignment.
+      destructive: false
+      handler: "backend:handle_get_transcription"
+      input_schema:
+        type: object
+        properties:
+          run_id:
+            type: string
+            description: "ID of a transcribe__runs row."
+        required: [run_id]
+
   operations:
     - id: transcribe.run
       label: "Transcribe…"
