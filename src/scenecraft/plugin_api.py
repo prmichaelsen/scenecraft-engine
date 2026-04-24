@@ -322,26 +322,33 @@ def _call_service_urllib(service, method, path, body, headers, query, timeout_se
         raise ServiceTimeoutError(str(e)) from e
 
 
-def register_rest_endpoint(path_regex: str, handler, context=None):
+def register_rest_endpoint(path_regex: str, handler, *, method: str = "POST", context=None):
     """Route a handler on the shared scenecraft REST server.
 
-    Populates a dict that ``api_server.py`` consults during request dispatch
-    via ``PluginHost.dispatch_rest``. Returns a ``Disposable`` that removes
-    the route when disposed; if ``context`` is provided (a ``PluginContext``
-    from ``activate()``), the Disposable is auto-pushed into
-    ``context.subscriptions`` so the host cleans it up on ``deactivate``.
+    Populates a per-method dict that ``api_server.py`` consults during
+    request dispatch via ``PluginHost.dispatch_rest``. Returns a
+    ``Disposable`` that removes the route when disposed; if ``context``
+    is provided (a ``PluginContext`` from ``activate()``), the Disposable
+    is auto-pushed into ``context.subscriptions`` so the host cleans it
+    up on ``deactivate``.
 
-    ``handler`` signature: ``handler(path: str, *args, **kwargs) -> Any``.
-    ``api_server.py`` is responsible for calling it with whatever positional
-    and keyword context the host provides at dispatch time.
+    ``method`` selects the HTTP-method bucket. Default ``'POST'`` keeps
+    pre-task-130 callers working. ``handler`` signature is
+    ``handler(path: str, *args, **kwargs) -> Any``. For POST the host
+    passes ``(project_dir, project_name, body)``; for GET it passes
+    ``(project_dir, project_name, query)`` where ``query`` is a dict of
+    already-parsed query-string params.
     """
     from scenecraft.plugin_host import PluginHost
 
-    PluginHost._rest_routes[path_regex] = handler
+    method_upper = method.upper()
+    routes = PluginHost._rest_routes_by_method.setdefault(method_upper, {})
+    routes[path_regex] = handler
 
     def _dispose() -> None:
-        if PluginHost._rest_routes.get(path_regex) is handler:
-            del PluginHost._rest_routes[path_regex]
+        routes = PluginHost._rest_routes_by_method.get(method_upper, {})
+        if routes.get(path_regex) is handler:
+            del routes[path_regex]
 
     d = make_disposable(_dispose)
     if context is not None:
