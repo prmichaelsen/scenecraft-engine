@@ -182,6 +182,37 @@ class MixScalar:
     value: float
 
 
+# ── bounce_audio: rendered WAV cache (M16) ──────────────────────────
+
+@dataclass
+class AudioBounce:
+    """A cached audio bounce — a rendered WAV at pool/bounces/<hash>.wav.
+
+    ``composite_hash`` is the cache key: SHA-256 over the project's mix-graph
+    hash + selection (mode + track_ids/clip_ids) + format (sample_rate,
+    bit_depth, channels). Two bounces with identical mix state + selection +
+    format share a hash and reuse the same WAV file on disk.
+
+    ``mode`` is ``'full'`` (bounce everything), ``'tracks'`` (only the given
+    track_ids), or ``'clips'`` (only the given clip_ids). The ``selection_json``
+    column is a JSON string of ``{"track_ids": [...]}`` / ``{"clip_ids": [...]}``
+    / ``{}`` depending on mode.
+    """
+    id: str
+    composite_hash: str
+    start_time_s: float
+    end_time_s: float
+    mode: str                       # 'full' | 'tracks' | 'clips'
+    selection: dict[str, Any]       # deserialized from selection_json
+    sample_rate: int
+    bit_depth: int                  # 16 | 24 | 32
+    channels: int
+    rendered_path: str | None       # pool/bounces/<composite_hash>.wav; None while rendering
+    size_bytes: int | None
+    duration_s: float | None
+    created_at: str
+
+
 __all__ = [
     "CurvePoint",
     "TrackEffect",
@@ -200,4 +231,5 @@ __all__ = [
     "MixDatapoint",
     "MixSection",
     "MixScalar",
+    "AudioBounce",
 ]

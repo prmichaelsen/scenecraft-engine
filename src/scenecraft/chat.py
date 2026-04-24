@@ -203,6 +203,12 @@ Tools available:
     start_time_s, end_time_s, sample_rate, analyzer_version); re-calling with
     the same mix graph returns the cached run. Pass force_rerun=True to
     overwrite. Non-destructive.
+  • bounce_audio — render an audio bounce (full mix, a subset of tracks via
+    track_ids, or a subset of clips via clip_ids) to a WAV and return a
+    download URL. track_ids and clip_ids are mutually exclusive. Default
+    format 48 kHz / 24-bit / stereo; override via sample_rate / bit_depth /
+    channels. Cached by (mix_graph_hash + selection + format); identical
+    calls reuse the same bounce_id without re-rendering. Non-destructive.
   • apply_mix_plan — run an ordered list of audio mix operations as ONE
     atomic undo group so the whole auto-mix pass can be undone in a single
     click. Each operation names a child op (add_audio_track, add_audio_clip,
@@ -1261,6 +1267,85 @@ ANALYZE_MASTER_BUS_TOOL: dict = {
 }
 
 
+BOUNCE_AUDIO_TOOL: dict = {
+    "name": "bounce_audio",
+    "description": (
+        "Render an audio bounce (full mix, track subset, or clip subset) to "
+        "a WAV via the frontend's OfflineAudioContext, and return a download "
+        "URL for the resulting file. Three modes: (1) no selection → 'full' "
+        "bounce of every non-muted track; (2) track_ids → only those tracks "
+        "are summed; (3) clip_ids → only those specific clips are rendered. "
+        "track_ids and clip_ids are mutually exclusive — passing both errors. "
+        "Results are cached by (mix_graph_hash, selection, sample_rate, "
+        "bit_depth, channels); re-calling with identical args returns the "
+        "cached bounce_id without re-rendering. Default format is 48kHz / "
+        "24-bit / stereo. Requires playback paused on the frontend. "
+        "Non-destructive — a bounce is a write-once cache artifact, no undo."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "start_time_s": {
+                "type": ["number", "null"],
+                "default": None,
+                "description": (
+                    "Start of the bounce window in seconds. Omit (or null) "
+                    "for 0.0 (start of project)."
+                ),
+            },
+            "end_time_s": {
+                "type": ["number", "null"],
+                "default": None,
+                "description": (
+                    "End of the bounce window in seconds. Omit (or null) to "
+                    "bounce through the last audio_clip's end_time."
+                ),
+            },
+            "track_ids": {
+                "type": ["array", "null"],
+                "items": {"type": "string"},
+                "default": None,
+                "description": (
+                    "If provided, bounce only these audio_tracks (everything "
+                    "on those tracks). Mutually exclusive with clip_ids."
+                ),
+            },
+            "clip_ids": {
+                "type": ["array", "null"],
+                "items": {"type": "string"},
+                "default": None,
+                "description": (
+                    "If provided, bounce only these specific audio_clips. "
+                    "Mutually exclusive with track_ids."
+                ),
+            },
+            "sample_rate": {
+                "type": "integer",
+                "default": 48000,
+                "description": (
+                    "Target sample rate (Hz). One of: 44100, 48000, 88200, "
+                    "96000."
+                ),
+            },
+            "bit_depth": {
+                "type": "integer",
+                "default": 24,
+                "description": (
+                    "PCM bit depth. One of: 16, 24, 32 (32 = float). "
+                    "Default 24."
+                ),
+            },
+            "channels": {
+                "type": "integer",
+                "default": 2,
+                "description": "Channel count (1 = mono, 2 = stereo).",
+            },
+        },
+        "required": [],
+    },
+}
+
+
 TOOLS: list[dict] = [
     SQL_QUERY_TOOL,
     UPDATE_KEYFRAME_PROMPT_TOOL,
@@ -1294,6 +1379,7 @@ TOOLS: list[dict] = [
     GENERATE_DESCRIPTIONS_TOOL,
     APPLY_MIX_PLAN_TOOL,
     ANALYZE_MASTER_BUS_TOOL,
+    BOUNCE_AUDIO_TOOL,
 ]
 
 
@@ -1337,6 +1423,12 @@ _DESTRUCTIVE_TOOL_ALLOWLIST: frozenset[str] = frozenset({
     # happens regardless of this gate). Allowlisted defensively in case the
     # destructive-pattern list grows an "analyze_" entry later.
     "analyze_master_bus",
+    # bounce_audio renders a WAV via the frontend and writes a write-once
+    # audio_bounces row referencing pool/bounces/<hash>.wav. Like
+    # analyze_master_bus, it is neither DB-destructive nor expensive (the
+    # browser render happens regardless of this gate). Allowlisted so
+    # "bounce" doesn't accidentally match a future destructive pattern.
+    "bounce_audio",
 })
 
 
@@ -3180,6 +3272,406 @@ async def _exec_analyze_master_bus(
     }
 
 
+# ── bounce_audio (M16 — render a WAV bounce of the mix / tracks / clips) ───
+#
+# WS round-trip contract:
+#
+#   Server → Client (chat WS):
+#     {"type":           "bounce_audio_request",
+#      "request_id":     str (uuid4 hex),
+#      "bounce_id":      str (matches audio_bounces.id),
+#      "composite_hash": str (64-char hex SHA-256 — also the on-disk filename),
+#      "start_time_s":   float,
+#      "end_time_s":     float,
+#      "mode":           "full" | "tracks" | "clips",
+#      "track_ids":      list[str] | null,
+#      "clip_ids":       list[str] | null,
+#      "sample_rate":    int,
+#      "bit_depth":      int (16 | 24 | 32),
+#      "channels":       int (1 | 2)}
+#
+#   Client → Server (HTTP multipart POST):
+#     POST /api/projects/:name/bounce-upload
+#       audio:           binary WAV
+#       composite_hash:  str (same hex the server sent)
+#       start_time_s:    float
+#       end_time_s:      float
+#       sample_rate:     int
+#       bit_depth:       int
+#       channels:        int
+#       request_id:      str
+#
+#   Server on successful upload: writes pool/bounces/<composite_hash>.wav,
+#   then calls ``set_bounce_render_event(request_id)`` to unblock the tool.
+
+
+# Per-request pending events. Mirrors ``_MIX_RENDER_EVENTS``.
+_BOUNCE_RENDER_EVENTS: dict[str, asyncio.Event] = {}
+
+# Tests monkeypatch this (or pass ``timeout_s`` directly) to avoid real 60s waits.
+BOUNCE_RENDER_TIMEOUT_S: float = 60.0
+
+# Valid sample rates for bounce_audio. Matches the common ones the frontend's
+# OfflineAudioContext supports; extend here if more are needed later.
+_BOUNCE_VALID_SAMPLE_RATES: frozenset[int] = frozenset({44100, 48000, 88200, 96000})
+
+# Valid bit depths (16/24 = signed PCM, 32 = IEEE float).
+_BOUNCE_VALID_BIT_DEPTHS: frozenset[int] = frozenset({16, 24, 32})
+
+
+def set_bounce_render_event(request_id: str) -> bool:
+    """Release the chat tool waiting on this ``request_id``, if any.
+
+    Returns ``True`` if an event was set, ``False`` if no matching pending
+    event. Called by the api_server ``bounce-upload`` handler after a
+    successful WAV write. Same thread-safety posture as
+    :func:`set_mix_render_event` — the awaiting event loop picks up the flag
+    on its next scheduler tick.
+    """
+    evt = _BOUNCE_RENDER_EVENTS.get(request_id)
+    if evt is None:
+        return False
+    evt.set()
+    return True
+
+
+async def _exec_bounce_audio(
+    project_dir: Path,
+    input_data: dict,
+    *,
+    ws: Any = None,
+    project_name: str | None = None,
+    timeout_s: float | None = None,
+) -> dict:
+    """Render an audio bounce and return its download URL.
+
+    Mirrors :func:`_exec_analyze_master_bus`: validates inputs, resolves the
+    time window, computes a composite cache hash, checks the cache, and on a
+    miss emits a ``bounce_audio_request`` WS message before awaiting the
+    frontend upload. Never raises for invalid inputs — returns
+    ``{"error": ...}`` instead.
+    """
+    from scenecraft.bounce_hash import compute_bounce_hash
+    from scenecraft.db_bounces import (
+        create_bounce,
+        delete_bounce,
+        get_bounce_by_hash,
+        update_bounce_rendered,
+    )
+
+    # ── Parse start / end ───────────────────────────────────────────
+    start_raw = input_data.get("start_time_s")
+    if start_raw is None:
+        start_time_s = 0.0
+    else:
+        try:
+            start_time_s = float(start_raw)
+        except (TypeError, ValueError):
+            return {"error": "start_time_s must be a number or null"}
+    if start_time_s < 0:
+        return {"error": "start_time_s must be >= 0"}
+
+    end_raw = input_data.get("end_time_s")
+    end_time_s: float | None
+    if end_raw is None:
+        end_time_s = None
+    else:
+        try:
+            end_time_s = float(end_raw)
+        except (TypeError, ValueError):
+            return {"error": "end_time_s must be a number or null"}
+
+    # ── Parse selection (mutually exclusive) ────────────────────────
+    track_ids_raw = input_data.get("track_ids")
+    clip_ids_raw = input_data.get("clip_ids")
+
+    if track_ids_raw is not None and clip_ids_raw is not None:
+        # Allow empty lists to coexist — treat both [] as "no selection".
+        if track_ids_raw and clip_ids_raw:
+            return {"error": "pass either track_ids or clip_ids, not both"}
+
+    track_ids: list[str] | None = None
+    if track_ids_raw:
+        if not isinstance(track_ids_raw, list):
+            return {"error": "track_ids must be a list of strings"}
+        if not all(isinstance(t, str) for t in track_ids_raw):
+            return {"error": "track_ids must be a list of strings"}
+        track_ids = list(track_ids_raw)
+
+    clip_ids: list[str] | None = None
+    if clip_ids_raw:
+        if not isinstance(clip_ids_raw, list):
+            return {"error": "clip_ids must be a list of strings"}
+        if not all(isinstance(c, str) for c in clip_ids_raw):
+            return {"error": "clip_ids must be a list of strings"}
+        clip_ids = list(clip_ids_raw)
+
+    # ── Parse format ────────────────────────────────────────────────
+    try:
+        sample_rate = int(input_data.get("sample_rate", 48000))
+    except (TypeError, ValueError):
+        return {"error": "sample_rate must be an integer"}
+    if sample_rate not in _BOUNCE_VALID_SAMPLE_RATES:
+        return {
+            "error": (
+                f"sample_rate must be one of "
+                f"{sorted(_BOUNCE_VALID_SAMPLE_RATES)}, got {sample_rate}"
+            ),
+        }
+
+    try:
+        bit_depth = int(input_data.get("bit_depth", 24))
+    except (TypeError, ValueError):
+        return {"error": "bit_depth must be an integer"}
+    if bit_depth not in _BOUNCE_VALID_BIT_DEPTHS:
+        return {
+            "error": (
+                f"bit_depth must be one of {sorted(_BOUNCE_VALID_BIT_DEPTHS)}, "
+                f"got {bit_depth}"
+            ),
+        }
+
+    try:
+        channels = int(input_data.get("channels", 2))
+    except (TypeError, ValueError):
+        return {"error": "channels must be an integer"}
+    if channels not in (1, 2):
+        return {"error": f"channels must be 1 or 2, got {channels}"}
+
+    # ── Determine mode from selection ───────────────────────────────
+    if track_ids:
+        mode = "tracks"
+    elif clip_ids:
+        mode = "clips"
+    else:
+        mode = "full"
+
+    # ── Resolve end_time_s ──────────────────────────────────────────
+    if end_time_s is None:
+        end_time_s = _resolve_mix_end_time(project_dir)
+    if end_time_s <= start_time_s:
+        return {
+            "error": (
+                f"end_time_s ({end_time_s}) must be greater than start_time_s "
+                f"({start_time_s}); project may have no audio_clips"
+            ),
+        }
+
+    # ── Validate track_ids / clip_ids exist ─────────────────────────
+    from scenecraft.db import get_db
+    conn = get_db(project_dir)
+    if track_ids:
+        placeholders = ",".join("?" * len(track_ids))
+        found = {
+            r[0] for r in conn.execute(
+                f"SELECT id FROM audio_tracks WHERE id IN ({placeholders})",
+                track_ids,
+            ).fetchall()
+        }
+        missing = [t for t in track_ids if t not in found]
+        if missing:
+            return {"error": f"track_ids not found: {missing}"}
+    if clip_ids:
+        placeholders = ",".join("?" * len(clip_ids))
+        found = {
+            r[0] for r in conn.execute(
+                f"SELECT id FROM audio_clips WHERE id IN ({placeholders}) "
+                f"AND deleted_at IS NULL",
+                clip_ids,
+            ).fetchall()
+        }
+        missing = [c for c in clip_ids if c not in found]
+        if missing:
+            return {"error": f"clip_ids not found: {missing}"}
+
+    # ── Compute composite_hash ──────────────────────────────────────
+    composite_hash = compute_bounce_hash(
+        project_dir,
+        start_time_s=start_time_s,
+        end_time_s=end_time_s,
+        mode=mode,
+        track_ids=track_ids,
+        clip_ids=clip_ids,
+        sample_rate=sample_rate,
+        bit_depth=bit_depth,
+        channels=channels,
+    )
+
+    # ── Cache hit? ──────────────────────────────────────────────────
+    cached = get_bounce_by_hash(project_dir, composite_hash)
+    if cached is not None and cached.rendered_path is not None:
+        return {
+            "bounce_id": cached.id,
+            "cached": True,
+            "rendered_path": cached.rendered_path,
+            "download_url": _bounce_download_url(project_name, cached.id),
+            "duration_s": cached.duration_s,
+            "size_bytes": cached.size_bytes,
+            "mode": cached.mode,
+            "tracks_requested": list(track_ids) if track_ids else [],
+            "clips_requested": list(clip_ids) if clip_ids else [],
+            "composite_hash": composite_hash,
+            "sample_rate": cached.sample_rate,
+            "bit_depth": cached.bit_depth,
+            "channels": cached.channels,
+        }
+
+    # A cache row exists but rendering never completed (e.g. a prior
+    # request timed out). Delete and retry so the UNIQUE constraint
+    # doesn't block us.
+    if cached is not None and cached.rendered_path is None:
+        delete_bounce(project_dir, cached.id)
+
+    # ── Build selection payload for the DB row ──────────────────────
+    if mode == "tracks":
+        selection = {"track_ids": list(track_ids or [])}
+    elif mode == "clips":
+        selection = {"clip_ids": list(clip_ids or [])}
+    else:
+        selection = {}
+
+    # ── Insert pending bounce row ───────────────────────────────────
+    bounce = create_bounce(
+        project_dir,
+        composite_hash=composite_hash,
+        start_time_s=start_time_s,
+        end_time_s=end_time_s,
+        mode=mode,
+        selection=selection,
+        sample_rate=sample_rate,
+        bit_depth=bit_depth,
+        channels=channels,
+    )
+
+    # ── Locate the rendered WAV; request via WS if missing ──────────
+    bounces_dir = Path(project_dir) / "pool" / "bounces"
+    rendered_rel = f"pool/bounces/{composite_hash}.wav"
+    rendered_abs = bounces_dir / f"{composite_hash}.wav"
+
+    if not rendered_abs.exists():
+        if ws is None:
+            delete_bounce(project_dir, bounce.id)
+            return {
+                "error": (
+                    f"rendered bounce WAV not found at {rendered_abs} and no "
+                    f"ws context was supplied to request a frontend render. "
+                    f"Place the WAV at pool/bounces/<composite_hash>.wav or "
+                    f"call this tool via the chat WS."
+                ),
+                "composite_hash": composite_hash,
+                "expected_rendered_path": rendered_rel,
+            }
+
+        request_id = uuid.uuid4().hex
+        event = asyncio.Event()
+        _BOUNCE_RENDER_EVENTS[request_id] = event
+        effective_timeout = (
+            timeout_s if timeout_s is not None else BOUNCE_RENDER_TIMEOUT_S
+        )
+        try:
+            try:
+                await ws.send(json.dumps({
+                    "type": "bounce_audio_request",
+                    "request_id": request_id,
+                    "bounce_id": bounce.id,
+                    "composite_hash": composite_hash,
+                    "start_time_s": float(start_time_s),
+                    "end_time_s": float(end_time_s),
+                    "mode": mode,
+                    "track_ids": list(track_ids) if track_ids else None,
+                    "clip_ids": list(clip_ids) if clip_ids else None,
+                    "sample_rate": int(sample_rate),
+                    "bit_depth": int(bit_depth),
+                    "channels": int(channels),
+                }))
+            except Exception as e:
+                delete_bounce(project_dir, bounce.id)
+                return {
+                    "error": f"failed to send bounce_audio_request over ws: {e}",
+                    "composite_hash": composite_hash,
+                }
+
+            try:
+                await asyncio.wait_for(event.wait(), timeout=effective_timeout)
+            except asyncio.TimeoutError:
+                delete_bounce(project_dir, bounce.id)
+                return {
+                    "error": (
+                        f"bounce render timeout ({effective_timeout}s) — "
+                        f"frontend did not upload"
+                    ),
+                    "composite_hash": composite_hash,
+                    "expected_rendered_path": rendered_rel,
+                }
+        finally:
+            _BOUNCE_RENDER_EVENTS.pop(request_id, None)
+
+        if not rendered_abs.exists():
+            delete_bounce(project_dir, bounce.id)
+            return {
+                "error": (
+                    f"bounce-upload set its event but the WAV is still "
+                    f"missing at {rendered_abs}; upload may have failed "
+                    f"validation"
+                ),
+                "composite_hash": composite_hash,
+                "expected_rendered_path": rendered_rel,
+            }
+
+    # ── Read size + duration from the WAV and update the row ────────
+    try:
+        size_bytes = rendered_abs.stat().st_size
+    except OSError as e:
+        delete_bounce(project_dir, bounce.id)
+        return {"error": f"failed to stat rendered WAV: {e}"}
+
+    try:
+        import wave
+        with wave.open(str(rendered_abs), "rb") as wf:
+            frames = wf.getnframes()
+            wf_sr = wf.getframerate()
+        duration_s = frames / float(wf_sr) if wf_sr > 0 else 0.0
+    except Exception:
+        # 32-bit float WAVs may not be readable by the stdlib ``wave`` module;
+        # fall back to soundfile.
+        try:
+            import soundfile as _sf
+            info = _sf.info(str(rendered_abs))
+            duration_s = float(info.duration)
+        except Exception as e:
+            delete_bounce(project_dir, bounce.id)
+            return {"error": f"failed to read WAV header: {e}"}
+
+    update_bounce_rendered(
+        project_dir, bounce.id, rendered_rel, size_bytes, duration_s,
+    )
+
+    return {
+        "bounce_id": bounce.id,
+        "cached": False,
+        "rendered_path": rendered_rel,
+        "download_url": _bounce_download_url(project_name, bounce.id),
+        "duration_s": duration_s,
+        "size_bytes": size_bytes,
+        "mode": mode,
+        "tracks_requested": list(track_ids) if track_ids else [],
+        "clips_requested": list(clip_ids) if clip_ids else [],
+        "composite_hash": composite_hash,
+        "sample_rate": sample_rate,
+        "bit_depth": bit_depth,
+        "channels": channels,
+    }
+
+
+def _bounce_download_url(project_name: str | None, bounce_id: str) -> str:
+    """Build the bounce download URL. ``project_name`` is ``None`` for
+    direct-call test paths — fall back to a ``<project>`` placeholder so
+    callers can still assert the tail of the URL. Production calls always
+    pass the real project_name from the chat WS dispatch."""
+    pn = project_name or "<project>"
+    return f"/api/projects/{pn}/bounces/{bounce_id}.wav"
+
+
 # ── generate_descriptions (Phase 3 — structured LLM audio analysis) ────────
 
 
@@ -4450,6 +4942,11 @@ async def _execute_tool(
         return result, "error" in result
     if name == "analyze_master_bus":
         result = await _exec_analyze_master_bus(project_dir, input_data, ws=ws)
+        return result, "error" in result
+    if name == "bounce_audio":
+        result = await _exec_bounce_audio(
+            project_dir, input_data, ws=ws, project_name=project_name,
+        )
         return result, "error" in result
     if name == "apply_mix_plan":
         result = _exec_apply_mix_plan(project_dir, input_data)
