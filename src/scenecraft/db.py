@@ -2982,6 +2982,18 @@ def get_audio_clips(project_dir: Path, track_id: str | None = None) -> list[dict
         rate = source_span / kf_span
         return rate, stored_offset + trim_in
 
+    # Bulk-resolve variant_kind from pool_segments via audio_clips.selected FK
+    vk_map: dict[str, str | None] = {}
+    selected_ids = [r["selected"] for r in rows if r["selected"]]
+    if selected_ids:
+        vk_placeholders = ",".join("?" for _ in selected_ids)
+        vk_rows = conn.execute(
+            f"SELECT id, variant_kind FROM pool_segments WHERE id IN ({vk_placeholders})",
+            selected_ids,
+        ).fetchall()
+        for vr in vk_rows:
+            vk_map[vr["id"]] = vr["variant_kind"]
+
     result = []
     for r in rows:
         rate, eff_off = _derive(r["id"], float(r["source_offset"]), float(r["start_time"]), float(r["end_time"]))
@@ -2995,6 +3007,7 @@ def get_audio_clips(project_dir: Path, track_id: str | None = None) -> list[dict
             "remap": json.loads(r["remap"]) if r["remap"] else {"method": "linear", "target_duration": 0},
             "selected": r["selected"],
             "label": r["label"],
+            "variant_kind": vk_map.get(r["selected"]) if r["selected"] else None,
             # Derived fields (computed from linked transition at query time; not stored)
             "playback_rate": rate,
             "effective_source_offset": eff_off,
