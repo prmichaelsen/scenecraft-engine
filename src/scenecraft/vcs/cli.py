@@ -20,6 +20,7 @@ from .bootstrap import (
     list_orgs,
     list_users,
     list_org_members,
+    get_server_db,
 )
 from .auth import generate_token, create_login_code
 from .sessions import list_sessions, prune_sessions
@@ -246,6 +247,23 @@ def user_list(root_override: str | None):
         click.echo(f"  {u['username']}  role={u['role']}  created={u['created_at']}")
 
 
+@user_group.command("set-password")
+@click.argument("username")
+@_root_option()
+def user_set_password(username: str, root_override: str | None):
+    """Clear must_change_password flag for a user (simulates password reset completion)."""
+    root = _require_root(root_override)
+    conn = get_server_db(root)
+    row = conn.execute("SELECT username FROM users WHERE username = ?", (username,)).fetchone()
+    if not row:
+        click.echo(f"Error: user '{username}' not found.", err=True)
+        raise SystemExit(1)
+    conn.execute("UPDATE users SET must_change_password = 0 WHERE username = ?", (username,))
+    conn.commit()
+    conn.close()
+    click.echo(f"Cleared must_change_password for user: {username}")
+
+
 # ── session ──────────────────────────────────────────────────────
 
 @click.group("session")
@@ -277,6 +295,124 @@ def session_prune(days: int, root_override: str | None):
     click.echo(f"Pruned {count} stale session(s).")
 
 
+# ── auth ────────────────────────────────────────────────────────
+
+@click.group("auth")
+def auth_group():
+    """Authentication management (API keys, etc.)."""
+    pass
+
+
+@click.group("keys")
+def keys_group():
+    """Manage API keys for paid-plugin auth."""
+    pass
+
+
+auth_group.add_command(keys_group)
+
+
+@keys_group.command("issue")
+@click.argument("username")
+@click.option("--expires", required=True, help="Expiration date (YYYY-MM-DD)")
+@click.option("--label", default=None, help="Optional human-readable label")
+@_root_option()
+def keys_issue(username: str, expires: str, label: str | None, root_override: str | None):
+    """Issue a new API key for a user. Prints the raw key ONCE — it cannot be recovered."""
+    import os
+    import secrets
+    import uuid
+    from datetime import datetime, timezone
+    from scenecraft.auth_middleware import hash_api_key
+
+    root = _require_root(root_override)
+    conn = get_server_db(root)
+
+    # Verify user exists
+    row = conn.execute("SELECT username FROM users WHERE username = ?", (username,)).fetchone()
+    if not row:
+        click.echo(f"Error: user '{username}' not found.", err=True)
+        raise SystemExit(1)
+
+    # Validate expiry date
+    try:
+        expires_dt = datetime.strptime(expires, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        click.echo("Error: --expires must be YYYY-MM-DD format.", err=True)
+        raise SystemExit(1)
+
+    raw_key = secrets.token_urlsafe(32)
+    salt = os.urandom(16)
+    key_hash = hash_api_key(raw_key, salt)
+    key_id = f"ak_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(tz=timezone.utc).isoformat()
+    issued_by = username  # Self-issued via CLI; admin can also issue for others
+
+    conn.execute(
+        "INSERT INTO api_keys (id, username, key_hash, salt, issued_by, issued_at, expires_at, label)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (key_id, username, key_hash, salt.hex(), issued_by, now, expires_dt.isoformat(), label),
+    )
+    conn.commit()
+    conn.close()
+
+    click.echo(f"Key ID:    {key_id}")
+    click.echo(f"API Key:   {raw_key}")
+    click.echo(f"Expires:   {expires}")
+    if label:
+        click.echo(f"Label:     {label}")
+    click.echo("")
+    click.echo("Store this key securely — it will NOT be shown again.")
+
+
+@keys_group.command("list")
+@click.argument("username")
+@_root_option()
+def keys_list(username: str, root_override: str | None):
+    """List API keys for a user (shows metadata only, never the key itself)."""
+    root = _require_root(root_override)
+    conn = get_server_db(root)
+    rows = conn.execute(
+        "SELECT id, issued_at, expires_at, revoked_at, label FROM api_keys WHERE username = ? ORDER BY issued_at",
+        (username,),
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        click.echo(f"No API keys found for user '{username}'.")
+        return
+
+    click.echo(f"API keys for {username}:")
+    for r in rows:
+        status = "revoked" if r["revoked_at"] else "active"
+        label_str = f"  label={r['label']}" if r["label"] else ""
+        click.echo(f"  {r['id']}  issued={r['issued_at']}  expires={r['expires_at']}  status={status}{label_str}")
+
+
+@keys_group.command("revoke")
+@click.argument("key_id")
+@_root_option()
+def keys_revoke(key_id: str, root_override: str | None):
+    """Revoke an API key by setting revoked_at = now."""
+    from datetime import datetime, timezone
+
+    root = _require_root(root_override)
+    conn = get_server_db(root)
+    row = conn.execute("SELECT id, revoked_at FROM api_keys WHERE id = ?", (key_id,)).fetchone()
+    if not row:
+        click.echo(f"Error: key '{key_id}' not found.", err=True)
+        raise SystemExit(1)
+    if row["revoked_at"]:
+        click.echo(f"Key '{key_id}' is already revoked.")
+        return
+
+    now = datetime.now(tz=timezone.utc).isoformat()
+    conn.execute("UPDATE api_keys SET revoked_at = ? WHERE id = ?", (now, key_id))
+    conn.commit()
+    conn.close()
+    click.echo(f"Revoked key: {key_id}")
+
+
 # ── Registration helper (called from scenecraft.cli:main) ────────
 
 def register_commands(main_group: click.Group) -> None:
@@ -286,3 +422,4 @@ def register_commands(main_group: click.Group) -> None:
     main_group.add_command(org_group)
     main_group.add_command(user_group)
     main_group.add_command(session_group)
+    main_group.add_command(auth_group)
