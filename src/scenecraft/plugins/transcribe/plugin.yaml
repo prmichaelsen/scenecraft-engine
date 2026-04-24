@@ -96,6 +96,20 @@ contributes:
             description: "ID of a transcribe__runs row."
         required: [run_id]
 
+  restEndpoints:
+    # Full path auto-synthesized as:
+    #   ^/api/projects/(?P<project>[^/]+)/plugins/transcribe/<suffix>$
+    - method: POST
+      suffix: /run
+      handler: "backend:handle_rest_run"
+    - method: GET
+      suffix: /runs
+      handler: "backend:handle_rest_list_runs"
+    - method: GET
+      # Named group pulled out as path_groups.run_id by the dispatcher.
+      suffix: /runs/(?P<run_id>[^/]+)
+      handler: "backend:handle_rest_get_run"
+
   operations:
     - id: transcribe.run
       label: "Transcribe…"

@@ -296,6 +296,37 @@ class PluginHost:
                 ),
                 context=context,
             )
+        # REST endpoints: synthesize the full path regex from the plugin
+        # name + suffix so plugins can't collide with each other or with
+        # built-in routes, and the manifest stays concise.
+        from scenecraft import plugin_api as _plugin_api
+        for rest_m in manifest.rest_endpoints:
+            try:
+                handler = resolve_handler(plugin_module, rest_m.handler_ref)
+            except Exception as exc:  # noqa: BLE001
+                import sys
+                print(
+                    f"[plugin-host] {name}: restEndpoint {rest_m.method} "
+                    f"{rest_m.suffix!r} handler {rest_m.handler_ref!r} — {exc}",
+                    file=sys.stderr,
+                )
+                continue
+            # Auto-prefix: ^/api/projects/(?P<project>[^/]+)/plugins/{plugin}/{suffix}$
+            # The named `project` group is captured but plugins usually don't
+            # need it (dispatch_rest passes project_dir + project_name
+            # positionally); kept to help diagnostics that introspect matches.
+            full_pattern = (
+                r"^/api/projects/(?P<project>[^/]+)/plugins/"
+                + re.escape(manifest.name)
+                + rest_m.suffix
+                + r"$"
+            )
+            _plugin_api.register_rest_endpoint(
+                full_pattern,
+                handler,
+                method=rest_m.method,
+                context=context,
+            )
 
     @classmethod
     def get_manifest(cls, plugin_id: str):
@@ -425,13 +456,27 @@ class PluginHost:
     def dispatch_rest(cls, method: str, path: str, *args, **kwargs) -> Any:
         """Route (method, path) to a plugin-registered handler.
 
-        Returns the handler's return value, or ``None`` if no pattern matches
-        for the given method. ``api_server.py`` uses this as a fallback after
-        its built-in routes fail.
+        Returns the handler's return value, or ``None`` if no pattern
+        matches for the given method. ``api_server.py`` uses this as a
+        fallback after its built-in routes fail.
+
+        Named regex groups in the registered pattern are extracted from
+        the match and passed to the handler as ``path_groups=<dict>``
+        (on top of the caller-supplied ``*args`` / ``**kwargs``). Handlers
+        that don't care about path params can ignore the kwarg; the
+        existing non-manifest `register_rest_endpoint` callers that just
+        accept ``(path, *args, **kwargs)`` keep working unchanged.
         """
         routes = cls._rest_routes_by_method.get(method.upper(), {})
         for pattern, handler in routes.items():
-            if re.match(pattern, path):
+            m = re.match(pattern, path)
+            if m:
+                # Only pass path_groups when the regex has named groups —
+                # preserves back-compat with pre-task-130 handlers that
+                # have strict signatures (no **kwargs absorbing the extra).
+                path_groups = m.groupdict()
+                if path_groups:
+                    return handler(path, *args, path_groups=path_groups, **kwargs)
                 return handler(path, *args, **kwargs)
         return None
 

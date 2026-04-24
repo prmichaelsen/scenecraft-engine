@@ -26,6 +26,9 @@ from .handlers import (
     TRANSCRIBE_CLIP_TOOL_DESCRIPTION,
     handle_get_transcription,
     handle_list_transcriptions,
+    handle_rest_get_run,
+    handle_rest_list_runs,
+    handle_rest_run,
     handle_transcribe_clip,
     handle_transcribe_operation,
 )
@@ -41,6 +44,9 @@ __all__ = [
     "TRANSCRIBE_CLIP_TOOL_DESCRIPTION",
     "handle_get_transcription",
     "handle_list_transcriptions",
+    "handle_rest_get_run",
+    "handle_rest_list_runs",
+    "handle_rest_run",
     "handle_transcribe_clip",
     "handle_transcribe_operation",
 ]

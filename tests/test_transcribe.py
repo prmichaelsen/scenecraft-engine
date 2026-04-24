@@ -350,6 +350,104 @@ def test_plugin_settings_resolve_into_transcribe_clip(tmp_path, monkeypatch):
 # ── Plugin host registration ────────────────────────────────────────────
 
 
+def test_manifest_parses_rest_endpoints():
+    """The plugin.yaml loader recognises contributes.restEndpoints and
+    builds RESTEndpointManifest entries."""
+    from scenecraft.plugin_manifest import load_manifest
+    from scenecraft.plugins import transcribe as transcribe_plugin
+
+    manifest = load_manifest(transcribe_plugin)
+    assert manifest is not None
+    endpoints = {(e.method, e.suffix) for e in manifest.rest_endpoints}
+    assert endpoints == {
+        ("POST", "/run"),
+        ("GET", "/runs"),
+        ("GET", "/runs/(?P<run_id>[^/]+)"),
+    }
+
+
+def test_declared_rest_endpoints_registered_with_auto_prefix():
+    """PluginHost.register_declared wires restEndpoints from the manifest
+    into the per-method route tables, with the full path regex
+    auto-synthesized as
+    ``^/api/projects/(?P<project>[^/]+)/plugins/<plugin>/<suffix>$``."""
+    from scenecraft.plugin_host import PluginHost
+    from scenecraft.plugins import transcribe as transcribe_plugin
+
+    PluginHost._reset_for_tests()
+    PluginHost.register(transcribe_plugin)
+
+    get_routes = PluginHost._rest_routes_by_method.get("GET", {})
+    post_routes = PluginHost._rest_routes_by_method.get("POST", {})
+    get_patterns = set(get_routes.keys())
+    post_patterns = set(post_routes.keys())
+
+    assert r"^/api/projects/(?P<project>[^/]+)/plugins/transcribe/runs$" in get_patterns
+    assert r"^/api/projects/(?P<project>[^/]+)/plugins/transcribe/runs/(?P<run_id>[^/]+)$" in get_patterns
+    assert r"^/api/projects/(?P<project>[^/]+)/plugins/transcribe/run$" in post_patterns
+
+
+def test_dispatch_rest_passes_named_groups(tmp_path, monkeypatch):
+    """dispatch_rest extracts named regex groups and passes them to the
+    handler as ``path_groups=<dict>``. End-to-end: call the synthesized
+    route for GET /runs/:run_id and verify the handler saw run_id."""
+    from scenecraft.ai import transcriber
+    from scenecraft.plugin_host import PluginHost
+    from scenecraft.plugins import transcribe as transcribe_plugin
+    from scenecraft.plugins.transcribe.handlers import handle_transcribe_clip
+
+    project_dir = _make_project(tmp_path)
+    monkeypatch.setattr(transcriber, "WhisperClient", lambda: _StubClient(_stub_transcript("fast")))
+
+    # Create one run so get_run has something to find.
+    ctx = {"project_dir": project_dir, "project_name": "p", "ws": None, "tool_use_id": None}
+    created = handle_transcribe_clip({"clip_id": "c1"}, ctx)
+    run_id = created["run_id"]
+
+    # Activate the plugin so REST routes land.
+    PluginHost._reset_for_tests()
+    PluginHost.register(transcribe_plugin)
+
+    # Simulate the HTTP server dispatch path.
+    result = PluginHost.dispatch_rest(
+        "GET",
+        f"/api/projects/p/plugins/transcribe/runs/{run_id}",
+        project_dir,
+        "p",
+        {},   # query (empty)
+    )
+    assert result is not None, "route did not match"
+    assert result["run_id"] == run_id
+    assert result["text"] == "stub transcript"
+
+
+def test_dispatch_rest_post_run_end_to_end(tmp_path, monkeypatch):
+    """POST /plugins/transcribe/run through the full manifest-declared
+    path — mirrors what api_server does when a POST comes in."""
+    from scenecraft.ai import transcriber
+    from scenecraft.plugin_host import PluginHost
+    from scenecraft.plugins import transcribe as transcribe_plugin
+
+    project_dir = _make_project(tmp_path)
+    monkeypatch.setattr(transcriber, "WhisperClient", lambda: _StubClient(_stub_transcript("fast")))
+
+    PluginHost._reset_for_tests()
+    PluginHost.register(transcribe_plugin)
+
+    result = PluginHost.dispatch_rest(
+        "POST",
+        "/api/projects/p/plugins/transcribe/run",
+        project_dir,
+        "p",
+        {"clip_id": "c1", "model": "fast"},
+    )
+    assert result is not None
+    assert "error" not in result
+    assert result["text"] == "stub transcript"
+    assert result["cached"] is False
+    assert result["model"] == "fast"
+
+
 def test_plugin_registers_namespaced_tools():
     from scenecraft.plugin_host import PluginHost
     from scenecraft.plugins import transcribe as transcribe_plugin
