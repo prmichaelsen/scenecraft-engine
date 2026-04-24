@@ -105,11 +105,43 @@ __all__ = [
     "list_light_show_overrides",
     "set_light_show_overrides",
     "clear_light_show_overrides",
+    # Plugin-scoped WS broadcast
+    "broadcast_event",
 ]
 
 # Re-export the disposable factory so plugins can adapt arbitrary teardown
 # callables without reaching into plugin_host internals.
 from scenecraft.plugin_host import make_disposable  # noqa: E402
+
+
+def broadcast_event(
+    plugin_id: str,
+    event_type: str,
+    *,
+    project_name: str | None = None,
+    payload: dict | None = None,
+) -> None:
+    """Push a plugin-scoped WS event to all connected clients.
+
+    The emitted message has ``type: "{plugin_id}__{event_type}"`` —
+    mirrors the double-underscore namespacing convention already in use
+    for plugin-owned DB tables and MCP tool names. ``project_name`` is
+    included at top level when provided so clients can filter cheaply;
+    arbitrary additional context goes in ``payload``.
+
+    Best-effort: if the WS infrastructure is unreachable, the broadcast
+    is silently dropped. Never fails the enclosing mutation.
+    """
+    msg: dict = {"type": f"{plugin_id}__{event_type}"}
+    if project_name is not None:
+        msg["projectName"] = project_name
+    if payload:
+        msg.update(payload)
+    try:
+        from scenecraft.ws_server import job_manager
+        job_manager._broadcast(msg)
+    except Exception:
+        pass
 
 
 def extract_audio_as_wav(

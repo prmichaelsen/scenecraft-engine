@@ -13,26 +13,25 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from scenecraft.plugins.light_show import PLUGIN_ID
+
 
 def _broadcast_changed(project_name: str, kind: str) -> None:
-    """Push a 'light_show_changed' event to all connected WS clients.
-
-    Best-effort — never fails the enclosing mutation. Lets the panel
-    refresh immediately on chat-driven changes instead of waiting for
-    its next 2s poll tick.
+    """Push a 'changed' event scoped to this plugin. Lets the panel refresh
+    immediately on chat-driven changes instead of waiting for its next 2s
+    poll tick. Emits WS type ``light_show__changed`` (plugin-namespaced
+    via plugin_api.broadcast_event).
 
     ``kind`` is one of 'fixtures' or 'overrides' — the frontend may
     choose to refetch only the relevant endpoint.
     """
-    try:
-        from scenecraft.ws_server import job_manager
-        job_manager._broadcast({
-            "type": "light_show_changed",
-            "projectName": project_name,
-            "kind": kind,
-        })
-    except Exception:
-        pass
+    from scenecraft import plugin_api
+    plugin_api.broadcast_event(
+        PLUGIN_ID,
+        "changed",
+        project_name=project_name,
+        payload={"kind": kind},
+    )
 
 
 def _handle_list(path: str, project_dir: Path, project_name: str, query: dict) -> dict:
