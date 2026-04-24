@@ -1,6 +1,11 @@
-"""Pydantic request/response models (populated in T60-T64).
+"""Pydantic request/response models for the FastAPI app.
 
-Empty in T57 — the scaffold's routes return raw streams or the
-untyped ``load_config()`` dict. Routers that land business logic
-will add their per-operation ``Body`` / ``Response`` models here.
+Each router keeps its models colocated in a sibling module
+(``models/<router>.py``) so the growing surface doesn't overwhelm
+this package's ``__init__``. Routers import via::
+
+    from scenecraft.api.models.checkpoints import CheckpointCreateBody
+
+rather than from the package root — one module per router mirrors
+the ``routers/`` layout exactly.
 """
