@@ -17,7 +17,7 @@ from fastapi import FastAPI
 
 from scenecraft.api.deps import install_cors
 from scenecraft.api.errors import install_exception_handlers
-from scenecraft.api.routers import files, misc
+from scenecraft.api.routers import auth, files, misc, oauth
 
 
 def create_app(work_dir: Path | None = None, *, enable_docs: bool = True) -> FastAPI:
@@ -39,6 +39,9 @@ def create_app(work_dir: Path | None = None, *, enable_docs: bool = True) -> Fas
     )
     install_cors(app)
     install_exception_handlers(app)
+    app.include_router(auth.router)
+    app.include_router(oauth.router)
+    app.include_router(oauth.callback_router)
     app.include_router(misc.router)
     app.include_router(files.router)
     app.state.work_dir = Path(work_dir) if work_dir is not None else None

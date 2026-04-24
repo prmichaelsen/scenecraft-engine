@@ -1,22 +1,26 @@
-"""Error-handling plumbing for the FastAPI app (M16 T57, spec R1-R3, R9, R26, R28).
+"""Error-handling plumbing for the FastAPI app (M16 T57/T58, spec R9, R26-R28).
 
-The legacy server shipped two slightly different envelope shapes
-(``{"error": <msg>, "code": <code>}`` on some paths, ``{"error": <code>,
-"message": <msg>}`` on others) — the migration spec (R9) normalizes
-on the latter: ``{"error": "<CODE>", "message": "<human text>"}``.
+Canonical envelope (R9): ``{"error": "<CODE>", "message": "<human text>"}``.
 
-All 4xx/5xx responses (except 204/304) emit this shape; FastAPI's
-native 422 validation envelope is remapped to 400 ``BAD_REQUEST`` so
-existing clients don't need to learn a new error format.
+Handlers installed by ``install_exception_handlers``:
+  * ``HTTPException`` / Starlette ``HTTPException`` → canonical envelope with
+    code derived from status (or ``ApiError.code`` override).
+  * ``RequestValidationError`` → ``400 BAD_REQUEST`` (not FastAPI's default
+    422); first error surfaced; missing-field messages match legacy text
+    (``"Missing '<field>'"``).
+  * Unrouted GET/POST/... (Starlette's internal 404) → ``NOT_FOUND`` envelope
+    with ``"No route: <METHOD> <PATH>"`` message.
+  * Bare ``Exception`` → ``500 INTERNAL_ERROR``; traceback logged at ERROR
+    level but never leaked to the response body. The message is ``str(exc)``
+    so clients can still see the failure mode without seeing file paths or
+    line numbers.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, status
-from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -47,12 +51,17 @@ class ApiError(HTTPException):
     """``HTTPException`` that carries an explicit error code.
 
     Handlers can raise ``ApiError("PLUGIN_ERROR", "handler raised", 500)``
-    to bypass the default status→code mapping — useful for domain
-    codes like ``PLUGIN_ERROR`` that don't correspond to an HTTP
-    status 1:1.
+    to bypass the default status→code mapping — useful for domain codes like
+    ``PLUGIN_ERROR`` that don't correspond to an HTTP status 1:1.
     """
 
-    def __init__(self, code: str, message: str, status_code: int = 400, headers: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        status_code: int = 400,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         super().__init__(status_code=status_code, detail=message, headers=headers)
         self.code = code
 
@@ -62,34 +71,71 @@ def _envelope(code: str, message: str) -> dict[str, str]:
 
 
 async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
-    code = getattr(exc, "code", None) or _code_for_status(exc.status_code)
-    # HTTPException.detail can be a string or a dict; normalize to text.
-    if isinstance(exc.detail, str):
-        message = exc.detail
-    elif exc.detail is None:
-        message = ""
+    """Canonical envelope for any ``HTTPException``.
+
+    Unrouted paths: Starlette raises a plain ``HTTPException(404, "Not Found")``
+    from ``ExceptionMiddleware`` before any route matches. We detect that case
+    by checking ``request.scope.get("route")`` — if no route was matched, the
+    404 message is replaced with ``"No route: <METHOD> <PATH>"`` so clients
+    can tell "unknown endpoint" from "endpoint found, resource missing".
+    """
+    status_code = exc.status_code
+    code = getattr(exc, "code", None) or _code_for_status(status_code)
+
+    # Detect the unknown-route case: no route was matched in the scope.
+    if status_code == status.HTTP_404_NOT_FOUND and request.scope.get("route") is None:
+        message = f"No route: {request.method} {request.url.path}"
     else:
-        message = str(exc.detail)
+        # HTTPException.detail can be a string or a dict; normalize to text.
+        if isinstance(exc.detail, str):
+            message = exc.detail
+        elif exc.detail is None:
+            message = ""
+        else:
+            message = str(exc.detail)
+
     headers = getattr(exc, "headers", None) or None
     return JSONResponse(
-        status_code=exc.status_code,
+        status_code=status_code,
         content=_envelope(code, message),
         headers=headers,
     )
 
 
-async def _validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
-    """Flatten Pydantic validation errors to legacy 400 BAD_REQUEST envelope.
+def _format_validation_message(err: dict) -> str:
+    """Translate a single Pydantic error dict to legacy envelope text.
 
-    Spec R26: preserve ``{"error": "BAD_REQUEST", "message": ...}`` — do
-    NOT leak FastAPI's default ``{"detail": [...]}`` 422 shape.
+    Legacy behavior:
+      * Missing-field errors become ``"Missing '<field>'"`` so front-ends that
+        already parse that message (e.g., the keyframe editor) keep working.
+      * Everything else becomes ``"<loc>: <msg>"`` with ``body.`` stripped
+        from the location so the client sees ``"start_time: ..."`` rather
+        than ``"body.start_time: ..."``.
+    """
+    err_type = err.get("type", "")
+    raw_loc = err.get("loc", ())
+    parts = [str(p) for p in raw_loc if p != "body"]
+
+    if err_type in ("missing", "value_error.missing") or "missing" in err_type:
+        field_name = parts[-1] if parts else "field"
+        return f"Missing '{field_name}'"
+
+    loc = ".".join(parts)
+    msg = err.get("msg", "Invalid request body")
+    return f"{loc}: {msg}" if loc else msg
+
+
+async def _validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Flatten Pydantic validation errors to 400 BAD_REQUEST envelope (R26).
+
+    We always emit 400, never 422, so existing clients don't need to learn a
+    new error format.
     """
     errors = exc.errors()
     if errors:
-        first = errors[0]
-        loc = ".".join(str(part) for part in first.get("loc", ()) if part != "body")
-        msg = first.get("msg", "Invalid request body")
-        message = f"{loc}: {msg}" if loc else msg
+        message = _format_validation_message(errors[0])
     else:
         message = "Invalid request body"
     return JSONResponse(
@@ -99,20 +145,23 @@ async def _validation_exception_handler(request: Request, exc: RequestValidation
 
 
 async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    """Catch-all 500. Logs the traceback; the response body never leaks it."""
+    """Catch-all 500 (R28).
+
+    The traceback is logged at ERROR level (``logger.exception`` attaches
+    ``exc_info``). The response body carries ``str(exc)`` only — never the
+    traceback — so we don't leak file paths or stack contents to clients.
+    """
     logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content=_envelope("INTERNAL_ERROR", "Internal server error"),
+        content=_envelope("INTERNAL_ERROR", str(exc) or "Internal server error"),
     )
 
 
 def install_exception_handlers(app: FastAPI) -> None:
     """Wire every exception handler the migration spec requires (R9, R26, R28)."""
     app.add_exception_handler(HTTPException, _http_exception_handler)
-    # Starlette raises its own HTTPException subclass for some paths (e.g.
-    # unrouted requests). Register against it too so the envelope is
-    # consistent across both surfaces.
+    # Starlette raises its own HTTPException subclass for unrouted requests.
     from starlette.exceptions import HTTPException as StarletteHTTPException
 
     app.add_exception_handler(StarletteHTTPException, _http_exception_handler)
@@ -124,6 +173,3 @@ __all__ = [
     "ApiError",
     "install_exception_handlers",
 ]
-
-# Silence lint: `Any` reserved for future typed exception payloads.
-_ = Any

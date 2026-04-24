@@ -1,18 +1,18 @@
-"""Misc router — hosts ``GET /api/config`` for the T57 smoke test.
+"""Misc router — hosts ``GET /api/config``.
 
-Auth is deliberately NOT required here: T58 will add the real
-``Depends(current_user)`` dependency once the bearer+cookie code
-is ported. This mirrors the legacy server, where ``/api/config``
-is public (see ``api_server.py:189``).
+T57 shipped this open for the scaffold spike; T58 gates it behind the real
+``current_user`` dependency since the legacy server treats ``/api/config`` as
+an authenticated endpoint (any path not in the public carve-out list is
+auth-gated — see ``api_server.py::_authenticate`` line 130).
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
-from scenecraft.config import load_config
+from scenecraft.api.deps import current_user
 
-router = APIRouter(tags=["misc"])
+router = APIRouter(tags=["misc"], dependencies=[Depends(current_user)])
 
 
 @router.get(
@@ -21,4 +21,6 @@ router = APIRouter(tags=["misc"])
     summary="Return the persisted scenecraft configuration",
 )
 async def get_config() -> dict:
+    from scenecraft.config import load_config
+
     return load_config()
