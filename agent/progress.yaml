@@ -683,11 +683,145 @@ milestones:
           - task-53
           - task-54
 
+  - id: M16
+    title: FastAPI Migration + OpenAPI-Driven Tool Codegen
+    file: agent/milestones/milestone-16-fastapi-migration-and-tool-codegen.md
+    status: not_started
+    estimated_weeks: 2
+    tasks_total: 12
+    tasks_completed: 0
+    tasks:
+      - id: task-57
+        title: FastAPI scaffold + streaming spike
+        file: agent/tasks/milestone-16-fastapi-migration-and-tool-codegen/task-57-fastapi-scaffold-streaming-spike.md
+        status: not_started
+        estimated_hours: 5
+        started: null
+        actual_hours: null
+        dependencies: []
+      - id: task-58
+        title: Auth + CORS + error envelope + validation
+        file: agent/tasks/milestone-16-fastapi-migration-and-tool-codegen/task-58-auth-cors-error-envelope.md
+        status: not_started
+        estimated_hours: 5
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-57
+      - id: task-59
+        title: Structural lock dependency + timeline validator post-hook
+        file: agent/tasks/milestone-16-fastapi-migration-and-tool-codegen/task-59-structural-lock-timeline-validator.md
+        status: not_started
+        estimated_hours: 3
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-57
+          - task-58
+      - id: task-60
+        title: Projects + misc routers
+        file: agent/tasks/milestone-16-fastapi-migration-and-tool-codegen/task-60-projects-and-misc-routers.md
+        status: not_started
+        estimated_hours: 7
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-57
+          - task-58
+      - id: task-61
+        title: Keyframes + transitions routers
+        file: agent/tasks/milestone-16-fastapi-migration-and-tool-codegen/task-61-keyframes-transitions-routers.md
+        status: not_started
+        estimated_hours: 7
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-57
+          - task-58
+          - task-59
+      - id: task-62
+        title: Audio routers (tracks, clips, effect-curves, send-buses, master-bus, mix-render)
+        file: agent/tasks/milestone-16-fastapi-migration-and-tool-codegen/task-62-audio-routers.md
+        status: not_started
+        estimated_hours: 8
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-57
+          - task-58
+          - task-59
+      - id: task-63
+        title: Rendering + files + pool + candidates routers
+        file: agent/tasks/milestone-16-fastapi-migration-and-tool-codegen/task-63-rendering-files-pool-candidates-routers.md
+        status: not_started
+        estimated_hours: 8
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-57
+          - task-58
+          - task-59
+      - id: task-64
+        title: Checkpoints + chat + plugin catch-all + unknown-route handler
+        file: agent/tasks/milestone-16-fastapi-migration-and-tool-codegen/task-64-checkpoints-chat-plugins-catchall.md
+        status: not_started
+        estimated_hours: 5
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-57
+          - task-58
+          - task-59
+      - id: task-65
+        title: Hard cutover — CLI swap, delete api_server.py, perf baseline, suite-green
+        file: agent/tasks/milestone-16-fastapi-migration-and-tool-codegen/task-65-hard-cutover.md
+        status: not_started
+        estimated_hours: 5
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-60
+          - task-61
+          - task-62
+          - task-63
+          - task-64
+      - id: task-66
+        title: gen_chat_tools.py — spec walk, schema derivation, deterministic emit, --check
+        file: agent/tasks/milestone-16-fastapi-migration-and-tool-codegen/task-66-gen-chat-tools-script.md
+        status: not_started
+        estimated_hours: 5
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-65
+      - id: task-67
+        title: Annotate 32 existing routes with x-tool / x-tool-description / x-destructive
+        file: agent/tasks/milestone-16-fastapi-migration-and-tool-codegen/task-67-annotate-32-routes.md
+        status: not_started
+        estimated_hours: 3.5
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-65
+          - task-66
+      - id: task-68
+        title: Wire chat.py + delete 32 legacy constants + snapshot + golden + parity + CI
+        file: agent/tasks/milestone-16-fastapi-migration-and-tool-codegen/task-68-wire-chat-delete-legacy-ci.md
+        status: not_started
+        estimated_hours: 5
+        started: null
+        actual_hours: null
+        dependencies:
+          - task-65
+          - task-66
+          - task-67
+
 documentation:
   design_documents: 8
-  milestone_documents: 13
+  spec_documents: 3
+  milestone_documents: 14
   pattern_documents: 0
-  task_documents: 55
+  task_documents: 67
 
 progress:
   planning: 100
@@ -695,6 +829,10 @@ progress:
   overall: 94
 
 recent_work:
+  - date: 2026-04-24
+    description: "M16 planned (TDD mode) — FastAPI Migration + OpenAPI-Driven Tool Codegen. 12 tasks (T57-T68) totaling ~54-72 dev hours across 2 phases. Phase A (T57-T65): port 164 routes from hand-rolled api_server.py to FastAPI/uvicorn, preserve auth/streaming/Range/CORS/plugin-catchall/structural-lock behavior, hard cut (no feature flag), WS stays independent on 8891. Phase B (T66-T68): scripts/gen_chat_tools.py reads openapi.json, filters x-tool:true operations, emits src/scenecraft/chat_tools_generated.py replacing ~1000 LOC of hand-written tool schemas in chat.py. Source: two specs shipped 2026-04-24 (local.fastapi-migration 35R/60 behavior rows; local.openapi-tool-codegen 30R/37 behavior rows). Each task lists named tests it covers — tests-first ordering. 897-test suite is the migration confidence anchor; only 11 test files touch HTTP directly."
+  - date: 2026-04-24
+    description: "Two specs created proofing the next milestone (2026-04-24): agent/specs/local.fastapi-migration.md (replace api_server.py with FastAPI/uvicorn, preserving 164 routes byte-for-byte; hard cut) and agent/specs/local.openapi-tool-codegen.md (scripts/gen_chat_tools.py emits chat_tools_generated.py from openapi.json x-tool annotations; replaces 32 hand-written tool dicts in chat.py). Single open decision: chat tool execution path (OQ-1) — recommendation (a) in-process + parity test, with (b) ASGI round-trip and (c) extracted service layer as alternatives. Commit: ae151a0."
   - date: 2026-04-23
     description: "M13 DISCOVERED COMPLETE on main — 12/12 tasks (45-56) already merged across scenecraft-engine (45, 52, 56) and scenecraft frontend (46, 47, 48, 49, 50, 51, 53, 54, 55, 56). progress.yaml was stale; corrected. Implications: all Phase 2 chat-audio tool blockers satisfied — add_audio_effect, update_volume_curve, update_effect_param_curve can all ship now without waiting."
   - date: 2026-04-23
@@ -729,22 +867,25 @@ recent_work:
     description: "M9 complete — Wan2.1 + FILM pipeline. wan.py, film.py, wan_pipeline.py, --engine wan/--preview flags, AI plan wan_denoise/transition_frames."
 
 next_steps:
-  - "Chat-audio Phase 2 (ALL blockers cleared — M13 is done): add_audio_effect, update_volume_curve, update_effect_param_curve. Plus auto-duck/mix/master pipeline via analyze_audio_track / analyze_audio_clip / apply_mix_plan (librosa already in deps; analyzer.py + audio_intelligence.py already do the work)."
-  - "DSP cache tables (proposed): dsp_analysis_runs + dsp_datapoints (EAV-ish) + dsp_sections + dsp_scalars. Cache librosa output by (source_segment_id, analyzer_version, params_hash). Unblocks sub-LLM auto-mix flows."
-  - "M14 (AI Rotoscope Plugin): complete @acp.clarification-address on remaining ~5% of clarification-8, then design → spec → plan. 2-day SAM2 spike before locking the plan."
+  - "M16 implementation — start with T57 (FastAPI scaffold + streaming spike). Tests-first per --tddmode. Spec dependencies satisfied; 897-test suite provides migration confidence."
+  - "Resolve M16 OQ-1 during T68 (chat tool execution path: in-process vs ASGI vs extracted service layer). Recommendation: (a) in-process + cross-execution parity test."
+  - "Backfill M14 + M15 tracking in progress.yaml — git log shows substantial M14/M15 work (mix-graph-hash, analyze_master_bus, mix-render-upload, master-bus effects) but no milestone docs exist. Separate effort; M16 task IDs (T57+) are deliberately chosen to avoid collision."
+  - "Chat-audio Phase 2 features are largely already shipped in the M14/M15 commits. A separate audit should reconcile which tools/endpoints are live vs which still need work."
+  - "M14 (originally planned: AI Rotoscope Plugin from clarification-8) — note that M14 label has been used in commit messages for other work. Rotoscope plan needs either a new milestone number or clarification that 'M14 rotoscope' is a different thing from 'M14 commit label'."
   - "Verify M11 task-35 (<PreviewViewport>) + task-36 (WebGL removal) actual state — session notes suggest task-35 was completed but progress.yaml still lists not_started. Audit with git log and update accordingly."
   - "Unassigned task-37: unified WebSocket protocol"
   - "Unassigned task-38: range-based preview frame cache invalidation"
 
 notes:
-  - "M1-M3, M5-M12 tracked (38/40 tasks if M11+M12 complete)"
-  - "M4 (Resolve integration) deferred"
+  - "M1-M3, M5-M13 tracked. M11 still open (task-35, task-36 not started). M4 (Resolve integration) deferred."
+  - "M14 + M15 work exists in git commits (mix-graph-hash, M15 mix analysis cache, analyze_master_bus chat tool, master-bus effects backend) but is NOT tracked in progress.yaml. Commit messages use per-milestone internal numbering (task 7, task 8) rather than the global scheme. Backfill is a separate concern."
+  - "M16 task IDs 57-68 (12 tasks); source: specs/local.fastapi-migration.md (35R/60 behavior rows) + specs/local.openapi-tool-codegen.md (30R/37 behavior rows). Planned in --tddmode (tests-first per task)."
   - "M11 task IDs 32-36 (30/31/37/38 are unassigned one-offs in agent/tasks/unassigned/)"
   - "M12 task IDs 39-44; 37 (unified WS) is a prereq for task-43's live UI push; task-44 (chunked proxies) extends task-39"
   - "M13 task IDs 45-56 (12 tasks); source: clarification-7 → design/local.effect-curves-macro-panel.md → specs/local.effect-curves-macro-panel.md (54 requirements, 29 tests)"
   - "Wan2.1 requires 24GB+ VRAM (cloud GPU)"
   - "FILM runs between ALL clip boundaries (intra-section smoothing + inter-section style morphing)"
   - "FILM falls back to ffmpeg minterpolate if torch not available"
-  - "Hit marker UI uses stdlib http.server (no FastAPI dependency needed)"
+  - "Hit marker UI uses stdlib http.server (no FastAPI dependency needed — separate module from api_server.py, not affected by M16 migration)"
 
 current_blockers: []
