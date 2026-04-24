@@ -35,6 +35,10 @@ STRUCTURAL_ROUTES: frozenset[str] = frozenset(
         "insert-pool-item",
         "paste-group",
         "checkpoint",
+        # M16 T61 — net-new REST surface for a previously chat-only op.
+        # Legacy has no HTTP route for this, so there's no legacy set to
+        # keep in sync with. T65 will delete the legacy set anyway.
+        "batch-delete-transitions",
     }
 )
 
