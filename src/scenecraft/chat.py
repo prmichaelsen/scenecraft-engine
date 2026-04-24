@@ -176,6 +176,15 @@ Tools available:
     reverb_send, delay_send, echo_send, tremolo, auto_pan, chorus, flanger,
     phaser, drive). Optional static_params dict seeds parameter defaults.
     Inserting at an occupied index shifts later effects by +1.
+  • add_master_bus_effect — append (or insert at a given order_index) a new
+    effect on the MASTER BUS chain (summed mix, pre-destination). This is
+    the canonical home for a master limiter / bus compressor / final glue
+    EQ. Same 17 effect_type allowlist as add_audio_effect. Do NOT stack
+    limiters across individual tracks to control master loudness — put a
+    single limiter here instead. Wrapped in an undo group.
+  • remove_master_bus_effect — delete a master-bus effect by id. Errors if
+    the id belongs to a track instead of the master bus (guard against
+    confusing the two remove flows). Cascades to automation curves.
   • update_effect_param_curve — replace (upsert) an automation curve on a
     track effect's parameter. First point time must be 0, times strictly
     increasing, min 2 points. Duplicate (effect_id, param_name) updates in
@@ -958,6 +967,57 @@ ADD_AUDIO_EFFECT_TOOL: dict = {
     },
 }
 
+ADD_MASTER_BUS_EFFECT_TOOL: dict = {
+    "name": "add_master_bus_effect",
+    "description": (
+        "Append (or insert) a new effect on the MASTER BUS — the summed mix "
+        "(output of masterGain, pre-destination). This is the correct home "
+        "for a master limiter, bus compressor, or final glue EQ. Stacking "
+        "per-track limiters causes pumping artifacts; one master limiter on "
+        "this chain is the pro-audio standard safety net. "
+        "effect_type MUST be one of the same 17 known types as add_audio_effect "
+        "(compressor, gate, limiter, eq_band, highpass, lowpass, pan, "
+        "stereo_width, reverb_send, delay_send, echo_send, tremolo, auto_pan, "
+        "chorus, flanger, phaser, drive). static_params is a dict of parameter "
+        "defaults; shape is not validated backend-side. When order_index is "
+        "omitted the effect is appended (max(existing master-bus effects)+1, "
+        "or 0 on an empty master chain). When order_index is provided and "
+        "already taken, existing master-bus effects at >= that index are "
+        "shifted by +1 in the same undo group. Wrapped in an undo group. "
+        "Automation on master-bus effects uses update_effect_param_curve "
+        "exactly like track effects — the returned effect_id is opaque."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "effect_type":   {"type": "string", "description": "One of the 17 known effect types (see description)."},
+            "static_params": {"type": "object", "description": "Parameter defaults dict. Optional."},
+            "order_index":   {"type": "integer", "description": "Position in the master-bus chain. Omit to append."},
+            "enabled":       {"type": "boolean", "default": True, "description": "Whether the effect is enabled."},
+        },
+        "required": ["effect_type"],
+    },
+}
+
+REMOVE_MASTER_BUS_EFFECT_TOOL: dict = {
+    "name": "remove_master_bus_effect",
+    "description": (
+        "Delete a master-bus effect by id. Validates that the id actually "
+        "belongs to the master-bus chain (track_id IS NULL); passing a "
+        "track-scoped effect_id returns an error instead of silently "
+        "deleting a track effect. ON DELETE CASCADE on effect_curves "
+        "removes any automation on the deleted effect. Wrapped in an undo "
+        "group (the delete + cascaded curve rows all revert together)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "effect_id": {"type": "string", "description": "track_effects.id of the master-bus effect to remove."},
+        },
+        "required": ["effect_id"],
+    },
+}
+
 UPDATE_EFFECT_PARAM_CURVE_TOOL: dict = {
     "name": "update_effect_param_curve",
     "description": (
@@ -1228,6 +1288,8 @@ TOOLS: list[dict] = [
     UPDATE_VOLUME_CURVE_TOOL,
     GENERATE_DSP_TOOL,
     ADD_AUDIO_EFFECT_TOOL,
+    ADD_MASTER_BUS_EFFECT_TOOL,
+    REMOVE_MASTER_BUS_EFFECT_TOOL,
     UPDATE_EFFECT_PARAM_CURVE_TOOL,
     GENERATE_DESCRIPTIONS_TOOL,
     APPLY_MIX_PLAN_TOOL,
@@ -2118,6 +2180,115 @@ def _exec_add_audio_effect(project_dir: Path, input_data: dict) -> dict:
         "effect_type": created.effect_type,
         "order_index": created.order_index,
     }
+
+
+def _exec_add_master_bus_effect(project_dir: Path, input_data: dict) -> dict:
+    """Append or insert a new master-bus effect (``track_id IS NULL``).
+
+    Validates effect_type against the known-17 tuple and shifts existing
+    master-bus effects when inserting at an occupied order_index. Wrapped
+    in a single undo group. Does NOT require a track_id — master-bus is
+    global to the project.
+    """
+    from scenecraft.db import (
+        add_master_bus_effect as db_add_master_bus_effect,
+        list_master_bus_effects as db_list_master_bus_effects,
+        update_track_effect as db_update_track_effect,
+        undo_begin,
+    )
+
+    effect_type = input_data.get("effect_type")
+    if not effect_type or not isinstance(effect_type, str):
+        return {"error": "effect_type is required and must be a string"}
+    if effect_type not in _KNOWN_EFFECT_TYPES:
+        return {
+            "error": (
+                f"unknown effect_type: {effect_type}, "
+                f"valid: {list(_KNOWN_EFFECT_TYPES)}"
+            )
+        }
+
+    static_params = input_data.get("static_params")
+    if static_params is not None and not isinstance(static_params, dict):
+        return {"error": "static_params must be a dict when provided"}
+
+    enabled = bool(input_data.get("enabled", True))
+
+    existing = db_list_master_bus_effects(project_dir)
+    requested_index = input_data.get("order_index")
+    if requested_index is None:
+        order_index = max((e.order_index for e in existing), default=-1) + 1
+        to_shift: list = []
+    else:
+        try:
+            order_index = int(requested_index)
+        except (TypeError, ValueError):
+            return {"error": "order_index must be an integer when provided"}
+        if order_index < 0:
+            return {"error": "order_index must be >= 0"}
+        to_shift = [e for e in existing if e.order_index >= order_index]
+
+    undo_begin(
+        project_dir,
+        f"Chat: add {effect_type} to master bus",
+    )
+    # Shift any conflicting master-bus effects up by 1 (descending to avoid
+    # colliding with ourselves mid-loop). update_track_effect operates on the
+    # effect id regardless of track_id, so it's safe for master-bus rows too.
+    for eff in sorted(to_shift, key=lambda e: e.order_index, reverse=True):
+        db_update_track_effect(
+            project_dir, eff.id, order_index=eff.order_index + 1
+        )
+
+    created = db_add_master_bus_effect(
+        project_dir,
+        effect_type=effect_type,
+        static_params=static_params,
+        order_index=order_index,
+        enabled=enabled,
+    )
+    return {
+        "effect_id": created.id,
+        "effect_type": created.effect_type,
+        "order_index": created.order_index,
+    }
+
+
+def _exec_remove_master_bus_effect(project_dir: Path, input_data: dict) -> dict:
+    """Delete a master-bus effect by id.
+
+    Guards against "track-effect id accidentally passed here" by scoping the
+    existence check to ``track_id IS NULL``. Effect-curves cascade-delete via
+    the existing FK, so automation is cleaned up automatically.
+    """
+    from scenecraft.db import (
+        delete_track_effect as db_delete_track_effect,
+        get_master_bus_effect as db_get_master_bus_effect,
+        get_track_effect as db_get_track_effect,
+        undo_begin,
+    )
+
+    effect_id = input_data.get("effect_id")
+    if not effect_id or not isinstance(effect_id, str):
+        return {"error": "effect_id is required and must be a string"}
+
+    master = db_get_master_bus_effect(project_dir, effect_id)
+    if master is None:
+        # Distinguish "truly missing" from "belongs to a track" for a clear
+        # agent-facing error message (avoid the cross-the-streams bug).
+        existing = db_get_track_effect(project_dir, effect_id)
+        if existing is not None and existing.track_id is not None:
+            return {
+                "error": (
+                    f"effect {effect_id} is on track {existing.track_id}, "
+                    "not the master bus — use the track-effect remove flow instead"
+                )
+            }
+        return {"error": f"master-bus effect not found: {effect_id}"}
+
+    undo_begin(project_dir, f"Chat: remove master-bus effect {effect_id}")
+    db_delete_track_effect(project_dir, effect_id)
+    return {"ok": True}
 
 
 def _exec_update_effect_param_curve(project_dir: Path, input_data: dict) -> dict:
@@ -4188,6 +4359,12 @@ async def _execute_tool(
         return result, "error" in result
     if name == "add_audio_effect":
         result = _exec_add_audio_effect(project_dir, input_data)
+        return result, "error" in result
+    if name == "add_master_bus_effect":
+        result = _exec_add_master_bus_effect(project_dir, input_data)
+        return result, "error" in result
+    if name == "remove_master_bus_effect":
+        result = _exec_remove_master_bus_effect(project_dir, input_data)
         return result, "error" in result
     if name == "update_effect_param_curve":
         result = _exec_update_effect_param_curve(project_dir, input_data)

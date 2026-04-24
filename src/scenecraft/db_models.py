@@ -26,7 +26,9 @@ CurvePoint = list[float]
 @dataclass
 class TrackEffect:
     id: str
-    track_id: str
+    # ``None`` means the effect processes the summed master bus (output of
+    # masterGain, pre-destination). Non-None values scope to an audio track.
+    track_id: str | None
     effect_type: str
     order_index: int
     enabled: bool

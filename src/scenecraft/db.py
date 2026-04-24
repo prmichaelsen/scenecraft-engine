@@ -460,9 +460,16 @@ def _ensure_schema(conn: sqlite3.Connection):
         -- M13 task-45: effect-curves + macro-panel schema (spec R1-R5).
         -- CORE tables (not plugin-owned; no __ prefix). Per-project scope is
         -- enforced by the project.db location, not an explicit project_id FK.
+        --
+        -- Master-bus effects (post-M13): ``track_id`` is nullable. NULL means
+        -- the effect processes the SUMMED master bus (output of ``masterGain``
+        -- before ``destination``). Non-NULL rows scope to an audio track as
+        -- before. A migration below rewrites legacy DBs created with
+        -- ``track_id NOT NULL`` in place (``track_id_is_nullable`` check via
+        -- ``PRAGMA table_info``).
         CREATE TABLE IF NOT EXISTS track_effects (
             id TEXT PRIMARY KEY,
-            track_id TEXT NOT NULL REFERENCES audio_tracks(id) ON DELETE CASCADE,
+            track_id TEXT REFERENCES audio_tracks(id) ON DELETE CASCADE,
             effect_type TEXT NOT NULL,
             order_index INTEGER NOT NULL,
             enabled INTEGER NOT NULL DEFAULT 1,
@@ -868,6 +875,37 @@ def _ensure_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE pool_segments ADD COLUMN context_entity_type TEXT")
     if "context_entity_id" not in ps_cols:
         conn.execute("ALTER TABLE pool_segments ADD COLUMN context_entity_id TEXT")
+
+    # ── Migration: relax track_effects.track_id to NULL (master-bus effects) ──
+    # SQLite can't ALTER COLUMN to change NOT NULL, so detect the legacy schema
+    # via PRAGMA table_info and rewrite the table in-place. Idempotent: the
+    # check short-circuits once track_id is already nullable. All existing rows
+    # keep their non-null track_id (untouched); future rows CAN pass NULL to
+    # mark master-bus effects.
+    te_info = conn.execute("PRAGMA table_info(track_effects)").fetchall()
+    te_track_id_notnull = any(
+        row[1] == "track_id" and row[3] == 1 for row in te_info
+    )
+    if te_track_id_notnull:
+        conn.executescript("""
+            CREATE TABLE track_effects__new (
+                id TEXT PRIMARY KEY,
+                track_id TEXT REFERENCES audio_tracks(id) ON DELETE CASCADE,
+                effect_type TEXT NOT NULL,
+                order_index INTEGER NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                static_params TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO track_effects__new
+                (id, track_id, effect_type, order_index, enabled, static_params, created_at)
+                SELECT id, track_id, effect_type, order_index, enabled, static_params, created_at
+                FROM track_effects;
+            DROP TABLE track_effects;
+            ALTER TABLE track_effects__new RENAME TO track_effects;
+            CREATE INDEX IF NOT EXISTS track_effects_track_order
+                ON track_effects(track_id, order_index);
+        """)
 
     # ── Undo triggers (AFTER all migrations so PRAGMA table_info sees all columns) ──
     _undo_tracked_tables = ["keyframes", "transitions", "suppressions", "effects", "tracks", "transition_effects", "markers", "audio_tracks", "audio_clips", "audio_isolations", "track_effects", "effect_curves", "project_send_buses", "project_frequency_labels"]
@@ -3289,6 +3327,71 @@ def delete_track_effect(project_dir: Path, effect_id: str) -> None:
     conn = get_db(project_dir)
     conn.execute("DELETE FROM track_effects WHERE id = ?", (effect_id,))
     conn.commit()
+
+
+# ── master-bus effects ────────────────────────────────────────────────────
+# Master-bus effects are ``track_effects`` rows with ``track_id IS NULL``. They
+# process the summed mix (output of ``masterGain`` before ``destination``) and
+# are the canonical home for a master limiter / bus compressor. Track-effect
+# helpers (``add_track_effect``, ``list_track_effects``, ``get_track_effect``)
+# scope by ``track_id = ?`` which already excludes NULL rows — no changes
+# needed there. ``effect_curves.effect_id`` is a FK to ``track_effects.id``
+# regardless of NULL-ness, so automation on master-bus effects works without
+# any additional table changes.
+
+def add_master_bus_effect(
+    project_dir: Path,
+    *,
+    effect_type: str,
+    static_params: dict | None = None,
+    order_index: int | None = None,
+    enabled: bool = True,
+) -> _TrackEffect:
+    """Insert a master-bus ``track_effects`` row (``track_id IS NULL``).
+
+    Defaults ``order_index`` to max(existing master-bus order_index)+1 when
+    not provided. Mirrors ``add_track_effect`` in every other respect; does
+    NOT validate ``effect_type`` against the registry (caller's job).
+    """
+    conn = get_db(project_dir)
+    eff_id = generate_id("eff")
+    sp_json = json.dumps(static_params or {})
+    if order_index is None:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(order_index), -1) + 1 FROM track_effects WHERE track_id IS NULL"
+        ).fetchone()
+        order_index = int(row[0])
+    conn.execute(
+        "INSERT INTO track_effects (id, track_id, effect_type, order_index, enabled, static_params, created_at) "
+        "VALUES (?, NULL, ?, ?, ?, ?, ?)",
+        (eff_id, effect_type, order_index, 1 if enabled else 0, sp_json, _now_iso()),
+    )
+    conn.commit()
+    return get_master_bus_effect(project_dir, eff_id)  # type: ignore[return-value]
+
+
+def list_master_bus_effects(project_dir: Path) -> list[_TrackEffect]:
+    """Return all master-bus effects (``track_id IS NULL``) ordered by
+    ``order_index`` ascending. Does not return any track-scoped rows."""
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        "SELECT * FROM track_effects WHERE track_id IS NULL ORDER BY order_index"
+    ).fetchall()
+    return [_row_to_track_effect(r) for r in rows]
+
+
+def get_master_bus_effect(project_dir: Path, effect_id: str) -> _TrackEffect | None:
+    """Fetch a master-bus effect by id. Returns None if the id does not exist
+    OR if it belongs to a track (``track_id IS NOT NULL``). This scoping lets
+    chat tools distinguish "track-effect id accidentally passed to a
+    master-bus API" from "missing effect" without a secondary lookup.
+    """
+    conn = get_db(project_dir)
+    row = conn.execute(
+        "SELECT * FROM track_effects WHERE id = ? AND track_id IS NULL",
+        (effect_id,),
+    ).fetchone()
+    return _row_to_track_effect(row) if row else None
 
 
 # ── effect_curves ─────────────────────────────────────────────────────────

@@ -10,8 +10,14 @@ Covered factors:
 - Audio clips (non-deleted only): id, track_id, source_path, source_offset,
   start_time, end_time, volume_curve, muted
 - Track effects: id, track_id, effect_type, order_index, enabled,
-  static_params (JSON-sorted keys)
-- Effect curves: id, effect_id, param_name, points, interpolation
+  static_params (JSON-sorted keys). Includes master-bus effects (rows with
+  ``track_id IS NULL``) — they process the summed master bus and absolutely
+  affect the rendered output, so they must contribute to the hash. SQLite's
+  default ``ORDER BY track_id ASC`` places NULLs first, giving a deterministic
+  position for the master-bus chain.
+- Effect curves: id, effect_id, param_name, points, interpolation (covers
+  automation on master-bus effects automatically — ``effect_id`` FK is
+  track-agnostic)
 - Send buses: id, bus_type, label, order_index, static_params
 - Track sends: track_id, bus_id, level
 
