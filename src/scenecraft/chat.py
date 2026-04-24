@@ -213,7 +213,77 @@ Key tables: meta, tracks, keyframes, transitions, kf_candidates, tr_candidates,
 chat_messages, audio_tracks. Inspect schema with
 `SELECT sql FROM sqlite_master WHERE type='table'` when unsure.
 
-Be concise. Use markdown for formatting when useful."""
+Be concise. Use markdown for formatting when useful.
+
+# Audio Engineering Reference
+
+When the user asks you to mix, balance, clean up, or otherwise improve audio, use this reference to pick effects and starting parameters. Default to gentle, reversible moves; verify with `analyze_master_bus` when a change is meant to hit a loudness / peak target; compose multi-op passes through `apply_mix_plan` so the whole pass undoes in one click.
+
+## Fundamentals
+
+**Gain staging.** Target -18 dBFS RMS per track as a working reference ("unity"), leaving headroom on the master. No track should peak above -6 dBFS; the master bus should peak below -3 dBFS before the limiter. If clipping shows up in `analyze_master_bus`, pull track faders down — don't compensate with a heavier limiter.
+
+**Loudness targets.** Streaming services normalize to roughly -14 LUFS integrated (Spotify, YouTube, Tidal, Amazon). Apple Music uses -16 LUFS. Broadcast is -23 LUFS (EBU R128). True-peak ceiling -1 dBTP (-2 dBTP for lossy-codec safety). `analyze_master_bus` reports both `lufs_integrated` and `true_peak_db` — use them to decide whether a mix is streaming-ready.
+
+**Static mix (levels + pan before anything else).** Anchor the lead element (usually vocal) and balance everything relative to it. Keep kick, bass, snare, and lead vocal dead-center (mono); pan hats / guitars / keys / pads / doubles outward with matched pairs panned symmetrically. Think in frequency ranges: sub (20-60 Hz), bass (60-250), low-mid (250-500, muddiness zone), mid (500-2k, body + vowels), high-mid (2-6k, presence), high (6-12k, definition), air (12-20k).
+
+**Subtractive before additive EQ.** Cut problem frequencies first; only boost after the mix is cleaner. A 3 dB cut beats a 6 dB boost every time. Boost wide, cut narrow.
+
+**Signal flow on a track.** HPF → gate → corrective EQ (cuts) → compressor → tonal EQ (boosts / shape) → saturation/drive → modulation → pan/stereo_width → sends (reverb, delay, echo — always last, post-fader).
+
+## Effect reference
+
+**compressor** — Evens out dynamics so quiet parts stay present, loud parts don't jump out. Uses: lead vocal (4:1, -6 to -10 dB GR), bass (3:1, steady), drum bus glue (1.5-2:1, 1-3 dB GR). Start: ratio 3:1-4:1, threshold for 3-6 dB GR, attack 10-30 ms, release 40-100 ms. Don't over-compress — audible pumping means back off.
+
+**gate** — Mutes audio below a threshold to remove bleed or hum. Uses: tight kick/snare, metal guitars between chugs. Start: threshold just above noise floor, attack 1 ms (drums) / 5-15 ms (vocals), hold 10-30 ms, release 50-150 ms, range -20 to -40 dB (not -∞). Don't chop word beginnings or reverb tails.
+
+**limiter** — Brick-wall ceiling. Uses: mastering, drum bus peak control, export safety net. Start: ceiling -1 dBTP, 2-4 dB GR max, release 50-200 ms or auto. More than 4-5 dB GR means the mix needs fixing, not more limiter.
+
+**eq_band** — Peaking/bell cut or boost. Uses: scoop mud at 200-400 Hz, add presence at 3-5 kHz on vocal, tame harshness at 2-4 kHz on cymbals. Start: Q 0.7-1.5 for musical, Q 3-8 for surgical, ±3 dB is a lot. Don't boost narrow — sounds cheap.
+
+**highpass** — Removes low rumble below the source's useful range. Uses: everything non-low-end (vocal 80-120 Hz, hats 200-400 Hz, overheads 60-100 Hz). Slope 12 or 24 dB/oct. Don't HPF kick or bass.
+
+**lowpass** — Removes fizz/hiss to push an element back. Uses: tame cymbal bleed on room mics, darken reverb returns, "behind a wall" effects. Start: 10-15 kHz gentle darkening, 4-8 kHz distant. Don't LPF lead vocal or cymbals.
+
+**pan** — Places source in stereo field. Uses: mono center for kick/bass/snare/vocal; hard-pan doubled guitars L/R; spread keys/pads 30-60%. Don't pan low-end off center (hurts mono compatibility).
+
+**stereo_width** — Widens/narrows via mid/side. Uses: overheads/keys to 110-130%, bass to 0% (mono below 120 Hz). Don't over-widen the master — phase cancels on mono playback.
+
+**reverb_send** — Adds space/depth. Uses: plate on vocals (decay 1.5-2.5 s, pre-delay 20-60 ms), room on drums (0.5-1 s), hall on strings/pads (2.5-4 s). Always use as a send, not an insert. Less is more.
+
+**delay_send** — Echoes that add depth without muddying. Uses: 1/8 or 1/4-note vocal throw (tempo-synced), slap delay (80-120 ms, one repeat) for intimacy. Feedback 15-30%. Must tempo-sync or it fights the groove.
+
+**echo_send** — Longer-tail, feedback-heavy delay for dub/ambient. Uses: dub vocal throws, atmospheric guitar. Feedback 40-70%, usually filtered (HPF 200 Hz / LPF 4 kHz). Watch feedback — can self-oscillate.
+
+**tremolo** — Rhythmic volume modulation. Uses: surf/vintage guitar, rhythmic pad, helicopter-stutter FX. Start: rate 4-8 Hz (or tempo-sync 1/8-1/16), depth 30-60%. Don't put on lead vocals unless deliberate.
+
+**auto_pan** — Moves source side-to-side over time. Uses: psychedelic guitar, widening mono synths, rhythmic texture. Rate tempo-synced (1/2 to 1/4 note), depth 50-80%. Don't auto-pan low-end — destabilizes the foundation.
+
+**chorus** — Thickens via detuned short-delay copies. Uses: clean guitars, synth pads, background vocals. Start: delay 15-35 ms, depth 20-40%, rate 0.5-1.5 Hz, mix 20-40%. Buries lead vocal intelligibility — use on doubles instead.
+
+**flanger** — Sweeping comb-filter "jet". Uses: drum fills, psychedelic guitar, transition risers. Start: delay 1-10 ms, depth 40-70%, rate 0.2-1 Hz, feedback 30-60%. Automate in for moments — exhausting when always on.
+
+**phaser** — Gentler sweeping notches than flanger. Uses: electric piano, funk guitar, subtle pad movement. Start: rate 0.3-1 Hz, depth 50-80%, stages 4-6. Don't stack with chorus — they fight.
+
+**drive** — Saturation / harmonic distortion — warmth, grit, or aggression. Uses: thicken bass, glue drum bus (subtle tape/tube), add edge to vocals or guitars. Start: 2-5 dB drive, mix 30-50% (or parallel). Always compensate output gain; don't let "louder" fool you into thinking "better."
+
+## Master bus defaults
+
+Gentle glue compressor (1.5-2:1, 1-2 dB GR, slow attack, auto release) → broad tonal EQ (tilt or ±1-2 dB shelf moves) → optional saturation/drive → true-peak limiter (ceiling -1 dBTP, 2-4 dB GR max).
+
+Target for "streaming-ready": -14 LUFS integrated, -1 dBTP. -16 LUFS for Apple Music. Don't exceed 4-5 dB GR on the mastering limiter — fix the mix instead.
+
+## Working method when the user says "mix this"
+
+1. Run `analyze_master_bus` first to measure starting LUFS, peak, and clipping.
+2. Set static balance via `update_volume_curve` — lead element anchored, supporting elements relative.
+3. Pan center-vs-sides via `add_audio_effect` `pan` on each track that needs it.
+4. Add subtractive EQ (HPF + corrective eq_band cuts) before reaching for compression.
+5. Add compression where needed — vocal / bass / drum bus, not everywhere.
+6. Shape with tonal EQ and drive; add modulation sparingly for character.
+7. Add reverb_send / delay_send as sends.
+8. Run `analyze_master_bus` again; adjust the final limiter / bus moves to hit the target.
+9. Wrap the full pass in `apply_mix_plan` so the user can undo it as one unit."""
 
 
 # ── Tools ────────────────────────────────────────────────────────────
