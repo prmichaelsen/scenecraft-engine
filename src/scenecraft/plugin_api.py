@@ -43,6 +43,11 @@ from scenecraft.db import (
     set_pool_segment_context,
     # Shared candidate-junction helper (tr-side) — needed by M16 + future plugins
     add_tr_candidate,
+    # M17 light_show plugin helpers
+    list_light_show_fixtures,
+    upsert_light_show_fixtures,
+    reset_light_show_fixtures,
+    remove_light_show_fixtures,
 )
 
 # --- Job infrastructure ---------------------------------------------------
@@ -89,6 +94,11 @@ __all__ = [
     "ServiceError",
     "ServiceConfigError",
     "ServiceTimeoutError",
+    # M17 light_show helpers
+    "list_light_show_fixtures",
+    "upsert_light_show_fixtures",
+    "reset_light_show_fixtures",
+    "remove_light_show_fixtures",
 ]
 
 # Re-export the disposable factory so plugins can adapt arbitrary teardown

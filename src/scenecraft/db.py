@@ -476,6 +476,27 @@ def _ensure_schema(conn: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_transcribe_segments_run
             ON transcribe__segments(run_id);
 
+        -- light_show plugin (M17 MVP): one row per rigged fixture in the
+        -- project's DMX simulation. Positions and rotations drive the 3D
+        -- preview panel's three.js scene. ``role`` is a denormalized
+        -- discriminant used by scene DSLs for role-based targeting
+        -- (@role.moving_head, @role.par, ...).
+        CREATE TABLE IF NOT EXISTS light_show__fixtures (
+            id TEXT PRIMARY KEY,
+            role TEXT NOT NULL,
+            label TEXT NOT NULL,
+            position_x REAL NOT NULL DEFAULT 0,
+            position_y REAL NOT NULL DEFAULT 0,
+            position_z REAL NOT NULL DEFAULT 0,
+            rotation_x REAL NOT NULL DEFAULT 0,
+            rotation_y REAL NOT NULL DEFAULT 0,
+            rotation_z REAL NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_light_show_fixtures_role
+            ON light_show__fixtures(role);
+
         CREATE TABLE IF NOT EXISTS sections (
             id TEXT PRIMARY KEY,
             label TEXT NOT NULL DEFAULT '',
@@ -3741,3 +3762,144 @@ def delete_frequency_label(project_dir: Path, label_id: str) -> None:
     conn = get_db(project_dir)
     conn.execute("DELETE FROM project_frequency_labels WHERE id = ?", (label_id,))
     conn.commit()
+
+
+# ── light_show plugin helpers (M17 MVP) ───────────────────────────────────
+
+# Default hardcoded rig — same 8 fixtures the frontend MVP ships. Seeded on
+# first access so fresh projects get a working rig without any user action.
+# The frontend reads these back via /plugins/light_show/fixtures and renders
+# them in the r3f preview panel. Post-MVP, users author via chat (MCP tools)
+# and the backend is source of truth.
+_LIGHT_SHOW_DEFAULT_RIG: list[dict] = [
+    {"id": "mh_1", "role": "moving_head", "label": "MH 1", "position_x": -3, "position_y": 4, "position_z": 2, "rotation_x": -0.7853981633974483, "rotation_y": 0, "rotation_z": 0},
+    {"id": "mh_2", "role": "moving_head", "label": "MH 2", "position_x": -1, "position_y": 4, "position_z": 2, "rotation_x": -0.7853981633974483, "rotation_y": 0, "rotation_z": 0},
+    {"id": "mh_3", "role": "moving_head", "label": "MH 3", "position_x":  1, "position_y": 4, "position_z": 2, "rotation_x": -0.7853981633974483, "rotation_y": 0, "rotation_z": 0},
+    {"id": "mh_4", "role": "moving_head", "label": "MH 4", "position_x":  3, "position_y": 4, "position_z": 2, "rotation_x": -0.7853981633974483, "rotation_y": 0, "rotation_z": 0},
+    {"id": "par_1", "role": "par", "label": "PAR 1", "position_x": -3, "position_y": 2, "position_z": -3, "rotation_x": -0.5235987755982988, "rotation_y": 0, "rotation_z": 0},
+    {"id": "par_2", "role": "par", "label": "PAR 2", "position_x": -1, "position_y": 2, "position_z": -3, "rotation_x": -0.5235987755982988, "rotation_y": 0, "rotation_z": 0},
+    {"id": "par_3", "role": "par", "label": "PAR 3", "position_x":  1, "position_y": 2, "position_z": -3, "rotation_x": -0.5235987755982988, "rotation_y": 0, "rotation_z": 0},
+    {"id": "par_4", "role": "par", "label": "PAR 4", "position_x":  3, "position_y": 2, "position_z": -3, "rotation_x": -0.5235987755982988, "rotation_y": 0, "rotation_z": 0},
+]
+
+
+def list_light_show_fixtures(project_dir: Path) -> list[dict]:
+    """List all fixtures in the project's rig, seeding the default rig on
+    first access so every project has a working starting point."""
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        "SELECT id, role, label, position_x, position_y, position_z, "
+        "rotation_x, rotation_y, rotation_z FROM light_show__fixtures"
+    ).fetchall()
+    if not rows:
+        seed_light_show_default_rig(project_dir)
+        rows = conn.execute(
+            "SELECT id, role, label, position_x, position_y, position_z, "
+            "rotation_x, rotation_y, rotation_z FROM light_show__fixtures"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def seed_light_show_default_rig(project_dir: Path) -> None:
+    """Insert the default 8-fixture rig. No-op if rows already exist."""
+    conn = get_db(project_dir)
+    existing = conn.execute("SELECT COUNT(*) FROM light_show__fixtures").fetchone()[0]
+    if existing > 0:
+        return
+    for f in _LIGHT_SHOW_DEFAULT_RIG:
+        conn.execute(
+            "INSERT INTO light_show__fixtures "
+            "(id, role, label, position_x, position_y, position_z, "
+            " rotation_x, rotation_y, rotation_z) "
+            "VALUES (:id, :role, :label, :position_x, :position_y, :position_z, "
+            "        :rotation_x, :rotation_y, :rotation_z)",
+            f,
+        )
+    conn.commit()
+
+
+def upsert_light_show_fixtures(project_dir: Path, fixtures: list[dict]) -> list[dict]:
+    """Bulk upsert fixtures with partial-state semantics: omitted fields
+    preserve current values. Unknown ``id`` creates a new row. Returns the
+    full current rig after the upsert.
+
+    Each input dict MUST have ``id``. Other fields are optional and merge
+    against existing row (or default zero/empty for new rows).
+    """
+    conn = get_db(project_dir)
+    for f in fixtures:
+        if "id" not in f or not f["id"]:
+            raise ValueError("upsert_light_show_fixtures: each fixture must have an id")
+        fid = f["id"]
+        # Read existing row for partial-state merge.
+        existing = conn.execute(
+            "SELECT role, label, position_x, position_y, position_z, "
+            "rotation_x, rotation_y, rotation_z FROM light_show__fixtures WHERE id = ?",
+            (fid,),
+        ).fetchone()
+        if existing is None:
+            # New fixture — default zero/empty for any unspecified field.
+            row = {
+                "id": fid,
+                "role": f.get("role", "par"),
+                "label": f.get("label", fid),
+                "position_x": float(f.get("position_x", 0)),
+                "position_y": float(f.get("position_y", 0)),
+                "position_z": float(f.get("position_z", 0)),
+                "rotation_x": float(f.get("rotation_x", 0)),
+                "rotation_y": float(f.get("rotation_y", 0)),
+                "rotation_z": float(f.get("rotation_z", 0)),
+            }
+            conn.execute(
+                "INSERT INTO light_show__fixtures "
+                "(id, role, label, position_x, position_y, position_z, "
+                " rotation_x, rotation_y, rotation_z) "
+                "VALUES (:id, :role, :label, :position_x, :position_y, :position_z, "
+                "        :rotation_x, :rotation_y, :rotation_z)",
+                row,
+            )
+        else:
+            # Existing — merge partial fields.
+            existing_d = dict(existing)
+            row = {
+                "id": fid,
+                "role": f.get("role", existing_d["role"]),
+                "label": f.get("label", existing_d["label"]),
+                "position_x": float(f.get("position_x", existing_d["position_x"])),
+                "position_y": float(f.get("position_y", existing_d["position_y"])),
+                "position_z": float(f.get("position_z", existing_d["position_z"])),
+                "rotation_x": float(f.get("rotation_x", existing_d["rotation_x"])),
+                "rotation_y": float(f.get("rotation_y", existing_d["rotation_y"])),
+                "rotation_z": float(f.get("rotation_z", existing_d["rotation_z"])),
+            }
+            conn.execute(
+                "UPDATE light_show__fixtures SET "
+                "role=:role, label=:label, "
+                "position_x=:position_x, position_y=:position_y, position_z=:position_z, "
+                "rotation_x=:rotation_x, rotation_y=:rotation_y, rotation_z=:rotation_z, "
+                "updated_at=datetime('now') "
+                "WHERE id=:id",
+                row,
+            )
+    conn.commit()
+    return list_light_show_fixtures(project_dir)
+
+
+def reset_light_show_fixtures(project_dir: Path) -> list[dict]:
+    """Delete all fixtures, then re-seed the default rig. Returns the
+    post-reset rig."""
+    conn = get_db(project_dir)
+    conn.execute("DELETE FROM light_show__fixtures")
+    conn.commit()
+    seed_light_show_default_rig(project_dir)
+    return list_light_show_fixtures(project_dir)
+
+
+def remove_light_show_fixtures(project_dir: Path, ids: list[str]) -> list[dict]:
+    """Delete specific fixtures by id. Returns the rig after removal.
+    Missing ids are silently ignored."""
+    conn = get_db(project_dir)
+    for fid in ids:
+        conn.execute("DELETE FROM light_show__fixtures WHERE id = ?", (fid,))
+    conn.commit()
+    return list_light_show_fixtures(project_dir)

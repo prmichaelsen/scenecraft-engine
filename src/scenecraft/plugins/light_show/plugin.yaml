@@ -1,0 +1,88 @@
+name: light_show
+version: 0.1.0
+displayName: "Light Show"
+description: "DMX-simulated light show authoring: rig fixtures, 3D preview, chat-driven rig editing."
+publisher: scenecraft
+license: MIT
+
+# Convention (matches isolate_vocals, generate_music):
+#   • Internal ids use dot notation (e.g. `light_show.reset_rig`).
+#   • Chat tool names use double underscore (e.g. `light_show__set_rig_layout`)
+#     because Claude's tool-name regex forbids dots.
+#
+# MVP scope:
+#   • No timeline integration — universes are simulated, rendered in 3D only.
+#   • No real DMX output (Art-Net / sACN / OLA) — sim-only.
+#   • No scene DSL / GDTF / MVR yet — fixtures are a flat role + position table.
+#   • Scenes run frontend-side as plain TS functions for now; backend owns
+#     only the rig (fixtures) until scenes / tracks / transitions land.
+
+activationEvents:
+  - onStartup
+
+contributes:
+  mcpTools:
+    - id: set_rig_layout
+      description: |
+        Upsert fixture positions, rotations, role, and label in bulk.
+        Partial-state semantics: each fixture MUST have an id; other fields
+        are optional and omitted fields preserve current values. Unknown
+        ids create new fixtures (defaulting to zero position/rotation and
+        role='par' if role is not provided). Returns the full rig after
+        the upsert.
+      handler: "backend:tools_set_rig_layout"
+      input_schema:
+        type: object
+        required: [fixtures]
+        properties:
+          fixtures:
+            type: array
+            description: List of fixture objects. Each must have an id.
+            items:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string }
+                role: { type: string, enum: ["moving_head", "par"] }
+                label: { type: string }
+                position_x: { type: number }
+                position_y: { type: number }
+                position_z: { type: number }
+                rotation_x: { type: number }
+                rotation_y: { type: number }
+                rotation_z: { type: number }
+
+    - id: list_fixtures
+      description: |
+        Read back the full current rig as a list of fixture objects with
+        id, role, label, position (xyz meters), and rotation (xyz radians).
+      handler: "backend:tools_list_fixtures"
+      input_schema:
+        type: object
+        properties: {}
+
+    - id: reset_rig
+      description: |
+        Delete all fixtures and re-seed the default 8-fixture rig (4 moving
+        heads upstage truss + 4 RGB wash pars downstage front). Returns the
+        full rig after the reset. Use this to recover from a broken rig
+        authored via set_rig_layout.
+      handler: "backend:tools_reset_rig"
+      destructive: true
+      input_schema:
+        type: object
+        properties: {}
+
+    - id: remove_fixtures
+      description: |
+        Delete specific fixtures by id. Missing ids are silently ignored.
+        Returns the full rig after removal.
+      handler: "backend:tools_remove_fixtures"
+      destructive: true
+      input_schema:
+        type: object
+        required: [ids]
+        properties:
+          ids:
+            type: array
+            items: { type: string }

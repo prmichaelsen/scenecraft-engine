@@ -10693,10 +10693,12 @@ def run_server(host: str = "0.0.0.0", port: int = 8890, work_dir: str | None = N
     from scenecraft.plugins import isolate_vocals
     from scenecraft.plugins import transcribe
     from scenecraft.plugins import generate_music
+    from scenecraft.plugins import light_show
 
     PluginHost.register(isolate_vocals)
     PluginHost.register(transcribe)
     PluginHost.register(generate_music)
+    PluginHost.register(light_show)
     _log(
         f"  Plugins: {len(PluginHost._registered)} registered, "
         f"{len(PluginHost._operations)} operations, "
