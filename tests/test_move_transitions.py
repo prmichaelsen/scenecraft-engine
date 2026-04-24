@@ -21,15 +21,12 @@ Downstream tasks (95/96) extend this endpoint with overlap resolution and copy m
 import json
 import shutil
 import tempfile
-import threading
-from http.server import HTTPServer
 from pathlib import Path
-from urllib.error import HTTPError
-from urllib.request import Request, urlopen
 
 import pytest
 
-from scenecraft.api_server import make_handler
+from fastapi.testclient import TestClient
+from scenecraft.api.app import create_app
 from scenecraft.db import (
     add_keyframe, add_transition, add_track, close_db, get_db,
     get_keyframe, get_keyframes, get_transition, get_transitions,
@@ -47,20 +44,16 @@ def project_env():
     set_meta(project_dir, "title", "Test Project")
     set_meta(project_dir, "fps", 24)
 
-    Handler = make_handler(work_dir)
-    server = HTTPServer(("127.0.0.1", 0), Handler)
-    port = server.server_address[1]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    app = create_app(work_dir=work_dir)
+    client = TestClient(app, raise_server_exceptions=False)
 
     yield {
         "work_dir": work_dir,
         "project_dir": project_dir,
         "project_name": project_name,
-        "base_url": f"http://127.0.0.1:{port}",
+        "client": client,
     }
 
-    server.shutdown()
     close_db(project_dir)
     db_path = str(project_dir / "project.db")
     _migrated_dbs.discard(db_path)
@@ -68,20 +61,19 @@ def project_env():
 
 
 def api(env, method, path, body=None):
-    url = f"{env['base_url']}{path}"
-    data = json.dumps(body).encode() if body is not None else None
-    req = Request(url, data=data, method=method)
-    if data:
-        req.add_header("Content-Type", "application/json")
+    client = env["client"]
+    if method == "GET":
+        resp = client.get(path)
+    elif method == "POST":
+        resp = client.post(path, json=body)
+    elif method == "DELETE":
+        resp = client.delete(path, json=body)
+    else:
+        resp = client.request(method, path, json=body)
     try:
-        resp = urlopen(req)
-        return resp.getcode(), json.loads(resp.read())
-    except HTTPError as e:
-        body_text = e.read().decode()
-        try:
-            return e.code, json.loads(body_text)
-        except Exception:
-            return e.code, {"error": body_text}
+        return resp.status_code, resp.json()
+    except Exception:
+        return resp.status_code, {"error": resp.text}
 
 
 def parse_ts(ts):

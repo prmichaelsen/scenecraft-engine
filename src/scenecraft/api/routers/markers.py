@@ -23,9 +23,9 @@ router = APIRouter(tags=["markers"], dependencies=[Depends(current_user)])
 
 
 def _log(msg: str) -> None:
-    from scenecraft.api_server import _log as legacy_log
+    from scenecraft.api.utils import _log as _util_log
 
-    legacy_log(msg)
+    _util_log(msg)
 
 
 @router.get(

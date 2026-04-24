@@ -228,7 +228,7 @@ async def generate_staged_candidate(
             client = GoogleVideoClient(vertex=True)
             _img_model = _get_meta_stg(pdir).get("image_model", "replicate/nano-banana-2")
 
-            from scenecraft.api_server import _next_variant
+            from scenecraft.api.utils import _next_variant
 
             staging_dir = pdir / "staging" / body.stagingId
             staging_dir.mkdir(parents=True, exist_ok=True)

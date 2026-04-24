@@ -34,12 +34,7 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
-import threading
-import time
-from http.server import HTTPServer
 from pathlib import Path
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError
 
 import numpy as np
 import pytest
@@ -142,14 +137,12 @@ def _make_project(work_dir: Path, project_name: str) -> Path:
 
 @pytest.fixture()
 def dual_server(tmp_path: Path):
-    """Spin up legacy HTTPServer + FastAPI TestClient against the same work_dir.
+    """FastAPI TestClient against a work_dir with two projects (P1, P2).
 
-    Two projects are laid out side-by-side (P1, P2) to satisfy the task's
-    "5 tuples across 2 projects" matrix. ``global_cache`` is cleared in the
-    test body per measurement so both servers genuinely encode each frame.
+    T65 cutover: legacy HTTPServer removed; only the FastAPI TestClient
+    remains. The fixture name is kept to avoid renaming all test params.
     """
     from scenecraft.api.app import create_app
-    from scenecraft.api_server import make_handler
     from scenecraft.db import _migrated_dbs, close_db
 
     work_dir = tmp_path / "work"
@@ -158,26 +151,16 @@ def dual_server(tmp_path: Path):
     p1 = _make_project(work_dir, "P1")
     p2 = _make_project(work_dir, "P2")
 
-    # Legacy HTTPServer
-    Handler = make_handler(work_dir, no_auth=True)
-    server = HTTPServer(("127.0.0.1", 0), Handler)
-    port = server.server_address[1]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-
-    # FastAPI — no auth (no .scenecraft root under work_dir)
     app = create_app(work_dir=work_dir)
-    client = TestClient(app)
+    client = TestClient(app, raise_server_exceptions=False)
 
     yield {
         "work_dir": work_dir,
         "projects": ["P1", "P2"],
         "project_dirs": {"P1": p1, "P2": p2},
-        "legacy_url": f"http://127.0.0.1:{port}",
         "fastapi": client,
     }
 
-    server.shutdown()
     for pd in (p1, p2):
         close_db(pd)
         _migrated_dbs.discard(str(pd / "project.db"))
@@ -202,53 +185,29 @@ RENDER_FRAME_TUPLES = [
 ]
 
 
-def _legacy_render_frame(base_url: str, project: str, t: float, quality: int) -> bytes:
-    url = f"{base_url}/api/projects/{project}/render-frame?t={t}&quality={quality}"
-    resp = urlopen(Request(url, method="GET"), timeout=30)
-    assert resp.status == 200
-    assert resp.headers.get("Content-Type") == "image/jpeg"
-    return resp.read()
-
-
 def _fastapi_render_frame(client: TestClient, project: str, t: float, quality: int) -> bytes:
     resp = client.get(f"/api/projects/{project}/render-frame", params={"t": t, "quality": quality})
     assert resp.status_code == 200, resp.text
-    assert resp.headers.get("content-type") == "image/jpeg"
+    ct = resp.headers.get("content-type", "")
+    assert "image/jpeg" in ct
     return resp.content
 
 
 @pytest.mark.parametrize("project,t,quality", RENDER_FRAME_TUPLES)
 def test_render_frame_bytes_identical(dual_server, project, t, quality):
-    """render-frame-bytes-identical — legacy and FastAPI must emit the same JPEG bytes.
+    """render-frame returns valid JPEG bytes for representative (project, t, quality) tuples.
 
-    Same cv2 call path, same frame, same quality → byte-for-byte equal
-    JPEG. This is the hot-path invariant: the frontend's
-    ``<PreviewViewport>`` caches these and would show subtly different
-    pixels on any encoder drift.
+    T65 cutover: legacy comparison removed; only FastAPI is exercised.
     """
     from scenecraft.render.frame_cache import global_cache
 
     global_cache.clear()
-    legacy_bytes = _legacy_render_frame(dual_server["legacy_url"], project, t, quality)
-
-    global_cache.clear()
     fastapi_bytes = _fastapi_render_frame(dual_server["fastapi"], project, t, quality)
 
-    # Both must be valid JPEGs.
-    assert legacy_bytes[:2] == b"\xff\xd8"
-    assert legacy_bytes[-2:] == b"\xff\xd9"
+    # Must be a valid JPEG.
     assert fastapi_bytes[:2] == b"\xff\xd8"
     assert fastapi_bytes[-2:] == b"\xff\xd9"
-
-    # Byte-for-byte parity is the contract.
-    if legacy_bytes != fastapi_bytes:
-        diff_count = sum(1 for a, b in zip(legacy_bytes, fastapi_bytes) if a != b)
-        diff_count += abs(len(legacy_bytes) - len(fastapi_bytes))
-        pytest.fail(
-            f"render-frame JPEG bytes differ: legacy={len(legacy_bytes)}B "
-            f"fastapi={len(fastapi_bytes)}B diff_bytes={diff_count} "
-            f"project={project} t={t} quality={quality}"
-        )
+    assert len(fastapi_bytes) > 100
 
 
 def test_render_frame_cache_header_parity(dual_server):

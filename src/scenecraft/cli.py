@@ -1303,8 +1303,42 @@ def server(port: int, host: str, work_dir: str | None, no_auth: bool):
         wd = Path(wd)
         wd.mkdir(parents=True, exist_ok=True)
 
-    from scenecraft.api_server import run_server
-    run_server(host, port, work_dir=str(wd), no_auth=no_auth)
+    import uvicorn
+    from scenecraft.api.app import create_app
+    from scenecraft.api.utils import _log as _api_log
+
+    # Start WebSocket server (unchanged from legacy)
+    ws_port = port + 1
+    from scenecraft.ws_server import start_ws_server, FolderWatcher
+    import scenecraft.ws_server as _ws_mod
+    _ws_mod.folder_watcher = FolderWatcher(wd)
+    start_ws_server(host, ws_port, work_dir=wd)
+
+    # Plugin host — static registry for MVP
+    from scenecraft.plugin_host import PluginHost
+    from scenecraft.plugins import isolate_vocals
+    from scenecraft.plugins import transcribe
+
+    PluginHost.register(isolate_vocals)
+    PluginHost.register(transcribe)
+    _api_log(
+        f"  Plugins: {len(PluginHost._registered)} registered, "
+        f"{len(PluginHost._operations)} operations, "
+        f"{len(PluginHost._mcp_tools)} mcp tools"
+    )
+
+    _api_log(f"SceneCraft API server running at http://{host}:{port}")
+    _api_log(f"SceneCraft WebSocket server at ws://{host}:{ws_port}")
+    _api_log(f"  Work dir: {wd}")
+    _api_log(f"  Projects: {len([d for d in wd.iterdir() if d.is_dir()])}")
+    _api_log("")
+
+    # Interactive console (TTY only)
+    from scenecraft.interactive_console import start_if_tty as _start_console
+    _start_console()
+
+    app = create_app(work_dir=wd)
+    uvicorn.run(app, host=host, port=port, log_level="info")
 
 
 @main.command(name="audio-transcribe")

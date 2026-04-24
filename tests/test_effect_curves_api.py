@@ -23,15 +23,12 @@ from __future__ import annotations
 import json
 import shutil
 import tempfile
-import threading
-from http.server import HTTPServer
 from pathlib import Path
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError
 
 import pytest
 
-from scenecraft.api_server import make_handler
+from fastapi.testclient import TestClient
+from scenecraft.api.app import create_app
 from scenecraft.db import (
     _migrated_dbs,
     add_audio_track,
@@ -62,11 +59,8 @@ def env(tmp_path, monkeypatch):
     set_meta(project_dir, "title", "M13 API Test")
     set_meta(project_dir, "fps", 24)
 
-    Handler = make_handler(work_dir, no_auth=True)
-    server = HTTPServer(("127.0.0.1", 0), Handler)
-    port = server.server_address[1]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    app = create_app(work_dir=work_dir)
+    client = TestClient(app, raise_server_exceptions=False)
 
     # Seed an audio track so track_sends auto-seed for the default buses fires.
     track_id = "track_fx_api"
@@ -77,10 +71,9 @@ def env(tmp_path, monkeypatch):
         "project_dir": project_dir,
         "project_name": project_name,
         "track_id": track_id,
-        "base_url": f"http://127.0.0.1:{port}",
+        "client": client,
     }
 
-    server.shutdown()
     close_db(project_dir)
     _migrated_dbs.discard(str(project_dir / "project.db"))
     shutil.rmtree(work_dir, ignore_errors=True)
@@ -94,29 +87,25 @@ def _req(
     *,
     expect_status: int | None = None,
 ):
-    """Raw HTTP request returning (status, body). Accepts an expected status;
-    raises AssertionError if the returned status does not match."""
-    url = f"{env['base_url']}{path}"
-    data = json.dumps(body).encode() if body is not None else None
-    req = Request(url, data=data, method=method)
-    if data is not None:
-        req.add_header("Content-Type", "application/json")
+    """TestClient request returning (status, body)."""
+    client = env["client"]
+    if method == "GET":
+        resp = client.get(path)
+    elif method == "POST":
+        resp = client.post(path, json=body)
+    elif method == "DELETE":
+        resp = client.delete(path, json=body)
+    else:
+        resp = client.request(method, path, json=body)
     try:
-        resp = urlopen(req)
-        raw = resp.read()
-        status = resp.status
-    except HTTPError as e:
-        raw = e.read()
-        status = e.code
-    try:
-        parsed = json.loads(raw) if raw else {}
-    except json.JSONDecodeError:
-        parsed = {"_raw": raw}
+        parsed = resp.json() if resp.content else {}
+    except Exception:
+        parsed = {"_raw": resp.text}
     if expect_status is not None:
-        assert status == expect_status, (
-            f"{method} {path}: expected {expect_status}, got {status}: {parsed}"
+        assert resp.status_code == expect_status, (
+            f"{method} {path}: expected {expect_status}, got {resp.status_code}: {parsed}"
         )
-    return status, parsed
+    return resp.status_code, parsed
 
 
 def _project_path(env: dict, sub: str) -> str:

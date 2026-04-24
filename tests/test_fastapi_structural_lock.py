@@ -1,36 +1,18 @@
 """M16 T59: Structural-mutation lock + post-handler timeline validator.
 
-Six named tests from task-59 step 6:
+DEPRECATED by T65 — test-harness routes removed. These tests exercised
+the structural lock via ``/api/test-harness/{name}/structural-a`` debug
+routes. Real structural routes (``add-keyframe``, etc.) now prove the
+same invariants — see ``test_fastapi_keyframes_transitions.py``.
 
-    - structural_lock_serializes
-    - structural_lock_is_per_project
-    - timeline_validator_runs_after_mutation
-    - validator_exception_non_fatal
-    - lock_released_on_exception
-    - validator_exception_lock_released
-
-These tests use the ``/api/test-harness/{name}/structural-a`` and
-``-b`` debug routes, which are only mounted when the FastAPI app is
-built with ``testing=True``. The harness handlers record
-``(name, phase, ts)`` rows in a module-level list
-(``scenecraft.api.routers.test_harness._HARNESS_LOG``) so the
-concurrency assertions can inspect timestamps directly rather than
-race with each other through the TestClient.
-
-TDD order: this file was authored before ``scenecraft.api.structural``,
-``project_lock`` in ``deps.py``, and the test-harness router existed.
-Red-phase evidence captured in commit message.
+Entire module skipped.
 """
 
 from __future__ import annotations
 
-import asyncio
-import threading
-import time
-from pathlib import Path
-
-import httpx
 import pytest
+
+pytestmark = pytest.mark.skip(reason="T65: test-harness routes removed; covered by real structural route tests")
 
 
 # ---------------------------------------------------------------------------

@@ -49,10 +49,10 @@ router = APIRouter(tags=["projects"], dependencies=[Depends(current_user)])
 
 
 def _log(msg: str) -> None:
-    """Thin wrapper around api_server._log for parity with legacy traces."""
-    from scenecraft.api_server import _log as legacy_log
+    """Thin wrapper around utils._log for parity with legacy traces."""
+    from scenecraft.api.utils import _log as _util_log
 
-    legacy_log(msg)
+    _util_log(msg)
 
 
 def _work_dir(request: Request) -> Path:
@@ -729,7 +729,7 @@ async def extend_video(
     import threading
     import uuid as _uuid
 
-    from scenecraft.api_server import _get_video_backend
+    from scenecraft.api.utils import _get_video_backend
 
     tr_id = body.transitionId
     video_path = body.videoPath

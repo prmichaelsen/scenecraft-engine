@@ -54,12 +54,11 @@ router = APIRouter(tags=["pool"], dependencies=[Depends(current_user)])
 
 
 # Media-type classification — re-imported from legacy so the wire payload
-# stays identical. If the legacy helper ever moves out of api_server we
-# copy it locally; for now a direct import keeps one source of truth.
+# T65: relocated from api_server to scenecraft.api.utils.
 def _classify_media_type(path: str) -> str:
-    from scenecraft.api_server import _classify_media_type as _legacy
+    from scenecraft.api.utils import _classify_media_type as _util
 
-    return _legacy(path)
+    return _util(path)
 
 
 def _authenticated_user_id(user) -> str:

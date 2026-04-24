@@ -23,17 +23,12 @@ FakeWs captures every ``send()`` payload so tests can assert message shape.
 from __future__ import annotations
 
 import json
-import socket
-import threading
-import time
-import urllib.error
-import urllib.request
-from http.server import HTTPServer
 from pathlib import Path
 
 import pytest
 
-from scenecraft.api_server import make_handler
+from fastapi.testclient import TestClient
+from scenecraft.api.app import create_app
 
 
 # ── Fixtures ────────────────────────────────────────────────────────
@@ -44,21 +39,10 @@ def server(tmp_path):
     work_dir = tmp_path / "work"
     work_dir.mkdir()
 
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
+    app = create_app(work_dir=work_dir)
+    client = TestClient(app, raise_server_exceptions=False)
 
-    Handler = make_handler(work_dir)
-    httpd = HTTPServer(("127.0.0.1", port), Handler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    time.sleep(0.05)
-
-    yield {"port": port, "work_dir": work_dir, "base": f"http://127.0.0.1:{port}"}
-
-    httpd.shutdown()
-    httpd.server_close()
+    yield {"work_dir": work_dir, "client": client}
 
 
 def _make_project(work_dir: Path, name: str) -> Path:
@@ -77,17 +61,12 @@ def _make_project(work_dir: Path, name: str) -> Path:
 # ── HTTP helpers ────────────────────────────────────────────────────
 
 
-def _get_json(base: str, path: str) -> tuple[int, dict]:
-    req = urllib.request.Request(f"{base}{path}", method="GET")
+def _get_json(srv, path: str) -> tuple[int, dict]:
+    resp = srv["client"].get(path)
     try:
-        with urllib.request.urlopen(req, timeout=5) as r:
-            return r.status, json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode()
-        try:
-            return e.code, json.loads(raw)
-        except Exception:
-            return e.code, {"raw": raw}
+        return resp.status_code, resp.json()
+    except Exception:
+        return resp.status_code, {"raw": resp.text}
 
 
 # ── FakeWs (mirrors test_analyze_master_bus_roundtrip.py) ───────────
@@ -113,7 +92,7 @@ def test_get_master_bus_effects_empty(server):
     _make_project(server["work_dir"], "empty")
 
     status, resp = _get_json(
-        server["base"], "/api/projects/empty/master-bus-effects",
+        server, "/api/projects/empty/master-bus-effects",
     )
     assert status == 200, resp
     assert resp == {"effects": []}
@@ -137,7 +116,7 @@ def test_get_master_bus_effects_returns_added_effect(server):
     close_db(project)
 
     status, resp = _get_json(
-        server["base"], "/api/projects/p_added/master-bus-effects",
+        server, "/api/projects/p_added/master-bus-effects",
     )
     assert status == 200, resp
     assert len(resp["effects"]) == 1
@@ -168,7 +147,7 @@ def test_get_master_bus_effects_ordered(server):
     close_db(project)
 
     status, resp = _get_json(
-        server["base"], "/api/projects/p_ordered/master-bus-effects",
+        server, "/api/projects/p_ordered/master-bus-effects",
     )
     assert status == 200, resp
     ids = [e["id"] for e in resp["effects"]]
@@ -192,7 +171,7 @@ def test_get_master_bus_effects_reflects_deletes(server):
     close_db(project)
 
     status, resp = _get_json(
-        server["base"], "/api/projects/p_del/master-bus-effects",
+        server, "/api/projects/p_del/master-bus-effects",
     )
     assert status == 200, resp
     ids = [e["id"] for e in resp["effects"]]
@@ -309,7 +288,7 @@ def test_get_master_bus_effects_missing_project(server):
     """Requesting a non-existent project must return 404 with the
     standard error shape, not a 500 or empty list."""
     status, resp = _get_json(
-        server["base"], "/api/projects/does_not_exist/master-bus-effects",
+        server, "/api/projects/does_not_exist/master-bus-effects",
     )
     assert status == 404, resp
     assert resp.get("code") == "NOT_FOUND"
