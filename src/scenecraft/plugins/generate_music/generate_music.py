@@ -15,6 +15,7 @@ default to '' in the spend_ledger row until the auth milestone ships.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
 import threading
@@ -419,6 +420,15 @@ def _save_song(
         raise
     tmp_abs.rename(pool_abs)
 
+    # Fallback to ffprobe when Musicful's reported duration is missing or
+    # absurd (pre-fix rows stored ms; sporadically the API returns 0).
+    # The file is freshly on disk so this is cheap and authoritative.
+    api_duration = float(song.duration) if song.duration and song.duration > 0 else None
+    if api_duration is None or api_duration > 36000:  # >10h = ms-era stored as s
+        probed = _probe_audio_duration(pool_abs)
+        if probed:
+            song.duration = probed
+
     generation_params = {
         "provider": "musicful",
         "model": generation_row.get("model"),
@@ -449,6 +459,32 @@ def _save_song(
         variant_kind="music",
     )
     return seg_id
+
+
+def _probe_audio_duration(path: Path) -> float | None:
+    """Return audio duration in seconds via ffprobe, or None on any failure.
+    Used as the authoritative fallback when Musicful's /tasks response has
+    a missing/zero duration field. ffprobe ships with ffmpeg."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        _log(f"ffprobe failed on {path}: {e}")
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        d = float(result.stdout.strip())
+        return d if d > 0 else None
+    except ValueError:
+        return None
 
 
 def _download_file(url: str, out_path: Path, timeout_seconds: float) -> None:
