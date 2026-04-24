@@ -690,6 +690,14 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             if m:
                 return self._handle_audio_isolations_list(m.group(1), parsed.query)
 
+            # GET /api/projects/:name/bounces/:bounce_id.wav — download a
+            # bounce WAV (M16). The on-disk file lives at
+            # pool/bounces/<composite_hash>.wav and the bounce_id is the
+            # public identifier clients receive from the bounce_audio tool.
+            m = re.match(r"^/api/projects/([^/]+)/bounces/([^/]+)\.wav$", path)
+            if m:
+                return self._handle_bounce_download(m.group(1), m.group(2))
+
             self._error(404, "NOT_FOUND", f"No route: GET {path}")
 
         def do_POST(self):
@@ -961,6 +969,13 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             m = re.match(r"^/api/projects/([^/]+)/mix-render-upload$", path)
             if m:
                 return self._handle_mix_render_upload(m.group(1))
+
+            # POST /api/projects/:name/bounce-upload — frontend-rendered bounce WAV
+            # (M16) uploaded for delivery via /bounces/<id>.wav. Content-addressable
+            # via composite_hash (SHA-256 over mix-graph + selection + format).
+            m = re.match(r"^/api/projects/([^/]+)/bounce-upload$", path)
+            if m:
+                return self._handle_bounce_upload(m.group(1))
 
             # POST /api/projects/:name/pool/rename — update a pool segment's label
             m = re.match(r"^/api/projects/([^/]+)/pool/rename$", path)
@@ -5110,6 +5125,261 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     "duration_s": wav_duration,
                     "chat_released": released,
                 }, status=201)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self._error(500, "INTERNAL_ERROR", str(e))
+
+        def _handle_bounce_upload(self, project_name: str):
+            """POST /api/projects/:name/bounce-upload — store a frontend-rendered
+            bounce WAV at pool/bounces/<composite_hash>.wav so the
+            ``/bounces/<bounce_id>.wav`` download endpoint can serve it back.
+
+            Multipart form fields:
+              audio:           binary WAV
+              composite_hash:  64-char hex SHA-256 computed by the client
+              start_time_s:    float
+              end_time_s:      float
+              sample_rate:     int
+              bit_depth:       int (16 | 24 | 32)
+              channels:        int (1 or 2)
+              request_id:      str (echoes the WS message so the waiting chat
+                               tool's asyncio.Event can be released)
+
+            Content-addressable: the same bounce graph produces the same hash,
+            so repeat uploads overwrite the same file safely. Validates the
+            WAV header matches the declared sample_rate + channels — on
+            mismatch, the written file is deleted so the cache never holds a
+            corrupt artifact (mirrors the mix-render-upload handler).
+            """
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+
+            try:
+                content_type = self.headers.get('Content-Type', '')
+                if 'multipart/form-data' not in content_type:
+                    return self._error(400, "BAD_REQUEST", "Expected multipart/form-data")
+
+                content_length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(content_length)
+
+                boundary = content_type.split('boundary=')[-1].encode()
+                parts = body.split(b'--' + boundary)
+                audio_data: bytes | None = None
+                composite_hash: str | None = None
+                start_time_s: str | None = None
+                end_time_s: str | None = None
+                sample_rate_str: str | None = None
+                bit_depth_str: str | None = None
+                channels_str: str | None = None
+                # Echoed from the bounce_audio_request WS message so the chat
+                # tool's asyncio.Event can be released. Absent means a
+                # non-chat-initiated upload (e.g. direct-call testing).
+                request_id: str | None = None
+
+                for part in parts:
+                    if b'Content-Disposition' not in part:
+                        continue
+                    header_end = part.find(b'\r\n\r\n')
+                    if header_end < 0:
+                        continue
+                    header = part[:header_end].decode('utf-8', errors='replace')
+                    payload = part[header_end + 4:]
+                    if payload.endswith(b'\r\n'):
+                        payload = payload[:-2]
+
+                    if 'name="audio"' in header:
+                        audio_data = payload
+                    elif 'name="composite_hash"' in header:
+                        composite_hash = payload.decode('utf-8', errors='replace').strip()
+                    elif 'name="start_time_s"' in header:
+                        start_time_s = payload.decode('utf-8', errors='replace').strip()
+                    elif 'name="end_time_s"' in header:
+                        end_time_s = payload.decode('utf-8', errors='replace').strip()
+                    elif 'name="sample_rate"' in header:
+                        sample_rate_str = payload.decode('utf-8', errors='replace').strip()
+                    elif 'name="bit_depth"' in header:
+                        bit_depth_str = payload.decode('utf-8', errors='replace').strip()
+                    elif 'name="channels"' in header:
+                        channels_str = payload.decode('utf-8', errors='replace').strip()
+                    elif 'name="request_id"' in header:
+                        request_id = payload.decode('utf-8', errors='replace').strip()
+
+                # Validate required fields
+                if audio_data is None or len(audio_data) == 0:
+                    return self._error(400, "BAD_REQUEST", "Missing 'audio' file")
+                if not composite_hash:
+                    return self._error(400, "BAD_REQUEST", "Missing 'composite_hash'")
+                if start_time_s is None:
+                    return self._error(400, "BAD_REQUEST", "Missing 'start_time_s'")
+                if end_time_s is None:
+                    return self._error(400, "BAD_REQUEST", "Missing 'end_time_s'")
+                if sample_rate_str is None:
+                    return self._error(400, "BAD_REQUEST", "Missing 'sample_rate'")
+                if bit_depth_str is None:
+                    return self._error(400, "BAD_REQUEST", "Missing 'bit_depth'")
+                if channels_str is None:
+                    return self._error(400, "BAD_REQUEST", "Missing 'channels'")
+
+                # Hash must be exactly 64 hex chars
+                if len(composite_hash) != 64 or not all(c in "0123456789abcdefABCDEF" for c in composite_hash):
+                    return self._error(400, "BAD_REQUEST", "composite_hash must be 64 hex chars")
+
+                try:
+                    start_time_f = float(start_time_s)
+                    end_time_f = float(end_time_s)
+                    sample_rate_i = int(sample_rate_str)
+                    bit_depth_i = int(bit_depth_str)
+                    channels_i = int(channels_str)
+                except ValueError as ve:
+                    return self._error(400, "BAD_REQUEST", f"Invalid numeric field: {ve}")
+
+                if channels_i not in (1, 2):
+                    return self._error(400, "BAD_REQUEST", f"channels must be 1 or 2, got {channels_i}")
+                if sample_rate_i <= 0:
+                    return self._error(400, "BAD_REQUEST", f"sample_rate must be positive, got {sample_rate_i}")
+                if bit_depth_i not in (16, 24, 32):
+                    return self._error(400, "BAD_REQUEST", f"bit_depth must be 16, 24, or 32; got {bit_depth_i}")
+                if end_time_f <= start_time_f:
+                    return self._error(400, "BAD_REQUEST", "end_time_s must be > start_time_s")
+
+                # Write to pool/bounces/<hash>.wav (create dir on first upload)
+                bounces_dir = project_dir / "pool" / "bounces"
+                bounces_dir.mkdir(parents=True, exist_ok=True)
+                rel_path = f"pool/bounces/{composite_hash}.wav"
+                dest = project_dir / rel_path
+                dest.write_bytes(audio_data)
+
+                # Validate WAV header (sample_rate + channels only — bit_depth
+                # comparison is fiddly for 32-bit float WAVs which ``wave``
+                # rejects outright). On any validation failure, delete the
+                # file so the cache never holds a corrupt artifact.
+                try:
+                    import wave
+                    with wave.open(str(dest), 'rb') as wf:
+                        wav_channels = wf.getnchannels()
+                        wav_sample_rate = wf.getframerate()
+                        wav_frames = wf.getnframes()
+                    wav_duration = wav_frames / float(wav_sample_rate) if wav_sample_rate > 0 else 0.0
+                    wav_readable = True
+                except Exception:
+                    # 32-bit float WAVs: fall back to soundfile for header
+                    # inspection. If that also fails, it's genuinely corrupt.
+                    try:
+                        import soundfile as _sf
+                        info = _sf.info(str(dest))
+                        wav_channels = int(info.channels)
+                        wav_sample_rate = int(info.samplerate)
+                        wav_duration = float(info.duration)
+                        wav_readable = True
+                    except Exception as we:
+                        try:
+                            dest.unlink()
+                        except Exception:
+                            pass
+                        return self._error(400, "BAD_REQUEST", f"Invalid WAV file: {we}")
+
+                if wav_channels != channels_i:
+                    try:
+                        dest.unlink()
+                    except Exception:
+                        pass
+                    return self._error(400, "BAD_REQUEST",
+                        f"channels mismatch: form says {channels_i}, WAV header says {wav_channels}")
+
+                if wav_sample_rate != sample_rate_i:
+                    try:
+                        dest.unlink()
+                    except Exception:
+                        pass
+                    return self._error(400, "BAD_REQUEST",
+                        f"sample_rate mismatch: form says {sample_rate_i}, WAV header says {wav_sample_rate}")
+
+                bytes_written = dest.stat().st_size
+                _log(f"bounce-upload: {project_name} {composite_hash[:12]}… "
+                     f"({bytes_written // 1024}KB, {wav_duration:.2f}s, {wav_sample_rate}Hz, {wav_channels}ch, {bit_depth_i}-bit)")
+
+                # Release the chat tool waiting on this request, if any.
+                released = False
+                if request_id:
+                    try:
+                        from scenecraft.chat import set_bounce_render_event
+                        released = set_bounce_render_event(request_id)
+                    except Exception as se:
+                        _log(f"bounce-upload: set_bounce_render_event raised: {se}")
+
+                return self._json_response({
+                    "rendered_path": rel_path,
+                    "bytes": bytes_written,
+                    "channels": wav_channels,
+                    "sample_rate": wav_sample_rate,
+                    "bit_depth": bit_depth_i,
+                    "duration_s": wav_duration,
+                    "chat_released": released,
+                }, status=201)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self._error(500, "INTERNAL_ERROR", str(e))
+
+        def _handle_bounce_download(self, project_name: str, bounce_id: str):
+            """GET /api/projects/:name/bounces/:bounce_id.wav — stream a
+            rendered bounce WAV.
+
+            Returns 404 if the bounce row is missing OR the on-disk WAV is
+            missing (edge case for orphaned rows where the cache entry
+            survived a ``pool/bounces/`` cleanup). Sets
+            ``Content-Disposition: attachment`` so browsers treat the
+            response as a file download named ``<project>-<bounce_id>.wav``.
+            """
+            project_dir = self._require_project_dir(project_name)
+            if project_dir is None:
+                return
+            try:
+                from scenecraft.db_bounces import get_bounce_by_id
+                bounce = get_bounce_by_id(project_dir, bounce_id)
+                if bounce is None:
+                    return self._error(404, "NOT_FOUND",
+                        f"Bounce not found: {bounce_id}")
+
+                # Resolve the on-disk path. Prefer the row's rendered_path
+                # (set once the upload completes); fall back to the
+                # composite-hash convention if the row exists but
+                # rendered_path hasn't been populated yet.
+                rel = bounce.rendered_path or f"pool/bounces/{bounce.composite_hash}.wav"
+                full_path = (project_dir / rel).resolve()
+
+                # Defensive path-traversal guard — rendered_path comes from
+                # our own writer but still worth checking.
+                if not str(full_path).startswith(str(project_dir.resolve())):
+                    return self._error(403, "FORBIDDEN", "Path traversal denied")
+
+                if not full_path.exists():
+                    return self._error(404, "NOT_FOUND",
+                        f"Bounce WAV file missing on disk: {rel}")
+
+                file_size = full_path.stat().st_size
+                filename = f"{project_name}-{bounce_id}.wav"
+
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/wav")
+                self.send_header("Content-Length", str(file_size))
+                self.send_header("Content-Disposition",
+                    f'attachment; filename="{filename}"')
+                self.send_header("Accept-Ranges", "bytes")
+                self._cors_headers()
+                self.end_headers()
+
+                try:
+                    with open(full_path, "rb") as f:
+                        while True:
+                            chunk = f.read(65536)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
             except Exception as e:
                 import traceback
                 traceback.print_exc()
