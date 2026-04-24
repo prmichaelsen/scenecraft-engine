@@ -17,7 +17,20 @@ from fastapi import FastAPI
 
 from scenecraft.api.deps import install_cors
 from scenecraft.api.errors import install_exception_handlers
-from scenecraft.api.routers import auth, files, misc, oauth
+from scenecraft.api.routers import (
+    auth,
+    bench,
+    config as config_router,
+    files,
+    ingredients,
+    markers,
+    misc,
+    oauth,
+    projects,
+    prompt_roster,
+    settings as settings_router,
+    workspace,
+)
 
 
 def create_app(
@@ -54,6 +67,15 @@ def create_app(
     app.include_router(oauth.callback_router)
     app.include_router(misc.router)
     app.include_router(files.router)
+    # M16 T60 — projects + misc routers.
+    app.include_router(projects.router)
+    app.include_router(workspace.router)
+    app.include_router(settings_router.router)
+    app.include_router(ingredients.router)
+    app.include_router(bench.router)
+    app.include_router(markers.router)
+    app.include_router(prompt_roster.router)
+    app.include_router(config_router.router)
     app.state.work_dir = Path(work_dir) if work_dir is not None else None
     app.state.testing = bool(testing)
     if app.state.testing:
