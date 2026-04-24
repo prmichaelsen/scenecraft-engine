@@ -33,8 +33,22 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import asyncio
+
 from scenecraft.api_server import make_handler
-from scenecraft.chat import _exec_analyze_master_bus
+from scenecraft.chat import _exec_analyze_master_bus as _exec_analyze_master_bus_async
+
+
+def _exec_analyze_master_bus(project_dir, input_data):
+    """Sync wrapper around the now-async analyzer.
+
+    The e2e tests predate task-7's WS round-trip. The round-trip never fires
+    when ``ws=None`` (the function short-circuits on missing WAV before
+    awaiting), so ``asyncio.run`` is safe.
+    """
+    return asyncio.run(_exec_analyze_master_bus_async(project_dir, input_data))
+
+
 from scenecraft.db import (
     add_audio_clip,
     add_audio_track,
