@@ -217,32 +217,35 @@ def test_get_master_bus_effect_scoped(project: Path) -> None:
 # ── Chat tool: add_master_bus_effect ──────────────────────────────────────
 
 
-def test_chat_add_master_bus_effect_happy(project: Path) -> None:
+@pytest.mark.asyncio
+async def test_chat_add_master_bus_effect_happy(project: Path) -> None:
     from scenecraft.chat import _exec_add_master_bus_effect
 
-    result = _exec_add_master_bus_effect(project, {"effect_type": "limiter"})
+    result = await _exec_add_master_bus_effect(project, {"effect_type": "limiter"})
     assert "error" not in result
     assert result["effect_type"] == "limiter"
     assert result["order_index"] == 0
     assert isinstance(result["effect_id"], str) and result["effect_id"]
 
 
-def test_chat_add_master_bus_effect_appends_in_order(project: Path) -> None:
+@pytest.mark.asyncio
+async def test_chat_add_master_bus_effect_appends_in_order(project: Path) -> None:
     from scenecraft.chat import _exec_add_master_bus_effect
 
-    first = _exec_add_master_bus_effect(project, {"effect_type": "compressor"})
-    second = _exec_add_master_bus_effect(project, {"effect_type": "limiter"})
+    first = await _exec_add_master_bus_effect(project, {"effect_type": "compressor"})
+    second = await _exec_add_master_bus_effect(project, {"effect_type": "limiter"})
     assert first["order_index"] == 0
     assert second["order_index"] == 1
 
 
-def test_chat_add_master_bus_effect_shift_on_explicit_index(project: Path) -> None:
+@pytest.mark.asyncio
+async def test_chat_add_master_bus_effect_shift_on_explicit_index(project: Path) -> None:
     from scenecraft.chat import _exec_add_master_bus_effect
     from scenecraft.db import list_master_bus_effects
 
-    a = _exec_add_master_bus_effect(project, {"effect_type": "compressor"})
-    b = _exec_add_master_bus_effect(project, {"effect_type": "limiter"})
-    new = _exec_add_master_bus_effect(
+    a = await _exec_add_master_bus_effect(project, {"effect_type": "compressor"})
+    b = await _exec_add_master_bus_effect(project, {"effect_type": "limiter"})
+    new = await _exec_add_master_bus_effect(
         project, {"effect_type": "eq_band", "order_index": 0}
     )
     assert "error" not in new
@@ -257,42 +260,46 @@ def test_chat_add_master_bus_effect_shift_on_explicit_index(project: Path) -> No
     assert all(e.track_id is None for e in effects)
 
 
-def test_chat_add_master_bus_effect_invalid_type(project: Path) -> None:
+@pytest.mark.asyncio
+async def test_chat_add_master_bus_effect_invalid_type(project: Path) -> None:
     from scenecraft.chat import _exec_add_master_bus_effect
     from scenecraft.db import list_master_bus_effects
 
-    result = _exec_add_master_bus_effect(project, {"effect_type": "bogus"})
+    result = await _exec_add_master_bus_effect(project, {"effect_type": "bogus"})
     assert "error" in result
     assert "unknown effect_type" in result["error"]
     # No DB write.
     assert list_master_bus_effects(project) == []
 
 
-def test_chat_add_master_bus_effect_missing_type(project: Path) -> None:
+@pytest.mark.asyncio
+async def test_chat_add_master_bus_effect_missing_type(project: Path) -> None:
     from scenecraft.chat import _exec_add_master_bus_effect
 
-    result = _exec_add_master_bus_effect(project, {})
+    result = await _exec_add_master_bus_effect(project, {})
     assert "error" in result
     assert "effect_type" in result["error"]
 
 
-def test_chat_add_master_bus_effect_creates_undo_group(project: Path) -> None:
+@pytest.mark.asyncio
+async def test_chat_add_master_bus_effect_creates_undo_group(project: Path) -> None:
     from scenecraft.chat import _exec_add_master_bus_effect
     from scenecraft.db import get_db
 
     conn = get_db(project)
     before = conn.execute("SELECT COUNT(*) FROM undo_groups").fetchone()[0]
-    result = _exec_add_master_bus_effect(project, {"effect_type": "limiter"})
+    result = await _exec_add_master_bus_effect(project, {"effect_type": "limiter"})
     assert "error" not in result
     after = conn.execute("SELECT COUNT(*) FROM undo_groups").fetchone()[0]
     assert after == before + 1
 
 
-def test_chat_add_master_bus_effect_static_params(project: Path) -> None:
+@pytest.mark.asyncio
+async def test_chat_add_master_bus_effect_static_params(project: Path) -> None:
     from scenecraft.chat import _exec_add_master_bus_effect
     from scenecraft.db import get_master_bus_effect
 
-    result = _exec_add_master_bus_effect(
+    result = await _exec_add_master_bus_effect(
         project,
         {"effect_type": "limiter", "static_params": {"threshold": -1.0}},
     )
@@ -305,46 +312,50 @@ def test_chat_add_master_bus_effect_static_params(project: Path) -> None:
 # ── Chat tool: remove_master_bus_effect ───────────────────────────────────
 
 
-def test_chat_remove_master_bus_effect_happy(project: Path) -> None:
+@pytest.mark.asyncio
+async def test_chat_remove_master_bus_effect_happy(project: Path) -> None:
     from scenecraft.chat import (
         _exec_add_master_bus_effect,
         _exec_remove_master_bus_effect,
     )
     from scenecraft.db import list_master_bus_effects
 
-    added = _exec_add_master_bus_effect(project, {"effect_type": "limiter"})
+    added = await _exec_add_master_bus_effect(project, {"effect_type": "limiter"})
     assert "error" not in added
 
-    removed = _exec_remove_master_bus_effect(
+    removed = await _exec_remove_master_bus_effect(
         project, {"effect_id": added["effect_id"]}
     )
     assert removed == {"ok": True}
     assert list_master_bus_effects(project) == []
 
 
-def test_chat_remove_master_bus_effect_rejects_track_effect(project: Path) -> None:
+@pytest.mark.asyncio
+async def test_chat_remove_master_bus_effect_rejects_track_effect(project: Path) -> None:
     """Calling remove_master_bus_effect with a track-effect id must error
     with a clear message — don't silently delete a track effect."""
     from scenecraft.chat import _exec_remove_master_bus_effect
     from scenecraft.db import add_track_effect, list_track_effects
 
     track_eff = add_track_effect(project, track_id="at1", effect_type="compressor")
-    result = _exec_remove_master_bus_effect(project, {"effect_id": track_eff.id})
+    result = await _exec_remove_master_bus_effect(project, {"effect_id": track_eff.id})
     assert "error" in result
     assert "not the master bus" in result["error"] or "track" in result["error"].lower()
     # Track effect still exists — no stealth delete.
     assert len(list_track_effects(project, "at1")) == 1
 
 
-def test_chat_remove_master_bus_effect_missing(project: Path) -> None:
+@pytest.mark.asyncio
+async def test_chat_remove_master_bus_effect_missing(project: Path) -> None:
     from scenecraft.chat import _exec_remove_master_bus_effect
 
-    result = _exec_remove_master_bus_effect(project, {"effect_id": "nope"})
+    result = await _exec_remove_master_bus_effect(project, {"effect_id": "nope"})
     assert "error" in result
     assert "not found" in result["error"]
 
 
-def test_chat_remove_master_bus_effect_cascades_curves(project: Path) -> None:
+@pytest.mark.asyncio
+async def test_chat_remove_master_bus_effect_cascades_curves(project: Path) -> None:
     """Deleting a master-bus effect must cascade to effect_curves."""
     from scenecraft.chat import (
         _exec_add_master_bus_effect,
@@ -353,7 +364,7 @@ def test_chat_remove_master_bus_effect_cascades_curves(project: Path) -> None:
     )
     from scenecraft.db import get_db, list_curves_for_effect
 
-    added = _exec_add_master_bus_effect(project, {"effect_type": "limiter"})
+    added = await _exec_add_master_bus_effect(project, {"effect_type": "limiter"})
     effect_id = added["effect_id"]
     curve = _exec_update_effect_param_curve(
         project,
@@ -366,7 +377,7 @@ def test_chat_remove_master_bus_effect_cascades_curves(project: Path) -> None:
     assert curve.get("ok") is True
     assert len(list_curves_for_effect(project, effect_id)) == 1
 
-    _exec_remove_master_bus_effect(project, {"effect_id": effect_id})
+    await _exec_remove_master_bus_effect(project, {"effect_id": effect_id})
 
     # Cascade: the curve row should be gone.
     conn = get_db(project)
@@ -376,10 +387,11 @@ def test_chat_remove_master_bus_effect_cascades_curves(project: Path) -> None:
     assert row[0] == 0
 
 
-def test_chat_remove_master_bus_effect_missing_id(project: Path) -> None:
+@pytest.mark.asyncio
+async def test_chat_remove_master_bus_effect_missing_id(project: Path) -> None:
     from scenecraft.chat import _exec_remove_master_bus_effect
 
-    result = _exec_remove_master_bus_effect(project, {})
+    result = await _exec_remove_master_bus_effect(project, {})
     assert "error" in result
     assert "effect_id" in result["error"]
 
@@ -387,7 +399,8 @@ def test_chat_remove_master_bus_effect_missing_id(project: Path) -> None:
 # ── update_effect_param_curve on master-bus effects ───────────────────────
 
 
-def test_update_effect_param_curve_on_master_bus(project: Path) -> None:
+@pytest.mark.asyncio
+async def test_update_effect_param_curve_on_master_bus(project: Path) -> None:
     """Automation curves on master-bus effects work exactly like track
     effects — effect_id is opaque, same code path."""
     from scenecraft.chat import (
@@ -396,7 +409,7 @@ def test_update_effect_param_curve_on_master_bus(project: Path) -> None:
     )
     from scenecraft.db import list_curves_for_effect
 
-    added = _exec_add_master_bus_effect(project, {"effect_type": "limiter"})
+    added = await _exec_add_master_bus_effect(project, {"effect_type": "limiter"})
     assert "error" not in added
     effect_id = added["effect_id"]
 
