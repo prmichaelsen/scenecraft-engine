@@ -20,12 +20,22 @@ from scenecraft.api.errors import install_exception_handlers
 from scenecraft.api.routers import auth, files, misc, oauth
 
 
-def create_app(work_dir: Path | None = None, *, enable_docs: bool = True) -> FastAPI:
+def create_app(
+    work_dir: Path | None = None,
+    *,
+    enable_docs: bool = True,
+    testing: bool = False,
+) -> FastAPI:
     """Build a configured FastAPI app rooted at ``work_dir``.
 
     ``work_dir`` may be ``None`` when the app is imported for
     OpenAPI introspection or Swagger UI rendering; file routes will
     500 on that configuration, which is the correct failure mode.
+
+    ``testing=True`` mounts the ``test_harness`` router (debug routes
+    used by M16 T59 concurrency tests). It is NEVER set in the
+    module-level ``app`` below, so production boots never expose the
+    harness endpoints.
     """
     app = FastAPI(
         title="scenecraft-engine",
@@ -45,6 +55,13 @@ def create_app(work_dir: Path | None = None, *, enable_docs: bool = True) -> Fas
     app.include_router(misc.router)
     app.include_router(files.router)
     app.state.work_dir = Path(work_dir) if work_dir is not None else None
+    app.state.testing = bool(testing)
+    if app.state.testing:
+        # Imported lazily so production boots never pay the cost or
+        # expose the module to module-level side-effects.
+        from scenecraft.api.routers import test_harness
+
+        app.include_router(test_harness.router)
     return app
 
 

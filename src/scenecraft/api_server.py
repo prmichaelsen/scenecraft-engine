@@ -85,12 +85,35 @@ def _get_video_backend(project_dir: Path) -> str:
     return _get_project_settings(project_dir).get("video_backend", "vertex")
 
 
+# ── Module-level project-lock registry ──────────────────────────────
+#
+# Hoisted from the ``make_handler`` closure so the FastAPI port
+# (``scenecraft.api.deps.project_lock``, M16 T59) can reuse exactly
+# the same per-project locks the legacy ``do_POST`` handler acquires.
+# Both paths must share state — during Phase A (T57-T64) the two
+# servers run side by side and either may mutate the same project.
+# T65 hard cutover will relocate this to ``scenecraft.locks``.
+import threading as _threading
+
+_project_locks: dict[str, _threading.Lock] = {}
+_locks_lock = _threading.Lock()
+
+
+def _get_project_lock(project_name: str) -> _threading.Lock:
+    """Get (or create) a per-project lock for serializing YAML and git operations.
+
+    Module-level so the M16 FastAPI port (``scenecraft.api.deps``) can
+    import the same registry and serialize against the legacy
+    ``do_POST`` handler during the parallel-port phase.
+    """
+    with _locks_lock:
+        if project_name not in _project_locks:
+            _project_locks[project_name] = _threading.Lock()
+        return _project_locks[project_name]
+
+
 def make_handler(work_dir: Path, no_auth: bool = False):
     """Create a request handler class with the work_dir baked in."""
-    import threading
-    _project_locks: dict[str, threading.Lock] = {}
-    _locks_lock = threading.Lock()
-
     # Auth: detect .scenecraft root for JWT validation (opt-in — no .scenecraft = no auth)
     _sc_root = None
     if not no_auth:
@@ -99,13 +122,6 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             _sc_root = find_root(work_dir)
         except Exception:
             pass
-
-    def _get_project_lock(project_name: str) -> threading.Lock:
-        """Get a per-project lock for serializing YAML and git operations."""
-        with _locks_lock:
-            if project_name not in _project_locks:
-                _project_locks[project_name] = threading.Lock()
-            return _project_locks[project_name]
 
     def _yaml_lock(project_name: str):
         """Context manager for serializing YAML read-modify-write operations on a project."""
