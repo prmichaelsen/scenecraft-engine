@@ -48,6 +48,9 @@ from scenecraft.db import (
     upsert_light_show_fixtures,
     reset_light_show_fixtures,
     remove_light_show_fixtures,
+    list_light_show_overrides,
+    set_light_show_overrides,
+    clear_light_show_overrides,
 )
 
 # --- Job infrastructure ---------------------------------------------------
@@ -99,6 +102,9 @@ __all__ = [
     "upsert_light_show_fixtures",
     "reset_light_show_fixtures",
     "remove_light_show_fixtures",
+    "list_light_show_overrides",
+    "set_light_show_overrides",
+    "clear_light_show_overrides",
 ]
 
 # Re-export the disposable factory so plugins can adapt arbitrary teardown

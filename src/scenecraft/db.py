@@ -497,6 +497,23 @@ def _ensure_schema(conn: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_light_show_fixtures_role
             ON light_show__fixtures(role);
 
+        -- Per-fixture manual channel overrides. NULL column = that channel is
+        -- NOT overridden (scene-driven); non-NULL = the value the shader uses
+        -- regardless of what the active scene writes. ``color`` is a single
+        -- override (all 3 RGB channels together) — set all three or none.
+        -- Enables chat-driven 'force MH 2 to bright red' without having to
+        -- change the active scene.
+        CREATE TABLE IF NOT EXISTS light_show__overrides (
+            fixture_id TEXT PRIMARY KEY REFERENCES light_show__fixtures(id) ON DELETE CASCADE,
+            intensity REAL,
+            color_r REAL,
+            color_g REAL,
+            color_b REAL,
+            pan REAL,
+            tilt REAL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
         CREATE TABLE IF NOT EXISTS sections (
             id TEXT PRIMARY KEY,
             label TEXT NOT NULL DEFAULT '',
@@ -3903,3 +3920,117 @@ def remove_light_show_fixtures(project_dir: Path, ids: list[str]) -> list[dict]:
         conn.execute("DELETE FROM light_show__fixtures WHERE id = ?", (fid,))
     conn.commit()
     return list_light_show_fixtures(project_dir)
+
+
+# ── light_show channel overrides ───────────────────────────────────────────
+
+
+def list_light_show_overrides(project_dir: Path) -> list[dict]:
+    """Return current overrides as a list. Each entry has ``fixture_id`` and
+    zero or more channel keys (``intensity``, ``color`` [r,g,b], ``pan``,
+    ``tilt``) — keys are present only when the channel is overridden."""
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        "SELECT fixture_id, intensity, color_r, color_g, color_b, pan, tilt "
+        "FROM light_show__overrides"
+    ).fetchall()
+    out = []
+    for r in rows:
+        entry: dict = {"fixture_id": r["fixture_id"]}
+        if r["intensity"] is not None:
+            entry["intensity"] = r["intensity"]
+        if r["color_r"] is not None:
+            entry["color"] = [r["color_r"], r["color_g"], r["color_b"]]
+        if r["pan"] is not None:
+            entry["pan"] = r["pan"]
+        if r["tilt"] is not None:
+            entry["tilt"] = r["tilt"]
+        out.append(entry)
+    return out
+
+
+def set_light_show_overrides(project_dir: Path, overrides: list[dict]) -> list[dict]:
+    """Bulk upsert overrides with partial-field semantics.
+
+    Each input dict MUST have ``id`` (the fixture id). Optional keys:
+      - ``intensity`` (float 0..1)
+      - ``color`` ([r, g, b] each 0..1) — all three or none
+      - ``pan`` (radians, signed)
+      - ``tilt`` (radians, signed)
+
+    Omitted keys on an existing override row are preserved (still NULL or
+    still set, whichever they were). To clear a channel back to scene-driven,
+    use ``clear_light_show_overrides`` with the specific fixture_id (clears
+    all channels for that fixture) — per-channel clear is TODO if needed.
+
+    Returns the full override list after upsert.
+    """
+    conn = get_db(project_dir)
+    for o in overrides:
+        fid = o.get("id") or o.get("fixture_id")
+        if not fid:
+            raise ValueError("set_light_show_overrides: each entry must have an id")
+
+        # Verify the fixture exists — overrides are FK'd to fixtures.
+        exists = conn.execute(
+            "SELECT 1 FROM light_show__fixtures WHERE id = ?", (fid,)
+        ).fetchone()
+        if not exists:
+            raise ValueError(f"fixture {fid!r} does not exist")
+
+        # Partial merge against the existing override row, if any.
+        existing = conn.execute(
+            "SELECT intensity, color_r, color_g, color_b, pan, tilt "
+            "FROM light_show__overrides WHERE fixture_id = ?",
+            (fid,),
+        ).fetchone()
+        row = {
+            "fixture_id": fid,
+            "intensity": existing["intensity"] if existing else None,
+            "color_r": existing["color_r"] if existing else None,
+            "color_g": existing["color_g"] if existing else None,
+            "color_b": existing["color_b"] if existing else None,
+            "pan": existing["pan"] if existing else None,
+            "tilt": existing["tilt"] if existing else None,
+        }
+
+        if "intensity" in o:
+            row["intensity"] = None if o["intensity"] is None else float(o["intensity"])
+        if "color" in o:
+            c = o["color"]
+            if c is None:
+                row["color_r"] = row["color_g"] = row["color_b"] = None
+            else:
+                if not isinstance(c, (list, tuple)) or len(c) != 3:
+                    raise ValueError(f"color must be [r, g, b], got {c!r}")
+                row["color_r"], row["color_g"], row["color_b"] = (float(c[0]), float(c[1]), float(c[2]))
+        if "pan" in o:
+            row["pan"] = None if o["pan"] is None else float(o["pan"])
+        if "tilt" in o:
+            row["tilt"] = None if o["tilt"] is None else float(o["tilt"])
+
+        conn.execute(
+            "INSERT INTO light_show__overrides "
+            "(fixture_id, intensity, color_r, color_g, color_b, pan, tilt) "
+            "VALUES (:fixture_id, :intensity, :color_r, :color_g, :color_b, :pan, :tilt) "
+            "ON CONFLICT(fixture_id) DO UPDATE SET "
+            "intensity=:intensity, color_r=:color_r, color_g=:color_g, color_b=:color_b, "
+            "pan=:pan, tilt=:tilt, updated_at=datetime('now')",
+            row,
+        )
+    conn.commit()
+    return list_light_show_overrides(project_dir)
+
+
+def clear_light_show_overrides(project_dir: Path, fixture_ids: list[str] | None = None) -> list[dict]:
+    """Clear overrides. If ``fixture_ids`` is None or empty, clears ALL
+    overrides. Otherwise clears only the specified fixtures. Returns the
+    remaining override list."""
+    conn = get_db(project_dir)
+    if not fixture_ids:
+        conn.execute("DELETE FROM light_show__overrides")
+    else:
+        for fid in fixture_ids:
+            conn.execute("DELETE FROM light_show__overrides WHERE fixture_id = ?", (fid,))
+    conn.commit()
+    return list_light_show_overrides(project_dir)

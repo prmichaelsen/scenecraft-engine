@@ -86,3 +86,64 @@ contributes:
           ids:
             type: array
             items: { type: string }
+
+    - id: set_fixture_state
+      description: |
+        Override per-fixture channel values (intensity, color, pan, tilt).
+        Overrides win over whatever the active scene would otherwise write,
+        so you can pin a specific fixture to a specific look regardless of
+        scene choice. Each entry MUST include `id`; any of intensity/color/
+        pan/tilt may be specified — omitted fields preserve current override
+        state (or stay scene-driven if not previously overridden). Use
+        `clear_overrides` to restore scene control.
+
+        Coordinate notes:
+          - intensity: 0.0 (off) to 1.0 (full).
+          - color: [r, g, b] each 0.0..1.0 (linear). Set all three or none.
+          - pan: radians; signed offset from fixture's base rotation. Only
+            meaningful for moving_head role.
+          - tilt: radians; signed offset. Only meaningful for moving_head.
+      handler: "backend:tools_set_fixture_state"
+      input_schema:
+        type: object
+        required: [overrides]
+        properties:
+          overrides:
+            type: array
+            items:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string }
+                intensity: { type: number, minimum: 0, maximum: 1 }
+                color:
+                  type: array
+                  minItems: 3
+                  maxItems: 3
+                  items: { type: number, minimum: 0, maximum: 1 }
+                pan: { type: number }
+                tilt: { type: number }
+
+    - id: list_overrides
+      description: |
+        List current per-fixture channel overrides. Each returned entry has
+        `fixture_id` and zero or more channel keys (intensity, color, pan,
+        tilt) — present only when that channel is currently overridden.
+      handler: "backend:tools_list_overrides"
+      input_schema:
+        type: object
+        properties: {}
+
+    - id: clear_overrides
+      description: |
+        Clear channel overrides, returning affected fixtures to scene-driven
+        channel values. If `ids` is provided, only those fixtures are
+        cleared; otherwise ALL overrides are cleared. Non-destructive on
+        the rig itself — only removes the override layer.
+      handler: "backend:tools_clear_overrides"
+      input_schema:
+        type: object
+        properties:
+          ids:
+            type: array
+            items: { type: string }

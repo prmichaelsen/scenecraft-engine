@@ -21,11 +21,14 @@ __all__ = [
     "activate",
     "deactivate",
     "PLUGIN_ID",
-    # Tool handlers (referenced by plugin.yaml handler refs as "light_show.tools_*")
+    # Tool handlers (referenced by plugin.yaml handler refs as "backend:tools_*")
     "tools_set_rig_layout",
     "tools_list_fixtures",
     "tools_reset_rig",
     "tools_remove_fixtures",
+    "tools_set_fixture_state",
+    "tools_list_overrides",
+    "tools_clear_overrides",
 ]
 
 
@@ -93,3 +96,39 @@ def tools_remove_fixtures(args, tool_context) -> dict:
         return {"error": "ids must be a list"}
     fixtures = plugin_api.remove_light_show_fixtures(project_dir, [str(i) for i in ids])
     return {"fixtures": fixtures}
+
+
+def tools_set_fixture_state(args, tool_context) -> dict:
+    """Override per-fixture channel values (intensity, color, pan, tilt).
+    Overrides win over scene output until cleared. Each override entry
+    MUST include ``id``; fields not specified stay at whatever they were
+    in the existing override (or NULL / scene-driven)."""
+    from scenecraft import plugin_api
+    project_dir = tool_context["project_dir"]
+    overrides = args.get("overrides") or []
+    if not isinstance(overrides, list):
+        return {"error": "overrides must be a list"}
+    try:
+        rows = plugin_api.set_light_show_overrides(project_dir, overrides)
+    except ValueError as e:
+        return {"error": str(e)}
+    return {"overrides": rows}
+
+
+def tools_list_overrides(args, tool_context) -> dict:
+    del args
+    from scenecraft import plugin_api
+    project_dir = tool_context["project_dir"]
+    return {"overrides": plugin_api.list_light_show_overrides(project_dir)}
+
+
+def tools_clear_overrides(args, tool_context) -> dict:
+    """Clear overrides, restoring scene-driven channel values. If ``ids``
+    is provided, only clears those fixtures; otherwise clears everything."""
+    from scenecraft import plugin_api
+    project_dir = tool_context["project_dir"]
+    ids = args.get("ids") or []
+    if not isinstance(ids, list):
+        return {"error": "ids must be a list"}
+    rows = plugin_api.clear_light_show_overrides(project_dir, [str(i) for i in ids] or None)
+    return {"overrides": rows}
