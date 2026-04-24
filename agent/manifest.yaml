@@ -4,9 +4,9 @@
 packages:
   acp-core:
     source: https://github.com/prmichaelsen/agent-context-protocol.git
-    package_version: 5.30.0
-    installed_at: 2026-03-23T20:34:45Z
-    updated_at: 2026-03-23T20:34:45Z
+    package_version: 5.32.0
+    installed_at: 2026-04-23T07:11:19Z
+    updated_at: 2026-04-23T07:11:19Z
     files:
       commands:
         - name: acp.artifact-glossary.md
@@ -45,6 +45,7 @@ packages:
         - name: acp.report.md
         - name: acp.resume.md
         - name: acp.sessions.md
+        - name: acp.spec.md
         - name: acp.status.md
         - name: acp.sync.md
         - name: acp.task-create.md
@@ -63,4 +64,4 @@ packages:
         - name: requirements.template.md
 
 manifest_version: 1.0.0
-last_updated: 2026-03-23T20:34:45Z
+last_updated: 2026-04-23T07:11:19Z
