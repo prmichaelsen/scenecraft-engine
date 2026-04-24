@@ -701,6 +701,28 @@ def _ensure_schema(conn: sqlite3.Connection):
             value REAL NOT NULL,
             PRIMARY KEY (run_id, metric)
         );
+
+        -- M16: bounce_audio cache. Each row is one rendered WAV at
+        -- pool/bounces/<composite_hash>.wav. composite_hash = SHA-256 over
+        -- (mix_graph_hash + selection + format) — see scenecraft/bounce_hash.py.
+        -- UNIQUE on composite_hash guarantees cache-hit semantics:
+        -- identical mix + selection + format reuses the same row and file.
+        CREATE TABLE IF NOT EXISTS audio_bounces (
+            id TEXT PRIMARY KEY,
+            composite_hash TEXT NOT NULL UNIQUE,
+            start_time_s REAL NOT NULL,
+            end_time_s REAL NOT NULL,
+            mode TEXT NOT NULL,
+            selection_json TEXT NOT NULL,
+            sample_rate INTEGER NOT NULL,
+            bit_depth INTEGER NOT NULL,
+            channels INTEGER NOT NULL DEFAULT 2,
+            rendered_path TEXT,
+            size_bytes INTEGER,
+            duration_s REAL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_audio_bounces_hash ON audio_bounces(composite_hash);
     """)
 
     # ── Undo system ──
