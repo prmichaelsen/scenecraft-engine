@@ -55,8 +55,17 @@ from scenecraft.vcs.bootstrap import (
     find_root,
 )
 
+# --- Typed provider namespace (M18 task-142) ------------------------------
+# Plugins access provider-specific surfaces via ``plugin_api.providers.<name>``.
+# Each provider owns auth, HTTP, polling, backoff, spend_ledger, download,
+# and disconnect-survival. Supersedes ``call_service`` for Replicate-backed
+# plugins; ``call_service`` stays for Musicful and other providers until they
+# migrate to the typed surface.
+from scenecraft.plugin_api import providers  # noqa: E402,F401
+
 
 __all__ = [
+    "providers",
     "get_audio_clips",
     "add_pool_segment",
     "get_pool_segment",
