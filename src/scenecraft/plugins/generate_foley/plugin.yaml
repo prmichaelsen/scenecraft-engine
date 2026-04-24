@@ -1,0 +1,50 @@
+# Backend mirror of the frontend plugin.yaml (canonical copy lives in
+# scenecraft/src/plugins/generate-foley/plugin.yaml — task-146).
+#
+# This file is documentation-only at MVP; the static PluginHost registry
+# is the runtime authority.
+
+id: generate-foley
+name: Foley Generator
+version: 0.1.0
+description: >
+  Generate foley sound effects from text prompts (t2fx) or video clips (v2fx)
+  using MMAudio via Replicate.
+
+license:
+  plugin: MIT
+  upstream_models:
+    - name: MMAudio
+      license: CC-BY-NC 4.0
+      url: https://github.com/hkchengrex/MMAudio
+      commercial_use: false
+      note: >
+        Non-commercial weights. Scenecraft's current posture is non-commercial;
+        if commercial access opens, switch to HunyuanVideo-Foley (Apache 2.0).
+
+providers:
+  - replicate
+
+contributes:
+  rest_endpoints:
+    - path: /api/projects/:project/plugins/generate-foley/run
+      method: POST
+    - path: /api/projects/:project/plugins/generate-foley/generations
+      method: GET
+    - path: /api/projects/:project/plugins/generate-foley/generations/:id/retry
+      method: POST
+  chat_tools:
+    - generate_foley
+  variant_kinds:
+    - name: foley
+      color: orange
+
+invariants:
+  - no-raw-db-access: true        # provider writes spend_ledger via plugin_api.record_spend
+  - survives-ws-disconnect: true  # Replicate predictions continue server-side
+  - mvp-count-is-one: true        # variant_count > 1 rejected at API boundary
+
+# Duration bounds (product ceiling, enforced at API + chat tool boundaries).
+duration_bounds_seconds:
+  min: 1.0
+  max: 30.0
