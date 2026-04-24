@@ -2182,13 +2182,42 @@ def _exec_add_audio_effect(project_dir: Path, input_data: dict) -> dict:
     }
 
 
-def _exec_add_master_bus_effect(project_dir: Path, input_data: dict) -> dict:
+async def _emit_master_bus_effects_changed(
+    ws: Any, project_name: str | None
+) -> None:
+    """Emit a ``master_bus_effects_changed`` WS message so the frontend mixer
+    can refetch + rebuild the master chain. Silent no-op when ``ws`` is None
+    (direct-call tests) or the send raises (disconnected clients).
+    """
+    if ws is None or not project_name:
+        return
+    try:
+        await ws.send(
+            json.dumps(
+                {"type": "master_bus_effects_changed", "project": project_name}
+            )
+        )
+    except Exception as e:
+        _log(f"master_bus_effects_changed emit failed: {e}")
+
+
+async def _exec_add_master_bus_effect(
+    project_dir: Path,
+    input_data: dict,
+    *,
+    ws: Any = None,
+    project_name: str | None = None,
+) -> dict:
     """Append or insert a new master-bus effect (``track_id IS NULL``).
 
     Validates effect_type against the known-17 tuple and shifts existing
     master-bus effects when inserting at an occupied order_index. Wrapped
     in a single undo group. Does NOT require a track_id — master-bus is
     global to the project.
+
+    On successful DB write, emits a ``master_bus_effects_changed`` WS
+    message (if ``ws`` is supplied) so the frontend mixer invalidates its
+    cached master chain.
     """
     from scenecraft.db import (
         add_master_bus_effect as db_add_master_bus_effect,
@@ -2247,6 +2276,7 @@ def _exec_add_master_bus_effect(project_dir: Path, input_data: dict) -> dict:
         order_index=order_index,
         enabled=enabled,
     )
+    await _emit_master_bus_effects_changed(ws, project_name)
     return {
         "effect_id": created.id,
         "effect_type": created.effect_type,
@@ -2254,12 +2284,21 @@ def _exec_add_master_bus_effect(project_dir: Path, input_data: dict) -> dict:
     }
 
 
-def _exec_remove_master_bus_effect(project_dir: Path, input_data: dict) -> dict:
+async def _exec_remove_master_bus_effect(
+    project_dir: Path,
+    input_data: dict,
+    *,
+    ws: Any = None,
+    project_name: str | None = None,
+) -> dict:
     """Delete a master-bus effect by id.
 
     Guards against "track-effect id accidentally passed here" by scoping the
     existence check to ``track_id IS NULL``. Effect-curves cascade-delete via
     the existing FK, so automation is cleaned up automatically.
+
+    On successful DB delete, emits a ``master_bus_effects_changed`` WS
+    message (if ``ws`` is supplied).
     """
     from scenecraft.db import (
         delete_track_effect as db_delete_track_effect,
@@ -2288,6 +2327,7 @@ def _exec_remove_master_bus_effect(project_dir: Path, input_data: dict) -> dict:
 
     undo_begin(project_dir, f"Chat: remove master-bus effect {effect_id}")
     db_delete_track_effect(project_dir, effect_id)
+    await _emit_master_bus_effects_changed(ws, project_name)
     return {"ok": True}
 
 
@@ -4361,10 +4401,14 @@ async def _execute_tool(
         result = _exec_add_audio_effect(project_dir, input_data)
         return result, "error" in result
     if name == "add_master_bus_effect":
-        result = _exec_add_master_bus_effect(project_dir, input_data)
+        result = await _exec_add_master_bus_effect(
+            project_dir, input_data, ws=ws, project_name=project_name
+        )
         return result, "error" in result
     if name == "remove_master_bus_effect":
-        result = _exec_remove_master_bus_effect(project_dir, input_data)
+        result = await _exec_remove_master_bus_effect(
+            project_dir, input_data, ws=ws, project_name=project_name
+        )
         return result, "error" in result
     if name == "update_effect_param_curve":
         result = _exec_update_effect_param_curve(project_dir, input_data)

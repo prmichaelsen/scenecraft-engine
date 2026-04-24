@@ -445,6 +445,23 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     payload.append(d)
                 return self._json_response({"effects": payload})
 
+            # GET /api/projects/:name/master-bus-effects — list every master-
+            # bus effect (track_id IS NULL), ordered by order_index. Lets the
+            # frontend mixer refetch + rebuild the master chain after the
+            # chat agent mutates it (signalled via master_bus_effects_changed
+            # on the WS).
+            m = re.match(r"^/api/projects/([^/]+)/master-bus-effects$", path)
+            if m:
+                project_dir = self._require_project_dir(m.group(1))
+                if project_dir is None:
+                    return
+                from scenecraft.db import list_master_bus_effects
+                effects = [
+                    self._m13_effect_as_json(eff)
+                    for eff in list_master_bus_effects(project_dir)
+                ]
+                return self._json_response({"effects": effects})
+
             # GET /api/projects/:name/send-buses — list every send bus (reverb/
             # delay/echo) on this project, ordered by order_index.
             m = re.match(r"^/api/projects/([^/]+)/send-buses$", path)
