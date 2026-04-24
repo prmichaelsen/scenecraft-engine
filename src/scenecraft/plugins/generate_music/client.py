@@ -18,7 +18,7 @@ class Song:
     id: str                     # Musicful task id
     title: str | None
     style: str | None
-    duration: int               # seconds
+    duration: float             # seconds (Musicful returns ms; we divide at parse time)
     audio_url: str | None
     cover_url: str | None
     status: int                 # Musicful status code (integer)
@@ -133,7 +133,9 @@ def musicful_get_tasks(task_ids: list[str]) -> list[Song]:
                 id=str(r.get("id") or r.get("task_id") or ""),
                 title=r.get("title"),
                 style=r.get("style"),
-                duration=int(r.get("duration") or 0),
+                # Musicful returns duration in milliseconds (e.g. 167920 = 2:48).
+                # Normalize to seconds so pool_segments.duration_seconds stays honest.
+                duration=(float(r.get("duration") or 0) / 1000.0) if (r.get("duration") or 0) > 0 else 0.0,
                 audio_url=r.get("audio_url"),
                 cover_url=r.get("cover_url"),
                 status=int(r.get("status") or 0),
