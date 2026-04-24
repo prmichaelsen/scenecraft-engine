@@ -782,6 +782,86 @@ ISOLATE_VOCALS_TOOL: dict = {
     },
 }
 
+GENERATE_FOLEY_TOOL: dict = {
+    "name": "generate_foley",
+    "description": (
+        "Generate a foley sound effect (SFX) using MMAudio via Replicate. Two "
+        "modes inferred from inputs:\n"
+        "  - Text-only (t2fx): provide `prompt` and optionally `duration_seconds` "
+        "(default 2s, bounds 1..30). Use for discrete bursts like gunshots, door "
+        "slams, glass breaks, ambience beds.\n"
+        "  - Video-conditioned (v2fx): provide `source_candidate_id` (the "
+        "pool_segment_id of a visual tr_candidate) plus `in_seconds` and "
+        "`out_seconds` defining the [in, out] window within that source clip. "
+        "Duration is derived from (out - in); max 30s. `prompt` is optional "
+        "in v2fx — empty lets the model infer from visuals; providing it "
+        "steers semantics ('footsteps on gravel' vs 'boots on wet wood').\n"
+        "Costs one Replicate prediction (~$0.01-0.05 per call). Requires user "
+        "confirmation via elicitation.\n"
+        "Output lands in pool_segments with variant_kind='foley' (orange on the "
+        "timeline). Drag the resulting pool_segment onto any audio track.\n"
+        "MVP enforces count=1; multi-variant comes later."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "description": "Text prompt. Optional in v2fx mode.",
+            },
+            "duration_seconds": {
+                "type": "number",
+                "minimum": 1,
+                "maximum": 30,
+                "description": "t2fx only. Length of generated foley in seconds (1..30).",
+            },
+            "source_candidate_id": {
+                "type": "string",
+                "description": (
+                    "v2fx only. pool_segment_id of the visual tr_candidate to "
+                    "condition on. If provided, in_seconds and out_seconds are required."
+                ),
+            },
+            "in_seconds": {
+                "type": "number",
+                "description": "v2fx only. In-point within the source clip.",
+            },
+            "out_seconds": {
+                "type": "number",
+                "description": "v2fx only. Out-point within the source clip. Must be > in_seconds and (out-in) <= 30.",
+            },
+            "negative_prompt": {
+                "type": "string",
+                "description": "Optional. Default is 'music' (prevents music leaking into SFX).",
+            },
+            "cfg_strength": {
+                "type": "number",
+                "description": "Optional. MMAudio guidance strength; cog default 4.5.",
+            },
+            "seed": {
+                "type": "integer",
+                "description": "Optional. For reproducibility.",
+            },
+            "entity_type": {
+                "type": "string",
+                "enum": ["transition"],
+                "description": "Optional. Context entity type; MVP only supports 'transition'.",
+            },
+            "entity_id": {
+                "type": "string",
+                "description": "Optional. Context entity id (e.g. transition id).",
+            },
+            "count": {
+                "type": "integer",
+                "const": 1,
+                "default": 1,
+                "description": "MUST be 1 in MVP. Multi-variant coming later.",
+            },
+        },
+        "required": [],
+    },
+}
+
 ADD_AUDIO_TRACK_TOOL: dict = {
     "name": "add_audio_track",
     "description": (
@@ -1368,6 +1448,7 @@ TOOLS: list[dict] = [
     GENERATE_KEYFRAME_CANDIDATES_TOOL,
     GENERATE_TRANSITION_CANDIDATES_TOOL,
     ISOLATE_VOCALS_TOOL,
+    GENERATE_FOLEY_TOOL,
     ADD_AUDIO_TRACK_TOOL,
     ADD_AUDIO_CLIP_TOOL,
     UPDATE_VOLUME_CURVE_TOOL,
@@ -5031,6 +5112,36 @@ async def _execute_tool(
             return kickoff, True
         if ws is None or tool_use_id is None:
             return {"error": "isolate_vocals requires ws context (internal error)"}, True
+        return await _await_generation_job(ws, tool_use_id, project_name or "", kickoff["job_id"])
+    if name == "generate_foley":
+        # M18 foley plugin. Validation happens inside the plugin's run handler
+        # and the REST route; we just delegate and translate errors.
+        from scenecraft.plugins.generate_foley import generate_foley as foley_impl
+        count = int(input_data.get("count", 1))
+        if count != 1:
+            return {"error": "count must be 1 in MVP; multi-variant coming later"}, True
+        try:
+            kickoff = foley_impl.run(
+                project_dir,
+                project_name or "",
+                prompt=input_data.get("prompt"),
+                duration_seconds=input_data.get("duration_seconds"),
+                source_candidate_id=input_data.get("source_candidate_id"),
+                source_in_seconds=input_data.get("in_seconds"),
+                source_out_seconds=input_data.get("out_seconds"),
+                negative_prompt=input_data.get("negative_prompt"),
+                cfg_strength=input_data.get("cfg_strength"),
+                seed=input_data.get("seed"),
+                entity_type=input_data.get("entity_type"),
+                entity_id=input_data.get("entity_id"),
+                variant_count=count,
+            )
+        except ValueError as e:
+            return {"error": str(e)}, True
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}, True
+        if ws is None or tool_use_id is None:
+            return {"error": "generate_foley requires ws context (internal error)"}, True
         return await _await_generation_job(ws, tool_use_id, project_name or "", kickoff["job_id"])
     return {"error": f"unknown tool: {name}"}, True
 
