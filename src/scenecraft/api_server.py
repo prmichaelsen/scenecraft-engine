@@ -698,6 +698,24 @@ def make_handler(work_dir: Path, no_auth: bool = False):
             if m:
                 return self._handle_bounce_download(m.group(1), m.group(2))
 
+            # Plugin-registered GET routes (fallback — after all built-in routes).
+            m = re.match(r"^/api/projects/([^/]+)/plugins/[^/]+/", path)
+            if m:
+                project_name = m.group(1)
+                project_dir = self._require_project_dir(project_name)
+                if project_dir is None:
+                    return
+                from urllib.parse import parse_qs
+                query = {k: v[0] if v else "" for k, v in parse_qs(parsed.query).items()}
+                from scenecraft.plugin_host import PluginHost
+                try:
+                    result = PluginHost.dispatch_rest("GET", path, project_dir, project_name, query)
+                except Exception as e:
+                    _log(f"  plugin dispatch error: {e}")
+                    return self._error(500, "PLUGIN_ERROR", str(e))
+                if result is not None:
+                    return self._json_response(result)
+
             self._error(404, "NOT_FOUND", f"No route: GET {path}")
 
         def do_POST(self):
@@ -2373,7 +2391,7 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 body = self._read_json_body() or {}
                 from scenecraft.plugin_host import PluginHost
                 try:
-                    result = PluginHost.dispatch_rest(path, project_dir, project_name, body)
+                    result = PluginHost.dispatch_rest("POST", path, project_dir, project_name, body)
                 except Exception as e:
                     _log(f"  plugin dispatch error: {e}")
                     return self._error(500, "PLUGIN_ERROR", str(e))
@@ -10559,9 +10577,11 @@ def run_server(host: str = "0.0.0.0", port: int = 8890, work_dir: str | None = N
     from scenecraft.plugin_host import PluginHost
     from scenecraft.plugins import isolate_vocals
     from scenecraft.plugins import transcribe
+    from scenecraft.plugins import generate_music
 
     PluginHost.register(isolate_vocals)
     PluginHost.register(transcribe)
+    PluginHost.register(generate_music)
     _log(
         f"  Plugins: {len(PluginHost._registered)} registered, "
         f"{len(PluginHost._operations)} operations, "

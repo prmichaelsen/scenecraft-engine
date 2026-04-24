@@ -140,7 +140,16 @@ class PluginHost:
     """
 
     _operations: dict[str, OperationDef] = {}
-    _rest_routes: dict[str, Callable] = {}
+    # Per-method dicts keyed by regex pattern. The pre-task-130 shape was a
+    # single `_rest_routes` dict that implicitly meant POST; that alias is
+    # kept as a property below so legacy callers still work.
+    _rest_routes_by_method: dict[str, dict[str, Callable]] = {
+        "GET": {},
+        "POST": {},
+        "PUT": {},
+        "DELETE": {},
+        "PATCH": {},
+    }
     _mcp_tools: dict[str, "MCPToolDef"] = {}
     # Parsed manifests, keyed by plugin id (the `name` field). Stores the
     # settings schema + any metadata not already captured by the
@@ -413,13 +422,15 @@ class PluginHost:
         return list(cls._mcp_tools.values())
 
     @classmethod
-    def dispatch_rest(cls, path: str, *args, **kwargs) -> Any:
-        """Route a REST path to a plugin-registered handler.
+    def dispatch_rest(cls, method: str, path: str, *args, **kwargs) -> Any:
+        """Route (method, path) to a plugin-registered handler.
 
-        Returns the handler's return value, or ``None`` if no pattern matches.
-        ``api_server.py`` uses this as a fallback after its built-in routes fail.
+        Returns the handler's return value, or ``None`` if no pattern matches
+        for the given method. ``api_server.py`` uses this as a fallback after
+        its built-in routes fail.
         """
-        for pattern, handler in cls._rest_routes.items():
+        routes = cls._rest_routes_by_method.get(method.upper(), {})
+        for pattern, handler in routes.items():
             if re.match(pattern, path):
                 return handler(path, *args, **kwargs)
         return None
@@ -433,6 +444,12 @@ class PluginHost:
         for name in list(cls._contexts.keys()):
             cls.deactivate(name)
         cls._operations = {}
-        cls._rest_routes = {}
+        cls._rest_routes_by_method = {
+            "GET": {},
+            "POST": {},
+            "PUT": {},
+            "DELETE": {},
+            "PATCH": {},
+        }
         cls._contexts = {}
         cls._registered = []

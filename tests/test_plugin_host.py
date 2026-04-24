@@ -112,10 +112,10 @@ def test_dispatch_rest_matches_and_invokes_handler():
         captured["kwargs"] = kwargs
         return {"routed": path}
 
-    PluginHost._rest_routes[r"^/api/plugins/isolate_vocals/.*$"] = handler
+    PluginHost._rest_routes_by_method["POST"][r"^/api/plugins/isolate_vocals/.*$"] = handler
 
     result = PluginHost.dispatch_rest(
-        "/api/plugins/isolate_vocals/run", "arg1", extra="ok"
+        "POST", "/api/plugins/isolate_vocals/run", "arg1", extra="ok"
     )
     assert result == {"routed": "/api/plugins/isolate_vocals/run"}
     assert captured["path"] == "/api/plugins/isolate_vocals/run"
@@ -124,12 +124,40 @@ def test_dispatch_rest_matches_and_invokes_handler():
 
 
 def test_dispatch_rest_no_match_returns_none():
-    PluginHost._rest_routes[r"^/api/plugins/foo/.*$"] = lambda *a, **k: "hit"
-    assert PluginHost.dispatch_rest("/api/unrelated") is None
+    PluginHost._rest_routes_by_method["POST"][r"^/api/plugins/foo/.*$"] = lambda *a, **k: "hit"
+    assert PluginHost.dispatch_rest("POST", "/api/unrelated") is None
 
 
 def test_dispatch_rest_empty_registry_returns_none():
-    assert PluginHost.dispatch_rest("/anything") is None
+    assert PluginHost.dispatch_rest("POST", "/anything") is None
+
+
+def test_dispatch_rest_respects_method_routing():
+    """A GET-registered handler should not fire on a POST request, and vice versa."""
+    get_hit = {"n": 0}
+    post_hit = {"n": 0}
+
+    def get_handler(path, *args, **kwargs):
+        get_hit["n"] += 1
+        return "get"
+
+    def post_handler(path, *args, **kwargs):
+        post_hit["n"] += 1
+        return "post"
+
+    PluginHost._rest_routes_by_method["GET"][r"^/api/plugins/mytest/list$"] = get_handler
+    PluginHost._rest_routes_by_method["POST"][r"^/api/plugins/mytest/run$"] = post_handler
+
+    # Correct-method dispatch hits the right handler.
+    assert PluginHost.dispatch_rest("GET", "/api/plugins/mytest/list") == "get"
+    assert PluginHost.dispatch_rest("POST", "/api/plugins/mytest/run") == "post"
+
+    # Wrong method → no handler → None.
+    assert PluginHost.dispatch_rest("POST", "/api/plugins/mytest/list") is None
+    assert PluginHost.dispatch_rest("GET", "/api/plugins/mytest/run") is None
+
+    assert get_hit["n"] == 1
+    assert post_hit["n"] == 1
 
 
 # --- register (full module activation) -----------------------------------
@@ -228,12 +256,12 @@ def test_register_rest_endpoint_returns_disposable():
     fake.activate = activate
 
     PluginHost.register(fake)
-    # Route is dispatchable
-    assert PluginHost.dispatch_rest("/api/test") == {"ok": "/api/test"}
+    # Route is dispatchable (default method for register_rest_endpoint is POST).
+    assert PluginHost.dispatch_rest("POST", "/api/test") == {"ok": "/api/test"}
 
     # Deactivate disposes the route
     PluginHost.deactivate("fake_plugin_rest")
-    assert PluginHost.dispatch_rest("/api/test") is None
+    assert PluginHost.dispatch_rest("POST", "/api/test") is None
 
 
 def test_deactivate_then_register_is_idempotent():

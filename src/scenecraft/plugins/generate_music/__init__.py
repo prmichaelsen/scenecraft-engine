@@ -15,10 +15,15 @@ PLUGIN_ID = "generate-music"
 __all__ = ["run", "check_api_key", "activate", "PLUGIN_ID"]
 
 
-def activate(context):
-    """Plugin activation hook — called by PluginHost at server startup."""
+def activate(plugin_api, context):
+    """Plugin activation hook — called by PluginHost at server startup.
+
+    ``plugin_api`` is the ``scenecraft.plugin_api`` module (passed by the
+    host); ``context`` is the ``PluginContext`` with
+    ``context.subscriptions`` for teardown.
+    """
     # Import here to avoid circular imports at module load time.
     from scenecraft.plugins.generate_music import routes
 
-    routes.register(context)
+    routes.register(plugin_api, context)
     return context
