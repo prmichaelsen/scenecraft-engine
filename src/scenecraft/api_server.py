@@ -10288,9 +10288,15 @@ def run_server(host: str = "0.0.0.0", port: int = 8890, work_dir: str | None = N
     # here at startup; a future dynamic loader will reuse the same surface.
     from scenecraft.plugin_host import PluginHost
     from scenecraft.plugins import isolate_vocals
+    from scenecraft.plugins import transcribe
 
     PluginHost.register(isolate_vocals)
-    _log(f"  Plugins: {len(PluginHost._registered)} registered, {len(PluginHost._operations)} operations")
+    PluginHost.register(transcribe)
+    _log(
+        f"  Plugins: {len(PluginHost._registered)} registered, "
+        f"{len(PluginHost._operations)} operations, "
+        f"{len(PluginHost._mcp_tools)} mcp tools"
+    )
 
     # Folder watches are lazy — activated when frontend opens a project and calls watch-folder,
     # NOT restored on server boot. This avoids inotify overhead for projects not being viewed.

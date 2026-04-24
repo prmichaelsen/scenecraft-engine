@@ -436,6 +436,46 @@ def _ensure_schema(conn: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_gm_tracks_pool
             ON generate_music__tracks(pool_segment_id);
 
+        -- Transcribe plugin: one `transcribe__runs` row per completed
+        -- transcription invocation, keyed by (clip_id, model, word_timestamps)
+        -- so re-runs with identical inputs hit the cache. Segments live in
+        -- the child table keyed by run_id with preserved ordering. `output`
+        -- stores the raw provider response for debugging / re-parsing.
+        CREATE TABLE IF NOT EXISTS transcribe__runs (
+            id TEXT PRIMARY KEY,
+            clip_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            model_slug TEXT NOT NULL,
+            language TEXT,
+            word_timestamps INTEGER NOT NULL DEFAULT 0 CHECK (word_timestamps IN (0, 1)),
+            text TEXT NOT NULL DEFAULT '',
+            detected_language TEXT,
+            duration_seconds REAL,
+            status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+            error TEXT,
+            raw_output TEXT,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_transcribe_runs_clip
+            ON transcribe__runs(clip_id);
+        CREATE INDEX IF NOT EXISTS idx_transcribe_runs_cache
+            ON transcribe__runs(clip_id, model, word_timestamps);
+        CREATE INDEX IF NOT EXISTS idx_transcribe_runs_created
+            ON transcribe__runs(created_at);
+
+        CREATE TABLE IF NOT EXISTS transcribe__segments (
+            run_id TEXT NOT NULL REFERENCES transcribe__runs(id),
+            seq INTEGER NOT NULL,
+            start_seconds REAL NOT NULL,
+            end_seconds REAL NOT NULL,
+            text TEXT NOT NULL,
+            words_json TEXT,
+            PRIMARY KEY (run_id, seq)
+        );
+        CREATE INDEX IF NOT EXISTS idx_transcribe_segments_run
+            ON transcribe__segments(run_id);
+
         CREATE TABLE IF NOT EXISTS sections (
             id TEXT PRIMARY KEY,
             label TEXT NOT NULL DEFAULT '',

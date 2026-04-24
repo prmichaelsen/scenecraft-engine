@@ -88,6 +88,40 @@ class OperationDef:
     handler: Callable[[str, str, dict], dict]
 
 
+# ── MCP / chat-tool definition ──────────────────────────────────────────
+
+
+@dataclass
+class MCPToolDef:
+    """A plugin-contributed chat/MCP tool.
+
+    The tool appears in Claude's tool list as ``{plugin}__{tool_id}`` —
+    the same double-underscore convention the project uses for
+    plugin-owned DB tables and the existing ``isolate_vocals__run`` tool.
+
+    ``handler`` is called as ``handler(args, context)`` where ``args`` is
+    the parsed ``input`` dict from Claude and ``context`` is a dict the
+    chat dispatcher builds (``project_dir``, ``project_name``, ``auth``,
+    any other state). Return value is a JSON-serializable dict sent back
+    as the tool_result payload.
+
+    ``destructive=True`` routes the call through the elicitation gate the
+    same way built-in destructive tools do — no plugin-side work required.
+    """
+
+    plugin: str
+    tool_id: str
+    description: str
+    input_schema: dict
+    handler: Callable[[dict, dict], dict]
+    destructive: bool = False
+
+    @property
+    def full_name(self) -> str:
+        """The name Claude sees. Must match the tool-name regex."""
+        return f"{self.plugin}__{self.tool_id}"
+
+
 # ── PluginHost ──────────────────────────────────────────────────────────
 
 
@@ -100,6 +134,7 @@ class PluginHost:
 
     _operations: dict[str, OperationDef] = {}
     _rest_routes: dict[str, Callable] = {}
+    _mcp_tools: dict[str, "MCPToolDef"] = {}
     # Map module name → PluginContext for the registered instance.
     _contexts: dict[str, PluginContext] = {}
     # Mirror of _contexts.keys() in registration order — kept around for
@@ -215,6 +250,42 @@ class PluginHost:
         if entity_type is None:
             return list(cls._operations.values())
         return [op for op in cls._operations.values() if entity_type in op.entity_types]
+
+    # ── MCP / chat-tool contributions ────────────────────────────────
+
+    @classmethod
+    def register_mcp_tool(
+        cls,
+        tool: "MCPToolDef",
+        context: Optional[PluginContext] = None,
+    ) -> Disposable:
+        """Register a plugin-contributed chat/MCP tool.
+
+        The tool's visible name is namespaced as ``{plugin}__{tool_id}`` —
+        matching the double-underscore convention used by plugin-owned DB
+        tables and the existing ``isolate_vocals__run`` tool. Duplicate
+        full-names raise.
+        """
+        full = tool.full_name
+        assert full not in cls._mcp_tools, f"duplicate mcp tool id: {full}"
+        cls._mcp_tools[full] = tool
+
+        def _dispose() -> None:
+            if cls._mcp_tools.get(full) is tool:
+                del cls._mcp_tools[full]
+
+        d = make_disposable(_dispose)
+        if context is not None:
+            context.subscriptions.append(d)
+        return d
+
+    @classmethod
+    def get_mcp_tool(cls, full_name: str) -> Optional["MCPToolDef"]:
+        return cls._mcp_tools.get(full_name)
+
+    @classmethod
+    def list_mcp_tools(cls) -> list["MCPToolDef"]:
+        return list(cls._mcp_tools.values())
 
     @classmethod
     def dispatch_rest(cls, path: str, *args, **kwargs) -> Any:

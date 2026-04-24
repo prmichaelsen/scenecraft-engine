@@ -1307,6 +1307,66 @@ def server(port: int, host: str, work_dir: str | None, no_auth: bool):
     run_server(host, port, work_dir=str(wd), no_auth=no_auth)
 
 
+@main.command(name="audio-transcribe")
+@click.argument("project", type=str)
+@click.argument("clip_id", type=str)
+@click.option("--model", type=click.Choice(["fast", "whisperx", "whisper", "whisper-timestamped"]), default=None,
+              help="Whisper model to use. Omit to use the plugin's default_model setting (falls back to 'fast').")
+@click.option("--language", type=str, default=None,
+              help="ISO language code (e.g. 'en', 'ja'). Omit for auto-detect.")
+@click.option("--words", "word_timestamps", is_flag=True, default=False,
+              help="Return per-word timestamps in addition to segments.")
+@click.option("--force-rerun", is_flag=True, default=False,
+              help="Ignore cache and run fresh.")
+@click.option("--work-dir", default=None, type=str, help="Work directory (overrides config)")
+def audio_transcribe(
+    project: str,
+    clip_id: str,
+    model: str | None,
+    language: str | None,
+    word_timestamps: bool,
+    force_rerun: bool,
+    work_dir: str | None,
+):
+    """Transcribe an audio_clip via Whisper on Replicate.
+
+    Requires REPLICATE_API_TOKEN in the environment. Prints a compact
+    summary (run_id, model, segment count, duration) and the full text
+    to stdout; segments persist in the project's transcribe__runs +
+    transcribe__segments tables.
+    """
+    from scenecraft.config import resolve_work_dir
+    from scenecraft.ai.transcriber import transcribe_clip
+
+    wd = resolve_work_dir(work_dir)
+    if wd is None:
+        raise click.ClickException(
+            "No projects directory configured. Run `scenecraft server` once to set one."
+        )
+    project_dir = Path(wd) / project
+    if not project_dir.exists():
+        raise click.ClickException(f"project directory not found: {project_dir}")
+
+    try:
+        result = transcribe_clip(
+            project_dir,
+            clip_id,
+            model=model,
+            language=language,
+            word_timestamps=word_timestamps,
+            force_rerun=force_rerun,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(f"transcribe failed: {exc}") from exc
+
+    cache = "CACHED" if result.cached else "FRESH"
+    _log(f"[{cache}] run={result.run_id} model={result.model} "
+         f"segments={len(result.segments)} "
+         f"duration={result.duration_seconds} "
+         f"lang={result.language or 'auto'}")
+    click.echo(result.text)
+
+
 @main.command(name="audio-intelligence")
 @click.argument("video_file", type=click.Path(exists=True))
 @click.option("--work-dir", default=".scenecraft_work", type=str, help="Work directory")

@@ -1344,6 +1344,16 @@ def _is_destructive(tool_name: str) -> bool:
     name = tool_name.lower()
     if name in _DESTRUCTIVE_TOOL_ALLOWLIST:
         return False
+    # Plugin-contributed tools declare destructiveness explicitly in their
+    # MCPToolDef; trust that flag rather than regex-matching the tool name.
+    if "__" in name:
+        try:
+            from scenecraft.plugin_host import PluginHost as _PluginHost
+            tool = _PluginHost.get_mcp_tool(tool_name)
+            if tool is not None:
+                return bool(tool.destructive)
+        except Exception:  # noqa: BLE001
+            pass
     return any(p in name for p in _DESTRUCTIVE_TOOL_PATTERNS)
 
 
@@ -4351,6 +4361,28 @@ async def _execute_tool(
     synchronous DB operations.
     """
     input_data = input_data or {}
+
+    # Plugin-contributed MCP tools — namespaced as `{plugin}__{tool_id}`.
+    # Dispatched before built-in names so plugins can't accidentally be
+    # shadowed, and so the built-in switch below can stay a plain match.
+    from scenecraft.plugin_host import PluginHost as _PluginHost
+    if "__" in name:
+        plugin_tool = _PluginHost.get_mcp_tool(name)
+        if plugin_tool is not None:
+            context = {
+                "project_dir": project_dir,
+                "project_name": project_name,
+                "ws": ws,
+                "tool_use_id": tool_use_id,
+            }
+            try:
+                result = plugin_tool.handler(input_data, context)
+            except Exception as exc:  # noqa: BLE001
+                return {"error": f"{type(exc).__name__}: {exc}"}, True
+            if not isinstance(result, dict):
+                return {"error": f"plugin tool {name!r} returned non-dict: {type(result).__name__}"}, True
+            return result, "error" in result
+
     if name == "sql_query":
         sql = input_data.get("sql", "")
         limit = input_data.get("limit", 100)
@@ -4690,9 +4722,20 @@ async def _stream_response(
     system_prompt = _build_system_prompt(project_dir, project_name)
     client = anthropic.AsyncAnthropic(api_key=api_key)
 
-    # Merge built-in tools with any tools exposed by connected MCP services
+    # Merge built-in tools with:
+    #   - plugin-contributed chat tools (PluginHost.list_mcp_tools)
+    #   - tools exposed by connected external MCP services (bridge)
+    from scenecraft.plugin_host import PluginHost as _PluginHost
+    plugin_contributed = [
+        {
+            "name": t.full_name,
+            "description": t.description,
+            "input_schema": t.input_schema,
+        }
+        for t in _PluginHost.list_mcp_tools()
+    ]
     mcp_tools = bridge.all_tools() if bridge else []
-    tools_for_claude = list(TOOLS) + mcp_tools
+    tools_for_claude = list(TOOLS) + plugin_contributed + mcp_tools
 
     # Blocks accumulated across all tool-call iterations, persisted at the end.
     all_blocks: list[dict] = []

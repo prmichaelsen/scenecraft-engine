@@ -1,0 +1,75 @@
+name: transcribe
+version: 0.1.0
+displayName: "Transcribe Audio"
+description: "Transcribe audio_clip rows to text via Whisper models on Replicate. Supports OpenAI Whisper, incredibly-fast-whisper (large-v3-turbo), WhisperX (word-level timestamps via forced alignment), and whisper-timestamped. The `default_model` plugin setting picks which variant runs when no per-call override is given; the chat tool exposes an explicit `model` field for overrides."
+publisher: scenecraft
+license: MIT
+
+# Plugin id `transcribe` — the double-underscore tool name convention
+# produces `transcribe__transcribe_clip` at Claude's tool surface. Plugin
+# ids must not contain `__` themselves.
+
+settings:
+  default_model:
+    type: enum
+    values: [fast, whisperx, whisper, whisper-timestamped]
+    default: fast
+    description: "Whisper variant used when a call omits the `model` field."
+  default_language:
+    type: string
+    default: ""
+    description: "ISO language code to force (e.g. 'en', 'ja'). Empty = auto-detect."
+  default_word_timestamps:
+    type: boolean
+    default: false
+    description: "Request word-level timestamps by default. Only supported on models that can return them (all four in this plugin, with varying accuracy)."
+
+activationEvents:
+  - onCommand:transcribe.run
+  - onContextMenu:audio_clip
+
+contributes:
+  mcpTools:
+    - id: transcribe_clip
+      # Claude sees this as `transcribe__transcribe_clip`.
+      description: >
+        Transcribe an audio_clip to text via Whisper on Replicate. Caches by
+        (clip_id, model, word_timestamps) — identical re-calls hit cache and
+        are free. Results persist in transcribe__runs + transcribe__segments.
+        Non-destructive. Returns run_id, model, full text, segment count,
+        detected language, and duration.
+      destructive: false
+      handler: "backend:handle_transcribe_clip"
+      input_schema:
+        type: object
+        properties:
+          clip_id:
+            type: string
+            description: "audio_clips.id to transcribe."
+          model:
+            type: string
+            enum: [fast, whisperx, whisper, whisper-timestamped]
+            description: "Override the plugin default_model for this call."
+          language:
+            type: string
+            description: "ISO language code (e.g. 'en', 'es', 'ja'). Omit or '' for auto-detect."
+          word_timestamps:
+            type: boolean
+            description: "Return per-word timestamps. Overrides default_word_timestamps."
+          force_rerun:
+            type: boolean
+            description: "Skip the cache and run fresh even if a matching run exists."
+        required: [clip_id]
+
+  operations:
+    - id: transcribe.run
+      label: "Transcribe…"
+      entityTypes: [audio_clip]
+      handler: "backend:handle_transcribe_operation"
+
+  contextMenus:
+    - entityType: audio_clip
+      items:
+        - operation: transcribe.run
+          label: "Transcribe…"
+          icon: type
