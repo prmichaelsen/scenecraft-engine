@@ -13,12 +13,15 @@ out of `starting` / `processing`.
 from __future__ import annotations
 
 import base64
+import io
 import json
 import mimetypes
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
+import uuid as _uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -321,6 +324,11 @@ def resolve_model(alias: str) -> dict[str, Any]:
 class WhisperClient:
     """Transcribe audio clips via Whisper models on Replicate."""
 
+    # Process-wide cache of model slug → latest_version.id. Lookups are
+    # cheap (one GET per unique slug) but caching avoids re-fetching on
+    # every transcribe call during a session.
+    _version_cache: dict[str, str] = {}
+
     def __init__(self, api_token: str | None = None):
         token = api_token or os.environ.get("REPLICATE_API_TOKEN")
         if not token:
@@ -331,21 +339,45 @@ class WhisperClient:
         self.token = token
 
     def _headers(self) -> dict:
+        # Replicate's edge (Cloudflare) returns 403 to the default
+        # Python-urllib user-agent for POST /v1/predictions — the GET
+        # endpoints tolerate it, but prediction creation is WAF-checked.
+        # Setting any browser-ish UA clears it; we use the scenecraft
+        # string so the audit log on their end is clear.
         return {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
+            "User-Agent": "scenecraft-engine/0.5 (whisper-client)",
         }
 
     def _post(self, url: str, data: dict) -> dict:
         body = json.dumps(data).encode()
         req = urllib.request.Request(url, data=body, headers=self._headers(), method="POST")
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.loads(resp.read())
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            # Surface the server's error body so debugging isn't a guessing
+            # game — plain "HTTP 403" tells you nothing, but Replicate's
+            # body usually includes a human-readable `detail`.
+            try:
+                err_body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                err_body = "<no body>"
+            _log(f"POST {url} -> HTTP {exc.code}: {err_body[:500]}")
+            raise RuntimeError(f"Replicate POST {url} failed ({exc.code}): {err_body[:500]}") from exc
 
     def _get(self, url: str) -> dict:
         req = urllib.request.Request(url, headers=self._headers())
         with urllib.request.urlopen(req, timeout=60) as resp:
             return json.loads(resp.read())
+
+    # Payloads above this size get routed through Replicate's file-upload
+    # endpoint instead of being embedded as a data URI in the prediction
+    # request body. ~5MB is comfortably under the POST size cap that
+    # /v1/models/.../predictions enforces (413 Payload Too Large
+    # otherwise) with headroom for base64 overhead.
+    _DATA_URI_MAX_BYTES = 5 * 1024 * 1024
 
     def _audio_to_data_uri(self, audio_path: str | Path) -> str:
         path = Path(audio_path)
@@ -356,6 +388,96 @@ class WhisperClient:
         with open(path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
         return f"data:{mime};base64,{b64}"
+
+    def _upload_file(self, audio_path: str | Path) -> str:
+        """POST the audio to Replicate's file store, return the file's URL.
+
+        Used for files too large to embed as a data URI in the prediction
+        request body (WAV music stems run ~50-100MB and slam the body
+        limit). The returned URL is a signed public URL Replicate's
+        model containers can fetch from internally.
+
+        Builds a multipart/form-data payload manually to avoid a
+        `requests` dep — stdlib urllib supports it if we do the
+        boundary framing ourselves.
+        """
+        path = Path(audio_path)
+        mime, _ = mimetypes.guess_type(str(path))
+        mime = mime or "audio/mpeg"
+        with open(path, "rb") as f:
+            data = f.read()
+
+        boundary = f"----scenecraft-{_uuid.uuid4().hex}"
+        crlf = b"\r\n"
+        buf = io.BytesIO()
+        buf.write(f"--{boundary}{crlf.decode()}".encode())
+        buf.write(
+            f'Content-Disposition: form-data; name="content"; filename="{path.name}"{crlf.decode()}'.encode()
+        )
+        buf.write(f"Content-Type: {mime}{crlf.decode()}".encode())
+        buf.write(crlf)
+        buf.write(data)
+        buf.write(crlf)
+        buf.write(f"--{boundary}--{crlf.decode()}".encode())
+        body = buf.getvalue()
+
+        url = f"{REPLICATE_API}/files"
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Content-Length": str(len(body)),
+            },
+            method="POST",
+        )
+        _log(f"upload_file {path.name} ({len(data) // 1024} KB) -> {url}")
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            payload = json.loads(resp.read())
+        urls = payload.get("urls") or {}
+        file_url = urls.get("get") or payload.get("url")
+        if not file_url:
+            raise RuntimeError(f"Replicate file upload returned no url: {payload}")
+        _log(f"upload_file OK id={payload.get('id', '?')} url={file_url}")
+        return file_url
+
+    def _audio_to_replicate_input(self, audio_path: str | Path) -> str:
+        """Pick the smallest working representation for the audio input.
+
+        Small files → data URI (one HTTP call, no upload round-trip).
+        Large files → Replicate file upload (URL stays well under the
+        prediction POST body limit). Boundary is _DATA_URI_MAX_BYTES.
+        """
+        path = Path(audio_path)
+        size = path.stat().st_size
+        if size <= self._DATA_URI_MAX_BYTES:
+            return self._audio_to_data_uri(path)
+        return self._upload_file(path)
+
+    def _resolve_model_version(self, slug: str) -> str:
+        """Look up the model's latest version hash.
+
+        Some community Replicate models (e.g.
+        ``vaibhavs10/incredibly-fast-whisper``) don't expose the
+        ``/v1/models/{slug}/predictions`` convenience endpoint —
+        creating a prediction against them requires the explicit
+        ``version:`` field on ``/v1/predictions``. We always use the
+        versioned form for robustness and cache the hash per-slug.
+        """
+        cached = self._version_cache.get(slug)
+        if cached:
+            return cached
+        info = self._get(f"{REPLICATE_API}/models/{slug}")
+        latest = info.get("latest_version") or {}
+        version = latest.get("id")
+        if not version:
+            raise RuntimeError(
+                f"model {slug!r} has no latest_version — "
+                f"check the slug and that the model is published."
+            )
+        self._version_cache[slug] = version
+        return version
 
     def _wait_for_prediction(
         self,
@@ -399,11 +521,14 @@ class WhisperClient:
         """Transcribe a local audio file via the chosen Replicate model."""
         cfg = resolve_model(model)
         _log(f"transcribe model={model} slug={cfg['slug']} path={audio_path}")
-        audio_uri = self._audio_to_data_uri(audio_path)
+        audio_uri = self._audio_to_replicate_input(audio_path)
         input_data = cfg["build_input"](audio_uri, language, word_timestamps)
+        # Use /v1/predictions with explicit version — some community models
+        # don't support the /models/{slug}/predictions shortcut.
+        version = self._resolve_model_version(cfg["slug"])
         prediction = self._post(
-            f"{REPLICATE_API}/models/{cfg['slug']}/predictions",
-            {"input": input_data},
+            f"{REPLICATE_API}/predictions",
+            {"version": version, "input": input_data},
         )
         result = self._wait_for_prediction(
             prediction,
