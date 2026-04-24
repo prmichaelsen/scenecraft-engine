@@ -4946,6 +4946,11 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 end_time_s: str | None = None
                 sample_rate_str: str | None = None
                 channels_str: str | None = None
+                # Optional — echoed from the mix_render_request WS message so
+                # the analyze_master_bus chat tool can unblock. Absent means
+                # this upload was initiated by something other than the chat
+                # round-trip (e.g. direct-call testing).
+                request_id: str | None = None
 
                 for part in parts:
                     if b'Content-Disposition' not in part:
@@ -4970,6 +4975,8 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                         sample_rate_str = payload.decode('utf-8', errors='replace').strip()
                     elif 'name="channels"' in header:
                         channels_str = payload.decode('utf-8', errors='replace').strip()
+                    elif 'name="request_id"' in header:
+                        request_id = payload.decode('utf-8', errors='replace').strip()
 
                 # Validate required fields
                 if audio_data is None or len(audio_data) == 0:
@@ -5062,12 +5069,29 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 _log(f"mix-render-upload: {project_name} {mix_graph_hash[:12]}… "
                      f"({bytes_written // 1024}KB, {wav_duration:.2f}s, {wav_sample_rate}Hz, {wav_channels}ch)")
 
+                # Release the chat tool waiting on this request, if any. When
+                # the upload was triggered by a mix_render_request WS message,
+                # the frontend echoes the request_id back — we set the matching
+                # asyncio.Event so ``_exec_analyze_master_bus`` unblocks and
+                # proceeds with analysis. When no request_id is present (e.g.
+                # a direct-call test or a future standalone "Bounce" button),
+                # the call is a no-op.
+                released = False
+                if request_id:
+                    try:
+                        from scenecraft.chat import set_mix_render_event
+                        released = set_mix_render_event(request_id)
+                    except Exception as se:
+                        # Never fail the upload because event-signalling failed.
+                        _log(f"mix-render-upload: set_mix_render_event raised: {se}")
+
                 return self._json_response({
                     "rendered_path": rel_path,
                     "bytes": bytes_written,
                     "channels": wav_channels,
                     "sample_rate": wav_sample_rate,
                     "duration_s": wav_duration,
+                    "chat_released": released,
                 }, status=201)
             except Exception as e:
                 import traceback

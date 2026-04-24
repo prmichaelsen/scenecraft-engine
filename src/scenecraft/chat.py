@@ -2420,6 +2420,62 @@ def _exec_generate_dsp(project_dir: Path, input_data: dict) -> dict:
 
 
 # ── analyze_master_bus (M15 — master-bus metrics on rendered mix) ──────────
+#
+# WS round-trip contract (M15 task-7):
+#
+#   Server → Client (chat WS):
+#     {"type": "mix_render_request",
+#      "request_id":      str (uuid4 hex),
+#      "mix_graph_hash":  str (64-char hex SHA-256),
+#      "start_time_s":    float,
+#      "end_time_s":      float,
+#      "sample_rate":     int}
+#
+#   Client → Server (HTTP multipart POST):
+#     POST /api/projects/:name/mix-render-upload
+#       audio:           binary WAV (16-bit PCM)
+#       mix_graph_hash:  str
+#       start_time_s:    float
+#       end_time_s:      float
+#       sample_rate:     int
+#       channels:        int (1 or 2)
+#       request_id:      str  (NEW — echoes the WS message so the server can
+#                              release the waiting chat tool)
+#
+#   Server on successful upload:
+#     Writes pool/mixes/<mix_graph_hash>.wav, then if request_id matches a
+#     pending entry in ``_MIX_RENDER_EVENTS`` the event is ``.set()`` so the
+#     chat tool's ``await event.wait()`` unblocks and analysis resumes.
+
+
+# Pending render-request events, keyed by request_id. The chat tool creates
+# an asyncio.Event here before emitting the WS message, and the API upload
+# handler sets it when the WAV lands. Both sides run in the same asyncio
+# event loop — the HTTP server posts into the loop via ``asyncio.run_coroutine_threadsafe``
+# (see ``set_mix_render_event`` below) since the stdlib HTTPServer thread
+# cannot touch an Event directly without an event loop reference.
+_MIX_RENDER_EVENTS: dict[str, asyncio.Event] = {}
+
+# Tests monkeypatch this to a short value (e.g. 2.0) to avoid real 60s waits.
+MIX_RENDER_TIMEOUT_S: float = 60.0
+
+
+def set_mix_render_event(request_id: str) -> bool:
+    """Release the chat tool waiting on this request_id, if any.
+
+    Returns True if an event was set, False if no matching pending event.
+    Called by the api_server ``mix-render-upload`` handler after a successful
+    WAV write. Safe to call from any thread — the asyncio.Event's ``set()``
+    method is thread-safe enough for our usage pattern since the waiter's
+    event-loop picks up the flag on its next scheduler tick.
+    """
+    evt = _MIX_RENDER_EVENTS.get(request_id)
+    if evt is None:
+        return False
+    # Event.set() itself is thread-safe; the loop that's awaiting it will
+    # notice on its next iteration via the underlying _waiters machinery.
+    evt.set()
+    return True
 
 
 _MIX_KNOWN_ANALYSES: frozenset[str] = frozenset({
@@ -2580,20 +2636,28 @@ def _resolve_mix_end_time(project_dir: Path) -> float:
     return float(row[0])
 
 
-def _exec_analyze_master_bus(project_dir: Path, input_data: dict) -> dict:
+async def _exec_analyze_master_bus(
+    project_dir: Path,
+    input_data: dict,
+    *,
+    ws: Any = None,
+    timeout_s: float | None = None,
+) -> dict:
     """Analyze the rendered master mix and cache the results.
 
-    Workflow (MVP — frontend round-trip stubbed):
+    Workflow:
       1. Resolve ``end_time_s`` (None → MAX(audio_clips.end_time)).
-      2. Compute ``mix_graph_hash`` (stubbed on this branch).
+      2. Compute ``mix_graph_hash``.
       3. Cache lookup by (hash, window, sr, analyzer_version); return cached
          run unless ``force_rerun``.
-      4. Create a run row with ``rendered_path=None``.
-      5. Locate the rendered mix WAV at
-         ``<project_dir>/pool/mixes/<mix_graph_hash>.wav``. On this branch the
-         frontend round-trip does not yet exist — tests place the WAV
-         directly; a real chat request would emit a ``mix_render_request`` WS
-         message and await an upload handler (see task-7).
+      4. If the rendered WAV does not already exist at
+         ``pool/mixes/<mix_graph_hash>.wav`` AND a ``ws`` connection is
+         supplied, emit a ``mix_render_request`` and await the frontend
+         upload (default 60s; tests override via ``timeout_s`` or the
+         ``MIX_RENDER_TIMEOUT_S`` module constant).
+         When ``ws`` is None (unit tests that place the WAV directly), the
+         missing-WAV path returns an error as before.
+      5. Create a run row with ``rendered_path=None``.
       6. Run each requested analysis (unknown names silently skipped).
       7. Persist datapoints / sections / scalars; update rendered_path.
       8. Return the run summary.
@@ -2692,21 +2756,72 @@ def _exec_analyze_master_bus(project_dir: Path, input_data: dict) -> dict:
     mixes_dir = Path(project_dir) / "pool" / "mixes"
     rendered_rel = f"pool/mixes/{mix_graph_hash}.wav"
     rendered_abs = mixes_dir / f"{mix_graph_hash}.wav"
-    # TODO(M15 task-7): when the frontend WS round-trip lands, emit a
-    # ``mix_render_request`` message here, await an ``asyncio.Event`` keyed by
-    # run_id, and time out after 60s. For now we expect the WAV to already be
-    # on disk (test fixture or a manually-triggered frontend render).
     if not rendered_abs.exists():
-        return {
-            "error": (
-                f"rendered mix WAV not found at {rendered_abs}. The frontend "
-                f"OfflineAudioContext round-trip is not wired on this branch; "
-                f"place the rendered WAV at pool/mixes/<mix_graph_hash>.wav "
-                f"or wait for task-7 to ship the WS round-trip."
-            ),
-            "mix_graph_hash": mix_graph_hash,
-            "expected_rendered_path": rendered_rel,
-        }
+        # Frontend WS round-trip (M15 task-7). When a chat ws is available,
+        # ask the browser to render via OfflineAudioContext and upload the
+        # WAV. We key the handshake on a per-request uuid so multiple chats
+        # / concurrent renders cannot collide in ``_MIX_RENDER_EVENTS``.
+        if ws is None:
+            return {
+                "error": (
+                    f"rendered mix WAV not found at {rendered_abs} and no ws "
+                    f"context was supplied to request a frontend render. "
+                    f"Place the WAV at pool/mixes/<mix_graph_hash>.wav or "
+                    f"call this tool via the chat WS."
+                ),
+                "mix_graph_hash": mix_graph_hash,
+                "expected_rendered_path": rendered_rel,
+            }
+
+        request_id = uuid.uuid4().hex
+        event = asyncio.Event()
+        _MIX_RENDER_EVENTS[request_id] = event
+        effective_timeout = (
+            timeout_s if timeout_s is not None else MIX_RENDER_TIMEOUT_S
+        )
+        try:
+            try:
+                await ws.send(json.dumps({
+                    "type": "mix_render_request",
+                    "request_id": request_id,
+                    "mix_graph_hash": mix_graph_hash,
+                    "start_time_s": float(start_time_s),
+                    "end_time_s": float(end_time_s),
+                    "sample_rate": int(sample_rate),
+                }))
+            except Exception as e:
+                return {
+                    "error": f"failed to send mix_render_request over ws: {e}",
+                    "mix_graph_hash": mix_graph_hash,
+                }
+
+            try:
+                await asyncio.wait_for(event.wait(), timeout=effective_timeout)
+            except asyncio.TimeoutError:
+                return {
+                    "error": (
+                        f"mix render timeout ({effective_timeout}s) — frontend "
+                        f"did not upload"
+                    ),
+                    "mix_graph_hash": mix_graph_hash,
+                    "expected_rendered_path": rendered_rel,
+                }
+        finally:
+            _MIX_RENDER_EVENTS.pop(request_id, None)
+
+        # The upload handler set the event after writing the WAV — but
+        # re-check disk to guard against the (impossible-in-prod) race where
+        # set() lands before the file is flushed.
+        if not rendered_abs.exists():
+            return {
+                "error": (
+                    f"mix-render-upload set its event but the WAV is still "
+                    f"missing at {rendered_abs}; upload may have failed "
+                    f"validation"
+                ),
+                "mix_graph_hash": mix_graph_hash,
+                "expected_rendered_path": rendered_rel,
+            }
 
     # ── Load audio ──────────────────────────────────────────────────
     try:
@@ -4081,7 +4196,7 @@ async def _execute_tool(
         result = _exec_generate_descriptions(project_dir, input_data)
         return result, "error" in result
     if name == "analyze_master_bus":
-        result = _exec_analyze_master_bus(project_dir, input_data)
+        result = await _exec_analyze_master_bus(project_dir, input_data, ws=ws)
         return result, "error" in result
     if name == "apply_mix_plan":
         result = _exec_apply_mix_plan(project_dir, input_data)

@@ -26,6 +26,7 @@ Test cases:
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import numpy as np
@@ -34,10 +35,21 @@ import pytest
 from scenecraft.chat import (
     ANALYZE_MASTER_BUS_TOOL,
     TOOLS,
-    _exec_analyze_master_bus,
     _is_destructive,
 )
+from scenecraft.chat import _exec_analyze_master_bus as _exec_analyze_master_bus_async
 from scenecraft.db import get_db
+
+
+def _exec_analyze_master_bus(project_dir: Path, input_data: dict) -> dict:
+    """Sync test wrapper around the now-async analyzer.
+
+    Tests in this file predate M15 task-7's WS round-trip and were written
+    sync. The round-trip never fires when ``ws=None`` (the function short-
+    circuits with its own error before awaiting anything), so ``asyncio.run``
+    is a straightforward shim.
+    """
+    return asyncio.run(_exec_analyze_master_bus_async(project_dir, input_data))
 
 
 STUB_HASH = "0" * 64  # fixed hash used by the autouse fixture below
@@ -254,7 +266,8 @@ def test_silent_wav_reports_no_errors(project):
 
 
 def test_missing_rendered_wav_returns_error(project):
-    # Do not place any WAV at pool/mixes/<hash>.wav.
+    # Do not place any WAV at pool/mixes/<hash>.wav. Without a ws context the
+    # function must not attempt a render round-trip.
     result = _exec_analyze_master_bus(project, {})
     assert "error" in result
     assert "rendered mix WAV not found" in result["error"]
