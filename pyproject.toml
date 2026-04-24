@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scenecraft-engine"
-version = "0.4.0"
+version = "0.5.0"
 description = "AI video editor"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -21,6 +21,9 @@ dependencies = [
     "websockets>=12.0",
     # M15 analyze_master_bus — ITU-R BS.1770 loudness metering.
     "pyloudnorm>=0.1.0",
+    # Plugin-manifest loader — .acp/.scenecraft persist as SQLite, but
+    # plugin.yaml files stay yaml (carve-out, see memory).
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

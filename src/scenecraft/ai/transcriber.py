@@ -232,19 +232,44 @@ def _persist_run(
 # ── Clip lookup ─────────────────────────────────────────────────────────
 
 
-def _resolve_clip_audio_path(project_dir: Path, clip_id: str) -> Path:
-    """Find the audio_clip row and return an absolute path to its source."""
+def _resolve_clip_audio_path(project_dir: Path, clip_or_segment_id: str) -> Path:
+    """Find the audio file for a given id.
+
+    Checks ``audio_clips`` first (the timeline-placed sources the transcribe
+    tool is shaped around); if no match, falls back to ``pool_segments`` so
+    users can transcribe pool audio directly without first dragging it onto
+    a timeline. In either case returns an absolute file path; raises
+    ValueError if the id doesn't exist in either table, and FileNotFoundError
+    if the resolved path isn't on disk.
+    """
     from scenecraft.db import get_db
     conn = get_db(project_dir)
+
+    # 1. Timeline-placed audio clip
     row = conn.execute(
         "SELECT source_path FROM audio_clips WHERE id = ? AND deleted_at IS NULL",
-        (clip_id,),
+        (clip_or_segment_id,),
     ).fetchone()
-    if row is None:
-        raise ValueError(f"audio_clip not found: {clip_id}")
-    source = row["source_path"] or ""
-    if not source:
-        raise ValueError(f"audio_clip {clip_id} has no source_path")
+    if row is not None:
+        source = row["source_path"] or ""
+        if not source:
+            raise ValueError(f"audio_clip {clip_or_segment_id} has no source_path")
+    else:
+        # 2. Pool segment — transcribe the raw import without needing a
+        #    timeline placement. `pool_segments.pool_path` is a relative
+        #    path under the project dir (e.g. pool/segments/import_<uuid>.wav).
+        pool_row = conn.execute(
+            "SELECT pool_path FROM pool_segments WHERE id = ?",
+            (clip_or_segment_id,),
+        ).fetchone()
+        if pool_row is None:
+            raise ValueError(
+                f"id not found in audio_clips or pool_segments: {clip_or_segment_id}"
+            )
+        source = pool_row["pool_path"] or ""
+        if not source:
+            raise ValueError(f"pool_segment {clip_or_segment_id} has no pool_path")
+
     candidate = Path(source)
     if not candidate.is_absolute():
         candidate = project_dir / source

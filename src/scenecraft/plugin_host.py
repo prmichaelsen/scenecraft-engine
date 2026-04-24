@@ -64,10 +64,17 @@ class PluginContext:
     """Per-plugin activation context. ``subscriptions`` is the list of
     ``Disposable`` objects the plugin registers during activation; the host
     disposes them in LIFO order on deactivation.
+
+    ``manifest`` is the parsed ``plugin.yaml`` (if the plugin ships one),
+    populated by ``PluginHost.register`` before the plugin's ``activate()``
+    hook runs. Plugins can introspect their own declared contributions
+    there, or let ``PluginHost.register_declared(plugin_module, context)``
+    auto-wire operations and mcpTools in one call.
     """
 
     name: str
     subscriptions: list[Disposable] = field(default_factory=list)
+    manifest: Any = None
 
 
 # ── Operation definition ────────────────────────────────────────────────
@@ -135,6 +142,10 @@ class PluginHost:
     _operations: dict[str, OperationDef] = {}
     _rest_routes: dict[str, Callable] = {}
     _mcp_tools: dict[str, "MCPToolDef"] = {}
+    # Parsed manifests, keyed by plugin id (the `name` field). Stores the
+    # settings schema + any metadata not already captured by the
+    # operation/mcp-tool/rest-endpoint registries.
+    _manifests: dict[str, Any] = {}
     # Map module name → PluginContext for the registered instance.
     _contexts: dict[str, PluginContext] = {}
     # Mirror of _contexts.keys() in registration order — kept around for
@@ -145,11 +156,27 @@ class PluginHost:
     def register(cls, plugin_module) -> PluginContext:
         """Activate a plugin module.
 
-        The plugin is expected to expose ``activate(plugin_api, context)``
-        (or the legacy single-arg form ``activate(plugin_api)``) and register
-        contributions via ``register_operation`` / ``register_rest_endpoint``
-        etc. during activation. Any ``Disposable`` pushed into
-        ``context.subscriptions`` gets disposed on ``deactivate``.
+        Flow:
+          1. **Load manifest (metadata only).** If the plugin ships a
+             ``plugin.yaml``, parse it and cache it on the host so
+             other code can introspect the plugin's declared
+             contributions (settings schema, activation events,
+             contextMenus, operations + mcpTools) WITHOUT having to
+             actually activate the plugin first. The manifest is
+             metadata — the host does NOT auto-register anything from
+             it. This matches VSCode's ``package.json`` ``contributes``
+             model.
+          2. **Call ``activate(plugin_api, context)``** — the plugin's
+             imperative hook. Declarative contributions are registered
+             here by calling ``PluginHost.register_declared(...)``
+             (one-liner that reads the cached manifest and wires the
+             pieces up), or the plugin can call individual
+             ``register_operation`` / ``register_mcp_tool`` helpers
+             directly when it needs custom control.
+
+        ``context.manifest`` is populated before activate() runs, so
+        plugins can query their own declared settings / operations
+        inside the activate body.
         """
         from scenecraft import plugin_api
         import inspect
@@ -160,17 +187,115 @@ class PluginHost:
             return cls._contexts[name]
 
         context = PluginContext(name=name)
-        activate = plugin_module.activate
-        sig = inspect.signature(activate)
-        # Support both the 1-arg (legacy) and 2-arg shapes.
-        if len(sig.parameters) >= 2:
-            activate(plugin_api, context)
-        else:
-            activate(plugin_api)
+
+        # ── Load manifest (metadata-only) ──────────────────────────────
+        try:
+            from scenecraft.plugin_manifest import load_manifest
+            manifest = load_manifest(plugin_module)
+        except Exception as exc:  # noqa: BLE001
+            import sys
+            print(
+                f"[plugin-host] manifest load failed for {name}: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            manifest = None
+
+        if manifest is not None:
+            cls._manifests[manifest.name] = manifest
+            context.manifest = manifest
+
+        # ── activate() — imperative registration ───────────────────────
+        activate = getattr(plugin_module, "activate", None)
+        if activate is not None:
+            sig = inspect.signature(activate)
+            if len(sig.parameters) >= 2:
+                activate(plugin_api, context)
+            else:
+                activate(plugin_api)
 
         cls._contexts[name] = context
         cls._registered.append(name)
         return context
+
+    @classmethod
+    def register_declared(cls, plugin_module, context: PluginContext) -> None:
+        """Helper for plugins that want the declarative shortcut.
+
+        Reads the plugin's cached manifest (loaded by
+        ``PluginHost.register`` before ``activate()`` runs), resolves
+        each ``contributes.operations`` and ``contributes.mcpTools``
+        entry's handler ref against the plugin module, and registers
+        the resulting ``OperationDef`` / ``MCPToolDef`` with the host.
+        Disposables are pushed into ``context.subscriptions`` so they
+        tear down at deactivate() time.
+
+        Plugins call this from their ``activate(plugin_api, context)``
+        body when the manifest is the source of truth for their
+        contributions. Plugins that need custom wiring (conditional
+        registration, computed schemas, etc.) can skip this and call
+        ``register_operation`` / ``register_mcp_tool`` directly.
+        """
+        from scenecraft.plugin_manifest import resolve_handler
+
+        manifest = context.manifest
+        if manifest is None:
+            # No manifest loaded — caller asked for declarative wiring
+            # on an imperative-only plugin. Harmless; just no-op.
+            return
+
+        name = getattr(plugin_module, "__name__", manifest.name)
+        for op_m in manifest.operations:
+            try:
+                handler = resolve_handler(plugin_module, op_m.handler_ref)
+            except Exception as exc:  # noqa: BLE001
+                import sys
+                print(
+                    f"[plugin-host] {name}: operation {op_m.id!r} handler "
+                    f"{op_m.handler_ref!r} — {exc}",
+                    file=sys.stderr,
+                )
+                continue
+            cls.register_operation(
+                OperationDef(
+                    id=op_m.id,
+                    label=op_m.label,
+                    entity_types=op_m.entity_types,
+                    handler=handler,
+                ),
+                context=context,
+            )
+        for tool_m in manifest.mcp_tools:
+            try:
+                handler = resolve_handler(plugin_module, tool_m.handler_ref)
+            except Exception as exc:  # noqa: BLE001
+                import sys
+                print(
+                    f"[plugin-host] {name}: mcpTool {tool_m.tool_id!r} "
+                    f"handler {tool_m.handler_ref!r} — {exc}",
+                    file=sys.stderr,
+                )
+                continue
+            cls.register_mcp_tool(
+                MCPToolDef(
+                    plugin=manifest.name,
+                    tool_id=tool_m.tool_id,
+                    description=tool_m.description,
+                    input_schema=tool_m.input_schema,
+                    handler=handler,
+                    destructive=tool_m.destructive,
+                ),
+                context=context,
+            )
+
+    @classmethod
+    def get_manifest(cls, plugin_id: str):
+        """Return the parsed PluginManifest for a registered plugin (or None)."""
+        return cls._manifests.get(plugin_id)
+
+    @classmethod
+    def list_manifests(cls) -> list:
+        return list(cls._manifests.values())
 
     @classmethod
     def deactivate(cls, name: str) -> None:
