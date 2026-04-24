@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS users (
     pubkey_fingerprint TEXT NOT NULL DEFAULT '',
     pubkey TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'editor'
+    role TEXT NOT NULL DEFAULT 'editor',
+    must_change_password INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS orgs (
@@ -64,6 +65,23 @@ CREATE INDEX IF NOT EXISTS idx_ledger_org    ON spend_ledger(org, unit, created_
 CREATE INDEX IF NOT EXISTS idx_ledger_plugin ON spend_ledger(plugin_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_ledger_unit   ON spend_ledger(unit, created_at);
 CREATE INDEX IF NOT EXISTS idx_ledger_source ON spend_ledger(source, created_at);
+
+-- M16: api_keys for paid-plugin double-gate auth.
+-- Each key is scoped to a user. The raw key is shown once at issue time; only
+-- the PBKDF2 hash is persisted. Revocation is soft (revoked_at timestamp).
+CREATE TABLE IF NOT EXISTS api_keys (
+    id           TEXT PRIMARY KEY,
+    username     TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+    key_hash     TEXT NOT NULL,
+    salt         TEXT NOT NULL,
+    issued_by    TEXT NOT NULL,
+    issued_at    TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    revoked_at   TEXT,
+    label        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_api_keys_username ON api_keys(username);
+CREATE INDEX IF NOT EXISTS idx_api_keys_expires  ON api_keys(expires_at);
 """
 
 ORG_DB_SCHEMA = """
@@ -114,7 +132,15 @@ def _init_db(db_path: Path, schema: str) -> sqlite3.Connection:
 
 
 def get_server_db(root: Path) -> sqlite3.Connection:
-    return _init_db(root / "server.db", SERVER_DB_SCHEMA)
+    conn = _init_db(root / "server.db", SERVER_DB_SCHEMA)
+    # -- Migrations for existing databases --
+    # Add must_change_password column to users if missing (added in M16 auth milestone).
+    try:
+        conn.execute("SELECT must_change_password FROM users LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    return conn
 
 
 def get_sessions_db(root: Path) -> sqlite3.Connection:
@@ -331,7 +357,8 @@ def create_user(root: Path, username: str, pubkey: str = "", role: str = "editor
 
     conn = get_server_db(sc)
     conn.execute(
-        "INSERT INTO users (username, pubkey_fingerprint, pubkey, created_at, role) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO users (username, pubkey_fingerprint, pubkey, created_at, role, must_change_password)"
+        " VALUES (?, ?, ?, ?, ?, 1)",
         (username, fingerprint, pubkey, now, role),
     )
     conn.commit()
