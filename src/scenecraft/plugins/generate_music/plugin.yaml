@@ -1,0 +1,76 @@
+name: generate_music
+version: 1.0.0
+displayName: "Music Generation"
+description: >
+  AI-composed music via Musicful. Exposes a write-path chat tool
+  (generate_music__run) gated by the destructive-tool elicitation flow,
+  and a read-path tool (generate_music__credits) that checks the
+  remaining key balance without consuming any.
+publisher: scenecraft
+license: MIT
+
+activationEvents:
+  - onCommand:generate_music.run
+
+contributes:
+  operations:
+    - id: generate_music.run
+      label: "Generate music"
+      entityTypes: [audio_clip, transition]
+      handler: "backend:run_operation"
+
+  mcpTools:
+    - id: run
+      # Claude sees this as `generate_music__run`. Mirrors
+      # `isolate_vocals__run`; task-131's frontend plugin-id uses the
+      # hyphenated `generate-music` for URL / package conventions but
+      # the backend plugin name stays underscored (Python module).
+      description: >
+        Generate AI-composed music via Musicful. Returns a running
+        generation that completes asynchronously; songs land in the
+        project's candidate pool. Costs real credits and requires user
+        confirmation. Use action='auto' for describe-a-song-get-a-song;
+        action='custom' for user-supplied lyrics. Set instrumental=1
+        for scores and background music (the primary use case); 0
+        requires lyrics under 'custom'.
+      destructive: true
+      handler: "backend:handle_generate_music"
+      input_schema:
+        type: object
+        properties:
+          action:
+            type: string
+            enum: [auto, custom]
+          style:
+            type: string
+            description: "Free-form style prompt, <=5000 chars."
+          lyrics:
+            type: string
+            description: "Used only for action=custom + instrumental=0."
+          title:
+            type: string
+            maxLength: 80
+          instrumental:
+            type: integer
+            enum: [0, 1]
+            default: 1
+          gender:
+            type: string
+            enum: [male, female, ""]
+          model:
+            type: string
+            default: "MFV2.0"
+        required: [action, style]
+
+    - id: credits
+      # Claude sees this as `generate_music__credits`. Free, no elicitation.
+      description: >
+        Check remaining Musicful credits without consuming any. Free to
+        call; no user confirmation. Use before suggesting run to avoid
+        queuing a job the user cannot afford.
+      destructive: false
+      handler: "backend:handle_get_credits"
+      input_schema:
+        type: object
+        properties: {}
+        required: []
