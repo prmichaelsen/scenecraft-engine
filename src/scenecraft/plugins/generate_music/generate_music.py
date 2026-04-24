@@ -407,8 +407,12 @@ def _save_song(
         raise ValueError(f"song {song.id} has no audio_url")
 
     file_uuid = uuid.uuid4().hex
-    pool_rel = f"segments/{file_uuid}.mp3"
-    pool_abs = project_dir / "pool" / pool_rel
+    # Convention is `pool/segments/<uuid>.<ext>` — matches isolate_vocals
+    # and the Bin's pool imports. The /api/.../files/ serve endpoint
+    # resolves paths relative to the project root, so the `pool/` prefix
+    # is required for play/preview URLs to work.
+    pool_rel = f"pool/segments/{file_uuid}.mp3"
+    pool_abs = project_dir / pool_rel
     pool_abs.parent.mkdir(parents=True, exist_ok=True)
     tmp_abs = pool_abs.with_suffix(".mp3.tmp")
 
