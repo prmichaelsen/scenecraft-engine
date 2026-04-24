@@ -816,10 +816,27 @@ milestones:
           - task-66
           - task-67
 
+  - id: M17
+    title: "Voice-Controlled Video Editing — Research Spike"
+    file: agent/milestones/milestone-17-voice-agent-research-spike.md
+    status: not_started
+    estimated_weeks: 0.5
+    tasks_total: 1
+    tasks_completed: 0
+    tasks:
+      - id: task-69
+        title: "Voice agent API feature-matrix comparison"
+        file: null
+        status: not_started
+        estimated_hours: 4
+        started: null
+        actual_hours: null
+        dependencies: []
+
 documentation:
   design_documents: 8
   spec_documents: 3
-  milestone_documents: 14
+  milestone_documents: 15
   pattern_documents: 0
   task_documents: 67
 
