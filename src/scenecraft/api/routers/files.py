@@ -8,14 +8,20 @@ Path traversal: we resolve ``(work_dir / name / file_path)`` and require
 the result to live under ``work_dir.resolve()``. Any escape attempt
 (``..``, symlinks, absolute segments) falls through to the legacy
 404 + envelope response (R22).
+
+T63 extension: ``GET /api/projects/{name}/descriptions`` is added to
+this router because it is a read-only file-adjacent endpoint (parses
+``descriptions.md`` into structured sections).
 """
 
 from __future__ import annotations
 
+import re as _re
 from pathlib import Path
 
-from fastapi import APIRouter, Request, status
+from fastapi import APIRouter, Depends, Request, status
 
+from scenecraft.api.deps import current_user, project_dir
 from scenecraft.api.errors import ApiError
 from scenecraft.api.streaming import file_response_with_range
 
@@ -87,3 +93,49 @@ async def head_project_file(name: str, file_path: str, request: Request):
         )
     full = _resolve_project_file(work_dir, name, file_path)
     return file_response_with_range(full, request, head_only=True)
+
+
+# ---------------------------------------------------------------------------
+# Descriptions (T63): read-only parse of descriptions.md into sections.
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/{name}/descriptions",
+    operation_id="get_descriptions",
+    summary="Parse descriptions.md into structured section objects.",
+    dependencies=[Depends(current_user)],
+)
+async def get_descriptions(
+    name: str, pdir: Path = Depends(project_dir)
+) -> dict:
+    desc_path = pdir / "descriptions.md"
+    if not desc_path.exists():
+        return {"sections": []}
+
+    content = desc_path.read_text()
+    # Split on "## Section N" headers; ``re.split`` returns alternating
+    # [preamble, header1, body1, header2, body2, ...] so we step by 2.
+    parts = _re.split(r"^## (Section \d+.*?)$", content, flags=_re.MULTILINE)
+    sections: list[dict] = []
+    for i in range(1, len(parts), 2):
+        header = parts[i].strip()
+        body = parts[i + 1].strip() if i + 1 < len(parts) else ""
+
+        idx_match = _re.match(r"Section (\d+)", header)
+        section_index = int(idx_match.group(1)) if idx_match else -1
+
+        time_match = _re.search(r"\*\*Time\*\*:\s*([\d.]+)s\s*-\s*([\d.]+)s", body)
+        start_time = float(time_match.group(1)) if time_match else 0
+        end_time = float(time_match.group(2)) if time_match else 0
+
+        sections.append(
+            {
+                "sectionIndex": section_index,
+                "label": header,
+                "startTime": start_time,
+                "endTime": end_time,
+                "content": body,
+            }
+        )
+    return {"sections": sections}
