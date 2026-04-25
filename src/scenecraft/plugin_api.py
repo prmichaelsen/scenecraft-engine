@@ -51,6 +51,10 @@ from scenecraft.db import (
     list_light_show_overrides,
     set_light_show_overrides,
     clear_light_show_overrides,
+    list_light_show_screens,
+    upsert_light_show_screens,
+    remove_light_show_screens,
+    reset_light_show_screens,
 )
 
 # --- Job infrastructure ---------------------------------------------------
@@ -105,6 +109,10 @@ __all__ = [
     "list_light_show_overrides",
     "set_light_show_overrides",
     "clear_light_show_overrides",
+    "list_light_show_screens",
+    "upsert_light_show_screens",
+    "remove_light_show_screens",
+    "reset_light_show_screens",
     # Plugin-scoped WS broadcast
     "broadcast_event",
 ]

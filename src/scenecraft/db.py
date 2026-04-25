@@ -514,6 +514,25 @@ def _ensure_schema(conn: sqlite3.Connection):
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
+        -- light_show screens: flat video panels rendered in the 3D preview
+        -- as textured planes. MVP renders the scenecraft main-timeline
+        -- frame preview onto every screen (shared texture); per-screen
+        -- timelines are a post-MVP follow-up. Dimensions in meters.
+        CREATE TABLE IF NOT EXISTS light_show__screens (
+            id TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            position_x REAL NOT NULL DEFAULT 0,
+            position_y REAL NOT NULL DEFAULT 0,
+            position_z REAL NOT NULL DEFAULT 0,
+            rotation_x REAL NOT NULL DEFAULT 0,
+            rotation_y REAL NOT NULL DEFAULT 0,
+            rotation_z REAL NOT NULL DEFAULT 0,
+            width REAL NOT NULL DEFAULT 4,
+            height REAL NOT NULL DEFAULT 2.25,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
         CREATE TABLE IF NOT EXISTS sections (
             id TEXT PRIMARY KEY,
             label TEXT NOT NULL DEFAULT '',
@@ -4047,3 +4066,104 @@ def clear_light_show_overrides(project_dir: Path, fixture_ids: list[str] | None 
             conn.execute("DELETE FROM light_show__overrides WHERE fixture_id = ?", (fid,))
     conn.commit()
     return list_light_show_overrides(project_dir)
+
+
+# ── light_show video screens ──────────────────────────────────────────────
+
+
+_SCREEN_SELECT = (
+    "SELECT id, label, position_x, position_y, position_z, "
+    "rotation_x, rotation_y, rotation_z, width, height "
+    "FROM light_show__screens ORDER BY id"
+)
+
+
+def list_light_show_screens(project_dir: Path) -> list[dict]:
+    """List all screens in the project. Empty by default — screens are
+    opt-in via chat, unlike fixtures which seed a default rig."""
+    conn = get_db(project_dir)
+    rows = conn.execute(_SCREEN_SELECT).fetchall()
+    return [dict(r) for r in rows]
+
+
+def upsert_light_show_screens(project_dir: Path, screens: list[dict]) -> list[dict]:
+    """Bulk upsert screens with partial-state semantics: omitted fields
+    preserve current values. Unknown ``id`` creates a new row (defaulting
+    size to 4x2.25m at the origin). Returns the full screen list after
+    the upsert."""
+    conn = get_db(project_dir)
+    for s in screens:
+        if "id" not in s or not s["id"]:
+            raise ValueError("upsert_light_show_screens: each screen must have an id")
+        sid = s["id"]
+        existing = conn.execute(
+            "SELECT label, position_x, position_y, position_z, "
+            "rotation_x, rotation_y, rotation_z, width, height "
+            "FROM light_show__screens WHERE id = ?",
+            (sid,),
+        ).fetchone()
+        if existing is None:
+            row = {
+                "id": sid,
+                "label": s.get("label", sid),
+                "position_x": float(s.get("position_x", 0)),
+                "position_y": float(s.get("position_y", 0)),
+                "position_z": float(s.get("position_z", 0)),
+                "rotation_x": float(s.get("rotation_x", 0)),
+                "rotation_y": float(s.get("rotation_y", 0)),
+                "rotation_z": float(s.get("rotation_z", 0)),
+                "width": float(s.get("width", 4.0)),
+                "height": float(s.get("height", 2.25)),
+            }
+            conn.execute(
+                "INSERT INTO light_show__screens "
+                "(id, label, position_x, position_y, position_z, "
+                " rotation_x, rotation_y, rotation_z, width, height) "
+                "VALUES (:id, :label, :position_x, :position_y, :position_z, "
+                "        :rotation_x, :rotation_y, :rotation_z, :width, :height)",
+                row,
+            )
+        else:
+            ex = dict(existing)
+            row = {
+                "id": sid,
+                "label": s.get("label", ex["label"]),
+                "position_x": float(s.get("position_x", ex["position_x"])),
+                "position_y": float(s.get("position_y", ex["position_y"])),
+                "position_z": float(s.get("position_z", ex["position_z"])),
+                "rotation_x": float(s.get("rotation_x", ex["rotation_x"])),
+                "rotation_y": float(s.get("rotation_y", ex["rotation_y"])),
+                "rotation_z": float(s.get("rotation_z", ex["rotation_z"])),
+                "width": float(s.get("width", ex["width"])),
+                "height": float(s.get("height", ex["height"])),
+            }
+            conn.execute(
+                "UPDATE light_show__screens SET "
+                "label=:label, "
+                "position_x=:position_x, position_y=:position_y, position_z=:position_z, "
+                "rotation_x=:rotation_x, rotation_y=:rotation_y, rotation_z=:rotation_z, "
+                "width=:width, height=:height, updated_at=datetime('now') "
+                "WHERE id=:id",
+                row,
+            )
+    conn.commit()
+    return list_light_show_screens(project_dir)
+
+
+def remove_light_show_screens(project_dir: Path, ids: list[str]) -> list[dict]:
+    """Delete specific screens by id. Missing ids are silently ignored.
+    Returns the remaining screen list."""
+    conn = get_db(project_dir)
+    for sid in ids:
+        conn.execute("DELETE FROM light_show__screens WHERE id = ?", (sid,))
+    conn.commit()
+    return list_light_show_screens(project_dir)
+
+
+def reset_light_show_screens(project_dir: Path) -> list[dict]:
+    """Delete ALL screens. Unlike ``reset_light_show_fixtures``, this does
+    not re-seed defaults — screens start empty and are authored per project."""
+    conn = get_db(project_dir)
+    conn.execute("DELETE FROM light_show__screens")
+    conn.commit()
+    return list_light_show_screens(project_dir)

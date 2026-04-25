@@ -29,6 +29,7 @@ __all__ = [
     "tools_set_fixture_state",
     "tools_list_overrides",
     "tools_clear_overrides",
+    "tools_screens",
 ]
 
 
@@ -153,3 +154,46 @@ def tools_clear_overrides(args, tool_context) -> dict:
     rows = plugin_api.clear_light_show_overrides(project_dir, [str(i) for i in ids] or None)
     _notify(project_name, "overrides")
     return {"overrides": rows}
+
+
+def tools_screens(args, tool_context) -> dict:
+    """Single action-dispatched tool for video screens in the 3D preview.
+
+    Actions:
+      - ``list``: return current screens.
+      - ``set``: bulk upsert by id with partial-state semantics (omitted
+        fields preserve existing values; unknown ids create new screens
+        defaulting to a 4x2.25m panel at the origin).
+      - ``remove``: delete screens by id list.
+      - ``reset``: delete ALL screens.
+
+    At MVP every screen renders the same scenecraft main-timeline frame
+    preview — per-screen timelines are a follow-up.
+    """
+    from scenecraft import plugin_api
+    project_dir, project_name = _ctx(tool_context)
+    action = args.get("action")
+    if action == "list":
+        return {"screens": plugin_api.list_light_show_screens(project_dir)}
+    if action == "set":
+        screens = args.get("screens") or []
+        if not isinstance(screens, list):
+            return {"error": "screens must be a list"}
+        try:
+            rows = plugin_api.upsert_light_show_screens(project_dir, screens)
+        except ValueError as e:
+            return {"error": str(e)}
+        _notify(project_name, "screens")
+        return {"screens": rows}
+    if action == "remove":
+        ids = args.get("ids") or []
+        if not isinstance(ids, list):
+            return {"error": "ids must be a list"}
+        rows = plugin_api.remove_light_show_screens(project_dir, [str(i) for i in ids])
+        _notify(project_name, "screens")
+        return {"screens": rows}
+    if action == "reset":
+        rows = plugin_api.reset_light_show_screens(project_dir)
+        _notify(project_name, "screens")
+        return {"screens": rows}
+    return {"error": f"unknown action {action!r}; expected one of list/set/remove/reset"}

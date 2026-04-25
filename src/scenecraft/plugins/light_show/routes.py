@@ -99,6 +99,50 @@ def _handle_clear_overrides(path: str, project_dir: Path, project_name: str, bod
     return {"overrides": rows}
 
 
+# --- screens --------------------------------------------------------------
+
+
+def _handle_list_screens(path: str, project_dir: Path, project_name: str, query: dict) -> dict:
+    del path, project_name, query
+    from scenecraft import plugin_api
+    return {"screens": plugin_api.list_light_show_screens(project_dir)}
+
+
+def _handle_upsert_screens(path: str, project_dir: Path, project_name: str, body: dict) -> dict:
+    del path
+    from scenecraft import plugin_api
+    body = body or {}
+    screens = body.get("screens") or []
+    if not isinstance(screens, list):
+        return {"error": "screens must be a list"}
+    try:
+        rows = plugin_api.upsert_light_show_screens(project_dir, screens)
+    except ValueError as e:
+        return {"error": str(e)}
+    _broadcast_changed(project_name, "screens")
+    return {"screens": rows}
+
+
+def _handle_remove_screens(path: str, project_dir: Path, project_name: str, body: dict) -> dict:
+    del path
+    from scenecraft import plugin_api
+    body = body or {}
+    ids = body.get("ids") or []
+    if not isinstance(ids, list):
+        return {"error": "ids must be a list"}
+    rows = plugin_api.remove_light_show_screens(project_dir, [str(i) for i in ids])
+    _broadcast_changed(project_name, "screens")
+    return {"screens": rows}
+
+
+def _handle_reset_screens(path: str, project_dir: Path, project_name: str, body: dict) -> dict:
+    del path, body
+    from scenecraft import plugin_api
+    rows = plugin_api.reset_light_show_screens(project_dir)
+    _broadcast_changed(project_name, "screens")
+    return {"screens": rows}
+
+
 def register(plugin_api, context) -> None:
     """Wire REST endpoints into the plugin-host's dispatch tables."""
     # Fixtures
@@ -136,6 +180,31 @@ def register(plugin_api, context) -> None:
     plugin_api.register_rest_endpoint(
         r"^/api/projects/[^/]+/plugins/light_show/overrides/clear$",
         _handle_clear_overrides,
+        method="POST",
+        context=context,
+    )
+    # Screens
+    plugin_api.register_rest_endpoint(
+        r"^/api/projects/[^/]+/plugins/light_show/screens$",
+        _handle_list_screens,
+        method="GET",
+        context=context,
+    )
+    plugin_api.register_rest_endpoint(
+        r"^/api/projects/[^/]+/plugins/light_show/screens$",
+        _handle_upsert_screens,
+        method="PUT",
+        context=context,
+    )
+    plugin_api.register_rest_endpoint(
+        r"^/api/projects/[^/]+/plugins/light_show/screens/remove$",
+        _handle_remove_screens,
+        method="POST",
+        context=context,
+    )
+    plugin_api.register_rest_endpoint(
+        r"^/api/projects/[^/]+/plugins/light_show/screens/reset$",
+        _handle_reset_screens,
         method="POST",
         context=context,
     )

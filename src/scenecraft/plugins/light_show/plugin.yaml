@@ -147,3 +147,62 @@ contributes:
           ids:
             type: array
             items: { type: string }
+
+    - id: screens
+      description: |
+        Manage video screens in the 3D preview. Single action-dispatched
+        tool — use the `action` field to pick the operation.
+
+        Screens are flat rectangular panels rendered as textured planes.
+        At MVP every screen shows the same scenecraft main-timeline frame
+        preview at the unified playhead; per-screen timelines are a
+        follow-up feature.
+
+        Actions:
+          - "list": return the current screens.
+          - "set": bulk upsert. Each entry MUST have an `id`; any other
+            field is optional and partial — omitted fields preserve
+            existing values, unknown ids create new screens (defaulting
+            to a 4m x 2.25m panel at the origin).
+          - "remove": delete screens by `ids`.
+          - "reset": delete ALL screens (destructive). Screens start
+            empty per project — no defaults are re-seeded.
+
+        Coordinate notes:
+          - position: meters (x = stage right, y = up, z = downstage is
+            negative, matching the fixture coord system).
+          - rotation: radians (Euler XYZ).
+          - width / height: meters. The plane faces +Z by default;
+            rotate to face the audience (typical backdrop: y=2, z=-4,
+            rotation_y=0 faces the viewer at z=0).
+      handler: "backend:tools_screens"
+      destructive: true  # `reset` and `remove` are destructive; flag conservatively
+      input_schema:
+        type: object
+        required: [action]
+        properties:
+          action:
+            type: string
+            enum: [list, set, remove, reset]
+            description: Operation to perform.
+          screens:
+            type: array
+            description: For `set` — list of screen upserts. Each needs an `id`.
+            items:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string }
+                label: { type: string }
+                position_x: { type: number }
+                position_y: { type: number }
+                position_z: { type: number }
+                rotation_x: { type: number }
+                rotation_y: { type: number }
+                rotation_z: { type: number }
+                width: { type: number, minimum: 0 }
+                height: { type: number, minimum: 0 }
+          ids:
+            type: array
+            description: For `remove` — screen ids to delete.
+            items: { type: string }
