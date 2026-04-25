@@ -602,6 +602,65 @@ def _ensure_schema(conn: sqlite3.Connection):
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
+        -- ── M19 Light Show Scene Editor — three-tier data model ───────────
+        --
+        -- light_show__scenes: the scene library. Each row is a parameterized
+        -- instance of a primitive (rotating_head, static_color, ...). params
+        -- is stored SPARSE — only keys explicitly overridden by the user
+        -- live in params_json; catalog defaults are merged at evaluator time
+        -- (NOT at insert/update). This ensures list → modify → set round-
+        -- trips don't accidentally promote defaults to explicit overrides.
+        -- Spec R1.
+        CREATE TABLE IF NOT EXISTS light_show__scenes (
+            id TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            type TEXT NOT NULL,
+            params_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        -- light_show__scene_placements: pre-programmed timeline schedule.
+        -- Each row places a library scene on the main playhead from
+        -- start_time to end_time with optional fade in/out and a display
+        -- order for overlap resolution. Spec R2.
+        CREATE TABLE IF NOT EXISTS light_show__scene_placements (
+            id TEXT PRIMARY KEY,
+            scene_id TEXT NOT NULL REFERENCES light_show__scenes(id),
+            start_time REAL NOT NULL,
+            end_time REAL NOT NULL,
+            display_order INTEGER NOT NULL DEFAULT 0,
+            fade_in_sec REAL NOT NULL DEFAULT 0,
+            fade_out_sec REAL NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_light_show_placements_time
+            ON light_show__scene_placements(start_time, end_time);
+
+        -- light_show__live_override: single-slot live trigger that wins
+        -- over any timeline placement. Always 0 or 1 row (id checked to
+        -- 'current' so any other id is a write error). Either references
+        -- a library scene by id, OR carries an inline directive (type +
+        -- inline_params_json) — the CHECK constraint enforces exactly
+        -- one. Spec R3.
+        CREATE TABLE IF NOT EXISTS light_show__live_override (
+            id TEXT PRIMARY KEY CHECK (id = 'current'),
+            scene_id TEXT REFERENCES light_show__scenes(id),
+            inline_type TEXT,
+            inline_params_json TEXT,
+            label TEXT NOT NULL,
+            fade_in_sec REAL NOT NULL DEFAULT 0,
+            fade_out_sec REAL NOT NULL DEFAULT 0,
+            activated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            deactivation_started_at TEXT,
+            CHECK (
+                (scene_id IS NOT NULL AND inline_type IS NULL AND inline_params_json IS NULL)
+                OR
+                (scene_id IS NULL AND inline_type IS NOT NULL AND inline_params_json IS NOT NULL)
+            )
+        );
+
         CREATE TABLE IF NOT EXISTS sections (
             id TEXT PRIMARY KEY,
             label TEXT NOT NULL DEFAULT '',
@@ -4430,3 +4489,634 @@ def reset_light_show_screens(project_dir: Path) -> list[dict]:
     conn.execute("DELETE FROM light_show__screens")
     conn.commit()
     return list_light_show_screens(project_dir)
+
+
+# ── M19 Light Show Scene Editor — DB helpers ──────────────────────────────
+#
+# Three helpers per resource (list / upsert / remove) plus three for the
+# single-row live override (get / activate / deactivate). All sparse-params
+# semantics, atomic batches, and FK/CHECK enforcement live here so the
+# REST + MCP layers above can be thin dispatchers.
+
+
+_SCENE_SELECT = (
+    "SELECT id, label, type, params_json, created_at, updated_at "
+    "FROM light_show__scenes"
+)
+
+
+def _scene_row_to_dict(r) -> dict:
+    """Decode params_json into a sparse dict, leave everything else as-is."""
+    d = dict(r)
+    raw = d.pop("params_json", None)
+    try:
+        d["params"] = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        d["params"] = {}
+    return d
+
+
+def list_light_show_scenes(
+    project_dir: Path,
+    *,
+    ids: list[str] | None = None,
+    type_filter: str | None = None,
+    label_query: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    order_by: str = "updated_at",
+    order: str = "desc",
+) -> tuple[list[dict], int, bool]:
+    """List scenes with optional filtering. Returns (rows, total, has_more).
+
+    ``params`` field is the SPARSE stored value — only keys explicitly
+    overridden by the user. Catalog defaults are merged at evaluator time
+    (not here) so list → set round-trips don't promote defaults to overrides.
+    Spec R5.
+    """
+    if order_by not in ("updated_at", "created_at", "label"):
+        raise ValueError(f"order_by must be updated_at|created_at|label, got {order_by!r}")
+    if order not in ("asc", "desc"):
+        raise ValueError(f"order must be asc|desc, got {order!r}")
+    limit = max(0, min(int(limit), 1000))
+    offset = max(0, int(offset))
+
+    conn = get_db(project_dir)
+    where: list[str] = []
+    params: list = []
+    if ids:
+        placeholders = ",".join(["?"] * len(ids))
+        where.append(f"id IN ({placeholders})")
+        params.extend(ids)
+    if type_filter:
+        where.append("type = ?")
+        params.append(type_filter)
+    if label_query:
+        where.append("LOWER(label) LIKE LOWER(?)")
+        params.append(f"%{label_query}%")
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+
+    total_row = conn.execute(
+        f"SELECT COUNT(*) FROM light_show__scenes{clause}", params
+    ).fetchone()
+    total = int(total_row[0])
+
+    sql = f"{_SCENE_SELECT}{clause} ORDER BY {order_by} {order.upper()} LIMIT ? OFFSET ?"
+    rows = conn.execute(sql, [*params, limit, offset]).fetchall()
+    out = [_scene_row_to_dict(r) for r in rows]
+    has_more = (offset + len(out)) < total
+    return out, total, has_more
+
+
+def _validate_scene_type(conn: sqlite3.Connection, type_name: str) -> None:
+    """Type-name validation against the primitives catalog. Catalog access
+    deferred to caller — backend reads catalog YAML once and passes the
+    set of known types into the upsert path. Local helper here just trusts
+    the caller has already filtered, so DB enforces shape only."""
+    # Intentional pass-through. Catalog enforcement happens at the MCP /
+    # REST layer (task-154) where the catalog is loaded once. The DB layer
+    # accepts any string and only enforces FK + CHECK constraints.
+    del conn, type_name
+
+
+def upsert_light_show_scenes(
+    project_dir: Path,
+    scenes: list[dict],
+    *,
+    known_types: set[str] | None = None,
+) -> list[dict]:
+    """Bulk upsert scenes with id-presence dispatch and sparse params.
+
+    Behavior per spec R6/R7/R8:
+      - No ``id`` on entry → CREATE with server-generated UUID. ``label``
+        and ``type`` MUST be present (NOT NULL columns); rejected otherwise.
+      - ``id`` present → UPDATE existing row. ``label`` / ``type`` partial
+        merge (omitted preserves, value sets, null rejected). ``params``
+        merge per RFC 7396 JSON Merge Patch:
+          - omitted → preserve all stored params
+          - ``null`` → reject (caller must use ``{}`` to preserve, ``{key: null}`` to delete)
+          - ``{key: value}`` → set
+          - ``{key: null}`` → delete the key from stored params
+      - Atomic all-or-nothing across the batch (single transaction; any
+        rejection rolls back all writes).
+      - Storage is sparse — params_json contains ONLY explicitly-set keys.
+
+    ``known_types`` (optional): set of valid primitive type names. When
+    provided, entries with type not in the set are rejected. Pass ``None``
+    to skip type validation (legacy caller / testing).
+
+    Returns the list of upserted rows in input order with sparse params.
+    """
+    if not isinstance(scenes, list):
+        raise ValueError("scenes must be a list")
+
+    conn = get_db(project_dir)
+    out: list[dict] = []
+    try:
+        conn.execute("BEGIN")
+        for entry in scenes:
+            if not isinstance(entry, dict):
+                raise ValueError("each scene must be a dict")
+            if "id" in entry and entry["id"] is not None:
+                # UPDATE path
+                sid = str(entry["id"])
+                existing = conn.execute(
+                    "SELECT id, label, type, params_json FROM light_show__scenes WHERE id = ?",
+                    (sid,),
+                ).fetchone()
+                if existing is None:
+                    raise ValueError(f"unknown scene id: {sid}")
+
+                # label
+                if "label" in entry:
+                    if entry["label"] is None:
+                        raise ValueError("cannot null required column: label")
+                    new_label = str(entry["label"])
+                else:
+                    new_label = existing["label"]
+
+                # type
+                if "type" in entry:
+                    if entry["type"] is None:
+                        raise ValueError("cannot null required column: type")
+                    new_type = str(entry["type"])
+                else:
+                    new_type = existing["type"]
+                if known_types is not None and new_type not in known_types:
+                    raise ValueError(f"unknown primitive type: {new_type}")
+
+                # params merge-patch (sparse)
+                stored = json.loads(existing["params_json"] or "{}")
+                if "params" in entry:
+                    p = entry["params"]
+                    if p is None:
+                        raise ValueError(
+                            "params object cannot be null; use {} to preserve "
+                            "or {key: null} to delete a key"
+                        )
+                    if not isinstance(p, dict):
+                        raise ValueError("params must be an object")
+                    for k, v in p.items():
+                        if v is None:
+                            stored.pop(k, None)
+                        else:
+                            stored[k] = v
+                merged_params_json = json.dumps(stored)
+
+                conn.execute(
+                    "UPDATE light_show__scenes SET label=?, type=?, params_json=?, "
+                    "updated_at=datetime('now') WHERE id=?",
+                    (new_label, new_type, merged_params_json, sid),
+                )
+                row = conn.execute(_SCENE_SELECT + " WHERE id = ?", (sid,)).fetchone()
+                out.append(_scene_row_to_dict(row))
+            else:
+                # CREATE path
+                if "label" not in entry or entry.get("label") is None:
+                    raise ValueError("label and type required to create scene")
+                if "type" not in entry or entry.get("type") is None:
+                    raise ValueError("label and type required to create scene")
+                new_type = str(entry["type"])
+                if known_types is not None and new_type not in known_types:
+                    raise ValueError(f"unknown primitive type: {new_type}")
+                params = entry.get("params") or {}
+                if not isinstance(params, dict):
+                    raise ValueError("params must be an object")
+                # Sparse: store exactly what's supplied; null values dropped on insert
+                # since semantically null means 'delete' which is a no-op on a fresh row.
+                params = {k: v for k, v in params.items() if v is not None}
+                new_id = uuid.uuid4().hex
+                conn.execute(
+                    "INSERT INTO light_show__scenes (id, label, type, params_json) "
+                    "VALUES (?, ?, ?, ?)",
+                    (new_id, str(entry["label"]), new_type, json.dumps(params)),
+                )
+                row = conn.execute(_SCENE_SELECT + " WHERE id = ?", (new_id,)).fetchone()
+                out.append(_scene_row_to_dict(row))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return out
+
+
+def remove_light_show_scenes(project_dir: Path, ids: list[str]) -> list[dict]:
+    """Delete scenes atomically. Blocked when any id is referenced by a
+    placement OR held by the live override.
+
+    Spec R9: blocked-by-placements returns ``{error, blocked: [{scene_id, placement_ids}, ...]}``
+    Spec R10: blocked-by-live returns ``{error, blocked_by_live: scene_id}``
+    Caller (REST/MCP) translates ValueError messages into the structured error
+    shape — this function raises ValueError with structured details on the args.
+
+    Missing ids are silently skipped on success (no error). Returns the
+    deleted rows (pre-deletion state) on success.
+    """
+    if not isinstance(ids, list):
+        raise ValueError("ids must be a list")
+    ids = [str(i) for i in ids if i]
+    if not ids:
+        return []
+
+    conn = get_db(project_dir)
+    try:
+        conn.execute("BEGIN")
+        # Block-by-live check
+        live = conn.execute(
+            "SELECT scene_id FROM light_show__live_override WHERE scene_id IS NOT NULL"
+        ).fetchone()
+        if live is not None and live["scene_id"] in ids:
+            raise BlockedByLiveError(live["scene_id"])
+
+        # Block-by-placements check — collect ALL blocked scenes for the report
+        placeholders = ",".join(["?"] * len(ids))
+        place_rows = conn.execute(
+            f"SELECT scene_id, id AS placement_id FROM light_show__scene_placements "
+            f"WHERE scene_id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        if place_rows:
+            blocked: dict[str, list[str]] = {}
+            for r in place_rows:
+                blocked.setdefault(r["scene_id"], []).append(r["placement_id"])
+            raise BlockedByPlacementsError(
+                [{"scene_id": sid, "placement_ids": pids} for sid, pids in blocked.items()]
+            )
+
+        # Capture pre-deletion rows then delete
+        existing = conn.execute(
+            f"SELECT id, label, type, params_json, created_at, updated_at "
+            f"FROM light_show__scenes WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        deleted = [_scene_row_to_dict(r) for r in existing]
+        if existing:
+            conn.execute(
+                f"DELETE FROM light_show__scenes WHERE id IN ({placeholders})",
+                ids,
+            )
+        conn.execute("COMMIT")
+        return deleted
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+class BlockedByLiveError(ValueError):
+    """Scene cannot be removed because the live override holds it."""
+
+    def __init__(self, scene_id: str):
+        super().__init__(f"scene held by live override; deactivate first: {scene_id}")
+        self.scene_id = scene_id
+
+
+class BlockedByPlacementsError(ValueError):
+    """One or more scenes cannot be removed because placements reference them."""
+
+    def __init__(self, blocked: list[dict]):
+        super().__init__(f"scene(s) still referenced by placements: {blocked}")
+        self.blocked = blocked
+
+
+# ── Placements ────────────────────────────────────────────────────────────
+
+
+_PLACEMENT_SELECT = (
+    "SELECT id, scene_id, start_time, end_time, display_order, "
+    "fade_in_sec, fade_out_sec, created_at, updated_at "
+    "FROM light_show__scene_placements"
+)
+
+
+def list_light_show_placements(
+    project_dir: Path,
+    *,
+    ids: list[str] | None = None,
+    scene_id: str | None = None,
+    time_start: float | None = None,
+    time_end: float | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    order_by: str = "start_time",
+    order: str = "asc",
+) -> tuple[list[dict], int, bool]:
+    """List placements with optional filtering. Returns (rows, total, has_more).
+
+    ``time_start`` and ``time_end`` filter to placements that OVERLAP the window
+    — i.e. ``placement.start_time <= time_end AND placement.end_time >= time_start``.
+    Spec R12.
+    """
+    if order_by not in ("start_time", "created_at"):
+        raise ValueError(f"order_by must be start_time|created_at, got {order_by!r}")
+    if order not in ("asc", "desc"):
+        raise ValueError(f"order must be asc|desc, got {order!r}")
+    limit = max(0, min(int(limit), 1000))
+    offset = max(0, int(offset))
+
+    conn = get_db(project_dir)
+    where: list[str] = []
+    params: list = []
+    if ids:
+        placeholders = ",".join(["?"] * len(ids))
+        where.append(f"id IN ({placeholders})")
+        params.extend(ids)
+    if scene_id:
+        where.append("scene_id = ?")
+        params.append(scene_id)
+    if time_start is not None and time_end is not None:
+        # Overlap with [time_start, time_end]
+        where.append("start_time <= ? AND end_time >= ?")
+        params.append(float(time_end))
+        params.append(float(time_start))
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+
+    total = int(conn.execute(
+        f"SELECT COUNT(*) FROM light_show__scene_placements{clause}", params
+    ).fetchone()[0])
+    rows = conn.execute(
+        f"{_PLACEMENT_SELECT}{clause} ORDER BY {order_by} {order.upper()} LIMIT ? OFFSET ?",
+        [*params, limit, offset],
+    ).fetchall()
+    out = [dict(r) for r in rows]
+    has_more = (offset + len(out)) < total
+    return out, total, has_more
+
+
+def upsert_light_show_placements(
+    project_dir: Path,
+    placements: list[dict],
+) -> list[dict]:
+    """Bulk upsert placements with id-presence dispatch.
+
+    Spec R13: missing id → INSERT new uuid; present id → UPDATE merge.
+    Spec R14: rejects ``end_time <= start_time`` atomically.
+    Spec R15: rejects unknown ``scene_id`` atomically.
+
+    Returns the list of upserted rows in input order.
+    """
+    if not isinstance(placements, list):
+        raise ValueError("placements must be a list")
+
+    conn = get_db(project_dir)
+    out: list[dict] = []
+    try:
+        conn.execute("BEGIN")
+        for entry in placements:
+            if not isinstance(entry, dict):
+                raise ValueError("each placement must be a dict")
+            pid = entry.get("id")
+            if pid:
+                # UPDATE merge
+                pid = str(pid)
+                existing = conn.execute(
+                    "SELECT id, scene_id, start_time, end_time, display_order, "
+                    "fade_in_sec, fade_out_sec FROM light_show__scene_placements WHERE id = ?",
+                    (pid,),
+                ).fetchone()
+                if existing is None:
+                    raise ValueError(f"unknown placement id: {pid}")
+                merged = dict(existing)
+                for k in ("scene_id", "start_time", "end_time", "display_order", "fade_in_sec", "fade_out_sec"):
+                    if k in entry and entry[k] is not None:
+                        merged[k] = entry[k]
+                # Validate post-merge state.
+                if float(merged["end_time"]) <= float(merged["start_time"]):
+                    raise ValueError("placement end_time must be greater than start_time")
+                # FK is enforced at INSERT/UPDATE time by SQLite once PRAGMA foreign_keys
+                # is on. Belt-and-suspenders: explicit check for the error message shape.
+                exists = conn.execute(
+                    "SELECT 1 FROM light_show__scenes WHERE id = ?",
+                    (str(merged["scene_id"]),),
+                ).fetchone()
+                if not exists:
+                    raise ValueError(f"unknown scene_id: {merged['scene_id']}")
+                conn.execute(
+                    "UPDATE light_show__scene_placements SET "
+                    "scene_id=?, start_time=?, end_time=?, display_order=?, "
+                    "fade_in_sec=?, fade_out_sec=?, updated_at=datetime('now') "
+                    "WHERE id=?",
+                    (
+                        str(merged["scene_id"]),
+                        float(merged["start_time"]),
+                        float(merged["end_time"]),
+                        int(merged["display_order"]),
+                        float(merged["fade_in_sec"]),
+                        float(merged["fade_out_sec"]),
+                        pid,
+                    ),
+                )
+            else:
+                # INSERT
+                for required in ("scene_id", "start_time", "end_time"):
+                    if required not in entry or entry[required] is None:
+                        raise ValueError(f"placement missing required field: {required}")
+                if float(entry["end_time"]) <= float(entry["start_time"]):
+                    raise ValueError("placement end_time must be greater than start_time")
+                exists = conn.execute(
+                    "SELECT 1 FROM light_show__scenes WHERE id = ?",
+                    (str(entry["scene_id"]),),
+                ).fetchone()
+                if not exists:
+                    raise ValueError(f"unknown scene_id: {entry['scene_id']}")
+                pid = uuid.uuid4().hex
+                conn.execute(
+                    "INSERT INTO light_show__scene_placements "
+                    "(id, scene_id, start_time, end_time, display_order, fade_in_sec, fade_out_sec) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        pid,
+                        str(entry["scene_id"]),
+                        float(entry["start_time"]),
+                        float(entry["end_time"]),
+                        int(entry.get("display_order", 0)),
+                        float(entry.get("fade_in_sec", 0)),
+                        float(entry.get("fade_out_sec", 0)),
+                    ),
+                )
+            row = conn.execute(_PLACEMENT_SELECT + " WHERE id = ?", (pid,)).fetchone()
+            out.append(dict(row))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return out
+
+
+def remove_light_show_placements(project_dir: Path, ids: list[str]) -> list[dict]:
+    """Delete placements by id. Silently ignores missing ids; returns the
+    deleted rows (pre-deletion state). Spec R16."""
+    if not isinstance(ids, list):
+        raise ValueError("ids must be a list")
+    ids = [str(i) for i in ids if i]
+    if not ids:
+        return []
+    conn = get_db(project_dir)
+    placeholders = ",".join(["?"] * len(ids))
+    rows = conn.execute(
+        f"{_PLACEMENT_SELECT} WHERE id IN ({placeholders})", ids
+    ).fetchall()
+    deleted = [dict(r) for r in rows]
+    if rows:
+        conn.execute(
+            f"DELETE FROM light_show__scene_placements WHERE id IN ({placeholders})",
+            ids,
+        )
+        conn.commit()
+    return deleted
+
+
+# ── Live override ─────────────────────────────────────────────────────────
+
+
+def _live_override_row_to_dict(r) -> dict | None:
+    if r is None:
+        return None
+    d = dict(r)
+    if d.get("inline_params_json"):
+        try:
+            d["inline_params"] = json.loads(d["inline_params_json"])
+        except json.JSONDecodeError:
+            d["inline_params"] = {}
+    d.pop("inline_params_json", None)
+    return d
+
+
+def get_light_show_live_override(project_dir: Path) -> dict | None:
+    """Return the single-row live override (if active) or None.
+    Spec foundation for R26."""
+    conn = get_db(project_dir)
+    r = conn.execute(
+        "SELECT id, scene_id, inline_type, inline_params_json, label, "
+        "fade_in_sec, fade_out_sec, activated_at, deactivation_started_at "
+        "FROM light_show__live_override WHERE id = 'current'"
+    ).fetchone()
+    return _live_override_row_to_dict(r)
+
+
+def activate_light_show_live_override(
+    project_dir: Path,
+    payload: dict,
+    *,
+    known_types: set[str] | None = None,
+) -> dict:
+    """Activate (or replace) the live override.
+
+    Payload shape (per spec R18-R23):
+      - Either ``scene_id: <uuid>`` (library reference) OR
+        ``scene: {type, params?}`` (inline directive). Both/neither rejected.
+      - Optional ``label``, ``fade_in_sec`` (default 0).
+      - Optional ``save_as: <label>`` — inline only. When present, persists
+        the inline scene into ``light_show__scenes`` first, then references
+        it by id. Rejects ``save_as`` without inline ``scene``.
+
+    Replaces any existing override silently. Returns the resulting status
+    shape (same as get_light_show_live_override).
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be a dict")
+    has_scene_id = "scene_id" in payload and payload["scene_id"]
+    inline = payload.get("scene")
+    has_inline = isinstance(inline, dict) and "type" in inline
+    if has_scene_id and has_inline:
+        raise ValueError("provide scene_id OR scene, not both")
+    if not has_scene_id and not has_inline:
+        raise ValueError("provide scene_id OR scene")
+
+    save_as = payload.get("save_as")
+    if save_as is not None and not has_inline:
+        raise ValueError("save_as requires inline scene")
+
+    fade_in = float(payload.get("fade_in_sec", 0))
+    label = payload.get("label")
+
+    conn = get_db(project_dir)
+    try:
+        conn.execute("BEGIN")
+
+        if has_scene_id:
+            sid = str(payload["scene_id"])
+            scene = conn.execute(
+                "SELECT id, label, type FROM light_show__scenes WHERE id = ?",
+                (sid,),
+            ).fetchone()
+            if scene is None:
+                raise ValueError(f"unknown scene_id: {sid}")
+            row_label = label if label is not None else scene["label"]
+            conn.execute("DELETE FROM light_show__live_override WHERE id = 'current'")
+            conn.execute(
+                "INSERT INTO light_show__live_override "
+                "(id, scene_id, inline_type, inline_params_json, label, fade_in_sec, "
+                " fade_out_sec, activated_at, deactivation_started_at) "
+                "VALUES ('current', ?, NULL, NULL, ?, ?, 0, datetime('now'), NULL)",
+                (sid, str(row_label), fade_in),
+            )
+        else:
+            # Inline directive
+            inline_type = str(inline["type"])
+            if known_types is not None and inline_type not in known_types:
+                raise ValueError(f"unknown primitive type: {inline_type}")
+            inline_params = inline.get("params") or {}
+            if not isinstance(inline_params, dict):
+                raise ValueError("inline scene.params must be an object")
+            inline_params = {k: v for k, v in inline_params.items() if v is not None}
+
+            if save_as is not None:
+                # Persist as a library scene first, then reference it
+                new_id = uuid.uuid4().hex
+                conn.execute(
+                    "INSERT INTO light_show__scenes (id, label, type, params_json) "
+                    "VALUES (?, ?, ?, ?)",
+                    (new_id, str(save_as), inline_type, json.dumps(inline_params)),
+                )
+                row_label = label if label is not None else str(save_as)
+                conn.execute("DELETE FROM light_show__live_override WHERE id = 'current'")
+                conn.execute(
+                    "INSERT INTO light_show__live_override "
+                    "(id, scene_id, inline_type, inline_params_json, label, fade_in_sec, "
+                    " fade_out_sec, activated_at, deactivation_started_at) "
+                    "VALUES ('current', ?, NULL, NULL, ?, ?, 0, datetime('now'), NULL)",
+                    (new_id, str(row_label), fade_in),
+                )
+            else:
+                row_label = label if label is not None else "directive"
+                conn.execute("DELETE FROM light_show__live_override WHERE id = 'current'")
+                conn.execute(
+                    "INSERT INTO light_show__live_override "
+                    "(id, scene_id, inline_type, inline_params_json, label, fade_in_sec, "
+                    " fade_out_sec, activated_at, deactivation_started_at) "
+                    "VALUES ('current', NULL, ?, ?, ?, ?, 0, datetime('now'), NULL)",
+                    (inline_type, json.dumps(inline_params), str(row_label), fade_in),
+                )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    return get_light_show_live_override(project_dir) or {}
+
+
+def deactivate_light_show_live_override(
+    project_dir: Path,
+    fade_out_sec: float = 0,
+) -> dict:
+    """Mark the live override as deactivating. Sets ``deactivation_started_at``
+    and updates ``fade_out_sec``. Physical row deletion happens later (the
+    frontend evaluator triggers when fade-out completes — task-161).
+
+    Spec R24/R25: when no override is active, returns ``{active: False}``
+    (no-op). When active, returns the post-update status row.
+    """
+    conn = get_db(project_dir)
+    existing = conn.execute(
+        "SELECT id FROM light_show__live_override WHERE id = 'current'"
+    ).fetchone()
+    if existing is None:
+        return {"active": False}
+    conn.execute(
+        "UPDATE light_show__live_override SET "
+        "fade_out_sec = ?, deactivation_started_at = datetime('now') "
+        "WHERE id = 'current'",
+        (float(fade_out_sec),),
+    )
+    conn.commit()
+    return get_light_show_live_override(project_dir) or {"active": False}

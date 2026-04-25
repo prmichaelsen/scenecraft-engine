@@ -62,6 +62,18 @@ from scenecraft.db import (
     upsert_light_show_screens,
     remove_light_show_screens,
     reset_light_show_screens,
+    # M19 light_show scene editor
+    list_light_show_scenes,
+    upsert_light_show_scenes,
+    remove_light_show_scenes,
+    list_light_show_placements,
+    upsert_light_show_placements,
+    remove_light_show_placements,
+    get_light_show_live_override,
+    activate_light_show_live_override,
+    deactivate_light_show_live_override,
+    BlockedByLiveError,
+    BlockedByPlacementsError,
 )
 
 # --- Job infrastructure ---------------------------------------------------
@@ -136,6 +148,18 @@ __all__ = [
     "upsert_light_show_screens",
     "remove_light_show_screens",
     "reset_light_show_screens",
+    # M19 light_show scene editor
+    "list_light_show_scenes",
+    "upsert_light_show_scenes",
+    "remove_light_show_scenes",
+    "list_light_show_placements",
+    "upsert_light_show_placements",
+    "remove_light_show_placements",
+    "get_light_show_live_override",
+    "activate_light_show_live_override",
+    "deactivate_light_show_live_override",
+    "BlockedByLiveError",
+    "BlockedByPlacementsError",
     # Plugin-scoped WS broadcast
     "broadcast_event",
 ]
