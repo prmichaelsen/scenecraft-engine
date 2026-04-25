@@ -1,0 +1,63 @@
+# Light Show Scene Editor — primitive catalog (M19).
+#
+# Shared source of truth for primitive metadata: id, label, description,
+# JSON-schema for params with locked defaults. Backend reads via
+# yaml.safe_load and serves at GET /primitives + the scenes.list_primitives
+# MCP action. Frontend mirrors entries in PRIMITIVE_REGISTRY (primitives.ts)
+# with build-time / module-init assertion that ids match.
+#
+# Catalog defaults are the FALLBACK applied at evaluator time when a
+# scene's stored params object doesn't override that key. Storage is
+# sparse — list → modify → set round-trips never promote defaults to
+# explicit overrides. Updating a default here flows forward to every
+# scene that hasn't explicitly overridden the changed key.
+#
+# Adding a primitive: add an entry here AND a matching apply() function
+# in scenecraft/src/plugins/light_show/primitives.ts. The frontend asserts
+# at module init that catalog ids match registry ids — drift surfaces
+# loudly. See clarification-14 Q5 for the locked defaults rationale.
+
+primitives:
+  - id: rotating_head
+    label: Rotating Head
+    description: |
+      Sinusoidal pan/tilt sweep with hold color + intensity.
+      Period controls cycle length; amplitude controls arc width.
+    params_schema:
+      type: object
+      properties:
+        role:
+          type: string
+          default: moving_head
+          description: Fixture role filter; undefined = all fixtures
+        period_sec:        { type: number, minimum: 0.1, default: 4.0 }
+        pan_amplitude_rad: { type: number, minimum: 0,   default: 0.7853981633974483 }
+        tilt_center_rad:   { type: number, default: -0.3 }
+        tilt_amplitude_rad: { type: number, minimum: 0,  default: 0.2 }
+        tilt_period_sec:   { type: number, minimum: 0.1, default: 4.0 }
+        intensity:         { type: number, minimum: 0, maximum: 1, default: 1.0 }
+        color:
+          type: array
+          minItems: 3
+          maxItems: 3
+          items: { type: number, minimum: 0, maximum: 1 }
+          default: [1, 1, 1]
+
+  - id: static_color
+    label: Static Color
+    description: |
+      Hold a color + intensity. No animation; use for static
+      backdrops or baseline fills.
+    params_schema:
+      type: object
+      properties:
+        role:
+          type: string
+          description: Fixture role filter; undefined = all fixtures
+        intensity: { type: number, minimum: 0, maximum: 1, default: 1.0 }
+        color:
+          type: array
+          minItems: 3
+          maxItems: 3
+          items: { type: number, minimum: 0, maximum: 1 }
+          default: [1, 1, 1]
