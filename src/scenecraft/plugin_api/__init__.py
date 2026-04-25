@@ -41,6 +41,13 @@ from scenecraft.db import (
     get_music_generations_for_entity,
     get_music_generation_tracks,
     set_pool_segment_context,
+    # M18 foley generation
+    add_foley_generation,
+    update_foley_generation_status,
+    add_foley_track,
+    get_foley_generation,
+    get_foley_generations_for_entity,
+    get_foley_generation_tracks,
     # Shared candidate-junction helper (tr-side) — needed by M16 + future plugins
     add_tr_candidate,
     # M17 light_show plugin helpers
@@ -67,8 +74,17 @@ from scenecraft.vcs.bootstrap import (
     find_root,
 )
 
+# --- Typed provider namespace (M18 task-142) ------------------------------
+# Plugins access provider-specific surfaces via ``plugin_api.providers.<name>``.
+# Each provider owns auth, HTTP, polling, backoff, spend_ledger, download,
+# and disconnect-survival. Supersedes ``call_service`` for Replicate-backed
+# plugins; ``call_service`` stays for Musicful and other providers until they
+# migrate to the typed surface.
+from scenecraft.plugin_api import providers  # noqa: E402,F401
+
 
 __all__ = [
+    "providers",
     "get_audio_clips",
     "add_pool_segment",
     "get_pool_segment",
@@ -92,6 +108,13 @@ __all__ = [
     "get_music_generation",
     "get_music_generations_for_entity",
     "get_music_generation_tracks",
+    # M18 foley generation
+    "add_foley_generation",
+    "update_foley_generation_status",
+    "add_foley_track",
+    "get_foley_generation",
+    "get_foley_generations_for_entity",
+    "get_foley_generation_tracks",
     "set_pool_segment_context",
     "add_tr_candidate",
     "record_spend",

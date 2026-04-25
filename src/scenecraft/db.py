@@ -436,6 +436,65 @@ def _ensure_schema(conn: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_gm_tracks_pool
             ON generate_music__tracks(pool_segment_id);
 
+        -- M18 foley generation: plugin-owned tables under the __ prefix
+        -- convention. Mirrors generate_music shape exactly. MVP enforces
+        -- variant_count=1 at the API boundary; schema supports N for
+        -- forward-looking multi-variant.
+        -- See agent/design/local.foley-generation-plugin.md "Schema" and
+        -- agent/clarifications/clarification-12-foley-generation-plugin.md.
+        CREATE TABLE IF NOT EXISTS generate_foley__generations (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            created_by TEXT NOT NULL DEFAULT '',
+
+            -- mode + input
+            mode TEXT NOT NULL CHECK (mode IN ('t2fx', 'v2fx')),
+            prompt TEXT,
+            duration_seconds REAL,
+            source_candidate_id TEXT,
+            source_in_seconds REAL,
+            source_out_seconds REAL,
+
+            -- model params
+            model TEXT NOT NULL,
+            negative_prompt TEXT,
+            cfg_strength REAL,
+            seed INTEGER,
+
+            -- kickoff context (auto-stamped onto pool_segments)
+            entity_type TEXT CHECK (entity_type IN ('transition') OR entity_type IS NULL),
+            entity_id TEXT,
+
+            -- forward-looking multi-variant
+            variant_count INTEGER NOT NULL DEFAULT 1,
+
+            -- execution
+            status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+            error TEXT,
+
+            started_at TEXT,
+            completed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_gf_gen_status
+            ON generate_foley__generations(status);
+        CREATE INDEX IF NOT EXISTS idx_gf_gen_entity
+            ON generate_foley__generations(entity_type, entity_id);
+        CREATE INDEX IF NOT EXISTS idx_gf_gen_created
+            ON generate_foley__generations(created_at);
+
+        CREATE TABLE IF NOT EXISTS generate_foley__tracks (
+            generation_id TEXT NOT NULL REFERENCES generate_foley__generations(id),
+            pool_segment_id TEXT NOT NULL REFERENCES pool_segments(id),
+            variant_index INTEGER NOT NULL,
+            replicate_prediction_id TEXT NOT NULL,
+            duration_seconds REAL,
+            spend_ledger_id TEXT,
+            created_by TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (generation_id, pool_segment_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_gf_tracks_pool
+            ON generate_foley__tracks(pool_segment_id);
+
         -- Transcribe plugin: one `transcribe__runs` row per completed
         -- transcription invocation, keyed by (clip_id, model, word_timestamps)
         -- so re-runs with identical inputs hit the cache. Segments live in
@@ -3283,6 +3342,162 @@ def get_music_generation_tracks(project_dir: Path, generation_id: str) -> list[d
     conn = get_db(project_dir)
     rows = conn.execute(
         "SELECT * FROM generate_music__tracks WHERE generation_id = ?",
+        (generation_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── M18 foley generation helpers ─────────────────────────────────────────
+# Mirrors the M16 music helpers. Same shape; foley-specific columns.
+
+
+def add_foley_generation(
+    project_dir: Path,
+    *,
+    generation_id: str,
+    mode: str,
+    model: str,
+    prompt: str | None = None,
+    duration_seconds: float | None = None,
+    source_candidate_id: str | None = None,
+    source_in_seconds: float | None = None,
+    source_out_seconds: float | None = None,
+    negative_prompt: str | None = None,
+    cfg_strength: float | None = None,
+    seed: int | None = None,
+    entity_type: str | None = None,
+    entity_id: str | None = None,
+    variant_count: int = 1,
+    status: str = "pending",
+    created_by: str = "plugin:generate-foley",
+) -> str:
+    """Insert a new generate_foley__generations row. Returns the id."""
+    from datetime import datetime, timezone
+    conn = get_db(project_dir)
+    conn.execute(
+        """INSERT INTO generate_foley__generations (
+            id, created_at, created_by, mode, prompt, duration_seconds,
+            source_candidate_id, source_in_seconds, source_out_seconds,
+            model, negative_prompt, cfg_strength, seed,
+            entity_type, entity_id, variant_count, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            generation_id,
+            datetime.now(timezone.utc).isoformat(),
+            created_by,
+            mode, prompt, duration_seconds,
+            source_candidate_id, source_in_seconds, source_out_seconds,
+            model, negative_prompt, cfg_strength, seed,
+            entity_type, entity_id, variant_count, status,
+        ),
+    )
+    conn.commit()
+    return generation_id
+
+
+def update_foley_generation_status(
+    project_dir: Path,
+    generation_id: str,
+    status: str,
+    *,
+    error: str | None = None,
+    started_at: str | None = None,
+    completed_at: str | None = None,
+) -> None:
+    """Update status + optional error/timestamps on a foley generation row."""
+    conn = get_db(project_dir)
+    # Build the SET list dynamically to only touch provided fields
+    fields = ["status = ?", "error = ?"]
+    params: list = [status, error]
+    if started_at is not None:
+        fields.append("started_at = ?")
+        params.append(started_at)
+    if completed_at is not None:
+        fields.append("completed_at = ?")
+        params.append(completed_at)
+    params.append(generation_id)
+    conn.execute(
+        f"UPDATE generate_foley__generations SET {', '.join(fields)} WHERE id = ?",
+        tuple(params),
+    )
+    conn.commit()
+
+
+def add_foley_track(
+    project_dir: Path,
+    *,
+    generation_id: str,
+    pool_segment_id: str,
+    variant_index: int,
+    replicate_prediction_id: str,
+    duration_seconds: float | None = None,
+    spend_ledger_id: str | None = None,
+    created_by: str = "plugin:generate-foley",
+) -> None:
+    """Insert a generate_foley__tracks junction row."""
+    conn = get_db(project_dir)
+    conn.execute(
+        """INSERT INTO generate_foley__tracks (
+            generation_id, pool_segment_id, variant_index,
+            replicate_prediction_id, duration_seconds, spend_ledger_id,
+            created_by
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (generation_id, pool_segment_id, variant_index,
+         replicate_prediction_id, duration_seconds, spend_ledger_id,
+         created_by),
+    )
+    conn.commit()
+
+
+def get_foley_generation(project_dir: Path, generation_id: str) -> dict | None:
+    conn = get_db(project_dir)
+    row = conn.execute(
+        "SELECT * FROM generate_foley__generations WHERE id = ?",
+        (generation_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_foley_generations_for_entity(
+    project_dir: Path,
+    *,
+    entity_type: str | None = None,
+    entity_id: str | None = None,
+    limit: int = 200,
+) -> list[dict]:
+    """List foley generations with their tracks joined. Filters by entity
+    when both entity_type and entity_id are provided; otherwise returns all."""
+    conn = get_db(project_dir)
+    if entity_type and entity_id:
+        gen_rows = conn.execute(
+            "SELECT * FROM generate_foley__generations WHERE entity_type = ? AND entity_id = ? ORDER BY created_at DESC LIMIT ?",
+            (entity_type, entity_id, limit),
+        ).fetchall()
+    else:
+        gen_rows = conn.execute(
+            "SELECT * FROM generate_foley__generations ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    generations = []
+    for g in gen_rows:
+        tracks = conn.execute(
+            """SELECT t.*, p.pool_path, p.duration_seconds AS pool_duration
+               FROM generate_foley__tracks t
+               JOIN pool_segments p ON p.id = t.pool_segment_id
+               WHERE t.generation_id = ?
+               ORDER BY t.variant_index ASC""",
+            (g["id"],),
+        ).fetchall()
+        gd = dict(g)
+        gd["tracks"] = [dict(t) for t in tracks]
+        generations.append(gd)
+    return generations
+
+
+def get_foley_generation_tracks(project_dir: Path, generation_id: str) -> list[dict]:
+    conn = get_db(project_dir)
+    rows = conn.execute(
+        "SELECT * FROM generate_foley__tracks WHERE generation_id = ? ORDER BY variant_index ASC",
         (generation_id,),
     ).fetchall()
     return [dict(r) for r in rows]
