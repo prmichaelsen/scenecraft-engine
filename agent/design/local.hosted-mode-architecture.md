@@ -46,6 +46,21 @@ The instance admin is *both* a platform user (for billing/lifecycle) and the hig
 
 Trust boundary: admin has root on the instance and can modify engine code. The platform makes no attempt to defend any data from the admin within their own instance. The platform defends external attackers, defends platform users from other platform users (instance isolation), and provides admins with tooling to defend instance users from other instance users.
 
+### Reconciliation with the platform side (no identity federation)
+
+The platform (scenecraft.online) uses Firebase Auth for its own login. **The engine never sees Firebase tokens, never calls Firebase, and has never heard of Firebase.** The two credential domains are deliberately unfederated:
+
+| Where you log in | Identity store | Token format |
+|---|---|---|
+| `scenecraft.online` (platform UI: signup, billing, dashboard) | Firebase Auth (platform DB) | Firebase ID token → `__session` cookie |
+| `<tenant>.scenecraft.online` (the product UI) | engine's `server.db.users` (argon2id) | HS256 JWT signed with `SCENECRAFT_JWT_SECRET` |
+
+The admin happens to be the same person in both stores, but they have **two separate credentials** — they log into scenecraft.online with their Firebase account, and they log into their instance with the argon2id username/password chosen at signup. Browsers never carry one across origins to the other. Engine never validates Firebase tokens. Platform never issues instance JWTs.
+
+The only coupling between platform and engine is a **per-instance bearer token** issued at provision time (D1 column `instances.bearer_token`, written into `engine.env` as `SCENECRAFT_PLATFORM_BEARER_TOKEN`). It is a machine-to-machine credential, used only by the engine's outbound calls back to scenecraft.online (heartbeat, usage events, BYOP state). It never crosses a browser, never authenticates a user, and never has anything to do with Firebase.
+
+If you find yourself writing code in this repo that involves Firebase, JWK fetching, ID-token forwarding, or membership lookups against scenecraft.online, **stop** — you are reinventing the discarded federation model. The runtime composition is canonically specified in `../scenecraft.online/agent/design/local.per-instance-architecture.md`; consult that doc when uncertain.
+
 ### Cost attribution model
 
 All upstream generation costs (Anthropic, Google, Runway, Replicate, Musicful, Vast.ai) are charged to the **admin only**. Per-instance-user data is recorded in `server.db` for auditing and to feed admin-built quota/budget tooling — it is not billing data.
@@ -213,7 +228,7 @@ Self-hosted (current instance, future self-hosters): admin sets `SCENECRAFT_BOOT
 - **Proxy is a SPOF for hosted instances.** If `api.scenecraft.online` is down, no hosted instance can generate. Mitigation: proxy is small, stateless, deployable to multiple regions; SLO needs to match Cloudflare Tunnel's.
 - **Streaming proxying is non-trivial.** SSE pass-through requires care (no buffering, correct chunked transfer, timeout handling). One-time engineering cost; standard libraries (FastAPI `StreamingResponse`, hono streaming, Cloudflare Workers) handle it.
 - **Bandwidth costs at the proxy.** Replicate stem-splitter and Runway video can move large payloads. Mitigation: presigned URL pattern — proxy returns a short-lived URL the instance uploads directly to provider, bypassing the proxy for the byte-heavy step. Or carve those calls out of proxy mode entirely.
-- **Two JWT issuers in Phase 1.** Platform JWT and instance JWT are independent; the cross-issuance flow at provision time has to be implemented carefully (platform-signed token used once to bootstrap, then discarded).
+- **No JWT cross-issuance — bootstrap is by env-var injection.** The earlier draft floated a "platform-signed token used once to bootstrap" pattern; that was discarded. Provisioning writes `SCENECRAFT_BOOTSTRAP_ADMIN_USERNAME` / `_PASSWORD` directly into `engine.env`, engine consumes them on first boot, then ignores them. Engine issues its own JWTs against its own users table only — the platform JWT (Firebase) is never accepted by the engine.
 - **Per-user quota enforcement is admin's problem, not platform's.** If an admin's user runs up the bill, the platform charges the admin, not the user. Admin needs UI to set/monitor quotas. Initial version can be CLI-only; full UI is post-launch.
 
 ---
@@ -337,4 +352,6 @@ Self-hosters need only step 1 (set passwords for their users). Steps 2-9 of Phas
 
 **Status**: Proposal — Phase 0 ready to implement, Phase 1 deferred until first hosted customer.
 **Recommendation**: Implement Phase 0 (interim auth + CORS allowlist) before sharing this instance with anyone else. Defer Phase 1 work until a paying customer triggers the need.
-**Related Documents**: agent/design/local.beatlab-server.md (existing engine architecture)
+**Related Documents**:
+- `agent/design/local.beatlab-server.md` — existing engine architecture
+- `../scenecraft.online/agent/design/local.per-instance-architecture.md` — canonical cross-repo runtime topology + per-repo responsibilities (private). Authoritative for the platform/engine boundary; this doc is engine-internal.
