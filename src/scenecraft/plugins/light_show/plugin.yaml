@@ -51,6 +51,27 @@ contributes:
                 rotation_x: { type: number }
                 rotation_y: { type: number }
                 rotation_z: { type: number }
+                # DMX patch (optional). Null/omitted = auto-patcher fills
+                # the address into the next available gap. Pass an integer
+                # to pin the fixture to a specific address; pass null
+                # explicitly to clear an existing pin back to auto-patch.
+                dmx_universe:
+                  type: ["integer", "null"]
+                  minimum: 1
+                  description: 1-based universe number (default 1 if address set).
+                dmx_address:
+                  type: ["integer", "null"]
+                  minimum: 1
+                  maximum: 512
+                  description: 1-based DMX start address. Null = auto-patch.
+                dmx_channel_count:
+                  type: ["integer", "null"]
+                  minimum: 1
+                  maximum: 512
+                  description: |
+                    Override role-default channel count (6 for moving_head,
+                    4 for par). Use for non-default fixture modes (e.g.
+                    16-channel mover with fine pan/tilt + color wheel + gobo).
 
     - id: list_fixtures
       description: |

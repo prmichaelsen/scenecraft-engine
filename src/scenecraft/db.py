@@ -550,11 +550,21 @@ def _ensure_schema(conn: sqlite3.Connection):
             rotation_x REAL NOT NULL DEFAULT 0,
             rotation_y REAL NOT NULL DEFAULT 0,
             rotation_z REAL NOT NULL DEFAULT 0,
+            -- DMX patch (nullable; auto-patcher fills gaps when null).
+            -- ``dmx_address`` is 1-based start address of the fixture's
+            -- channel block in its universe. ``dmx_channel_count`` overrides
+            -- the role-default channel count (6 for moving_head, 4 for par)
+            -- when a fixture is in a non-default mode (e.g. 16-channel mover).
+            dmx_universe INTEGER,
+            dmx_address INTEGER,
+            dmx_channel_count INTEGER,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_light_show_fixtures_role
             ON light_show__fixtures(role);
+        CREATE INDEX IF NOT EXISTS idx_light_show_fixtures_dmx
+            ON light_show__fixtures(dmx_universe, dmx_address);
 
         -- Per-fixture manual channel overrides. NULL column = that channel is
         -- NOT overridden (scene-driven); non-NULL = the value the shader uses
@@ -1084,6 +1094,19 @@ def _ensure_schema(conn: sqlite3.Connection):
             CREATE INDEX IF NOT EXISTS track_effects_track_order
                 ON track_effects(track_id, order_index);
         """)
+
+    # ── Migration: add dmx_* patch columns to light_show__fixtures ──
+    ls_cols = {row[1] for row in conn.execute("PRAGMA table_info(light_show__fixtures)").fetchall()}
+    if "dmx_universe" not in ls_cols:
+        conn.execute("ALTER TABLE light_show__fixtures ADD COLUMN dmx_universe INTEGER")
+    if "dmx_address" not in ls_cols:
+        conn.execute("ALTER TABLE light_show__fixtures ADD COLUMN dmx_address INTEGER")
+    if "dmx_channel_count" not in ls_cols:
+        conn.execute("ALTER TABLE light_show__fixtures ADD COLUMN dmx_channel_count INTEGER")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_light_show_fixtures_dmx "
+        "ON light_show__fixtures(dmx_universe, dmx_address)"
+    )
 
     # ── Undo triggers (AFTER all migrations so PRAGMA table_info sees all columns) ──
     _undo_tracked_tables = ["keyframes", "transitions", "suppressions", "effects", "tracks", "transition_effects", "markers", "audio_tracks", "audio_clips", "audio_isolations", "track_effects", "effect_curves", "project_send_buses", "project_frequency_labels"]
@@ -4047,20 +4070,23 @@ _LIGHT_SHOW_DEFAULT_RIG: list[dict] = [
 ]
 
 
+_FIXTURE_SELECT = (
+    "SELECT id, role, label, position_x, position_y, position_z, "
+    "rotation_x, rotation_y, rotation_z, "
+    "dmx_universe, dmx_address, dmx_channel_count "
+    "FROM light_show__fixtures"
+)
+
+
 def list_light_show_fixtures(project_dir: Path) -> list[dict]:
     """List all fixtures in the project's rig, seeding the default rig on
-    first access so every project has a working starting point."""
+    first access so every project has a working starting point. dmx_*
+    fields are nullable — null means 'auto-patch fills the gap'."""
     conn = get_db(project_dir)
-    rows = conn.execute(
-        "SELECT id, role, label, position_x, position_y, position_z, "
-        "rotation_x, rotation_y, rotation_z FROM light_show__fixtures"
-    ).fetchall()
+    rows = conn.execute(_FIXTURE_SELECT).fetchall()
     if not rows:
         seed_light_show_default_rig(project_dir)
-        rows = conn.execute(
-            "SELECT id, role, label, position_x, position_y, position_z, "
-            "rotation_x, rotation_y, rotation_z FROM light_show__fixtures"
-        ).fetchall()
+        rows = conn.execute(_FIXTURE_SELECT).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -4091,6 +4117,12 @@ def upsert_light_show_fixtures(project_dir: Path, fixtures: list[dict]) -> list[
     against existing row (or default zero/empty for new rows).
     """
     conn = get_db(project_dir)
+
+    def _coerce_int_or_none(v):
+        if v is None:
+            return None
+        return int(v)
+
     for f in fixtures:
         if "id" not in f or not f["id"]:
             raise ValueError("upsert_light_show_fixtures: each fixture must have an id")
@@ -4098,11 +4130,15 @@ def upsert_light_show_fixtures(project_dir: Path, fixtures: list[dict]) -> list[
         # Read existing row for partial-state merge.
         existing = conn.execute(
             "SELECT role, label, position_x, position_y, position_z, "
-            "rotation_x, rotation_y, rotation_z FROM light_show__fixtures WHERE id = ?",
+            "rotation_x, rotation_y, rotation_z, "
+            "dmx_universe, dmx_address, dmx_channel_count "
+            "FROM light_show__fixtures WHERE id = ?",
             (fid,),
         ).fetchone()
         if existing is None:
             # New fixture — default zero/empty for any unspecified field.
+            # dmx_* default to NULL (auto-patcher will fill) unless caller
+            # specifies them.
             row = {
                 "id": fid,
                 "role": f.get("role", "par"),
@@ -4113,17 +4149,24 @@ def upsert_light_show_fixtures(project_dir: Path, fixtures: list[dict]) -> list[
                 "rotation_x": float(f.get("rotation_x", 0)),
                 "rotation_y": float(f.get("rotation_y", 0)),
                 "rotation_z": float(f.get("rotation_z", 0)),
+                "dmx_universe": _coerce_int_or_none(f.get("dmx_universe")),
+                "dmx_address": _coerce_int_or_none(f.get("dmx_address")),
+                "dmx_channel_count": _coerce_int_or_none(f.get("dmx_channel_count")),
             }
             conn.execute(
                 "INSERT INTO light_show__fixtures "
                 "(id, role, label, position_x, position_y, position_z, "
-                " rotation_x, rotation_y, rotation_z) "
+                " rotation_x, rotation_y, rotation_z, "
+                " dmx_universe, dmx_address, dmx_channel_count) "
                 "VALUES (:id, :role, :label, :position_x, :position_y, :position_z, "
-                "        :rotation_x, :rotation_y, :rotation_z)",
+                "        :rotation_x, :rotation_y, :rotation_z, "
+                "        :dmx_universe, :dmx_address, :dmx_channel_count)",
                 row,
             )
         else:
-            # Existing — merge partial fields.
+            # Existing — merge partial fields. ``in`` (rather than ``get``)
+            # for dmx_* so callers can explicitly clear back to null by
+            # passing ``None``; omitting the key preserves current value.
             existing_d = dict(existing)
             row = {
                 "id": fid,
@@ -4135,12 +4178,17 @@ def upsert_light_show_fixtures(project_dir: Path, fixtures: list[dict]) -> list[
                 "rotation_x": float(f.get("rotation_x", existing_d["rotation_x"])),
                 "rotation_y": float(f.get("rotation_y", existing_d["rotation_y"])),
                 "rotation_z": float(f.get("rotation_z", existing_d["rotation_z"])),
+                "dmx_universe": _coerce_int_or_none(f["dmx_universe"]) if "dmx_universe" in f else existing_d["dmx_universe"],
+                "dmx_address": _coerce_int_or_none(f["dmx_address"]) if "dmx_address" in f else existing_d["dmx_address"],
+                "dmx_channel_count": _coerce_int_or_none(f["dmx_channel_count"]) if "dmx_channel_count" in f else existing_d["dmx_channel_count"],
             }
             conn.execute(
                 "UPDATE light_show__fixtures SET "
                 "role=:role, label=:label, "
                 "position_x=:position_x, position_y=:position_y, position_z=:position_z, "
                 "rotation_x=:rotation_x, rotation_y=:rotation_y, rotation_z=:rotation_z, "
+                "dmx_universe=:dmx_universe, dmx_address=:dmx_address, "
+                "dmx_channel_count=:dmx_channel_count, "
                 "updated_at=datetime('now') "
                 "WHERE id=:id",
                 row,
