@@ -781,6 +781,23 @@ def make_handler(work_dir: Path, no_auth: bool = False):
 
         def _do_POST(self, path):
 
+            # POST /api/_internal/broadcast — local IPC for satellite processes
+            # (out-of-process MCP server, future workers) that need to push WS
+            # events through this engine's job_manager. Body is the pre-formed
+            # message: ``{"type": "...", "projectName": "...", ...}``. Bound to
+            # localhost in normal deployments — no auth on top.
+            if path == "/api/_internal/broadcast":
+                body = self._read_json_body()
+                if body is None: return
+                if not isinstance(body, dict) or not isinstance(body.get("type"), str):
+                    return self._error(400, "BAD_REQUEST", "missing 'type'")
+                try:
+                    from scenecraft.ws_server import job_manager
+                    job_manager._broadcast(body)
+                except Exception as e:
+                    return self._error(500, "INTERNAL_ERROR", str(e))
+                return self._json_response({"ok": True})
+
             # POST /api/config
             if path == "/api/config":
                 body = self._read_json_body()

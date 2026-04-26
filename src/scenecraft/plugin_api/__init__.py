@@ -184,14 +184,39 @@ def broadcast_event(
     included at top level when provided so clients can filter cheaply;
     arbitrary additional context goes in ``payload``.
 
-    Best-effort: if the WS infrastructure is unreachable, the broadcast
-    is silently dropped. Never fails the enclosing mutation.
+    Cross-process: when ``SCENECRAFT_REMOTE_BROADCAST_URL`` is set (e.g.
+    by the out-of-process MCP server), the event is forwarded to the
+    engine's ``POST /api/_internal/broadcast`` endpoint instead of going
+    direct to ``job_manager`` — which only has clients attached in the
+    engine process. The engine's in-process callers leave the env var
+    unset and pay zero overhead.
+
+    Best-effort: if the WS infrastructure / engine is unreachable, the
+    broadcast is silently dropped. Never fails the enclosing mutation.
     """
     msg: dict = {"type": f"{plugin_id}__{event_type}"}
     if project_name is not None:
         msg["projectName"] = project_name
     if payload:
         msg.update(payload)
+
+    import os as _os
+    remote = _os.environ.get("SCENECRAFT_REMOTE_BROADCAST_URL")
+    if remote:
+        try:
+            import urllib.request
+            import json as _json
+            req = urllib.request.Request(
+                f"{remote.rstrip('/')}/api/_internal/broadcast",
+                data=_json.dumps(msg).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=2.0).close()
+        except Exception:
+            pass
+        return
+
     try:
         from scenecraft.ws_server import job_manager
         job_manager._broadcast(msg)
