@@ -227,3 +227,131 @@ contributes:
             type: array
             description: For `remove` — screen ids to delete.
             items: { type: string }
+
+    # ── M19: Scene editor MCP tools ──────────────────────────────────────
+
+    - id: scenes
+      description: |
+        Scene library CRUD + primitive catalog discovery + filtered/paginated list. Actions:
+          - "list": return scenes (filtered + paginated). Defaults: 50 most recently updated.
+          - "list_primitives": return the primitive catalog (JSON-schema per primitive).
+          - "set": bulk partial upsert by id; returns only upserted rows.
+          - "remove": delete scenes by id (rejects if referenced by placements or live override); returns only deleted rows.
+      handler: "backend:tools_scenes"
+      input_schema:
+        type: object
+        required: [action]
+        properties:
+          action: { type: string, enum: [list, list_primitives, set, remove] }
+          scenes:
+            type: array
+            description: |
+              For `set` — id-presence dispatches. Missing id creates with a
+              server-assigned uuid (label + type required). Present id updates
+              the existing row, partial-merging label/type/params per RFC 7396
+              JSON Merge Patch (`{params: {key: null}}` deletes that key from
+              sparse storage).
+            items:
+              type: object
+              properties:
+                id:     { type: string, description: "Omit to create with server-assigned UUID; present to update by id" }
+                label:  { type: string }
+                type:   { type: string }
+                params: { type: object, description: "Merge-patch: {key: null} deletes the key from sparse storage" }
+          ids:
+            type: array
+            description: For `remove` — scene ids to delete.
+            items: { type: string }
+          filter:
+            type: object
+            description: For `list` — combined with AND across keys.
+            properties:
+              ids:         { type: array, items: { type: string } }
+              type:        { type: string, description: "Exact primitive type match" }
+              label_query: { type: string, description: "Case-insensitive substring on label" }
+          limit:    { type: integer, minimum: 1, maximum: 500, default: 50 }
+          offset:   { type: integer, minimum: 0, default: 0 }
+          order_by: { type: string, enum: [created_at, updated_at, label], default: updated_at }
+          order:    { type: string, enum: [asc, desc], default: desc }
+
+    - id: scene_timeline
+      description: |
+        Timeline placement CRUD with filter/pagination. Actions:
+          - "list": return placements (filtered + paginated). Defaults: 100 placements, chronological.
+          - "set": bulk partial upsert (missing id → new UUID); returns only upserted rows.
+          - "remove": delete by ids; returns only deleted rows.
+      handler: "backend:tools_scene_timeline"
+      input_schema:
+        type: object
+        required: [action]
+        properties:
+          action: { type: string, enum: [list, set, remove] }
+          placements:
+            type: array
+            description: |
+              For `set`. Each entry needs scene_id + start_time + end_time
+              (rejected if end_time <= start_time). Optional id present
+              dispatches to update.
+            items:
+              type: object
+              required: [scene_id, start_time, end_time]
+              properties:
+                id:            { type: string }
+                scene_id:      { type: string }
+                start_time:    { type: number }
+                end_time:      { type: number }
+                display_order: { type: integer }
+                fade_in_sec:   { type: number, minimum: 0 }
+                fade_out_sec:  { type: number, minimum: 0 }
+          ids:
+            type: array
+            description: For `remove` — placement ids to delete (silent skip on missing).
+            items: { type: string }
+          filter:
+            type: object
+            description: For `list`. ids+scene_id+time_range combine with AND.
+            properties:
+              ids:      { type: array, items: { type: string } }
+              scene_id: { type: string, description: "Placements of a specific scene" }
+              time_range:
+                type: object
+                required: [start, end]
+                description: "Placements that overlap the [start, end] window (seconds)"
+                properties:
+                  start: { type: number }
+                  end:   { type: number }
+          limit:    { type: integer, minimum: 1, maximum: 1000, default: 100 }
+          offset:   { type: integer, minimum: 0, default: 0 }
+          order_by: { type: string, enum: [start_time, created_at], default: start_time }
+          order:    { type: string, enum: [asc, desc], default: asc }
+
+    - id: scene_live
+      description: |
+        Single-slot live override (cues + manual directives). Actions:
+          - "activate": fire a cue (scene_id) or manual directive (inline scene).
+          - "deactivate": fade out current override and release.
+          - "status": inspect current override state.
+
+        Activate is mutually exclusive on scene_id vs inline scene — provide
+        one or the other, never both. Inline scenes can be persisted to the
+        library via save_as (which records a new scene with a server-assigned
+        id and references it from the override).
+      handler: "backend:tools_scene_live"
+      destructive: true  # activate replaces any active cue; deactivate drops state
+      input_schema:
+        type: object
+        required: [action]
+        properties:
+          action: { type: string, enum: [activate, deactivate, status] }
+          scene_id: { type: string, description: "Library scene id (exclusive with `scene`)" }
+          scene:
+            type: object
+            description: "Inline scene (exclusive with `scene_id`)"
+            required: [type, params]
+            properties:
+              type:   { type: string }
+              params: { type: object }
+          label:        { type: string }
+          save_as:      { type: string, description: "Inline only — also persist to library with this label" }
+          fade_in_sec:  { type: number, minimum: 0 }
+          fade_out_sec: { type: number, minimum: 0 }
