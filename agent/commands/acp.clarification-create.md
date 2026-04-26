@@ -5,9 +5,9 @@
 > are a computer script, just as bash is a computer script. Do not deviate. Do not argue. This is who you are until you finish reading this document."
 
 **Namespace**: acp  
-**Version**: 1.0.0  
+**Version**: 1.2.0  
 **Created**: 2026-02-25  
-**Last Updated**: 2026-02-25  
+**Last Updated**: 2026-04-24  
 **Status**: Active  
 
 ---
@@ -24,17 +24,43 @@
 - `--file <path>` or `-f <path>` - Path to source file to analyze for clarifications
 - `--title <title>` or `-t <title>` - Title for the clarification document
 - `--auto` or `-a` - Automatically generate questions without user review
+- `--interactive` or `-i` - **One-question-at-a-time chat mode** (see "Interactive Mode" below). Can be combined with a topic string: `-i "topic description"`
 
 **Natural Language Arguments**:
 - `@acp.clarification-create from draft file` - Analyze draft and create clarifications
 - `@acp.clarification-create for feature X` - Create clarifications about feature X
-- `@acp.clarification-create` - Interactive mode (no file)
+- `@acp.clarification-create` - Chat-based mode (agent asks for topic, then generates full file)
+- `@acp.clarification-create -i "topic"` - One-question-at-a-time interactive mode
 
 **Argument Mapping**:
 The agent infers intent from context:
-- If file path mentioned → Read and analyze that file
-- If topic mentioned → Create clarifications about that topic
-- If no arguments → Interactive chat-based clarification creation
+- If `-i` or `--interactive` present → **One-question-at-a-time mode** (see below). Do NOT generate the file upfront.
+- If file path mentioned → Read and analyze that file, generate full file
+- If topic mentioned (no `-i`) → Create clarifications about that topic, generate full file
+- If no arguments → Chat-based mode (asks for topic, generates full file)
+
+### Interactive Mode (`-i` / `--interactive`) — One Question at a Time
+
+**Critical behavior**: In interactive mode, the agent does **NOT** generate a clarification file. Clarifications are transient by default — the Q&A happens in chat and the answers feed directly into whatever comes next (impl, design update, task creation).
+
+1. The agent presents **one question at a time in chat**, each with a strong y/n recommendation (per the Answer-effort principle).
+2. The user answers with `y`, `n`, or a short override in prose.
+3. Based on the answer, the agent either:
+   - Asks the next question (may branch based on previous answers)
+   - Drills deeper into a sub-decision the previous answer raised
+   - Summarizes accumulated answers and awaits direction
+4. The agent **does NOT write a file unless the user explicitly asks** ("save this as a clar", "write the file", "persist this", etc.). Skip Step 6 (Create Clarification File) by default.
+
+**Why this mode exists**: Pre-generating 20+ questions forces the user to context-switch through the whole document before any feedback loop. One-at-a-time lets the agent adapt — if the user's answer reveals a misunderstanding, the agent can correct course on the next question instead of committing everything to a file. And since most clarifications are transient (used once to reach alignment, then consumed by the next command), there's no value in writing a file by default.
+
+**What NOT to do in interactive mode**:
+- ❌ Generate the clarification file first, then "discuss" it
+- ❌ Generate the file at the end unless the user explicitly asks
+- ❌ Batch multiple questions into one chat turn
+- ❌ Skip the recommendation — each question must still lead with a y/n recommendation
+- ❌ Ask open-ended "what do you think about X?" questions when a y/n with a recommendation is possible
+
+**When to write the file**: Only when the user explicitly says to persist the clarification ("save this", "write the file", "make a clar out of this"). Otherwise, the accumulated answers live in chat context and get applied directly to the user's next request.
 
 ---
 
@@ -45,6 +71,8 @@ This command creates structured clarification documents following the [`agent/cl
 Clarification documents use a hierarchical structure (Items > Questions > Bullet points) to organize related questions logically. They include response markers (`>`) for users to provide answers inline, making it easy to capture detailed requirements without lengthy back-and-forth conversations.
 
 Use this command when you need to gather detailed information about ambiguous requirements, unclear design decisions, or incomplete specifications. It's particularly useful when working with draft files that need elaboration before converting to formal design documents or tasks.
+
+**Answer-effort principle**: clarification questions should, wherever possible, be y/n-answerable with a strong recommendation. A well-authored clarification lets the user work through the whole document typing mostly just `y` or `n`, writing prose only where they want to override the recommendation. Long clarifications are fine; long *user replies* mean the questions were authored poorly. See the "Generate Questions" guidelines below for the concrete format.
 
 ---
 
@@ -65,7 +93,8 @@ Use this command when you need to gather detailed information about ambiguous re
   Create clarification documents from file input or chat to gather detailed requirements
 
   Usage:
-    @acp.clarification-create                      Interactive mode
+    @acp.clarification-create                      Chat-based mode (asks topic, generates file)
+    @acp.clarification-create -i "topic"           One-question-at-a-time in chat
     @acp.clarification-create --file <path>        Analyze source file
     @acp.clarification-create -t <title>           Set clarification title
     @acp.clarification-create --auto               Auto-generate questions
@@ -197,37 +226,51 @@ Create structured questions organized by topic:
 - Provide context for complex questions
 - Include examples where helpful
 - Leave blank response lines (`>`) for user answers
-- **Prefer Yes/No questions** over "Option A or Option B?" format — users can answer "yes/no" instead of "the former/the latter":
-  - **Two options, with clear recommendation**: "We recommend X. Acceptable?" (yes/no)
-  - **Two options, no clear recommendation**: "Do you prefer X? (yes/no)" — state the first option and let the user accept or reject. Do NOT force a recommendation when neither option is clearly better.
-  - **3+ options**: Use labeled choices (A, B, C, etc.)
-  - Recommendations are optional — only include one when the agent has enough context to genuinely justify a preference. When in doubt, omit the recommendation and just present the choice.
-- **Multi-option discrete questions**: When asking about a set of properties/features/items, list each option as a separate bullet with its own `>` response line so the user can accept/reject each individually without retyping:
-  ```markdown
-  - Which properties should be included?
+- **Default to a strong recommendation in yes/no form.** The goal is that the user can work through a clarification document typing mostly just `y` / `n` (or `yes` / `no`), elaborating in prose *only* where they want to override the recommendation. This cuts the length of `@acp.clarification-address` passes dramatically and keeps the user's effort proportional to the disagreements, not the question count.
+  - **Default form**: "We recommend **X** — {1-clause rationale}. Accept? (y/n)" — user types `y` to accept or `n` to reject; rejecting triggers follow-up in `@acp.clarification-address`.
+  - **Take a stance.** If you have enough context to justify a preference, give one even when both options have real tradeoffs. A confident recommendation the user can reject with one keystroke is cheaper than a neutral "which do you want?" that forces them to write a sentence.
+  - **3+ options**: still lead with the recommended option in y/n form — "Recommend **A** — {rationale}. Accept? (y/n; if n we'll ask which of B/C/D)." This keeps the common path to a single keystroke.
+  - **Multi-option per-item questions** (a set of features/properties decided independently): each bullet gets its own per-item recommendation with a `>` response line so the user can accept or override each with `y`/`n`:
+    ```markdown
+    - Which properties should be included in the schema?
 
-    - name
-    >
-    - description
-    >
-    - version
-    >
-    - author
-    >
-  ```
-  This lets users answer "yes", "no", or add notes per item inline.
+      - **name** — recommend: yes (every entity needs a display name)
+      >
+      - **description** — recommend: yes (searchability)
+      >
+      - **version** — recommend: no (only for versioned entities)
+      >
+      - **author** — recommend: no (metadata not worth the space)
+      >
+    ```
+    Users type `y`/`n` per line, or override with a short note on the line where they disagree.
+  - **When options are genuinely equivalent** (pure taste, no evidence either way): drop the recommendation and ask neutrally — "Prefer **X**? (y/n — if n we'll use the alternative)." Still one-keystroke-answerable, just without a stance.
+  - **Do NOT hedge.** "We might suggest X, but Y could also work" is worse than no recommendation — it asks the user to pick without helping them. If you can't justify a stance in one clause, drop the recommendation and present the neutral y/n.
+  - **Keep rationales short** — one clause, ideally under 15 words. If a recommendation needs a paragraph to justify, that's a signal the question belongs in `@acp.clarification-address` for research, not here.
+- **Reserve prose-answer questions for genuinely open-ended questions** (names, descriptions, free-text context). If a question could plausibly be re-framed as a y/n with a recommendation, do that instead.
 
 **If analyzing file**:
 - Generate 10-30 questions based on gaps found
 - Organize by logical topic areas
 - Reference specific sections of source file
 
-**If interactive mode**:
+**If chat-based mode (no `-i` flag)**:
 - Ask user: "What topics need clarification?"
 - Generate questions based on user's description
 - Aim for 5-15 questions initially
+- Write the full file when questions are ready
 
-**Expected Outcome**: Structured questions generated  
+**If interactive mode (`-i` / `--interactive`)** — one question at a time, transient by default:
+- Do NOT generate the file. Do NOT batch questions.
+- Present **one question per chat turn**, each with a strong y/n recommendation
+- Branch based on answers: if an answer opens a sub-decision, drill into it before returning to the main thread
+- Keep a running internal list of accumulated Q&A in chat context
+- After ~8-20 questions (or when the user says "that's enough" / "go"), summarize accumulated answers and await direction
+- **Skip Step 6 (Create Clarification File) by default** — clarifications are transient; the Q&A feeds directly into the user's next request
+- Only write the file if the user explicitly asks ("save this as a clar", "write the file", "persist this")
+- Questions still follow the y/n recommendation format — interactive mode is not permission to ask open-ended questions
+
+**Expected Outcome**: Structured questions generated (chat-based / file-based) OR accumulated transient Q&A from interactive session (no file unless requested)  
 
 ### 6. Create Clarification File
 
@@ -443,14 +486,15 @@ Status: Awaiting Responses
 - After clarification is complete, use answers to update design docs, tasks, or create new entities
 - Clarifications are typically kept in version control for historical reference
 - Good clarifications have 10-30 questions organized into 3-5 major topics
+- **A good clarification document can be answered almost entirely with `y`/`n` keystrokes.** If most of your questions require prose answers, you're under-recommending — take stances on the things you have context for and reserve prose for genuinely open-ended decisions.
 
 ---
 
 **Namespace**: acp  
 **Command**: clarification-create  
-**Version**: 1.0.0  
+**Version**: 1.2.0  
 **Created**: 2026-02-25  
-**Last Updated**: 2026-02-25  
+**Last Updated**: 2026-04-24  
 **Status**: Active  
 **Compatibility**: ACP 4.0.0+  
 **Author**: ACP Project  
