@@ -30,6 +30,13 @@ primitives:
           type: string
           default: moving_head
           description: Fixture role filter; undefined = all fixtures
+        fixtures:
+          type: array
+          items: { type: string }
+          description: |
+            Fixture id allow-list. If present, only these fixtures are
+            affected (intersected with role if both are set). undefined
+            = no id filter.
         period_sec:        { type: number, minimum: 0.1, default: 4.0 }
         pan_amplitude_rad: { type: number, minimum: 0,   default: 0.7853981633974483 }
         tilt_center_rad:   { type: number, default: -0.3 }
@@ -54,6 +61,13 @@ primitives:
         role:
           type: string
           description: Fixture role filter; undefined = all fixtures
+        fixtures:
+          type: array
+          items: { type: string }
+          description: |
+            Fixture id allow-list. If present, only these fixtures are
+            affected (intersected with role if both are set). undefined
+            = no id filter.
         intensity: { type: number, minimum: 0, maximum: 1, default: 1.0 }
         color:
           type: array
@@ -61,3 +75,27 @@ primitives:
           maxItems: 3
           items: { type: number, minimum: 0, maximum: 1 }
           default: [1, 1, 1]
+
+  - id: composite
+    label: Composite
+    description: |
+      Dispatch to multiple sub-primitives in order. Each layer is
+      ``{type, params}`` and runs as its own primitive against the same
+      SceneContext. Layers run sequentially; later layers can overwrite
+      fixture state set by earlier ones (use disjoint fixtures/role
+      filters to avoid stomping). No fade or blending — for that, use
+      separate placements with their own fade envelopes. Bindings inside
+      sub-layer params resolve against the same context as the top
+      level.
+    params_schema:
+      type: object
+      properties:
+        layers:
+          type: array
+          description: Ordered list of sub-primitive invocations.
+          items:
+            type: object
+            properties:
+              type:   { type: string, description: Primitive id from this catalog. }
+              params: { type: object, description: Sparse params for the sub-primitive. }
+            required: [type]
