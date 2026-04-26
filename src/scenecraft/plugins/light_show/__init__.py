@@ -30,6 +30,10 @@ __all__ = [
     "tools_list_overrides",
     "tools_clear_overrides",
     "tools_screens",
+    # M19 scene editor tools
+    "tools_scenes",
+    "tools_scene_timeline",
+    "tools_scene_live",
 ]
 
 
@@ -197,3 +201,258 @@ def tools_screens(args, tool_context) -> dict:
         _notify(project_name, "screens")
         return {"screens": rows}
     return {"error": f"unknown action {action!r}; expected one of list/set/remove/reset"}
+
+
+# ── M19: Scene editor MCP tool handlers ──────────────────────────────────
+
+
+_VALID_SCENES_ORDER_BY = {"updated_at", "created_at", "label"}
+_VALID_PLACEMENTS_ORDER_BY = {"start_time", "created_at"}
+_VALID_ORDER = {"asc", "desc"}
+
+
+def _scenes_list_args(args: dict) -> dict:
+    """Coerce + validate list arguments from the action payload. Returns a
+    kwargs dict ready for plugin_api.list_light_show_scenes, or raises
+    ValueError on invalid enum / out-of-range pagination."""
+    f = args.get("filter") or {}
+    if not isinstance(f, dict):
+        raise ValueError("filter must be an object")
+    ids = f.get("ids")
+    if ids is not None and not isinstance(ids, list):
+        raise ValueError("filter.ids must be a list of strings")
+
+    order_by = args.get("order_by", "updated_at")
+    order = args.get("order", "desc")
+    if order_by not in _VALID_SCENES_ORDER_BY:
+        raise ValueError(f"order_by must be one of {sorted(_VALID_SCENES_ORDER_BY)}")
+    if order not in _VALID_ORDER:
+        raise ValueError(f"order must be one of {sorted(_VALID_ORDER)}")
+
+    limit = args.get("limit", 50)
+    try:
+        limit = max(0, min(int(limit), 500))
+    except (TypeError, ValueError):
+        raise ValueError("limit must be a non-negative integer")
+    offset = args.get("offset", 0)
+    try:
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        raise ValueError("offset must be a non-negative integer")
+
+    return {
+        "ids": ids or None,
+        "type_filter": f.get("type"),
+        "label_query": f.get("label_query"),
+        "limit": limit,
+        "offset": offset,
+        "order_by": order_by,
+        "order": order,
+    }
+
+
+def tools_scenes(args, tool_context) -> dict:
+    """Action-dispatched MCP tool for the scene library.
+
+    Actions per spec:
+      - ``list``                — paginated/filtered query over scenes
+      - ``list_primitives``     — return parsed primitives_catalog.yaml verbatim
+      - ``set``                 — bulk upsert with id-presence dispatch
+                                  (RFC 7396 JSON Merge Patch on params)
+      - ``remove``              — atomic batch delete with reference-blocking
+
+    Mutating actions (``set``, ``remove``) emit a ``light_show__changed`` WS
+    event with ``kind: "scenes"``.
+    """
+    from scenecraft import plugin_api
+    from scenecraft.plugins.light_show.routes import _load_catalog
+    project_dir, project_name = _ctx(tool_context)
+    action = args.get("action")
+
+    if action == "list":
+        try:
+            kwargs = _scenes_list_args(args)
+        except ValueError as e:
+            return {"error": str(e)}
+        rows, total, has_more = plugin_api.list_light_show_scenes(project_dir, **kwargs)
+        return {"scenes": rows, "total": total, "has_more": has_more}
+
+    if action == "list_primitives":
+        return _load_catalog()
+
+    if action == "set":
+        scenes = args.get("scenes")
+        if not isinstance(scenes, list):
+            return {"error": "scenes must be a list"}
+        known_types = {p["id"] for p in _load_catalog().get("primitives", []) if "id" in p}
+        try:
+            out = plugin_api.upsert_light_show_scenes(
+                project_dir, scenes, known_types=known_types
+            )
+        except ValueError as e:
+            return {"error": str(e)}
+        _notify(project_name, "scenes")
+        return {"scenes": out}
+
+    if action == "remove":
+        ids = args.get("ids")
+        if not isinstance(ids, list):
+            return {"error": "ids must be a list"}
+        try:
+            deleted = plugin_api.remove_light_show_scenes(project_dir, [str(i) for i in ids])
+        except plugin_api.BlockedByLiveError as e:
+            return {
+                "error": "scene held by live override; deactivate first",
+                "blocked_by_live": e.scene_id,
+            }
+        except plugin_api.BlockedByPlacementsError as e:
+            return {
+                "error": "scene(s) still referenced",
+                "blocked": e.blocked,
+            }
+        except ValueError as e:
+            return {"error": str(e)}
+        _notify(project_name, "scenes")
+        return {"scenes": deleted}
+
+    return {
+        "error": f"unknown action {action!r}; expected one of "
+        "list/list_primitives/set/remove"
+    }
+
+
+def _placements_list_args(args: dict) -> dict:
+    """Coerce + validate list arguments for placements."""
+    f = args.get("filter") or {}
+    if not isinstance(f, dict):
+        raise ValueError("filter must be an object")
+    ids = f.get("ids")
+    if ids is not None and not isinstance(ids, list):
+        raise ValueError("filter.ids must be a list of strings")
+    tr = f.get("time_range")
+    time_start = time_end = None
+    if tr is not None:
+        if not isinstance(tr, dict) or "start" not in tr or "end" not in tr:
+            raise ValueError("filter.time_range must be {start, end}")
+        time_start = float(tr["start"])
+        time_end = float(tr["end"])
+
+    order_by = args.get("order_by", "start_time")
+    order = args.get("order", "asc")
+    if order_by not in _VALID_PLACEMENTS_ORDER_BY:
+        raise ValueError(f"order_by must be one of {sorted(_VALID_PLACEMENTS_ORDER_BY)}")
+    if order not in _VALID_ORDER:
+        raise ValueError(f"order must be one of {sorted(_VALID_ORDER)}")
+
+    limit = args.get("limit", 100)
+    try:
+        limit = max(0, min(int(limit), 1000))
+    except (TypeError, ValueError):
+        raise ValueError("limit must be a non-negative integer")
+    offset = args.get("offset", 0)
+    try:
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        raise ValueError("offset must be a non-negative integer")
+
+    return {
+        "ids": ids or None,
+        "scene_id": f.get("scene_id"),
+        "time_start": time_start,
+        "time_end": time_end,
+        "limit": limit,
+        "offset": offset,
+        "order_by": order_by,
+        "order": order,
+    }
+
+
+def tools_scene_timeline(args, tool_context) -> dict:
+    """Action-dispatched MCP tool for placements (timeline schedule).
+
+    Actions per spec:
+      - ``list``                — paginated/filtered query
+      - ``set``                 — bulk upsert with id-presence dispatch
+      - ``remove``              — silently-skips-missing batch delete
+
+    Mutating actions emit ``light_show__changed`` with ``kind: "placements"``.
+    """
+    from scenecraft import plugin_api
+    project_dir, project_name = _ctx(tool_context)
+    action = args.get("action")
+
+    if action == "list":
+        try:
+            kwargs = _placements_list_args(args)
+        except ValueError as e:
+            return {"error": str(e)}
+        rows, total, has_more = plugin_api.list_light_show_placements(project_dir, **kwargs)
+        return {"placements": rows, "total": total, "has_more": has_more}
+
+    if action == "set":
+        placements = args.get("placements")
+        if not isinstance(placements, list):
+            return {"error": "placements must be a list"}
+        try:
+            out = plugin_api.upsert_light_show_placements(project_dir, placements)
+        except ValueError as e:
+            return {"error": str(e)}
+        _notify(project_name, "placements")
+        return {"placements": out}
+
+    if action == "remove":
+        ids = args.get("ids")
+        if not isinstance(ids, list):
+            return {"error": "ids must be a list"}
+        deleted = plugin_api.remove_light_show_placements(project_dir, [str(i) for i in ids])
+        _notify(project_name, "placements")
+        return {"placements": deleted}
+
+    return {"error": f"unknown action {action!r}; expected one of list/set/remove"}
+
+
+def tools_scene_live(args, tool_context) -> dict:
+    """Action-dispatched MCP tool for the singleton live override.
+
+    Actions per spec:
+      - ``activate``    — set or replace the live override (scene_id XOR inline)
+      - ``deactivate``  — start fade-out (evaluator finalizes the row delete)
+      - ``status``      — query current state
+
+    Mutating actions emit ``light_show__changed`` with ``kind: "live"``.
+    """
+    from scenecraft import plugin_api
+    from scenecraft.plugins.light_show.routes import _load_catalog
+    project_dir, project_name = _ctx(tool_context)
+    action = args.get("action")
+
+    if action == "status":
+        row = plugin_api.get_light_show_live_override(project_dir)
+        if row is None:
+            return {"active": False}
+        return {"active": True, **row}
+
+    if action == "activate":
+        known_types = {p["id"] for p in _load_catalog().get("primitives", []) if "id" in p}
+        try:
+            row = plugin_api.activate_light_show_live_override(
+                project_dir, args, known_types=known_types
+            )
+        except ValueError as e:
+            return {"error": str(e)}
+        _notify(project_name, "live")
+        return {"active": True, **row}
+
+    if action == "deactivate":
+        fade = args.get("fade_out_sec", 0)
+        try:
+            fade_f = float(fade)
+        except (TypeError, ValueError):
+            return {"error": "fade_out_sec must be a number"}
+        row = plugin_api.deactivate_light_show_live_override(project_dir, fade_out_sec=fade_f)
+        _notify(project_name, "live")
+        if isinstance(row, dict) and row.get("active") is False:
+            return {"active": False}
+        return {"active": True, **row}
+
+    return {"error": f"unknown action {action!r}; expected one of activate/deactivate/status"}
