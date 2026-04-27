@@ -121,41 +121,78 @@ def close_all_connections(tmp_path: Path, request):
 
 @pytest.fixture(scope="session")
 def engine_server(tmp_path_factory):
-    """Live server fixture for e2e tests — FastAPI via TestClient.
+    """Live HTTP server fixture for e2e tests — FastAPI via uvicorn on a real port.
 
-    Provides the same interface as the legacy HTTPServer fixture:
-      - `.base_url`  : "http://testserver" (TestClient's default)
-      - `.work_dir`  : temp work_dir (session-scoped)
-      - `.request(method, path, body=None, timeout=10)`
-                     : returns (status, headers_dict, body_bytes)
-      - `.json(method, path, body=None, timeout=10)`
-                     : returns (status, parsed_json)
+    Tests use raw ``urllib.request.urlopen`` against ``base_url``, so the server
+    must bind a real socket. We run uvicorn in a background thread on port 0
+    (auto-assigned) and provide the same interface as the legacy HTTPServer fixture:
+
+      - ``.base_url``  : e.g. ``http://127.0.0.1:<port>``
+      - ``.work_dir``  : temp work_dir (session-scoped)
+      - ``.request(method, path, body=None, timeout=10)``
+                       : helper returning (status, headers_dict, body_bytes)
+      - ``.json(method, path, body=None, timeout=10)``
+                       : helper returning (status, parsed_json)
     """
     import json as _json
+    import socket
+    import threading as _threading
+    import urllib.request
+    import urllib.error
 
     global _ENGINE_SERVER_WORK_DIR
     work_dir = tmp_path_factory.mktemp("engine_server_workdir")
     _ENGINE_SERVER_WORK_DIR = work_dir
 
-    from fastapi.testclient import TestClient
     from scenecraft.api.app import create_app
+    import uvicorn
 
     app = create_app(work_dir=work_dir, enable_docs=True, testing=True)
-    client = TestClient(app, raise_server_exceptions=False)
+
+    # Find a free port.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    server = uvicorn.Server(config)
+
+    thread = _threading.Thread(target=server.run, daemon=True)
+    thread.start()
+
+    # Wait for the server to be ready.
+    for _ in range(100):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.1)
+            s.connect(("127.0.0.1", port))
+            s.close()
+            break
+        except OSError:
+            import time as _t
+            _t.sleep(0.05)
+
+    base_url = f"http://127.0.0.1:{port}"
 
     class _Server:
         def __init__(self):
-            self.base_url = "http://testserver"
+            self.base_url = base_url
             self.work_dir = work_dir
-            self._client = client
 
         def request(self, method: str, path: str, body=None, timeout: float = 10.0):
-            kwargs = {"timeout": timeout}
+            url = self.base_url + path
+            data = None
+            headers = {}
             if body is not None:
-                kwargs["json"] = body
-            resp = self._client.request(method, path, **kwargs)
-            headers = dict(resp.headers)
-            return resp.status_code, headers, resp.content
+                data = _json.dumps(body).encode("utf-8")
+                headers["Content-Type"] = "application/json"
+            req = urllib.request.Request(url, data=data, method=method, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return resp.status, dict(resp.headers), resp.read()
+            except urllib.error.HTTPError as e:
+                return e.code, dict(e.headers or {}), e.read()
 
         def json(self, method: str, path: str, body=None, timeout: float = 10.0):
             status, _headers, raw = self.request(method, path, body=body, timeout=timeout)
@@ -166,7 +203,11 @@ def engine_server(tmp_path_factory):
             except Exception:
                 return status, raw
 
-    yield _Server()
+    try:
+        yield _Server()
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5.0)
 
 
 @pytest.fixture
