@@ -3125,7 +3125,7 @@ def get_audio_clips(project_dir: Path, track_id: str | None = None) -> list[dict
         tr_ids = list(set(link_map.values()))
         tr_placeholders = ",".join("?" for _ in tr_ids)
         tr_rows = conn.execute(
-            f"SELECT id, \"from\" AS from_kf, \"to\" AS to_kf, trim_in, trim_out, source_video_duration FROM transitions WHERE id IN ({tr_placeholders})",
+            f"SELECT id, from_kf, to_kf, trim_in, trim_out, source_video_duration FROM transitions WHERE id IN ({tr_placeholders})",
             tr_ids,
         ).fetchall()
         kf_ids = set()

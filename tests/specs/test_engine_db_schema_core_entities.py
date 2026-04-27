@@ -354,15 +354,6 @@ def test_audio_clip_unlinked_derivations(project_dir: Path, db_conn):
     assert c["linked_transition_id"] is None, "linked-transition-none: not linked"
 
 
-@pytest.mark.xfail(
-    reason="BUG witness: src/scenecraft/db.py:3128 aliases `\"from\" AS from_kf` in the "
-           "bulk preload SELECT, but the DDL column is named `from_kf` (no `from` column exists). "
-           "SQLite treats the double-quoted `from` as a string literal, so every transition row "
-           "yields from_kf='from' (never matching any real keyframe id) and the derivation "
-           "falls through to (1.0, stored_offset). Reported to the task author — spec-contracted "
-           "behavior (R25) is unreachable until this is fixed.",
-    strict=False,
-)
 def test_audio_clip_linked_derivations(project_dir: Path, db_conn):
     """covers R25."""
     # Given
