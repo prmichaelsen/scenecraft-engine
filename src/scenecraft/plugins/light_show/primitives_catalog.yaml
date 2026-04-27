@@ -76,6 +76,105 @@ primitives:
           items: { type: number, minimum: 0, maximum: 1 }
           default: [1, 1, 1]
 
+  - id: color_fade
+    label: Color Fade
+    description: |
+      Continuous sinusoidal fade between two colors. Uses sceneTime to animate
+      between color_a and color_b over period_sec, with optional phase offset
+      for staggering across fixtures.
+    params_schema:
+      type: object
+      properties:
+        role:
+          type: string
+          description: Fixture role filter; undefined = all fixtures
+        fixtures:
+          type: array
+          items: { type: string }
+          description: |
+            Fixture id allow-list. If present, only these fixtures are
+            affected (intersected with role if both are set). undefined
+            = no id filter.
+        color_a:
+          type: array
+          minItems: 3
+          maxItems: 3
+          items: { type: number, minimum: 0, maximum: 1 }
+          default: [0, 0, 1]
+          description: First color (e.g., blue)
+        color_b:
+          type: array
+          minItems: 3
+          maxItems: 3
+          items: { type: number, minimum: 0, maximum: 1 }
+          default: [1, 0, 1]
+          description: Second color (e.g., purple)
+        period_sec: { type: number, minimum: 0.1, default: 4.0, description: Full cycle duration }
+        phase: { type: number, default: 0, description: Phase offset in seconds }
+        intensity: { type: number, minimum: 0, maximum: 1, default: 1.0 }
+
+  - id: strobe
+    label: Strobe
+    description: |
+      Flash/strobe effect — rapidly flashes fixtures on and off.
+      Control frequency (Hz), duty cycle (on/off ratio), and intensity.
+    params_schema:
+      type: object
+      properties:
+        role:
+          type: string
+          description: Fixture role filter; undefined = all fixtures
+        fixtures:
+          type: array
+          items: { type: string }
+          description: |
+            Fixture id allow-list. If present, only these fixtures are
+            affected (intersected with role if both are set). undefined
+            = no id filter.
+        frequency_hz: { type: number, minimum: 0.1, default: 5.0, description: Flash rate in Hz }
+        duty_cycle: { type: number, minimum: 0.01, maximum: 0.99, default: 0.5, description: Fraction of time on (0-1) }
+        intensity: { type: number, minimum: 0, maximum: 1, default: 1.0 }
+        color:
+          type: array
+          minItems: 3
+          maxItems: 3
+          items: { type: number, minimum: 0, maximum: 1 }
+          default: [1, 1, 1]
+
+  - id: color_chase
+    label: Color Chase
+    description: |
+      Discrete color chase — cycles through an array of colors over period_sec,
+      with per-fixture phase offset to create a running/cascading effect.
+      Use in composite with different phase values per fixture for the chase.
+      Optional fade_sec smooths transitions between colors.
+    params_schema:
+      type: object
+      properties:
+        role:
+          type: string
+          description: Fixture role filter; undefined = all fixtures
+        fixtures:
+          type: array
+          items: { type: string }
+          description: |
+            Fixture id allow-list. If present, only these fixtures are
+            affected (intersected with role if both are set). undefined
+            = no id filter.
+        colors:
+          type: array
+          description: Array of RGB colors to cycle through
+          items:
+            type: array
+            minItems: 3
+            maxItems: 3
+            items: { type: number, minimum: 0, maximum: 1 }
+          default: [[1, 0, 0], [1, 1, 0], [0, 1, 0], [0, 1, 1], [0, 0, 1], [1, 0, 1]]
+        period_sec: { type: number, minimum: 0.1, default: 4.0, description: Full cycle duration }
+        phase: { type: number, default: 0, description: Phase offset in seconds }
+        fade_sec: { type: number, minimum: 0, default: 0, description: Transition fade duration; 0 = hard cuts }
+        intensity: { type: number, minimum: 0, maximum: 1, default: 1.0 }
+
   - id: composite
     label: Composite
     description: |

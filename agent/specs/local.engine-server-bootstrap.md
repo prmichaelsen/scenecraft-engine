@@ -72,6 +72,12 @@ Define the black-box contract for the `scenecraft server` command's process star
 16. **R16**: If `run_server` receives a `work_dir` string that does not resolve to an existing directory, it MUST print an error to stderr and exit with `SystemExit(1)` — BEFORE binding any socket.
 17. **R17**: Plugin activation is invoked by `PluginHost.register(...)`. If any plugin's `activate()` raises, the exception currently propagates (audit-2 leak #2), aborting boot. Subsequent plugins in the order are NOT registered. The socket IS bound but NOT served (process exits before `serve_forever`).
 18. **R18**: The handler class returned by `make_handler` MUST be a `BaseHTTPRequestHandler` subclass closed over `work_dir` and `no_auth`; a new instance is created per request by `ThreadingMixIn` (one thread per connection).
+19. **R19** (target, OQ-1): The WS daemon thread MUST signal the boot thread via a `threading.Event` on successful bind. The main thread MUST wait up to 5s for the event; if not set (WS bind failed), boot aborts with a clear error message and non-zero exit code.
+20. **R20** (target, OQ-4): Boot MUST install `signal.signal(signal.SIGTERM, ...)` mirroring the SIGINT path: call `PluginHost.deactivate_all()` then `server.shutdown()`.
+21. **R21** (target, OQ-2): Boot MUST preflight `os.access(work_dir, os.R_OK | os.W_OK)` and abort with `SystemExit(1)` + clear stderr message if the check fails.
+22. **R22** (target, OQ-3): `load_config` MUST wrap `json.load` in try/except; on `json.JSONDecodeError`, abort with message "invalid JSON in config.json; remove file to re-initialize." and non-zero exit.
+23. **R23** (target, OQ-5): If `.scenecraft/` root exists under `work_dir` AND `--no-auth` was passed, boot MUST refuse unless the additional `--no-auth-unsafe-i-know-what-im-doing` flag is also passed. Refusal prints a clear message + exits non-zero.
+24. **R24** (target, OQ-6): Boot MUST acquire an advisory `flock` on `<work_dir>/.scenecraft/server.lock`. If held by another process, abort with "another server is running on this work_dir" + non-zero exit.
 
 ## Interfaces / Data Shapes
 
@@ -157,17 +163,17 @@ Location: `$XDG_CONFIG_HOME/scenecraft/config.json` (default `~/.config/scenecra
 | 5 | `--no-auth` passed | `_sc_root` is None; every `_authenticate()` call returns True | `no-auth-disables-jwt-gate` |
 | 6 | Auth enabled but `find_root` raises | Exception swallowed; handler built with `_sc_root=None`; behaves auth-disabled | `find-root-failure-degrades-to-no-auth` |
 | 7 | Port already in use | `OSError` (EADDRINUSE) propagates from `HTTPServer.__init__`; process exits non-zero; WS thread not started | `http-port-already-in-use-aborts-before-ws` |
-| 8 | WS port (port+1) already in use | `undefined` — WS server runs inside a daemon thread; failure surfaces asynchronously | → [OQ-1](#open-questions) |
+| 8 | WS port (port+1) already in use | WS daemon signals boot thread via `threading.Event`; on timeout (5s), boot aborts with clear error | `ws-port-bind-failure-aborts-boot` (covers R19, OQ-1) |
 | 9 | `work_dir` string passed to `run_server` but path does not exist | Prints to stderr + `SystemExit(1)` before any socket bind | `nonexistent-work-dir-exits-before-bind` |
-| 10 | `work_dir` exists but is not readable / writable | `undefined` — no permission check happens at boot; failures surface later per-request | → [OQ-2](#open-questions) |
+| 10 | `work_dir` exists but is not readable / writable | Preflight `os.access` fails; `SystemExit(1)` with clear stderr message | `work-dir-unreadable-aborts-boot` (covers R21, OQ-2) |
 | 11 | A plugin's `activate()` raises during `PluginHost.register(...)` | Exception propagates, aborts boot; later plugins not registered; `serve_forever` never called; HTTP socket bound but not serving (leaked until GC) | `plugin-activate-failure-aborts-boot` |
-| 12 | `config.json` is corrupted (invalid JSON) | `undefined` — `load_config` will raise `json.JSONDecodeError` uncaught | → [OQ-3](#open-questions) |
+| 12 | `config.json` is corrupted (invalid JSON) | `load_config` catches `JSONDecodeError`, aborts with clear message | `corrupt-config-json-aborts-boot` (covers R22, OQ-3) |
 | 13 | Legacy `~/.scenecraft/config.json` exists, new location does not | Auto-migrated to `$XDG_CONFIG_HOME/scenecraft/config.json` on first `load_config` | `legacy-config-auto-migrates` |
 | 14 | `SIGINT` (Ctrl-C) during `serve_forever` | `server.shutdown()` called; `"Shutting down."` logged; process exits 0 | `sigint-triggers-shutdown` |
-| 15 | `SIGTERM` during `serve_forever` | `undefined` — no explicit SIGTERM handler; default Python behavior kills the process (no `shutdown()` call, no plugin cleanup) | → [OQ-4](#open-questions) |
+| 15 | `SIGTERM` during `serve_forever` | Installed handler calls `PluginHost.deactivate_all()` then `server.shutdown()`; `"Shutting down."` logged; process exits 0 | `sigterm-triggers-shutdown` (covers R20, OQ-4) |
 | 16 | `SIGKILL` | Process dies immediately; no cleanup possible (documented as expected) | `sigkill-leaves-no-cleanup-opportunity` |
-| 17 | `--no-auth` used against a work_dir that has a `.scenecraft/` (production) root | `undefined` — currently silently permitted; no warning, no refusal | → [OQ-5](#open-questions) |
-| 18 | Two `scenecraft server` processes on same `work_dir`, different ports | Both start successfully; they race on `sessions.db` writes (SQLite last-write-wins) | `concurrent-instances-same-workdir-race-sessions-db` |
+| 17 | `--no-auth` used against a work_dir that has a `.scenecraft/` (production) root | Boot refuses unless `--no-auth-unsafe-i-know-what-im-doing` also passed; clear error on refusal | `no-auth-in-production-requires-unsafe-flag` (covers R23, OQ-5) |
+| 18 | Two `scenecraft server` processes on same `work_dir`, different ports | Second aborts: advisory `flock` on `.scenecraft/server.lock` held by first | `concurrent-instance-advisory-lock-refuses` (covers R24, OQ-6) |
 | 19 | Two `scenecraft server` processes on same port | Second exits with EADDRINUSE (same as scenario 7) | `concurrent-instances-same-port-fails` |
 | 20 | Plugin registration count logged post-registration | Log line reports 4 plugins, non-zero operation + mcp tool counts | `post-registration-summary-logged` |
 | 21 | WS thread spawned before plugin registration | Boot order: `make_handler` → `HTTPServer` bind → WS thread → plugin register → banner → `serve_forever` | `boot-order-is-deterministic` |
@@ -459,6 +465,73 @@ Boundaries, concurrency, failure modes, and un-decided behaviors.
 - **second-fails-eaddrinuse**: second process exits with `OSError` (EADDRINUSE) during `HTTPServer.__init__`
 - **first-unaffected**: first process continues to serve
 
+#### Test: ws-port-bind-failure-aborts-boot (covers R19, OQ-1)
+
+**Given**: WS port `port+1` already bound; boot proceeds past HTTP bind.
+
+**When**: `run_server` waits up to 5s on the `threading.Event` signalled by the WS daemon.
+
+**Then**:
+- **event-not-set**: event remains unset because `websockets.serve` raised `OSError`.
+- **boot-aborts**: `run_server` exits non-zero with stderr message mentioning WS bind failure.
+- **http-socket-closed**: HTTP server is `shutdown()` before abort (no leaked socket).
+
+#### Test: work-dir-unreadable-aborts-boot (covers R21, OQ-2)
+
+**Given**: `work_dir` exists but `os.access(work_dir, os.R_OK | os.W_OK)` returns False.
+
+**When**: `run_server` runs preflight.
+
+**Then**:
+- **systemexit-1**: `SystemExit(1)` before `make_handler`.
+- **stderr-mentions-permissions**: stderr contains the work_dir path and a permissions hint.
+- **no-bind**: `HTTPServer.__init__` never called.
+
+#### Test: corrupt-config-json-aborts-boot (covers R22, OQ-3)
+
+**Given**: `config.json` contains `"not valid json{"`.
+
+**When**: `load_config` runs during boot.
+
+**Then**:
+- **aborts-non-zero**: exits non-zero.
+- **stderr-message**: stderr contains "invalid JSON in config.json; remove file to re-initialize."
+- **no-bind**: no socket bound.
+
+#### Test: sigterm-triggers-shutdown (covers R20, OQ-4)
+
+**Given**: running server with registered SIGTERM handler.
+
+**When**: process receives SIGTERM.
+
+**Then**:
+- **plugin-deactivate-called**: `PluginHost.deactivate_all()` invoked exactly once.
+- **shutdown-called**: `server.shutdown()` invoked exactly once.
+- **log-emitted**: `"Shutting down."` on stderr.
+- **exit-zero**: process exits 0.
+
+#### Test: no-auth-in-production-requires-unsafe-flag (covers R23, OQ-5)
+
+**Given**: `work_dir` has `.scenecraft/` root; `--no-auth` passed without the unsafe companion flag.
+
+**When**: `scenecraft server` runs.
+
+**Then**:
+- **refuses**: exits non-zero before binding any socket.
+- **stderr-message**: stderr contains guidance naming `--no-auth-unsafe-i-know-what-im-doing`.
+- **proceeds-with-unsafe-flag**: when both flags present, boot proceeds normally.
+
+#### Test: concurrent-instance-advisory-lock-refuses (covers R24, OQ-6)
+
+**Given**: one `scenecraft server` already running on `work_dir` holding `flock` on `.scenecraft/server.lock`.
+
+**When**: a second `scenecraft server` is started on the same `work_dir` (different port).
+
+**Then**:
+- **lock-acquire-fails**: second process's `flock` (non-blocking) fails.
+- **aborts-non-zero**: second exits non-zero with "another server is running on this work_dir".
+- **first-unaffected**: first continues serving.
+
 #### Test: sigkill-leaves-no-cleanup-opportunity (covers R14 — negative)
 
 **Given**: a running server
@@ -481,14 +554,32 @@ Boundaries, concurrency, failure modes, and un-decided behaviors.
 - Work-dir permission preflight (see OQ-2)
 - WS-port conflict recovery (see OQ-1)
 
+## Transitional Behavior
+
+Per INV-8, Requirements encode the target-ideal state. The following divergences from current code are documented transitionally:
+
+- **WS bind failure swallowed (R19 target)**: current code swallows `websockets.serve` errors in the daemon thread. Target: fail-fast via `threading.Event`.
+- **No SIGTERM handler (R20 target)**: current relies on Python default SIGTERM behavior. Target: explicit handler mirroring SIGINT.
+- **No `work_dir` preflight (R21 target)**: current defers to per-request `PermissionError`. Target: `os.access` preflight at boot.
+- **No `config.json` corruption handling (R22 target)**: current `json.load` raises uncaught. Target: wrap in try/except with clear abort message.
+- **`--no-auth` allowed silently in production (R23 target)**: current permits silently. Target: require `--no-auth-unsafe-i-know-what-im-doing` when `.scenecraft/` root exists.
+- **No concurrent-instance advisory lock (R24 target)**: current has no boot-time coordination. Target: `flock` on `.scenecraft/server.lock`.
+
 ## Open Questions
 
-- **OQ-1**: WS port (port+1) already in use. The WS server runs in a daemon thread calling `asyncio.run(_run_ws_server(...))`. If `websockets.serve` fails to bind, the exception is swallowed inside the daemon thread; the HTTP server continues running as if everything is fine. Should the boot sequence detect this and fail loudly? Currently undefined.
-- **OQ-2**: `work_dir` exists but is not readable / writable by the running user. No preflight check. Should boot `stat` the directory and fail fast, or continue and let per-request handlers surface `PermissionError` when they hit disk?
-- **OQ-3**: `config.json` is corrupted (invalid JSON). `load_config` calls `json.load` with no try/except. Should corruption trigger a prompt to re-initialize? Abort with a clear message? Silently overwrite?
-- **OQ-4**: SIGTERM handling. Python's default SIGTERM behavior terminates the process without raising `KeyboardInterrupt`, so `server.shutdown()` is not called. Should the server install a `signal.signal(SIGTERM, ...)` handler that mirrors the SIGINT path?
-- **OQ-5**: `--no-auth` in production (a work_dir that has a `.scenecraft/` root). Currently permitted silently. Should boot refuse? Emit a warning? Require `--no-auth-unsafe-i-know-what-im-doing`?
-- **OQ-6**: Multiple concurrent `scenecraft server` instances on the same `work_dir`. The `sessions.db` (and per-project `project.db` files) are plain SQLite — WAL mode tolerates multi-reader/single-writer, but there is no boot-time coordination. Should boot acquire an advisory lock (e.g., `flock` on `<work_dir>/.scenecraft.lock`) and refuse to start if held? The cost of ignoring: occasional duplicate-insert races on `sessions.db` during login flows.
+### Resolved
+
+**OQ-1 (resolved)**: WS port (port+1) already in use. The WS server runs in a daemon thread calling `asyncio.run(_run_ws_server(...))`. If `websockets.serve` fails to bind, the exception is swallowed inside the daemon thread; the HTTP server continues running as if everything is fine. **Decision**: WS daemon thread signals boot thread via `threading.Event`; main thread checks within 5s and aborts boot with clear error if WS bind failed. **Tests**: `ws-port-bind-failure-aborts-boot`.
+
+**OQ-2 (resolved)**: `work_dir` exists but is not readable / writable by the running user. No preflight check. **Decision**: preflight `os.access(work_dir, R_OK|W_OK)` + clear error. **Tests**: `work-dir-unreadable-aborts-boot`.
+
+**OQ-3 (resolved)**: `config.json` is corrupted (invalid JSON). `load_config` calls `json.load` with no try/except. **Decision**: wrap `json.load` in try/except; on `JSONDecodeError`, abort with "invalid JSON in config.json; remove file to re-initialize." **Tests**: `corrupt-config-json-aborts-boot`.
+
+**OQ-4 (resolved)**: SIGTERM handling. **Decision**: install `signal.signal(SIGTERM, ...)` handler mirroring SIGINT. Calls `PluginHost.deactivate_all()` then `server.shutdown()`. **Tests**: `sigterm-triggers-shutdown`.
+
+**OQ-5 (resolved)**: `--no-auth` in production (a work_dir that has a `.scenecraft/` root). **Decision**: if `.scenecraft/` root exists AND `--no-auth` passed, require `--no-auth-unsafe-i-know-what-im-doing` flag. Otherwise refuse with clear message. **Tests**: `no-auth-in-production-requires-unsafe-flag`.
+
+**OQ-6 (resolved)**: Multiple concurrent `scenecraft server` instances on the same `work_dir`. **Decision**: advisory `flock` on `.scenecraft/server.lock` at boot. Refuse to start if held, with clear error. **Tests**: `concurrent-instance-advisory-lock-refuses`.
 
 ## Related Artifacts
 

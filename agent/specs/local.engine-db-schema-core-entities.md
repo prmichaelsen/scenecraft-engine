@@ -122,6 +122,15 @@ Codify the per-project SQLite schema + DAL (Data Access Layer) contract for the 
 - **R42.** `get_sections()` returns rows `ORDER BY sort_order`.
 - **R43.** `set_sections(sections)` is a **full replace**: it `DELETE FROM sections` then inserts every supplied row with `sort_order = i` (index in supplied list). This is the only write path exposed; there is no granular `add_section`/`update_section`/`delete_section`.
 
+### DAL rejection errors (target)
+
+- **R51.** `delete_keyframe_hard(kf_id)` — if any row exists in `transitions` where `from_kf = kf_id OR to_kf = kf_id` (regardless of transition `deleted_at`), DAL raises `KeyframeInUseError` before attempting the DELETE. Transition hard-deletion MUST precede keyframe hard-deletion. (Resolves OQ-1.)
+- **R52.** `add_audio_candidate` — if the referenced `audio_clip_id` row has `deleted_at IS NOT NULL`, DAL raises `AudioClipDeletedError`. No insert. (Resolves OQ-3.)
+- **R53.** `add_tr_candidate` — if the referenced `transition_id` row has `deleted_at IS NOT NULL`, DAL raises `TransitionDeletedError`. No insert. (Resolves OQ-4.)
+- **R54.** DAL validates JSON curve columns (all `*_curve` columns on `transitions`, and `volume_curve` on audio_tracks/audio_clips) for monotonic non-decreasing `x` on every insert/update; non-monotonic input raises `ValueError`. No sort, no tolerance. (Resolves OQ-6.)
+- **R55.** Schema CHECK constraint on `transitions.remap` and `audio_clips.remap` rejects rows where the parsed `target_duration` is negative. Implemented via generated column or trigger (CHECK on JSON) at table creation; legacy rows validated on migration. (Resolves OQ-7.)
+- **R56.** `reorder_audio_tracks` holds no internal lock spanning multiple API calls. Concurrent invocations from the same user/project are undefined per INV-1 (single-writer per (user, project)). (Resolves OQ-5.)
+
 ### General — JSON columns
 
 - **R44.** `keyframes.candidates` is a JSON array of candidate IDs/metadata; `_row_to_keyframe` runs `json.loads`. Default `'[]'` parses as `[]`.
@@ -267,15 +276,15 @@ set_sections(project_dir, sections: list[dict]) -> None   # full replace
 | 32 | get_sections orders by sort_order | Ascending | `get-sections-ordered` |
 | 33 | add_tr_candidate bad source raises | AssertionError for source not in allowlist | `tr-candidate-bad-source-assertion` |
 | 34 | add_audio_candidate bad source raises | AssertionError for source not in allowlist | `audio-candidate-bad-source-assertion` |
-| 35 | Hard-delete a keyframe with live transitions | **undefined** | → [OQ-1](#open-questions) |
-| 36 | audio_clip whose track_id references a deleted track | **undefined** | → [OQ-2](#open-questions) |
-| 37 | add_audio_candidate for a soft-deleted audio_clip | **undefined** | → [OQ-3](#open-questions) |
-| 38 | add_tr_candidate for a soft-deleted transition | **undefined** | → [OQ-4](#open-questions) |
-| 39 | Concurrent reorder_audio_tracks producing display_order collisions | **undefined** | → [OQ-5](#open-questions) |
-| 40 | JSON curve with non-monotonic x values | **undefined** | → [OQ-6](#open-questions) |
-| 41 | remap.target_duration < 0 | **undefined** | → [OQ-7](#open-questions) |
+| 35 | Hard-delete a keyframe with live transitions | DAL raises `KeyframeInUseError` if any transition (soft-deleted or not) references kf.id via from_kf/to_kf | `keyframe-in-use-blocks-hard-delete` |
+| 36 | audio_clip whose track_id references a deleted track | Existing cascade (delete_audio_track soft-deletes clips) handles this; no new semantic | `audio-clip-track-cascade-preexisting` |
+| 37 | add_audio_candidate for a soft-deleted audio_clip | DAL raises `AudioClipDeletedError` | `add-audio-candidate-on-deleted-clip-rejected` |
+| 38 | add_tr_candidate for a soft-deleted transition | DAL raises `TransitionDeletedError` | `add-tr-candidate-on-deleted-transition-rejected` |
+| 39 | Concurrent reorder_audio_tracks producing display_order collisions | Undefined by INV-1 (single-writer per (user, project)); no internal lock held | `reorder-audio-tracks-no-internal-lock` |
+| 40 | JSON curve with non-monotonic x values | DAL raises `ValueError` on insert/update; no tolerance-and-sort | `curve-non-monotonic-x-rejected` |
+| 41 | remap.target_duration < 0 | CHECK constraint rejects at DB layer | `remap-negative-target-duration-rejected` |
 | 42 | transitions.from_kf references a nonexistent keyframe | Insert/update succeeds (no FK); get_transition returns the row; _row_to_transition emits it with the dangling id | `transition-dangling-from-kf-allowed` |
-| 43 | Legacy DB with `audio_clips.track_id NOT NULL` after master-bus migration | **undefined** | → [OQ-8](#open-questions) |
+| 43 | Legacy DB with `audio_clips.track_id NOT NULL` after master-bus migration | Target: table-rebuild migration via `register_migration` + `rebuild_table` helper re-creates audio_clips with nullable track_id. Transitional: column-existence check leaves NOT NULL in place | `audio-clips-legacy-nullable-track-id-rebuild` |
 | 44 | FK declared on audio_candidates.audio_clip_id but PRAGMA foreign_keys unset | Orphan insert succeeds at runtime | `audio-candidate-orphan-insert-succeeds` |
 | 45 | delete_keyframe with already-deleted_at | deleted_at overwritten with new value | `delete-keyframe-already-deleted-overwrites` |
 | 46 | update_transition with no fields | No-op; returns without executing UPDATE | `update-transition-noop-empty` |
@@ -598,11 +607,73 @@ set_sections(project_dir, sections: list[dict]) -> None   # full replace
 - **returns-three-ids**: return value is a list of length 3
 - **rows-gone**: `get_audio_clip_links_for_transition(T.id)` returns empty
 
-#### Test: hard-delete-keyframe-with-transitions (covers R4, undefined)
-**Given**: Keyframe K referenced by transition T.from_kf; if a hard-delete path existed.
-**When**: A raw `DELETE FROM keyframes WHERE id = K.id` is executed (no DAL helper exposes this).
+#### Test: keyframe-in-use-blocks-hard-delete (covers R51, resolves OQ-1)
+**Given**: Keyframe K referenced by transition T.from_kf (T not soft-deleted).
+**When**: `delete_keyframe_hard(project_dir, K.id)`.
 **Then**:
-- **undefined**: see [OQ-1](#open-questions)
+- **raises-keyframe-in-use**: `KeyframeInUseError` raised
+- **row-preserved**: K still present in `keyframes`
+- **transition-unchanged**: T row unchanged
+
+#### Test: audio-clip-track-cascade-preexisting (covers OQ-2 close)
+**Given**: Track T with clip C1 (non-deleted).
+**When**: `delete_audio_track(project_dir, T.id)` then a new `add_audio_clip` referencing `T.id` as `track_id`.
+**Then**:
+- **c1-soft-deleted**: C1.deleted_at set by existing cascade (R19)
+- **no-new-error-path**: spec adds no new semantic; existing cascade is authoritative
+
+#### Test: add-audio-candidate-on-deleted-clip-rejected (covers R52, resolves OQ-3)
+**Given**: Clip C with `deleted_at='T1'`.
+**When**: `add_audio_candidate(project_dir, audio_clip_id=C.id, pool_segment_id='seg_1', source='generated')`.
+**Then**:
+- **raises-audio-clip-deleted**: `AudioClipDeletedError` raised
+- **no-row-inserted**: `audio_candidates` count unchanged
+
+#### Test: add-tr-candidate-on-deleted-transition-rejected (covers R53, resolves OQ-4)
+**Given**: Transition T with `deleted_at='T1'`.
+**When**: `add_tr_candidate(project_dir, transition_id=T.id, slot=0, pool_segment_id='seg_1', source='generated')`.
+**Then**:
+- **raises-transition-deleted**: `TransitionDeletedError` raised
+- **no-row-inserted**: `tr_candidates` count unchanged
+
+#### Test: reorder-audio-tracks-no-internal-lock (covers R56, resolves OQ-5, INV-1 negative-assertion)
+**Given**: Three tracks A, B, C.
+**When**: `reorder_audio_tracks(project_dir, ['C','A','B'])` is invoked with a mock asserting no acquisition of a project-scoped mutex / module-level lock during the call.
+**Then**:
+- **no-internal-lock-held**: no `threading.Lock` or `asyncio.Lock` is acquired across the API call boundary
+- **concurrency-undefined**: spec asserts concurrency is undefined per INV-1; this test is a negative assertion, not a race test
+
+#### Test: curve-non-monotonic-x-rejected (covers R54, resolves OQ-6)
+**Given**: Transition T exists.
+**When**: `update_transition(project_dir, T.id, opacity_curve=[[0,0],[0.5,1],[0.3,0.5]])`.
+**Then**:
+- **raises-value-error**: `ValueError` with message mentioning non-monotonic x
+- **row-unchanged**: T.opacity_curve still the pre-call value
+
+#### Test: remap-negative-target-duration-rejected (covers R55, resolves OQ-7)
+**Given**: Transition T exists.
+**When**: `update_transition(project_dir, T.id, remap={'method':'linear','target_duration':-1})`.
+**Then**:
+- **check-constraint-violation**: `sqlite3.IntegrityError` (CHECK) raised at DB layer
+- **row-unchanged**: T.remap still the pre-call value
+
+#### Test: audio-clips-legacy-nullable-track-id-rebuild (covers R_transitional + OQ-8, target)
+**Given**: Legacy DB where `audio_clips.track_id` was created as NOT NULL.
+**When**: Target migration runs via `register_migration` applying `rebuild_table('audio_clips', new_schema_with_nullable_track_id)`.
+**Then**:
+- **column-nullable-post-migration**: `PRAGMA table_info(audio_clips)` reports track_id notnull=0
+- **rows-preserved**: row count and content identical across the rebuild
+- **transitional-note**: until `register_migration`/`rebuild_table` lands, legacy DBs keep NOT NULL — master-bus effect migration must not depend on nullable track_id
+
+---
+
+## Transitional Behavior (INV-8)
+
+Target-ideal behavior is captured in Requirements R51–R56. The following current code divergences are documented, not codified as the eventual contract:
+
+- **Legacy `audio_clips.track_id NOT NULL`**: schema bootstrap uses column-existence check (additive ALTER only). Making `track_id` nullable on legacy DBs requires the future `plugin_api.register_migration` + `migrate.rebuild_table` helpers (see `local.engine-migrations-framework` OQ-4). Until those land, legacy DBs retain the NOT NULL constraint; master-bus-effect paths that rely on nullable track_id MUST be guarded or deferred.
+- **No CHECK on `remap.target_duration`**: current DDL stores the JSON blob without validation; R55 requires a schema rebuild which, like above, depends on the future migration helpers.
+- **No DAL rejection errors for in-use/deleted entities today**: R51–R53 describe target-ideal errors not yet raised. Current code silently accepts these operations; tests for the errors will fail until the DAL is patched.
 
 ---
 
@@ -620,6 +691,23 @@ set_sections(project_dir, sections: list[dict]) -> None   # full replace
 ---
 
 ## Open Questions
+
+### Resolved
+
+- **OQ-1** (hard-delete keyframe with live transitions): **fix** — DAL raises `KeyframeInUseError` if any `transitions.from_kf = kf.id OR to_kf = kf.id` (soft-deleted or not). Encoded in R51 and test `keyframe-in-use-blocks-hard-delete`.
+- **OQ-2** (audio_clip.track_id → deleted track): **close** — existing cascade in R19 already handles this; no new semantic. Witnessed by test `audio-clip-track-cascade-preexisting`.
+- **OQ-3** (add_audio_candidate for soft-deleted clip): **fix** — DAL raises `AudioClipDeletedError`. R52, test `add-audio-candidate-on-deleted-clip-rejected`.
+- **OQ-4** (add_tr_candidate for soft-deleted transition): **fix** — DAL raises `TransitionDeletedError`. R53, test `add-tr-candidate-on-deleted-transition-rejected`.
+- **OQ-5** (concurrent reorder): closed per INV-1 (single-writer per (user, project)). R56 + negative-assertion test `reorder-audio-tracks-no-internal-lock`.
+- **OQ-6** (non-monotonic curve x): **fix** — DAL validates monotonic x; `ValueError` on violation. R54, test `curve-non-monotonic-x-rejected`.
+- **OQ-7** (remap.target_duration < 0): **fix** — CHECK constraint rejects at DB layer. R55, test `remap-negative-target-duration-rejected`.
+- **OQ-8** (legacy NOT NULL track_id): **fix (target)** — table-rebuild migration via `register_migration` + `rebuild_table`. Transitional (current): column-existence check leaves NOT NULL. See Transitional Behavior section and test `audio-clips-legacy-nullable-track-id-rebuild`.
+
+### Deferred
+
+(None — all 8 OQs resolved.)
+
+### Historical
 
 **OQ-1. Hard-delete of a keyframe with live transitions referencing it.**
 There is no DAL helper that hard-deletes a keyframe; soft-delete is the only exposed path. However, admin tooling, raw SQL, or an undo replay COULD issue `DELETE FROM keyframes WHERE id = ?`. Because there is no FK, SQLite will accept it, leaving transitions with dangling `from_kf`/`to_kf`. What is the intended behavior? Options: (a) add FK with `ON DELETE RESTRICT`, (b) add FK with `ON DELETE SET NULL` and treat transitions with NULL anchors as orphaned (new state), (c) leave dangling references permitted and document. Related: audit leak #8.

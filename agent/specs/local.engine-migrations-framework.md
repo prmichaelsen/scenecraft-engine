@@ -94,12 +94,14 @@
 - **R17**: Plugin-owned tables whose names are prefixed `<plugin_id>__<table>` MUST be defined in the core `_ensure_schema` DDL block today (hardcoded), not contributed at plugin activation. The prefix convention is the only boundary between core and plugin-owned tables; there is no runtime-enforced isolation.
 - **R18**: Plugin sidecar tables MUST follow the same `CREATE TABLE IF NOT EXISTS` and additive-column patterns as core tables (R5, R7–R10).
 
-### Gaps (explicit — not implemented)
+### Target-State Requirements (per INV-8)
 
-- **R19**: The framework MUST NOT be assumed to have a `schema_migrations` meta table. Implementations depending on "which migrations have run" MUST infer that from column/table presence via `PRAGMA` queries — the authoritative migration state is the schema itself.
-- **R20**: The framework MUST NOT be assumed to expose a `register_migration(plugin_id, version, up, down, context)` API on `PluginHost` or `plugin_api`. The scenecraft milestone-17 / task-135 design describes this primitive; it is **not implemented** as of this spec.
-- **R21**: The framework MUST NOT be assumed to support rollback. There is no `down` path and no way to return a DB to a prior schema revision via the framework; the only way to "undo" a migration is to edit `db.py` and redeploy, accepting that any rows written under the new schema may need manual reconciliation.
-- **R22**: The framework MUST NOT be assumed to support constraint migration (adding/removing `NOT NULL`, `UNIQUE`, `CHECK`, changing FK targets) on an existing column. SQLite `ALTER TABLE` does not support these in the additive pattern this framework uses; a full table rebuild (create new, copy, drop old, rename) is required and is not implemented here.
+- **R19 (target)**: Every per-project DB MUST contain a `schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, applied_by TEXT NOT NULL)` table. Migrations are applied in ascending `version` order; the DAL consults this table to determine which migrations have run. (Transitional: today the framework infers migration state from `PRAGMA table_info` presence; see [Transitional Behavior](#transitional-behavior).)
+- **R20 (target)**: `plugin_api.register_migration(version: int, up_fn: Callable[[sqlite3.Connection], None], down_fn: Callable[[sqlite3.Connection], None] | None = None) -> Disposable` MUST be callable from within a plugin's `activate()`. Migrations from all plugins + core are collected and applied in global `version` order on project open. Cycles or duplicate versions MUST raise at registration time.
+- **R21 (target — rollback)**: `down_fn` is optional. When provided, `scenecraft migrate down --to <version>` walks migrations in reverse, invoking each `down_fn`. When omitted, the migration is forward-only and MUST be documented as such in the plugin's migration file header. The framework MUST NOT fabricate rollback behavior.
+- **R22 (target — constraint migration via rebuild)**: The framework MUST expose `plugin_api.migrate.rebuild_table(name: str, new_schema: str, row_transform: Callable[[sqlite3.Row], dict] | None = None) -> None`, which (1) creates `<name>_new` with `new_schema`, (2) copies rows through the optional transform, (3) `DROP TABLE <name>`, (4) `ALTER TABLE <name>_new RENAME TO <name>`, inside a single transaction. CHECK / UNIQUE / NOT-NULL / FK-target changes MUST go through this helper. Additive `ALTER TABLE ADD COLUMN` is still permitted for the no-constraint-change case.
+- **R23 (target — data migrations)**: `up_fn(conn)` receives the live `sqlite3.Connection` and MAY execute arbitrary Python (multi-statement SQL, parse-per-row backfills, external-service lookups). There is no staged-migration framework; migration authors compose complex backfills inside a single `up_fn`.
+- **R24 (target — cross-process init lock)**: Schema init + migration-apply MUST be serialized across OS processes on the same `project.db` via an advisory `flock` on `.scenecraft/schema.lock`. The lock is acquired before `_ensure_schema` begins and released after the migration batch commits. A process that fails to acquire within a bounded timeout MUST fall through to reading the (now-migrated) schema state and verify before returning.
 
 ---
 
@@ -212,13 +214,13 @@ if conn.execute("SELECT COUNT(*) FROM <table>").fetchone()[0] == 0:
 | 11 | Seed-target table is empty | Fixture rows INSERTED (e.g. 4 default send buses in order) | `empty-seed-target-gets-defaults` |
 | 12 | Seed-target table already populated | No INSERT; existing rows untouched | `non-empty-seed-target-is-noop` |
 | 13 | Plugin sidecar table (e.g. `light_show__fixtures`) needed | Created by core `_ensure_schema` DDL (hardcoded), not by plugin | `plugin-sidecar-tables-created-by-core` |
-| 14 | Code path queries for `schema_migrations` table | **undefined** — table does not exist | → [OQ-1](#open-questions) |
-| 15 | Plugin calls `register_migration` today | **undefined** — no such API exists | → [OQ-2](#open-questions) |
-| 16 | Need to roll back a forward migration | **undefined** — no `down` path; only manual DB edit + redeploy | → [OQ-3](#open-questions) |
-| 17 | Legacy DB still has a `NOT NULL` constraint that current code wants nullable (e.g. `track_id`) | **undefined** — `PRAGMA table_info` reports column name but the framework does not inspect/change constraint state | → [OQ-4](#open-questions) |
-| 18 | Plugin needs to add a `CHECK` constraint to an existing column | **undefined** — `ALTER TABLE` does not support adding CHECK; framework does not rebuild tables | → [OQ-5](#open-questions) |
-| 19 | Migration that must re-seed or transform data beyond a single-pass UPDATE (e.g. multi-stage backfill) | **undefined** — no staged-data-migration framework | → [OQ-6](#open-questions) |
-| 20 | Concurrent schema init across OS processes on the same `project.db` | **undefined** — `_migrated_dbs` is process-local; SQLite file locking arbitrates DDL but dual full bootstrap is not specified | → [OQ-7](#open-questions) |
+| 14 | Code path queries for `schema_migrations` table (target) | Table exists; row per applied migration version | `schema-migrations-table-present-after-init` |
+| 15 | Plugin calls `plugin_api.register_migration(version, up_fn, down_fn)` (target) | Registered against host; applied in version order on next project open | `register-migration-applies-in-version-order` |
+| 16 | `scenecraft migrate down --to <v>` (target) | Walks registered migrations in reverse invoking each `down_fn`; refuses when any required `down_fn` is `None` | `migrate-down-invokes-down-fns-in-reverse` |
+| 17 | Legacy DB with `NOT NULL` on `keyframes.track_id` that current spec wants nullable | `rebuild_table` helper recreates table with relaxed schema, copies rows verbatim | `rebuild-table-relaxes-not-null-constraint` |
+| 18 | Plugin needs to add a `CHECK` constraint to `light_show__fixtures.intensity` | `rebuild_table` creates new schema with CHECK; rows copied through transform | `rebuild-table-adds-check-constraint` |
+| 19 | Migration that must re-seed or transform data beyond a single-pass UPDATE | `up_fn(conn)` runs arbitrary Python; multi-statement SQL supported | `up-fn-runs-arbitrary-python` |
+| 20 | Concurrent schema init across OS processes on the same `project.db` | Advisory `flock` on `.scenecraft/schema.lock` serializes; loser waits then verifies | `schema-lock-serializes-cross-process-init` |
 | 21 | `_ensure_schema` raises mid-way (e.g. ALTER TABLE fails on row with pre-existing NULL) | Exception propagates; partial DDL is durable (SQLite auto-commits DDL); `_migrated_dbs` is NOT updated so next call re-runs | `exception-leaves-dbs-unmarked-for-retry` |
 | 22 | Read `PRAGMA table_info` between two migration blocks on same table | Snapshot reflects earlier `ALTER TABLE ADD COLUMN` within the same `_ensure_schema` run | `table-info-reflects-in-run-alters` |
 
@@ -512,6 +514,91 @@ Boundaries and hazard classes: concurrency, partial failures, stale memo state, 
 - **no-framework-path**: the additive-migration framework has no codepath that modifies column constraints in place.
 - **requires-manual-table-rebuild**: the only way to achieve the change is a manual CREATE-new / INSERT-select / DROP-old / RENAME sequence authored by hand in `_ensure_schema`, which is out of the framework's contract.
 
+#### Test: schema-migrations-table-present-after-init (covers R19 target)
+
+**Given**: A fresh DB after `_ensure_schema`.
+
+**When**: Query `SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'`.
+
+**Then** (assertions):
+- **table-exists**: query returns one row.
+- **columns-present**: `PRAGMA table_info(schema_migrations)` lists `version`, `applied_at`, `applied_by`.
+- **seeded-with-core**: every core migration version has a row with non-null `applied_at`.
+
+#### Test: register-migration-applies-in-version-order (covers R20 target)
+
+**Given**: Plugin A registers `register_migration(version=1001, up_fn=fn_a1)`; Plugin B registers `register_migration(version=1000, up_fn=fn_b)`; Plugin A registers `register_migration(version=1002, up_fn=fn_a2)`.
+
+**When**: Project DB is opened and the framework applies pending migrations.
+
+**Then** (assertions):
+- **apply-order**: `fn_b` runs first, then `fn_a1`, then `fn_a2` — strict ascending version order regardless of registration order.
+- **ledger-updated**: `schema_migrations` gains three rows with versions 1000, 1001, 1002.
+- **idempotent-reopen**: reopening the project does not re-run any of the three.
+
+#### Test: migrate-down-invokes-down-fns-in-reverse (covers R21 target)
+
+**Given**: Two migrations applied — v1010 with `down_fn=d1` and v1011 with `down_fn=d2`.
+
+**When**: `scenecraft migrate down --to 1009` is invoked.
+
+**Then** (assertions):
+- **reverse-order**: `d2` runs before `d1`.
+- **ledger-pruned**: `schema_migrations` rows for 1010 and 1011 are deleted.
+- **refuses-on-none-down**: if v1010 had `down_fn=None`, the command aborts before any down runs with `MigrationNotReversibleError`.
+
+#### Test: rebuild-table-relaxes-not-null-constraint (covers R22 target)
+
+**Given**: A legacy DB where `keyframes.track_id` has `NOT NULL` and 10 populated rows.
+
+**When**: A migration calls `plugin_api.migrate.rebuild_table("keyframes", new_schema=<same schema but track_id TEXT nullable>)`.
+
+**Then** (assertions):
+- **new-schema-nullable**: post-rebuild, `PRAGMA table_info(keyframes)` reports `track_id` with `notnull=0`.
+- **rows-preserved**: all 10 rows present with identical `id`, `track_id`, and other values.
+- **atomic**: the rebuild executed inside a single transaction; partial failure would leave the original table in place.
+
+#### Test: rebuild-table-adds-check-constraint (covers R22 target)
+
+**Given**: `light_show__fixtures` exists without a CHECK on `intensity`.
+
+**When**: A migration calls `rebuild_table("light_show__fixtures", new_schema=<includes CHECK(intensity BETWEEN 0 AND 1)>, row_transform=lambda r: {**dict(r), "intensity": max(0, min(1, r["intensity"]))})`.
+
+**Then** (assertions):
+- **check-enforced**: subsequent inserts with `intensity=1.5` raise `sqlite3.IntegrityError`.
+- **transform-applied**: pre-existing rows with out-of-range values were clamped via the transform.
+
+#### Test: up-fn-runs-arbitrary-python (covers R23 target)
+
+**Given**: A migration whose `up_fn(conn)` (1) adds a column, (2) SELECTs every row, (3) parses a JSON blob per row, (4) writes derived values back, (5) creates an index.
+
+**When**: The framework applies the migration.
+
+**Then** (assertions):
+- **all-steps-applied**: column present, derived values correct, index listed in `sqlite_master`.
+- **single-version-row**: one `schema_migrations` row added, not five.
+
+#### Test: schema-lock-serializes-cross-process-init (covers R24 target)
+
+**Given**: Two OS processes both open the same `project.db` simultaneously with no prior init.
+
+**When**: Both call `_ensure_schema`.
+
+**Then** (assertions):
+- **flock-acquired-once**: advisory lock on `.scenecraft/schema.lock` is held by exactly one process at a time; the other blocks until release.
+- **no-double-apply**: each migration's `up_fn` runs exactly once (verified via spy or `schema_migrations` row count).
+- **both-return-healthy**: after release, the waiting process observes the completed schema and returns cleanly.
+
+#### Test: negative-no-internal-lock-across-api (covers INV-1)
+
+**Given**: A migration in progress for project A; a separate project B's DAL call arrives concurrently.
+
+**When**: The B call executes.
+
+**Then** (assertions):
+- **no-shared-lock**: B's call is not blocked by A's schema_lock (lock is per-project, path-specific).
+- **independent-connections**: INV-1 holds — single-writer applies per (user, project), not across projects.
+
 #### Test: undefined-legacy-not-null-track-id (covers OQ-4)
 
 **Given**: A DB produced by an older engine where `keyframes.track_id` was created with `NOT NULL` but no DEFAULT, and contains rows with `track_id = 'track_1'` (populated by an earlier ALTER) — AND a current code path that assumes `track_id` is nullable.
@@ -566,33 +653,71 @@ Boundaries and hazard classes: concurrency, partial failures, stale memo state, 
 
 ---
 
+## Transitional Behavior
+
+Per INV-8, Requirements R19–R24 describe the **target-ideal** migration framework. Until the FastAPI refactor milestone (task-135) lands, the following **transitional** behavior ships today in `src/scenecraft/db.py`:
+
+- **No `schema_migrations` table**: migration state is inferred purely from `PRAGMA table_info(<table>)` + `sqlite_master` queries. Code paths that depend on "did migration vN run?" MUST inspect schema shape, not a version ledger.
+- **No `register_migration` API**: `plugin_api` has no `register_migration` attribute; `PluginHost` has no `register_migration` method. Plugin sidecar DDL lives hardcoded in core `db.py` (`generate_music__*`, `transcribe__*`, `light_show__*`).
+- **Additive-only ALTER**: all column migrations use the `PRAGMA table_info` + `ALTER TABLE ADD COLUMN` pattern. Constraint changes (NOT NULL, CHECK, UNIQUE, FK target) are NOT supported; pre-existing legacy constraints (e.g. `audio_clips.track_id NOT NULL` on older DBs) remain in place.
+- **No rollback**: there is no `down_fn`, no `migrate down` CLI, no way to return a DB to a prior schema revision without editing `db.py` and redeploying.
+- **One-shot data transforms inline**: data-derivation migrations happen inside `_ensure_schema` using the `UPDATE ... WHERE new_col IS NULL` pattern. Multi-stage backfills are not supported.
+- **No cross-process lock**: `_migrated_dbs` is process-local. Two OS processes hitting an un-bootstrapped `project.db` both enter `_ensure_schema` concurrently; SQLite's per-statement file lock + `busy_timeout=60000` is the only coordination. Double-bootstrap is tolerated only because every DDL is guarded by `IF NOT EXISTS` or a column-existence check — it is NOT transactionally correct.
+
+Regression-lock tests (Tests 1–13 in Base Cases, Tests 21–22 in Edge Cases) cover this transitional behavior and stay in place until the target framework lands. The `### Base Cases` target-behavior tests added above (Tests 14–20) are authored against the target contract and will begin passing only after the migration primitive is implemented.
+
+**Migration sequence** to the target:
+1. Add `schema_migrations` table (idempotent `CREATE TABLE IF NOT EXISTS`) — cheap, non-breaking.
+2. Add `plugin_api.register_migration` + `plugin_api.migrate.rebuild_table` primitives.
+3. Move hardcoded plugin sidecar DDL out of `db.py` into each plugin's `activate()` via `register_migration`.
+4. Wire advisory `flock` on `.scenecraft/schema.lock`.
+5. Expose `scenecraft migrate down --to <version>` CLI + enforce `down_fn` presence check.
+
+---
+
 ## Open Questions
 
-### OQ-1: `schema_migrations` version table — is inference-from-schema sufficient indefinitely?
+### Resolved
+
+- **OQ-1 (`schema_migrations` version table)** — **Resolved** (fix): target state includes per-project `schema_migrations(version, applied_at, applied_by)` table; current column-existence check is transitional. See R19 and [Transitional Behavior](#transitional-behavior).
+- **OQ-2 (`register_migration` plugin primitive)** — **Resolved** (codify): yes, M17 design is the target. `plugin_api.register_migration(version, up_fn, down_fn=None)` called during plugin activation; migrations applied in global version order on project open. See R20.
+- **OQ-3 (rollback semantics)** — **Resolved** (codify): `down_fn` is optional; when omitted, migration is forward-only and docs must note it. `scenecraft migrate down --to <v>` walks reverse. See R21.
+- **OQ-4 (legacy DB pre-existing `NOT NULL`)** — **Resolved** (fix): target includes `migrate.rebuild_table(name, new_schema, row_transform=None)` helper. Current additive-ALTER approach is transitional and leaves legacy NOT NULL in place on pre-M13 DBs. See R22.
+- **OQ-5 (plugin CHECK constraints)** — **Resolved** (codify): supported via `rebuild_table`; CHECK / UNIQUE / NOT-NULL changes require a full table rebuild. See R22.
+- **OQ-6 (data migrations beyond single-pass UPDATE)** — **Resolved** (codify): `up_fn(conn)` accepts arbitrary Python including multi-statement SQL. See R23.
+- **OQ-7 (concurrent schema init across OS processes)** — **Resolved** (fix): advisory `flock` on `.scenecraft/schema.lock` during `_ensure_schema` + migration apply. See R24.
+
+### Deferred
+
+_(none — all OQs resolved in the 2026-04-27 pass)_
+
+### Historical (retained for audit trail)
+
+#### OQ-1: `schema_migrations` version table — is inference-from-schema sufficient indefinitely?
 
 Today, "which migration has run" is inferred purely from `PRAGMA table_info(<table>)` and table presence. This works as long as every migration is column-additive or table-creative. Constraint changes, data-only migrations, and rollback all require an explicit version ledger. Should the engine add a `schema_migrations` table unconditionally (cheap insurance), defer until a plugin needs it (YAGNI), or punt to M17 task-135 which already proposes one?
 
-### OQ-2: `register_migration` plugin primitive — is the M17 design still the target?
+#### OQ-2: `register_migration` plugin primitive — is the M17 design still the target?
 
 `agent/milestones/milestone-17-track-contribution-point-and-light-show-plugin.md` and `task-135-migration-contribution-point.md` describe a `register_migration(plugin_id, version, up, down, context)` API with per-plugin versioning, up/down roundtrip, SQL-string / list-of-SQL / callable content types, and transactional execution. That design is unimplemented. Is it still the intended direction, or has the team's thinking evolved (e.g. declarative `plugin.yaml` migration lists rather than imperative `register_migration` calls)?
 
-### OQ-3: Rollback semantics — what's the contract for reverting a shipped migration?
+#### OQ-3: Rollback semantics — what's the contract for reverting a shipped migration?
 
 Today: the only rollback is edit `db.py` + redeploy, and any rows written under the new schema may be unreconcilable. Is that acceptable as the permanent position, or does the team want first-class rollback? If yes, does it need to preserve the rows written under the new schema (transform back), or is it acceptable to fail on "cannot safely revert"?
 
-### OQ-4: Legacy DB with pre-existing `NOT NULL` constraint on a now-nullable column
+#### OQ-4: Legacy DB with pre-existing `NOT NULL` constraint on a now-nullable column
 
 The audit calls out `keyframes.track_id` specifically: older DBs may still have `NOT NULL` on `track_id` from before the framework added it nullably. `PRAGMA table_info` reports `notnull=1` but the framework never reads that field and never rebuilds the table. If a current DAL call writes `track_id = NULL`, the insert fails on the legacy DB but succeeds on a fresh DB. Is this acceptable as "known broken on pre-M13 DBs" (rare — scenecraft is greenfield), or does the framework need a one-time table-rebuild to normalize constraints? If yes, what's the rebuild heuristic (trigger from which marker)?
 
-### OQ-5: Plugin CHECK constraints — supported or explicitly forbidden?
+#### OQ-5: Plugin CHECK constraints — supported or explicitly forbidden?
 
 Plugins today cannot add `CHECK` constraints in their sidecar tables because those tables' DDL lives in core `db.py` where only the core team writes SQL. Once `register_migration` exists, plugins *could* declare CHECK via `CREATE TABLE` but *adding* a CHECK to an existing table requires a rebuild. Should the `register_migration` contract explicitly forbid constraint migration and require plugins to plan constraints at initial table creation?
 
-### OQ-6: Data migrations beyond single-pass `UPDATE ... WHERE new_col IS NULL`
+#### OQ-6: Data migrations beyond single-pass `UPDATE ... WHERE new_col IS NULL`
 
 The current framework's one-shot transform works for simple derivations. Multi-stage backfills (parse-per-row + normalize + validate + enforce-constraint) have no framework support. Should these be authored as Python callables inside `_ensure_schema` (expands the function indefinitely), as separate `post_schema` hooks (adds a phase the framework doesn't have), or punted to M17 task-135's callable migration content type?
 
-### OQ-7: Concurrent schema init across OS processes
+#### OQ-7: Concurrent schema init across OS processes
 
 `_migrated_dbs` is process-local. Two processes both hitting an un-bootstrapped `project.db` (e.g. engine server + a CLI admin command at the same moment) will both enter `_ensure_schema`. SQLite's file lock + `busy_timeout=60000` will serialize individual DDL statements, but the full sequence (DROP TABLE rescue + CREATE block + ALTER blocks + seeds) is not an atomic transaction. Possible outcomes: both complete cleanly (DDL is `IF NOT EXISTS` + guarded); one fails mid-way and retries on next invocation; one clobbers a partially-populated seed of the other. Is "both complete cleanly because every DDL is idempotent" the position the spec should cement, or does the framework need a lock file / meta-table advisory lock?
 

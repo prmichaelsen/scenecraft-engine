@@ -100,7 +100,15 @@
   8. Calls `_mux_audio(tmp, output_path, audio_to_mux, preview)` which runs a single ffmpeg re-encode (`libx264` + `aac`, `-shortest`, preset `ultrafast crf 28` for preview else `fast crf 18`), then unlinks the tmp file.
   9. Returns `output_path`.
 - **R43** Progress logs are emitted every 1000 frames and on the final frame.
-- **R44** `assemble_final` does not sanity-check that `ffmpeg` / `ffprobe` exist on PATH ahead of time.
+- **R44** `assemble_final` preflights `shutil.which("ffmpeg")` at function entry; missing → `MissingDependencyError("ffmpeg not found; install via: <platform-specific hint>")` raised before any schedule build or writer open. (Closes OQ-3; transitional: current code does not preflight.)
+- **R52** `cv2.VideoWriter.write(frame)` return value MUST be checked; on `False` raise `RenderError("VideoWriter rejected frame at t=<time>")`. Mux is NOT attempted on partial `.tmp.mp4`. (Closes OQ-2.)
+- **R53** `assemble_final` wraps the entire "open VideoWriter → loop → release → mux" flow in `try/finally`; the `finally` block unlinks `{output_path}.tmp.mp4` if it exists, ensuring no orphan `.tmp.mp4` persists on any exit path (crash or success). (Closes OQ-4.)
+- **R54** `_evaluate_curve` clamps `x` to `[0, 1]` as a contractual guarantee (not implementation detail). Callers may pass any float; the curve evaluator treats `x < 0` as `x = 0` and `x > 1` as `x = 1`. (Closes OQ-5.)
+- **R55** `_apply_transform` with `scale_x == 0` or `scale_y == 0` returns a black frame of target `(h, w)` dimensions (NumPy zeros, uint8). The current short-circuit-to-identity behavior is a bug to be fixed in the refactor; transitional behavior returns the original image. (Closes OQ-6.)
+- **R56** `cv2.resize` interpolation choice is direction-based: `INTER_AREA` when downscaling (new_w*new_h < old_w*old_h), `INTER_LINEAR` when upscaling or identity. Applied uniformly across all `cv2.resize` call sites (transform, overlay read, base-segment fit, frame-effect zoom, preview halving). (Closes OQ-7.)
+- **R57** `assemble_final` with `duration_seconds == 0` (no segments / zero-duration schedule) short-circuits before opening `cv2.VideoWriter`: returns success with no output file written. `total_output_frames == 0` path MUST NOT open a writer. (Closes OQ-8.)
+- **R58 (INV-1 single-writer)**: `assemble_final` holds the schedule snapshot built at function entry for the entire render loop. Coordinator invalidations / schedule rebuilds that fire mid-render do NOT abort the in-flight render; the render completes with snapshot-at-start semantics. No internal mutex is held across the render loop; negative-assertion test covers this. (Closes OQ-1; cross-ref cache-invalidation R31.)
+- **R59 (INV-7 per-working-copy cache partitioning)**: The `frame_cache` dict, `fragment_cache` entries, and `RenderCoordinator` worker state are keyed by `working_copy` (session_id / working_copy_db_path), NOT by `project_dir`. Renders initiated from different working copies for the same project operate on isolated caches. Target state; current `project_dir`-keyed structures transitional. Cross-ref cache-invalidation R27.
 
 ### Cache Invalidation
 
@@ -202,13 +210,14 @@ def invalidate_frames_for_mutation(
 | 31 | `invalidate_frames_for_mutation` when RenderCoordinator raises | Counts still returned correctly; no raise | `invalidate-coordinator-failure-swallowed` |
 | 32 | `invalidate_frames_for_mutation` with a malformed range `(20, 10)` | Dropped from range list; remaining valid ranges processed | `invalidate-drops-invalid-range` |
 | 33 | `render_frame_at` on schedule with overlay track `zOrder` out of order in DB | Rendered composite respects ascending zOrder regardless of DB insert order | `render-overlay-zorder-respected` |
-| 34 | Schedule rebuild mid-render (coordinator flips project dirty while `assemble_final` loop is running) | `undefined` | → [OQ-1](#open-questions) |
-| 35 | `cv2.VideoWriter` fails or returns a write error mid-frame | `undefined` — partial `.tmp.mp4` may persist | → [OQ-2](#open-questions) |
-| 36 | `ffmpeg` missing from PATH | `undefined` — FileNotFoundError from subprocess.run propagates uncaught | → [OQ-3](#open-questions) |
-| 37 | `assemble_final` crashes between `out.release()` and `_mux_audio` completion | `undefined` — orphaned `.tmp.mp4` remains on disk | → [OQ-4](#open-questions) |
-| 38 | Transform curve evaluation queried with `x > 1.0` (progress outside [0,1]) | `undefined` at the x-edge — currently `_evaluate_curve` clamps p to [0,1] via `max/min`, but this is not contractually guaranteed by the spec | → [OQ-5](#open-questions) |
-| 39 | `_apply_transform` with `scale_x=0.0` or `scale_y=0.0` | `undefined` — code path short-circuits when `new_w==0` or `new_h==0` (returns original image unchanged), but downstream contract ambiguous vs "expected black frame" | → [OQ-6](#open-questions) |
-| 40 | `cv2.resize` interpolation choice in `_apply_transform` / overlay read (always `INTER_LINEAR`, not `INTER_AREA`) | `undefined` — compositor uses `INTER_AREA` for preview downscale in base-segment path but `INTER_LINEAR` everywhere else; no spec rationale | → [OQ-7](#open-questions) |
+| 34 | Schedule rebuild mid-render (coordinator flips project dirty while `assemble_final` loop is running) | Render holds t=0 schedule snapshot; completes with snapshot-at-start semantics; coord signals do not abort (R58) | `assemble-snapshot-immune-to-mid-render-invalidate`, `assemble-no-lock-across-render-loop` |
+| 35 | `cv2.VideoWriter.write` returns False mid-frame | Raise `RenderError("VideoWriter rejected frame at t=<time>")`; do NOT proceed to mux; tmp cleaned up via R53 finally (R52) | `assemble-videowriter-false-raises-rendererror` |
+| 36 | `ffmpeg` missing from PATH | `MissingDependencyError("ffmpeg not found; install via: ...")` at function entry before any work (R44) | `assemble-ffmpeg-missing-preflight-error` |
+| 37 | `assemble_final` crashes between `out.release()` and `_mux_audio` completion | `try/finally` unlinks `.tmp.mp4` on any exit path; no orphan persists (R53) | `assemble-tmp-cleanup-on-crash-via-finally` |
+| 38 | Transform curve evaluation queried with `x > 1.0` (progress outside [0,1]) | `_evaluate_curve` clamps to `[0, 1]` as contract (R54) | `evaluate-curve-clamps-x-to-0-1` |
+| 39 | `_apply_transform` with `scale_x=0.0` or `scale_y=0.0` | Returns black frame of target `(h, w)` dims, dtype uint8 (R55). Current identity-return transitional. | `transform-scale-zero-returns-black-frame` |
+| 40 | `cv2.resize` interpolation choice | Direction-based: `INTER_AREA` for downscale, `INTER_LINEAR` for upscale / identity; uniform across all call sites (R56) | `resize-interpolation-by-direction` |
+| 41 | Zero-duration schedule (`duration_seconds == 0`) | Short-circuit before opening VideoWriter; return success with no output file (R57) | `assemble-zero-duration-short-circuits` |
 
 ---
 
@@ -651,14 +660,102 @@ def invalidate_frames_for_mutation(
 
 > Note: This is a weak concurrency contract — it only asserts safety with **separate** `frame_cache` dicts. Sharing a `frame_cache` across threads is explicitly unsupported (see Non-Goals).
 
-#### Test: assemble-zero-duration-schedule (covers R42)
+#### Test: assemble-zero-duration-short-circuits (covers R57)
 
 **Given**: Project with no base segments (`duration_seconds == 0`).
 
 **When**: `assemble_final(project_dir, "out.mp4")`.
 
 **Then**:
-- **undefined-or-empty**: `undefined` — behavior not specified. Links to [OQ-8](#open-questions).
+- **no-writer-opened**: `cv2.VideoWriter` is NOT instantiated (observable via mock / spy).
+- **no-ffmpeg-call**: no ffmpeg subprocess spawned.
+- **no-output-file**: `out.mp4` does not exist on disk.
+- **returns-success**: function returns without raising (return value may be `output_path` or `None`; spec leaves exact return value for product).
+
+#### Test: assemble-snapshot-immune-to-mid-render-invalidate (covers R58)
+
+**Given**: An `assemble_final` loop is rendering; a concurrent coroutine calls `invalidate_frames_for_mutation(project_dir, None)` halfway through.
+
+**When**: The render loop continues.
+
+**Then**:
+- **render-completes**: output mp4 is produced with all `total_output_frames` frames.
+- **snapshot-frames-used**: frames reflect the t=0 schedule snapshot, not any post-invalidate DB state.
+- **no-abort-signal**: no exception raised by the render loop from coordinator dirty state.
+
+#### Test: assemble-no-lock-across-render-loop (negative — INV-1, R58)
+
+**Given**: Inspection of `assemble_final` source.
+
+**When**: Inspected.
+
+**Then**:
+- **no-threading-lock**: no `threading.Lock` / `asyncio.Lock` acquired across the render loop.
+- **no-per-project-mutex**: no global `_render_locks[project_dir]` pattern.
+
+#### Test: assemble-videowriter-false-raises-rendererror (covers R52)
+
+**Given**: `cv2.VideoWriter.write` is patched to return `False` on the 5th frame.
+
+**When**: `assemble_final` runs.
+
+**Then**:
+- **raises-rendererror**: `RenderError` raised with message containing "VideoWriter rejected frame" and the time.
+- **no-mux-attempted**: ffmpeg mux subprocess is NOT spawned.
+- **tmp-cleaned**: `.tmp.mp4` does not exist on disk after the raise (via R53 finally).
+
+#### Test: assemble-ffmpeg-missing-preflight-error (covers R44)
+
+**Given**: `shutil.which("ffmpeg")` returns `None`.
+
+**When**: `assemble_final(project_dir, "out.mp4")` called.
+
+**Then**:
+- **raises-missing-dep**: `MissingDependencyError` raised at entry with message "ffmpeg not found".
+- **no-schedule-built**: `build_schedule` was NOT invoked.
+- **no-writer-opened**: `cv2.VideoWriter` NOT instantiated.
+
+#### Test: assemble-tmp-cleanup-on-crash-via-finally (covers R53)
+
+**Given**: `_mux_audio` raises `RuntimeError("ffmpeg failed")` mid-mux; a `.tmp.mp4` exists on disk at that point.
+
+**When**: `assemble_final` runs.
+
+**Then**:
+- **exception-propagates**: the `RuntimeError` reaches the caller.
+- **tmp-removed**: `.tmp.mp4` does NOT exist on disk (finally block unlinked it).
+
+#### Test: evaluate-curve-clamps-x-to-0-1 (covers R54)
+
+**Given**: Curve `[[0, 0], [0.5, 0.5], [1, 1]]`.
+
+**When**: `_evaluate_curve(curve, x)` called with x values `-0.5, 0.0, 1.0, 1.5`.
+
+**Then**:
+- **negative-clamped**: `_evaluate_curve(curve, -0.5) == 0.0`.
+- **over-one-clamped**: `_evaluate_curve(curve, 1.5) == 1.0`.
+- **boundary-identity**: `_evaluate_curve(curve, 0.0) == 0.0` and `(..., 1.0) == 1.0`.
+
+#### Test: transform-scale-zero-returns-black-frame (covers R55)
+
+**Given**: Solid-red image, clip_data with `scale_x=0.0, scale_y=1.0`.
+
+**When**: `_apply_transform(img, clip_data, 0.5)`.
+
+**Then**:
+- **returns-black**: output is all zeros, dtype uint8.
+- **same-shape**: output.shape == input.shape.
+
+#### Test: resize-interpolation-by-direction (covers R56)
+
+**Given**: Spy on `cv2.resize` calls.
+
+**When**: Renders involving both downscale (e.g., overlay source 4K → frame 1080p) and upscale (e.g., scale=1.5) occur.
+
+**Then**:
+- **downscale-uses-area**: `cv2.resize` invocations where target pixel count < source pixel count pass `interpolation=cv2.INTER_AREA`.
+- **upscale-uses-linear**: invocations where target > source pass `interpolation=cv2.INTER_LINEAR`.
+- **identity-uses-linear**: invocations where target == source pass `INTER_LINEAR`.
 
 #### Test: schedule-intel-file-auto-discovered (covers R14)
 
@@ -686,6 +783,20 @@ def invalidate_frames_for_mutation(
 ---
 
 ## Open Questions
+
+### Resolved
+
+- **OQ-1 (schedule rebuild mid-render)**: **Resolved 2026-04-27**. Snapshot-at-start semantics (R58). Closed under INV-1 single-writer; render holds schedule from t=0; coord signals do not abort. Cross-ref cache-invalidation OQ-4 / R31. Negative-assertion test `assemble-no-lock-across-render-loop`.
+- **OQ-2 (cv2.VideoWriter failure unchecked)**: **Resolved 2026-04-27**. Check return; raise `RenderError` on False; no mux on partial tmp (R52).
+- **OQ-3 (ffmpeg missing from PATH)**: **Resolved 2026-04-27**. Preflight `shutil.which("ffmpeg")`; raise `MissingDependencyError` before any work (R44).
+- **OQ-4 (orphaned .tmp.mp4 on crash)**: **Resolved 2026-04-27**. `try/finally` cleanup (R53).
+- **OQ-5 (curve x outside [0,1])**: **Resolved 2026-04-27 as codified**. `_evaluate_curve` clamps as contract (R54).
+- **OQ-6 (scale=0 short-circuits to identity)**: **Resolved 2026-04-27**. Returns black frame of target dims (R55); current identity-return is a bug fixed in refactor.
+- **OQ-7 (INTER_LINEAR vs INTER_AREA inconsistency)**: **Resolved 2026-04-27**. Direction-based: INTER_AREA for downscale, INTER_LINEAR for upscale/identity (R56).
+- **OQ-8 (zero-duration schedule)**: **Resolved 2026-04-27**. Short-circuit before opening VideoWriter; return success with no output file (R57).
+- **INV-7 (per-working-copy cache partitioning)**: Codified via R59; cross-ref cache-invalidation R27.
+
+### Open (none remaining)
 
 - **OQ-1 — Schedule rebuild mid-render / coordinator invalidation race**: If a mutating endpoint fires `invalidate_frames_for_mutation` while an `assemble_final` loop is running, `RenderCoordinator.invalidate_project` flips the project's dirty bit. `assemble_final` itself doesn't poll the coordinator; it holds the schedule it built at t=0 of the loop and finishes with stale data. Do we (a) accept stale-output-for-this-run as the contract, (b) abort the render on coordinator dirty, or (c) rebuild + restart? Current code does (a) implicitly. Behavior Table row 34.
 - **OQ-2 — `cv2.VideoWriter` failure mid-frame**: `out.write(frame)` returns `False` on failure, which is never checked. If the writer fails partway, we still call `out.release()` and proceed to ffmpeg mux on a partial/truncated `.tmp.mp4`. Do we detect + fail fast, or treat writer returns as advisory? Behavior Table row 35.

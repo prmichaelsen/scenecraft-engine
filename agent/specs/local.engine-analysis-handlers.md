@@ -92,8 +92,8 @@ Define the black-box behavior of the five engine-internal analysis handlers — 
 - **R-M15**: Load WAV via `soundfile`; if on-disk `sr != requested sample_rate`, return an error (no row inserted).
 - **R-M16**: Insert the run row (with `rendered_path=None`) BEFORE running analyses.
 - **R-M17**: For each requested analysis in `{peak, true_peak, rms, lufs, clipping_detect, spectral_centroid, dynamic_range}`, compute and accumulate datapoints / sections / scalars. Unknown analysis names are silently skipped.
-- **R-M18**: Per-analysis exceptions inside `true_peak`, `lufs`, `spectral_centroid` are caught and logged; that analysis is NOT added to `analyses_written`, but other analyses continue.
-- **R-M19**: A top-level exception during the analysis loop (outside the inner try/excepts) deletes the run row and returns `{"error": "analysis failed: ..."}`.
+- **R-M18**: Per-analysis exceptions inside **every** analysis (`peak`, `true_peak`, `rms`, `lufs`, `clipping_detect`, `spectral_centroid`, `dynamic_range`) are caught in an inner try/except and logged; the failing analysis is NOT added to `analyses_written`, but other analyses continue. (Target state per OQ-3 resolution; current code only wraps `true_peak`/`lufs`/`spectral_centroid` — transitional.)
+- **R-M19**: A top-level exception during the analysis loop (outside the inner try/excepts, e.g. catastrophic failure in the loop scaffolding itself) deletes the run row and returns `{"error": "analysis failed: ..."}`. Individual analysis failures must NOT reach this path once R-M18 target is implemented.
 - **R-M20**: `dynamic_range` = `peak_db - lufs_integrated`; computes inputs on demand if not already in the requested set; skips the scalar when either input is `-inf` (silence / too-short buffer).
 - **R-M21**: After the loop, bulk-insert datapoints (`rms`, `spectral_centroid`), sections (`clipping_event`), scalars (`peak_db`, `true_peak_db`, `lufs_integrated`, `clip_count`, `dynamic_range_db`); then `update_mix_run_rendered_path(run.id, "pool/mixes/<hash>.wav")`.
 - **R-M22**: Return `{run_id, cached:False, mix_graph_hash, start_time_s, end_time_s, rendered_path, scalars, clipping_events, analyses_written}`.
@@ -148,6 +148,12 @@ Define the black-box behavior of the five engine-internal analysis handlers — 
 - **R-P8**: Ffmpeg exits non-zero AND no bucket was written → `RuntimeError(f"ffmpeg rc={rc}: <stderr snippet>")`.
 - **R-P9**: Ffmpeg hangs > 60s → `proc.kill()` + `RuntimeError("ffmpeg timed out during peak decode")`.
 - **R-P10**: Cache write failure (`OSError`) is logged but the function still returns the computed bytes.
+- **R-P14**: Cache file writes MUST be atomic: write to `<key>.f16.tmp` then `os.rename` to `<key>.f16`. Readers never observe a partial file. (Closes OQ-5.)
+- **R-B22**: On cache hit (row with `rendered_path IS NOT NULL`), the on-disk WAV MUST be stat-checked; if missing, treat as cache miss and re-render via WS. Matches `_exec_analyze_master_bus` behavior. (Closes OQ-2.)
+- **R-G15**: Each per-chunk `_gemini_describe_chunk_structured` call is wrapped in try/except. On rate-limit exceptions (`google.api_core.exceptions.ResourceExhausted` and equivalents), the entire run fails fast with `{"error": "rate limit: ..."}` — no partial description rows persisted. Non-rate-limit exceptions also abort the run with error return. (Closes OQ-4.)
+- **R-B23**: On WS client disconnect mid-wait (detected via explicit cancellation event, distinct from timeout), handler returns a `tool_result` with `isError:true, reason:"client_disconnected"` rather than silent timeout. Row cleanup identical to timeout. Applies to `_exec_analyze_master_bus` as well. (Closes OQ-6.)
+- **R-A1 (startup sweep)**: On server boot, scan `pool/bounces/` and `pool/mixes/` for WAVs with no corresponding DB row (by `composite_hash` / `mix_graph_hash` filename) and delete them. (Closes OQ-1.)
+- **R-P15 (source-file mutation tolerated)**: Analysis operates on the on-disk snapshot at time of dispatch. Mutation mid-analysis is undefined but tolerated. No source-file watcher or lock held during analysis. Pool segments are content-addressed (new writes land at new paths), so this is rare. (Closes OQ-7 as codified.)
 - **R-P11**: `/audio-clips/:id/peaks` rejects missing clip (`404`), clip with no `source_path` (`400`), source path escaping the project dir (`400`), source missing on disk (`404`), `RuntimeError` from `compute_peaks` (`500 PEAKS_FAILED`).
 - **R-P12**: Response headers: `Content-Type: application/octet-stream`, `X-Peak-Resolution: <n>`, `X-Peak-Duration: <seconds:.6f>`.
 - **R-P13**: `/pool/:seg_id/peaks` uses the raw `pool_segments` row (full file, `source_offset=0`, `duration = full length`).
@@ -283,14 +289,14 @@ Define the black-box behavior of the five engine-internal analysis handlers — 
 | 49 | peaks source file mtime changes | Cache key changes → new file written | `peaks-mtime-bump-busts-cache` |
 | 50 | peaks HTTP route — missing clip / bad source_path / source missing / compute_peaks raises | 404 / 400 / 404 / 500 with structured error envelope | `peaks-route-error-responses` |
 | 51 | peaks HTTP route success | 200 with `X-Peak-Resolution`, `X-Peak-Duration`, `Content-Type: application/octet-stream` | `peaks-route-success-headers` |
-| 52 | concurrent peaks requests for the same clip | `undefined` | → [OQ-5](#open-questions) |
-| 53 | bounce timeout fires at T+60s but upload lands at T+61s | `undefined` — row deleted at timeout; late upload writes WAV but the pending event is gone, so `set_bounce_render_event` returns False; the WAV sits on disk as an orphan (not linked to any bounces row) | → [OQ-1](#open-questions) |
-| 54 | composite_hash cache hit but file on disk missing | `undefined` — bounce code checks `rendered_path IS NOT NULL` from DB but does NOT stat the file; analyze_master_bus re-renders via WS if file missing regardless of cache | → [OQ-2](#open-questions) |
-| 55 | librosa raises mid-analysis in `analyze_master_bus` for `rms` / `peak` / `clipping_detect` (no inner try/except) | `undefined` — top-level `except` deletes the run row but other analyses already computed in the same loop iteration are lost; partial in-memory accumulators are discarded | → [OQ-3](#open-questions) |
-| 56 | Gemini rate limit mid-chunk (raises inside `_gemini_describe_chunk_structured`) | `undefined` — current code expects `None` on failure; a raised exception propagates out of `_exec_generate_descriptions` and violates R-G14 | → [OQ-4](#open-questions) |
-| 57 | Two concurrent `compute_peaks` calls for same (source, offset, duration, resolution) | `undefined` — both may launch ffmpeg; `write_bytes` of the same content is last-write-wins; unlikely to corrupt because bytes are identical, but not enforced | → [OQ-5](#open-questions) |
-| 58 | bounce/analyze ws.send succeeds but WS closes before upload | `undefined` — the frontend never calls `/bounce-upload`, so timeout path fires; behavior identical to R-B16 / R-M12 | → [OQ-6](#open-questions) |
-| 59 | `_exec_generate_descriptions` / `_exec_generate_dsp` called with a pool_segment whose file is currently being written | `undefined` — no file-lock; librosa may read truncated audio | → [OQ-7](#open-questions) |
+| 52 | concurrent peaks requests for the same clip | Both launch ffmpeg (no lock); writes are atomic via tmp+rename (R-P14); readers never see partial file | `peaks-concurrent-write-atomic-via-rename` |
+| 53 | bounce timeout fires at T+60s but upload lands at T+61s | Row deleted at timeout. Late upload writes WAV; startup-sweep (R-A1) later removes orphan. Upload handler may optionally reject if no matching row; see Related | `bounce-late-upload-orphan-swept` |
+| 54 | composite_hash cache hit but file on disk missing | Stat-check on cache hit; missing → treat as cache miss, re-render via WS (R-B22) | `bounce-cache-hit-missing-file-refetches` |
+| 55 | librosa raises mid-analysis in `analyze_master_bus` for `rms` / `peak` / `clipping_detect` | Per-analysis try/except catches (R-M18 target); failing analysis skipped; others continue and persist. Current lack of inner try/except for these is transitional. | `analyze-inner-try-per-analysis-rms-peak-clipping` |
+| 56 | Gemini rate limit mid-chunk (raises inside `_gemini_describe_chunk_structured`) | Caught by per-chunk try/except (R-G15); whole run fails with `{"error":"rate limit: ..."}`, no partial description rows persisted | `descriptions-rate-limit-aborts-run-no-partials` |
+| 57 | Two concurrent `compute_peaks` calls for same (source, offset, duration, resolution) | Both compute; atomic tmp+rename per R-P14; readers see pre-rename full file or new full file | `peaks-concurrent-write-atomic-via-rename` |
+| 58 | bounce/analyze ws.send succeeds but WS closes before upload | Cancellation event fires; handler returns `tool_result` with `isError:true, reason:"client_disconnected"` (R-B23); row cleanup identical to timeout | `bounce-ws-close-mid-wait-disconnect-result` |
+| 59 | `_exec_generate_descriptions` / `_exec_generate_dsp` called with a pool_segment whose file is currently being written | Tolerated: analyze on-disk snapshot at dispatch; mutation undefined but rare (pool segments content-addressed). No watcher, no lock held. (R-P15) | `analysis-no-source-file-watcher` |
 
 ---
 
@@ -1010,6 +1016,81 @@ Boundaries, unusual inputs, concurrency, idempotency, ordering, time-dependent b
 - **identity-zero**: `0 → 0.0`.
 - **identity-one**: `1 → 1.0`.
 
+#### Test: peaks-concurrent-write-atomic-via-rename (covers R-P14)
+
+**Given**: Two coroutines call `compute_peaks(...)` simultaneously with identical cache-miss args; `Path.write_bytes` is patched to verify a `.tmp` path is used then renamed.
+
+**When**: Both run to completion.
+
+**Then**:
+- **tmp-file-used**: intermediate path contains suffix `.tmp`.
+- **final-rename**: `os.rename`/`Path.replace` called with source `<key>.f16.tmp` and target `<key>.f16`.
+- **reader-never-sees-partial**: any reader opening `<key>.f16` during either write sees a complete file (size > 0 and parseable as float16).
+
+#### Test: bounce-late-upload-orphan-swept (covers R-A1)
+
+**Given**: Bounce timed out at T+60s; row deleted; a stray WAV is written to `pool/bounces/<hash>.wav` at T+61s with no matching `audio_bounces` row.
+
+**When**: Engine is restarted and startup sweep runs.
+
+**Then**:
+- **orphan-removed**: the stray WAV no longer exists on disk.
+- **mixes-also-swept**: equivalent sweep applies to `pool/mixes/`.
+
+#### Test: bounce-cache-hit-missing-file-refetches (covers R-B22)
+
+**Given**: An `audio_bounces` row exists with non-null `rendered_path`, but the underlying WAV has been deleted from disk.
+
+**When**: `_exec_bounce_audio` is called with the same parameters; mocked `ws` + background task writes a fresh WAV and sets the render event.
+
+**Then**:
+- **stat-failed-detected**: handler stats the file on cache hit and sees it missing.
+- **ws-send-invoked**: `ws.send` invoked with a `bounce_audio_request` (not a short-circuit).
+- **row-finalized**: after upload, row's `rendered_path` still set, `size_bytes`/`duration_s` updated.
+
+#### Test: analyze-inner-try-per-analysis-rms-peak-clipping (covers R-M18 target)
+
+**Given**: Patched `_mix_rms` raises; default analyses requested.
+
+**When**: Handler runs.
+
+**Then**:
+- **rms-skipped**: `"rms" not in analyses_written`.
+- **peak-written**: `"peak" in analyses_written`.
+- **row-persisted**: run row still exists with `rendered_path` set (not rolled back — failure is per-analysis, not top-level).
+
+#### Test: descriptions-rate-limit-aborts-run-no-partials (covers R-G15)
+
+**Given**: Mocked `_gemini_describe_chunk_structured` raises `ResourceExhausted` on chunk 2 of 3.
+
+**When**: Handler runs.
+
+**Then**:
+- **error-returned**: `error` contains "rate limit".
+- **no-run-row**: no `audio_description_runs` row persisted.
+- **no-description-rows**: no `audio_descriptions` rows persisted for the in-flight run.
+
+#### Test: bounce-ws-close-mid-wait-disconnect-result (covers R-B23)
+
+**Given**: Handler is awaiting the render event; the WS client disconnects before upload arrives; cancellation event fires.
+
+**When**: Handler resumes.
+
+**Then**:
+- **error-with-reason**: returned dict has `error` and a `reason == "client_disconnected"` field (or in tool_result shape: `isError:true, reason:"client_disconnected"`).
+- **row-deleted**: bounce row removed.
+- **event-popped**: `_BOUNCE_RENDER_EVENTS` entry absent.
+
+#### Test: analysis-no-source-file-watcher (covers R-P15 — negative assertion)
+
+**Given**: The four `_exec_*` handlers in `chat.py` plus `compute_peaks` in `audio/peaks.py`.
+
+**When**: Inspected.
+
+**Then**:
+- **no-fsevent-import**: no `watchdog`, `inotify`, `fsevents` imports.
+- **no-file-lock-on-source**: no `fcntl.flock` / `portalocker` call wrapping analysis reads.
+
 #### Test: no-concurrency-in-handlers (negative — architectural)
 
 **Given**: The four `_exec_*` handlers in `chat.py`.
@@ -1037,7 +1118,17 @@ Boundaries, unusual inputs, concurrency, idempotency, ordering, time-dependent b
 
 ## Open Questions
 
-### OQ-1: Late upload after timeout (orphaned WAV, leaked row?)
+### Resolved
+
+- **OQ-1 (late upload after timeout — orphan WAV)**: **Resolved 2026-04-27**. Startup sweep (R-A1) deletes WAVs under `pool/bounces/` and `pool/mixes/` with no corresponding DB row. Upload handler policy TBD at a later milestone; sweep is sufficient for MVP.
+- **OQ-2 (composite_hash cache hit but file missing)**: **Resolved 2026-04-27**. Stat-check file on cache hit; missing → treat as cache miss, re-render via WS (R-B22).
+- **OQ-3 (librosa raises mid-analysis without inner try/except)**: **Resolved 2026-04-27**. Target: every analysis wrapped in inner try/except (R-M18); partial persistence per-analysis; top-level except only catches catastrophic loop-scaffolding failures. Applies analogously to `_exec_generate_dsp` `rms`/`onsets`/`vocal_presence`. Current narrow-wrap transitional.
+- **OQ-4 (Gemini rate limit mid-chunk)**: **Resolved 2026-04-27**. Per-chunk try/except (R-G15); rate-limit or other exceptions fail the whole run; no partial description rows persisted.
+- **OQ-5 (concurrent peaks request same clip — file cache write race)**: **Resolved 2026-04-27**. Atomic tmp-file write + rename (R-P14). Readers see pre-rename full file or new full file, never partial.
+- **OQ-6 (WS closes mid-wait)**: **Resolved 2026-04-27**. Distinguish WS-close from timeout via explicit cancellation event; emit `core__chat__tool_result` with `isError:true, reason:"client_disconnected"` (R-B23).
+- **OQ-7 (source file mutating during analysis)**: **Resolved 2026-04-27 as codified**. Analyze on-disk snapshot at dispatch; mutation tolerated but rare (pool segments content-addressed). No watcher, no lock. Negative-assertion test `analysis-no-source-file-watcher`.
+
+### OQ-1: Late upload after timeout (orphaned WAV, leaked row?) — RESOLVED, see Resolved section
 
 When `_exec_bounce_audio` times out at T+60s it deletes the bounce row AND removes the `_BOUNCE_RENDER_EVENTS` entry. If the frontend upload then lands at T+61s, the `/bounce-upload` handler writes `pool/bounces/<composite_hash>.wav` to disk but `set_bounce_render_event(request_id)` returns `False` (no matching event). The WAV is now an orphan: not tied to any `audio_bounces` row.
 

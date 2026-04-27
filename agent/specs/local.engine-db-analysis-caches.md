@@ -103,7 +103,17 @@
 
 - **R30** — The mix cache stores its rendered WAV at `<project_dir>/pool/mixes/<mix_graph_hash>.wav`. The DB row's `rendered_path` is the relative path `pool/mixes/<mix_graph_hash>.wav` or `NULL` if not yet uploaded.
 - **R31** — The bounce cache stores its rendered WAV at `<project_dir>/pool/bounces/<composite_hash>.wav`. The DB row's `rendered_path` is the relative path `pool/bounces/<composite_hash>.wav` or `NULL` if not yet uploaded.
-- **R32** — A cache *row* whose `rendered_path IS NULL` is treated by the bounce producer as "pending / failed" and is deleted before retry. A cache *row* whose `rendered_path` is set but whose WAV file is missing on disk is **undefined** — see OQ-7.
+- **R32** — A cache *row* whose `rendered_path IS NULL` is treated by the bounce producer as "pending / failed" and is deleted before retry. A cache *row* whose `rendered_path` is set but whose WAV file is missing on disk MUST be treated as a cache miss: on cache hit, producer MUST stat-check the file; missing file → delete the row and re-run. (Resolves OQ-7.)
+
+### Integrity Invariants (Target) — Resolutions to OQs
+
+- **R33** — (resolves OQ-1) A CLI command `scenecraft cache prune --analyzer-version <version>` deletes every cache-run row whose `analyzer_version` matches the supplied value (cascading children). Command is part of the `cache` CLI group. Default DSP + mix scope; description runs included when the version string matches.
+- **R34** — (resolves OQ-2) All cache keys (DSP `params_hash`, mix `mix_graph_hash`, bounce `composite_hash`, peaks filename) MUST be **SHA-256 full hex digest**. The peaks cache migrates from legacy SHA-1-truncated-to-64-bits to SHA-256 via a one-shot migration triggered on first access after the upgrade: existing `.f16` files with legacy keys are invalidated (either deleted or renamed to `<key>.legacy` for manual cleanup). No new code path computes SHA-1 keys.
+- **R35** — (resolves OQ-3) A startup sweep, run once per process bootstrap on the project DB, deletes every row in `dsp_analysis_runs`, `mix_analysis_runs`, and `audio_description_runs` where: the row has zero children (in every relevant child table) AND `rendered_path IS NULL` (where applicable) AND `created_at` is older than 10 minutes. Bounce rows follow the same rule (row with `rendered_path IS NULL` older than 10 min is deleted).
+- **R36** — (resolves OQ-4) The bounce and mix caches enforce an LRU cap of **200 rows per project**. On insert, if the row count exceeds 200, the oldest row by `created_at` is deleted (cascading children for mix). DSP and audio-description are not LRU-capped (keyed by `source_segment_id` which is itself bounded by pool growth). Peaks filesystem cache is swept by the `scenecraft cache gc` CLI command, not auto-capped.
+- **R37** — (resolves OQ-5 + INV-1) No internal lock is held across any `create_*_run` / `create_bounce` call. Concurrent invocations from the same user on the same project are undefined per INV-1. The UNIQUE constraint is the only contention surface; the caller receives `IntegrityError` and is responsible for retry (or not).
+- **R38** — (resolves OQ-6) `scenecraft cache gc` CLI scans `<project_dir>/audio_staging/.peaks/` and removes any `.f16` file whose cache-key-encoded `source_path` no longer exists on disk, whose pool_segment_id no longer exists in `pool_segments`, or whose `(mtime_ns, size)` component no longer matches the current file on disk.
+- **R39** — (resolves OQ-7) See R32 above: cache hits stat-check the rendered file; missing files are treated as miss and trigger a fresh run.
 
 ---
 
@@ -268,13 +278,13 @@ compute_peaks(source_path: Path, source_offset: float, duration: float,
 | 28 | Peaks: source file edited (mtime changes) | New key → cache miss; old `.f16` lingers | `peaks-source-edit-invalidates-key` |
 | 29 | Peaks: cache write fails | Bytes still returned; warning logged; no exception | `peaks-cache-write-failure-is-non-fatal` |
 | 30 | `list_bounces` / `list_*_runs` on empty DB | Returns `[]`, not `None` | `list-on-empty-returns-empty-list` |
-| 31 | Concurrent `create_dsp_run` with same key, two callers | **undefined** | → [OQ-5](#open-questions) |
-| 32 | Librosa version downgrade — old analyzer_version now unreachable | **undefined** (cost of immutability) | → [OQ-1](#open-questions) |
-| 33 | SHA-256 collision on `composite_hash` (or SHA-1 on peaks key) | **undefined** (no policy) | → [OQ-2](#open-questions) |
-| 34 | Process crash between `create_mix_run` and child inserts | **undefined** (partial row lingers) | → [OQ-3](#open-questions) |
-| 35 | Cache grows unbounded over project lifetime | **undefined** (no TTL / LRU) | → [OQ-4](#open-questions) |
-| 36 | Mix row has `rendered_path` set but WAV is missing on disk | **undefined** (no sweep) | → [OQ-7](#open-questions) |
-| 37 | Peaks cache orphan files after source deletion | **undefined** (no purge) | → [OQ-6](#open-questions) |
+| 31 | Concurrent `create_dsp_run` with same key, two callers | Undefined by INV-1 (single-writer per (user, project)); no internal lock held | `concurrent-create-no-internal-lock` |
+| 32 | Librosa version downgrade — old analyzer_version now unreachable | `scenecraft cache prune --analyzer-version <old>` CLI removes orphan rows on demand | `cache-prune-by-analyzer-version` |
+| 33 | SHA-256 collision on `composite_hash` (or SHA-1 on peaks key) | SHA-256 standardized across all caches; peaks migrates from SHA-1-64 → SHA-256 via one-shot migration on first access | `hash-standardized-sha256-peaks-migration` |
+| 34 | Process crash between `create_*_run` and child inserts | Startup sweep deletes runs with zero children AND `rendered_path IS NULL` older than 10 minutes | `startup-sweep-deletes-partial-rows` |
+| 35 | Cache grows unbounded over project lifetime | LRU cap per project on bounce + mix tables (last 200 by `created_at`, evict oldest on insert); peaks swept by `scenecraft cache gc` | `lru-cap-200-evicts-oldest` |
+| 36 | Mix row has `rendered_path` set but WAV is missing on disk | Stat-check file on cache hit; missing file → treat as miss, re-run | `mix-missing-wav-treated-as-miss` |
+| 37 | Peaks cache orphan files after source deletion | `scenecraft cache gc` purges peaks files whose pool_segment_id no longer exists or whose mtime+size no longer matches | `cache-gc-purges-peaks-orphans` |
 
 ---
 
@@ -604,6 +614,67 @@ Boundaries, unusual inputs, failure-injection, and the `undefined` set.
 - **null-extra-roundtrips**: The first datapoint's `extra_json` column is NULL (not the string `"null"`).
 - **object-extra-roundtrips**: The second datapoint's `extra` parses back to `{"bin": 42}`.
 
+#### Test: concurrent-create-no-internal-lock (covers R37, resolves OQ-5, INV-1 negative-assertion)
+
+**Given**: Producer code with a mock that asserts no `threading.Lock` or module-level mutex is acquired across the `create_dsp_run` call boundary.
+**When**: `create_dsp_run(...)` is invoked once.
+**Then**:
+- **no-internal-lock-held**: No internal lock is acquired or released across the DAL call.
+- **concurrency-undefined**: Spec asserts concurrency is undefined per INV-1.
+
+#### Test: cache-prune-by-analyzer-version (covers R33, resolves OQ-1)
+
+**Given**: Two DSP runs exist — one with `analyzer_version="dsp-librosa-0.10.2"`, one with `"dsp-librosa-0.10.3"`.
+**When**: `scenecraft cache prune --analyzer-version dsp-librosa-0.10.2` is invoked.
+**Then**:
+- **old-version-gone**: No rows remain with `analyzer_version="dsp-librosa-0.10.2"`.
+- **new-version-kept**: The 0.10.3 row remains.
+- **children-cascaded**: Children of the deleted run are gone by FK cascade.
+
+#### Test: hash-standardized-sha256-peaks-migration (covers R34, resolves OQ-2)
+
+**Given**: A peaks cache directory containing legacy SHA-1-truncated `.f16` files from a prior release.
+**When**: `compute_peaks(...)` is invoked for the first time after the upgrade on a corresponding source.
+**Then**:
+- **new-key-is-sha256**: The cache key written is the full SHA-256 hex digest of the same input tuple (length 64 chars).
+- **legacy-file-invalidated**: The legacy SHA-1-truncated file is either removed or renamed to `<key>.legacy` per implementation; it is no longer consulted for lookups.
+- **no-new-sha1-keys**: No code path computes the legacy 16-hex-char key.
+
+#### Test: startup-sweep-deletes-partial-rows (covers R35, resolves OQ-3)
+
+**Given**: A DSP run row created 15 minutes ago with zero datapoints/sections/scalars and `rendered_path IS NULL`; a mix run row created 2 minutes ago with zero children; a DSP run row created 15 minutes ago WITH children.
+**When**: The startup sweep runs.
+**Then**:
+- **old-partial-deleted**: The 15-min-old childless DSP run is gone.
+- **recent-partial-kept**: The 2-min-old childless mix run remains (below the 10-minute threshold).
+- **old-populated-kept**: The 15-min-old DSP run WITH children remains.
+
+#### Test: lru-cap-200-evicts-oldest (covers R36, resolves OQ-4)
+
+**Given**: `audio_bounces` has 200 rows, the oldest having `created_at='T0'`.
+**When**: A 201st bounce row is inserted via `create_bounce(...)`.
+**Then**:
+- **total-count-200**: Total bounce rows = 200 after the insert.
+- **oldest-evicted**: The row with `created_at='T0'` is gone.
+- **newest-present**: The newly-created row is present.
+
+#### Test: mix-missing-wav-treated-as-miss (covers R32, R39, resolves OQ-7)
+
+**Given**: A mix cache row exists with `rendered_path="pool/mixes/abc.wav"`, but the WAV file has been deleted from disk.
+**When**: `get_mix_run(...)` returns the cached row and the producer performs its stat-check.
+**Then**:
+- **treated-as-miss**: Producer deletes the row (cascading children) and triggers a fresh render.
+- **new-row-replaces**: After the render, a new row with the same 5-tuple exists with `rendered_path` populated and the WAV on disk.
+
+#### Test: cache-gc-purges-peaks-orphans (covers R38, resolves OQ-6)
+
+**Given**: `.peaks/` contains three `.f16` files: one for a still-extant `pool_segments` row (matching mtime+size), one whose source pool_segment was deleted, one whose source file's mtime has changed since the key was computed.
+**When**: `scenecraft cache gc` is invoked.
+**Then**:
+- **valid-file-kept**: The still-valid file remains.
+- **orphan-deleted**: The file for the deleted pool_segment is removed.
+- **stale-deleted**: The file whose mtime no longer matches is removed.
+
 #### Test: librosa-downgrade-old-cache-unreachable (references OQ-1)
 
 **Note**: This is an **undefined** scenario and cannot be fully specified. Current behavior: if the librosa package is downgraded and `analyzer_version` uses `librosa.__version__`, the downgrade produces a cache miss against any row that was written by a *newer* librosa version (since the version string reverts). Whether those newer rows become "unreachable" (they stay in the DB but are never queried), whether they should be garbage-collected, or whether a downgrade should trigger a warning is not decided. See OQ-1.
@@ -640,6 +711,22 @@ Boundaries, unusual inputs, failure-injection, and the `undefined` set.
 ---
 
 ## Open Questions
+
+### Resolved
+
+- **OQ-1** (librosa downgrade orphans): **fix** — `scenecraft cache prune --analyzer-version <old>` CLI command. R33, test `cache-prune-by-analyzer-version`.
+- **OQ-2** (hash collision policy; SHA-256 vs SHA-1-64 inconsistency): **fix** — standardize on SHA-256 full digest across all caches. Peaks migrates via one-shot invalidation on first access. R34, test `hash-standardized-sha256-peaks-migration`.
+- **OQ-3** (partial run rows after crash): **fix** — startup sweep deletes runs with zero children AND `rendered_path IS NULL` older than 10 min. Applies to dsp, mix, description, bounce. R35, test `startup-sweep-deletes-partial-rows`.
+- **OQ-4** (cache unbounded growth): **fix** — LRU cap of 200 per project on bounce + mix tables (evict oldest by `created_at` on insert). Peaks filesystem cache swept by `scenecraft cache gc` CLI. R36, test `lru-cap-200-evicts-oldest`.
+- **OQ-5** (concurrent writes with same cache key): closed per INV-1. R37 + negative-assertion test `concurrent-create-no-internal-lock`.
+- **OQ-6** (peaks orphan files): **fix** — `scenecraft cache gc` purges peaks by pool_segment_id existence + mtime/size match. R38, test `cache-gc-purges-peaks-orphans`.
+- **OQ-7** (cache row present, WAV missing): **fix** — stat-check on cache hit; treat missing as miss, re-run. R32 + R39, test `mix-missing-wav-treated-as-miss`.
+
+### Deferred
+
+(None — all 7 OQs resolved.)
+
+### Historical
 
 - **OQ-1** — **Librosa version downgrade → old cache unreachable.** `analyzer_version` uses `librosa.__version__`. A library downgrade produces a cache miss against rows written by a newer version, but those newer rows remain in the DB forever (storage cost) and never match a future lookup unless the library is upgraded again. Options: (a) accept the cost, (b) emit a one-time warning on startup listing orphaned `analyzer_version` values, (c) add a manual CLI to purge orphan versions, (d) GC rows whose `analyzer_version` doesn't match the currently installed library on next analysis run. Recommendation: (c) — explicit, cheap, never wrong. Deferred.
 - **OQ-2** — **Hash collision policy.** DSP (`params_hash` — hex digest), mix (`mix_graph_hash`), bounce (`composite_hash` — SHA-256), peaks (SHA-1 truncated to 16 hex = 64 bits) all treat hash equality as row identity with no content verification. Collision odds are astronomically low for SHA-256 (~2⁻²⁵⁶) and negligible for SHA-1 at 64 bits (~2⁻⁶⁴ per pair, higher than SHA-256 but still safe for practical project sizes). Policy on intentional collision / adversarial input is not defined. Is this acceptable, or should peaks move to SHA-256 for consistency?

@@ -141,11 +141,43 @@ of `PluginHost` in scenecraft-engine.
     `run_server`, a single log line MUST be emitted summarizing:
     `Plugins: N registered, M operations, K mcp tools` (using the
     current `_registered`/`_operations`/`_mcp_tools` counts).
-20. **R20 (plugin dependency order undefined)**: The host MUST NOT perform
-    any dependency analysis between plugins. If plugin A's `activate()` reads
-    a table plugin B creates, the fact that B is registered after A would
-    manifest as an `activate()`-time error (propagating per R8). No explicit
-    dependency declaration exists. (→ OQ-1)
+20. **R20 (plugin dependency order — target)**: `plugin.yaml` MUST support a
+    `requires: [plugin_id, ...]` field. `PluginHost` MUST topologically sort
+    the registered plugin set by `requires` before invoking `activate()` on
+    any of them. Cycles MUST raise `PluginCycleError` at boot. Missing
+    required plugin id MUST raise `PluginMissingDependencyError`. (Transitional:
+    today the host performs no dependency analysis; see [Transitional
+    Behavior](#transitional-behavior).)
+21. **R21 (atomic activation — target)**: `PluginHost.register` MUST wrap
+    `plugin.activate()` in `try/except`. On raise: already-appended entries in
+    `context.subscriptions` (from `register_declared` / `register_*` helpers
+    that ran before the raise) MUST be LIFO-disposed; the partial plugin MUST
+    NOT appear in `_contexts` or `_registered`; the exception MUST be logged
+    with the plugin name, cause chain, and (if available) traceback. Engine
+    boot MUST continue with the remaining plugins. (Transitional: today the
+    exception propagates and crashes boot — see R8 and [Transitional
+    Behavior](#transitional-behavior).)
+22. **R22 (shutdown hook — target)**: `PluginHost.deactivate_all()` MUST be
+    invoked on SIGINT and SIGTERM before `server.shutdown()`. Each plugin's
+    Disposables fire LIFO (per R11). Daemon threads registered via
+    `context.subscriptions` MUST be joined with a 5s timeout; threads that
+    fail to join in time are logged but not waited on indefinitely.
+23. **R23 (register_migration — target)**: `plugin_api.register_migration` is
+    exposed by the host (see `engine-migrations-framework` spec R20). Plugins
+    MUST use this primitive for schema contributions; inline
+    `plugin_api.create_table` / `add_column` calls inside `activate()` are
+    transitional and will be removed once all first-party plugins migrate.
+24. **R24 (filesystem-scan discovery — target)**: Plugin discovery MUST walk
+    `src/scenecraft/plugins/*/` at boot, look for `plugin.yaml`, and register
+    each discovered plugin module via the unified path. A core allowlist
+    (hardcoded list of plugin_ids in `config.json` or module-level constant)
+    MAY restrict which discovered plugins are activated. (Transitional: today
+    discovery is via dual hardcoded import lists in `api_server.run_server`
+    and `mcp_server.py`.)
+25. **R25 (generate_foley registration)**: `generate_foley` MUST be registered
+    by both `api_server` and `mcp_server`. (Target: registration flows from
+    R24 filesystem scan. Transitional: immediate fix adds `generate_foley` to
+    both hardcoded import lists until R24 lands.)
 
 ---
 
@@ -229,13 +261,15 @@ python -m scenecraft.mcp_server
 | 18 | `mcp_server` process starts | Module-level code registers the same four plugins in the same order as api_server | `mcp-server-mirrors-api-server-order` |
 | 19 | `api_server` and `mcp_server` both running | Two independent processes each with their own `PluginHost` class state; no shared registry | `plugin-host-is-per-process` |
 | 20 | `generate_foley` plugin module exists but is not in the import list | Not registered; its ops/tools/routes are absent from `PluginHost.list_*` | `generate-foley-not-registered-today` |
-| 21 | Plugin A depends on plugin B's sidecar table but activation order is A-before-B | `undefined` — today it would crash per R8+R20; no dependency DSL exists; authors must manually order imports | → [OQ-1](#open-questions) |
-| 22 | Plugin `activate()` raises — is engine-death the INTENDED contract? | `undefined` — code does it, but it contradicts scenecraft frontend spec R31 (atomic activation). Engine must decide: match frontend spec (try/except) or document engine divergence permanently | → [OQ-2](#open-questions) |
-| 23 | Shutdown hook to call `deactivate_all()` — worth adding or defer? | `undefined` — leak #3 HIGH severity but daemon threads are typically fine on process exit; decision pending | → [OQ-3](#open-questions) |
-| 24 | `register_migration` API — add it or redesign plugin schema ownership? | `undefined` — absence contradicts scenecraft frontend spec (R18); need to decide whether the engine adds the API, or the scenecraft spec is revised down to the imperative `create_table`-inside-activate model | → [OQ-4](#open-questions) |
-| 25 | Is `generate_foley` activation intended to land before or after some milestone? | `undefined` — module exists but isn't wired up; missing from the hardcoded import list in both api_server and mcp_server | → [OQ-5](#open-questions) |
-| 26 | Dev-mode hot reload of a plugin without full process restart | `undefined` — not possible today; is it worth building, or will `restart` console command cover it? | → [OQ-6](#open-questions) |
-| 27 | Two discovery paths (api_server vs mcp_server) — which is authoritative? | `undefined` — today they are kept in sync by hand; drift is likely. Should mcp_server import api_server's registration function instead of duplicating the list? | → [OQ-7](#open-questions) |
+| 21 | Plugin A declares `requires: [b]` and plugin B ships `plugin.yaml` (target) | Topological sort activates B before A regardless of discovery order | `requires-topologically-sorts-activation-order` |
+| 22 | Plugin `activate()` raises (target) | Partial `context.subscriptions` LIFO-disposed; plugin not in `_registered`; error logged; engine continues with remaining plugins | `activate-raise-is-atomic-rollback` |
+| 23 | SIGINT / SIGTERM (target) | `deactivate_all()` invoked before `server.shutdown()`; Disposables fire LIFO; daemon threads joined with 5s timeout | `shutdown-deactivates-all-plugins` |
+| 24 | Plugin calls `plugin_api.register_migration(version, up_fn)` (target) | Registered against host; applied per `engine-migrations-framework` R20 | `register-migration-exposed-on-plugin-api` |
+| 25 | `generate_foley` plugin loads (target + transitional fix) | Registered by both api_server and mcp_server; ops/tools/routes visible in host registries | `generate-foley-registered-both-paths` |
+| 26 | Dev-mode hot reload of a plugin | `undefined` — deferred to a future dev-mode milestone | → [OQ-6](#open-questions) |
+| 27 | Two discovery paths (target) | Filesystem scan of `src/scenecraft/plugins/*/plugin.yaml` replaces dual hardcoded lists; core allowlist optional | `filesystem-scan-discovers-all-plugins` |
+| 28 | Cycle in `requires` (e.g. A→B→A) | `PluginCycleError` raised at boot before any activation | `requires-cycle-raises` |
+| 29 | Unknown `requires` target (target) | `PluginMissingDependencyError` raised at boot | `requires-missing-raises` |
 
 ---
 
@@ -476,6 +510,75 @@ functions.
 **Then**:
 - **old-behavior-retained**: subsequent calls to `p__do_x` run the previously-imported code, not the on-disk version.
 - **no-reload-api**: no `PluginHost.reload(name)` or equivalent method exists.
+
+#### Test: requires-topologically-sorts-activation-order (covers R20 target)
+**Given**: Plugin A with `plugin.yaml` containing `requires: [b]`; Plugin B with no `requires`. Filesystem discovery finds them in order `[A, B]`.
+**When**: `PluginHost` activates the discovered set.
+**Then**:
+- **b-before-a**: B's `activate()` ran before A's.
+- **registered-order-reflects-topo**: `_registered` order is `[B, A]`.
+- **a-sees-b-tables**: during A's activate, B's sidecar tables already exist.
+
+#### Test: requires-cycle-raises (covers R20 target)
+**Given**: Plugin A with `requires: [b]`; Plugin B with `requires: [a]`.
+**When**: `PluginHost` attempts to compute activation order.
+**Then**:
+- **raises**: `PluginCycleError` is raised before any `activate()` runs.
+- **no-partial-registration**: neither A nor B appears in `_registered` or `_contexts`.
+
+#### Test: requires-missing-raises (covers R20 target)
+**Given**: Plugin A with `requires: [nonexistent]`; no plugin with that id on disk.
+**When**: `PluginHost` activates.
+**Then**:
+- **raises**: `PluginMissingDependencyError` with message naming A and `nonexistent`.
+
+#### Test: activate-raise-is-atomic-rollback (covers R21 target)
+**Given**: Plugin P whose `activate(plugin_api, ctx)` calls `register_mcp_tool(...)` (appending D1 to subscriptions), then `register_rest_endpoint(...)` (appending D2), then raises `RuntimeError("boom")`.
+**When**: `PluginHost.register(P)` runs.
+**Then**:
+- **lifo-dispose**: D2.dispose() then D1.dispose() were called.
+- **not-in-registered**: P's name NOT in `_registered`.
+- **not-in-contexts**: P's name NOT in `_contexts`.
+- **no-crash**: engine boot continues to the next plugin.
+- **error-logged-with-cause**: stderr contains plugin name, `RuntimeError: boom`, and a traceback line.
+
+#### Test: shutdown-deactivates-all-plugins (covers R22 target)
+**Given**: Engine booted with four plugins; each has a Disposable that writes "D-<name>" to a stderr spy on dispose; one plugin has a daemon thread registered as a Disposable.
+**When**: Process receives SIGTERM.
+**Then**:
+- **deactivate-all-called**: `PluginHost.deactivate_all()` invoked before `server.shutdown()`.
+- **all-dispose-lines**: stderr contains "D-<name>" for all four plugins.
+- **thread-joined-with-timeout**: daemon thread `.join(timeout=5.0)` was attempted; if still alive after 5s, a warning logs but shutdown proceeds.
+
+#### Test: register-migration-exposed-on-plugin-api (covers R23 target)
+**Given**: `plugin_api` module after engine init.
+**When**: `hasattr(plugin_api, "register_migration")`.
+**Then**:
+- **attribute-present**: `True`.
+- **callable-signature**: `inspect.signature(plugin_api.register_migration)` has parameters `version`, `up_fn`, `down_fn`.
+
+#### Test: generate-foley-registered-both-paths (covers R25)
+**Given**: Fresh `PluginHost` state; both api_server and mcp_server boot paths.
+**When**: Each boots to completion.
+**Then**:
+- **api-server-registers**: `generate_foley` is in api_server's `_registered` after `run_server` returns from plugin-registration.
+- **mcp-server-registers**: `generate_foley` is in mcp_server's `_registered` after module-level register calls complete.
+- **ops-visible**: at least one operation with plugin id `generate_foley` is in `PluginHost._operations` in both processes.
+
+#### Test: filesystem-scan-discovers-all-plugins (covers R24 target)
+**Given**: `src/scenecraft/plugins/` contains directories `isolate_vocals`, `transcribe`, `generate_music`, `light_show`, `generate_foley`, each with a valid `plugin.yaml`.
+**When**: Engine boot invokes the filesystem-scan discovery path.
+**Then**:
+- **all-discovered**: every directory with a `plugin.yaml` appears in the discovered list.
+- **allowlist-respected**: if a core allowlist is configured to include only four, the fifth is skipped and a log line notes the skip.
+- **no-hardcoded-lists-consulted**: `api_server.run_server` and `mcp_server.py` both delegate to the single discovery helper.
+
+#### Test: negative-no-concurrent-register-primitive (covers INV-1)
+**Given**: `PluginHost` class surface after M17 consolidation.
+**When**: Inspect registration flow.
+**Then**:
+- **no-internal-lock**: `PluginHost.register` acquires no `threading.Lock` internally; boot-thread single-caller remains the contract.
+- **invariant-INV-1**: per INV-1, concurrent `register` from multiple threads is undefined; the boot thread is the sole supported caller.
 
 #### Test: single-threaded-activation (covers R2, R8)
 **Given**: `run_server` plugin-registration block.

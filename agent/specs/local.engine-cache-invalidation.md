@@ -42,8 +42,8 @@
 
 ### Interface
 
-- **R1**: Function signature is `invalidate_frames_for_mutation(project_dir: Path, ranges: Iterable[tuple[float, float]] | None = None) -> tuple[int, int]`. `ranges` is optional, defaulting to `None`.
-- **R2**: Return value is a 2-tuple `(frames_dropped, fragments_dropped)`, both non-negative integers. Each counts the entries evicted from the corresponding cache during this call.
+- **R1**: Target signature is `invalidate_frames_for_mutation(working_copy, ranges: Iterable[tuple[float, float]] | None = None) -> tuple[int, int, bool]` where `working_copy` identifies the per-user working-copy partition (e.g., `session_id` or `working_copy_db_path`). Current code uses `(project_dir, ranges) -> tuple[int, int]`; this is **transitional** and migrates to the target during the per-working-copy cache refactor (see INV-7). Both forms reside in the same function, gated by a type-adapter during transition.
+- **R2**: Return value is a 3-tuple `(frames_dropped, fragments_dropped, coordinator_fallback)`. `frames_dropped` and `fragments_dropped` are non-negative integers counting entries evicted from the corresponding cache during this call. `coordinator_fallback` is a bool — `True` iff a wholesale `invalidate_project` fallback was triggered by a BG requeue exception (see R18 / OQ-2). Transitional 2-tuple return `(frames_dropped, fragments_dropped)` is accepted for pre-migration callers.
 - **R3**: The function is `@pure side-effect` from the caller's perspective: no exceptions propagate out under any failure mode of any collaborator. The return value remains well-formed even when every collaborator raises.
 
 ### Range Normalization
@@ -72,6 +72,15 @@
 - **R16**: In surgical mode **only**, after `invalidate_project`, `coord.invalidate_ranges_in_background(project_dir, range_list)` is called exactly once with the normalized range list.
 - **R17**: In wholesale mode, `invalidate_ranges_in_background` is **not** called — the BG requeue is deliberately skipped (rationale: the schedule rebuild + next play/seek will re-prime the queue cheaply; a full BG requeue would be wasteful).
 - **R18**: If any exception is raised anywhere in the coordinator block (import, `instance()` lookup, `invalidate_project`, or `invalidate_ranges_in_background`), it is swallowed. The function still returns normally with the cache counts already computed.
+- **R18a (BG requeue fallback)**: If `coord.invalidate_ranges_in_background` raises in surgical mode, the function falls back to `coord.invalidate_project(working_copy)` (wholesale schedule rebuild on the coordinator only — caches were already drained surgically) and sets `coordinator_fallback=True` in the return tuple. The fallback call's own exceptions are swallowed. (Closes OQ-2.)
+- **R24 (negative time clip)**: `(t_start, t_end)` tuples are normalized by clipping to `[0, +inf)` at this function's boundary: any negative value is clamped to `0.0`. Caches never observe negative times. Applied before the inversion filter (R6). (Closes OQ-6.)
+- **R25 (unknown working_copy / project_dir)**: Silent no-op. Caches return 0 and the coordinator no-ops. No warning logged. (Closes OQ-7.)
+- **R26 (large range lists)**: No upper threshold. Caller responsibility for batch size; collaborators iterate linearly. Caller may choose to collapse many ranges into wholesale. (Closes OQ-8.)
+- **R27 (per-working-copy cache partitioning — INV-7)**: Frame and fragment caches are keyed by `working_copy` (session_id / working_copy_db_path), NOT by `project_dir`. Each user's working copy has an isolated cache partition; invalidations from user A's working copy MUST NOT affect user B's working copy, even for the same project. Exception: peaks cache remains project-scoped (content-addressed; genuinely shareable). Target state; current `project_dir`-keyed caches are transitional.
+- **R28 (no internal lock held across collaborators — INV-1)**: The function holds no mutex across frame → fragment → coord side-effects. Concurrent calls from different working copies on the same project interleave freely and produce correct results because each working copy has its own cache partition (R27). Concurrent calls within the same (user, project) working copy are out of scope (INV-1). (Closes OQ-5.)
+- **R29 (active scrub during invalidate)**: Brief re-render at next-visible-frame; no UI flicker. Preview worker re-primes on-demand via cache miss → fresh render. No visible artifact other than a possible frame-latency spike. (Closes OQ-1.)
+- **R30 (non-overlapping ranges during scrub)**: No-op on the active fragment; the currently-playing fragment's cache entry is untouched when the invalidated ranges don't overlap its span. (Closes OQ-3.)
+- **R31 (wholesale invalidate during active render)**: `assemble_final` holds its schedule snapshot from t=0; coordinator signals do not abort in-flight renders. Render completes with snapshot-at-start semantics. (Closes OQ-4; cross-referenced by render-pipeline OQ-1.)
 
 ### Ordering
 
@@ -142,14 +151,15 @@ def invalidate_frames_for_mutation(
 | 18 | Wholesale mode skips BG requeue deliberately                                                  | `invalidate_ranges_in_background` is not called when ranges was None or empty                                  | `wholesale-skips-bg-requeue` |
 | 19 | Return type is always a 2-tuple of ints, even on full failure                                 | `(0, 0)` on total collaborator failure; always ints, never None                                                | `return-type-invariant` |
 | 20 | Generator/iterator passed as `ranges` (e.g., `(r for r in [...])`)                            | Consumed exactly once during normalization; both cache calls see the materialized list                         | `iterator-consumed-once` |
-| 21 | Invalidate called while a scrub/seek is in flight for an overlapping time                     | `undefined`                                                                                                    | → [OQ-1](#open-questions) |
-| 22 | BG requeue fails but caches were drained — cache vs DB consistency                            | `undefined`                                                                                                    | → [OQ-2](#open-questions) |
-| 23 | Invalidate with ranges that do not overlap current scrub position                             | `undefined`                                                                                                    | → [OQ-3](#open-questions) |
-| 24 | Wholesale invalidate during an active playback/export render                                  | `undefined`                                                                                                    | → [OQ-4](#open-questions) |
-| 25 | Concurrent invalidations from two mutating endpoints for the same project                     | `undefined`                                                                                                    | → [OQ-5](#open-questions) |
-| 26 | Negative `t_start` / `t_end` values                                                           | `undefined`                                                                                                    | → [OQ-6](#open-questions) |
-| 27 | `project_dir` that was never opened / non-existent                                             | `undefined`                                                                                                    | → [OQ-7](#open-questions) |
-| 28 | Very large range list (e.g., hundreds of tuples from a batch edit)                            | `undefined`                                                                                                    | → [OQ-8](#open-questions) |
+| 21 | Invalidate called while a scrub/seek is in flight for an overlapping time                     | Brief re-render at next-visible-frame; no UI flicker; preview worker re-primes on-demand (R29)                 | `scrub-overlap-re-renders-no-flicker` |
+| 22 | BG requeue fails but caches were drained — cache vs DB consistency                            | Fall back to wholesale `coord.invalidate_project`; return tuple `coordinator_fallback=True` (R18a)             | `bg-requeue-raises-wholesale-fallback` |
+| 23 | Invalidate with ranges that do not overlap current scrub position                             | No-op on active fragment; the currently-playing fragment's cache entry is untouched (R30)                      | `scrub-non-overlapping-no-op-on-active-fragment` |
+| 24 | Wholesale invalidate during an active playback/export render                                  | Render completes with snapshot-at-start semantics; coord signals do not abort in-flight renders (R31)          | `wholesale-during-render-snapshot-semantics` |
+| 25 | Concurrent invalidations from two mutating endpoints for the same project                     | Different working copies: interleave freely, isolated per-partition (R27, INV-1). Same (user, project): out of scope (INV-1) | `concurrent-invalidates-different-working-copies-isolated`, `no-internal-lock-across-collaborators` |
+| 26 | Negative `t_start` / `t_end` values                                                           | Clipped to `max(0, t)` at function boundary; caches never see negative times (R24)                             | `negative-times-clipped-to-zero` |
+| 27 | `working_copy` / `project_dir` that was never opened / non-existent                            | Silent no-op; caches return 0, coord no-ops; no warning logged (R25)                                           | `unknown-target-silent-noop` |
+| 28 | Very large range list (e.g., 1000 tuples from a batch edit)                                   | Accepted without threshold; linear iteration; caller responsibility for batch size (R26)                       | `large-range-list-1000-accepted` |
+| 29 | Call with per-working-copy partition key (target signature)                                   | Frame + fragment caches scoped to the working copy; another working copy's cache for same project is untouched (R27, INV-7) | `working-copy-cache-partition-isolation` |
 
 ---
 
@@ -421,6 +431,117 @@ Boundaries, iterator consumption, ordering, idempotency, and explicitly-flagged 
 - **bg-requeue-not-called**: `coord.invalidate_ranges_in_background` is NOT called.
 - **invalidate-project-called**: `coord.invalidate_project` IS called.
 
+#### Test: scrub-overlap-re-renders-no-flicker (covers R29)
+
+**Given**: A preview worker is actively serving a frame for t=2.0; caches contain the frame at t=2.0.
+
+**When**: `invalidate_frames_for_mutation(target, [(1.5, 2.5)])` fires.
+
+**Then**:
+- **cache-entry-removed**: The t=2.0 frame is evicted from `frame_cache`.
+- **next-visible-frame-re-renders**: The next scrub request at t=2.0 triggers a fresh render (cache miss).
+- **no-ui-flicker-contract**: The spec documents the preview worker as responsible for re-priming; no mid-stream abort is signaled.
+
+#### Test: bg-requeue-raises-wholesale-fallback (covers R18a, OQ-2)
+
+**Given**: Surgical range; caches healthy; `coord.invalidate_project` succeeds on first call; `coord.invalidate_ranges_in_background` raises.
+
+**When**: Handler runs.
+
+**Then**:
+- **fallback-invoked**: `coord.invalidate_project` is called a second time as the wholesale fallback (or equivalent fallback call).
+- **return-fallback-true**: Return tuple's `coordinator_fallback` field is `True`.
+- **no-propagation**: No exception propagates.
+- **cache-drops-preserved**: Surgical frame/fragment counts intact.
+
+#### Test: scrub-non-overlapping-no-op-on-active-fragment (covers R30)
+
+**Given**: Active scrub at t=2.0; cached fragment span [1.0, 3.0]; invalidation ranges `[(10.0, 12.0)]` (non-overlapping).
+
+**When**: `invalidate_frames_for_mutation` fires.
+
+**Then**:
+- **active-fragment-untouched**: The cached fragment for [1.0, 3.0] is NOT evicted.
+- **no-scrub-impact**: No evidence of re-render triggered for the active scrub.
+
+#### Test: wholesale-during-render-snapshot-semantics (covers R31)
+
+**Given**: A render (`assemble_final`) is actively streaming frames from a schedule snapshot taken at t=0; wholesale invalidate fires mid-render.
+
+**When**: The render continues.
+
+**Then**:
+- **render-completes**: Render reaches end of schedule without abort.
+- **uses-snapshot-schedule**: Output frames derive from the t=0 schedule snapshot (not from post-invalidate DB state).
+- **no-render-abort-signal**: Coordinator does not signal an abort to the in-flight render.
+
+#### Test: concurrent-invalidates-different-working-copies-isolated (covers R27, R28, INV-1)
+
+**Given**: Two working copies A and B both have cached entries for the same project; both fire invalidate simultaneously (different partition keys).
+
+**When**: Both complete.
+
+**Then**:
+- **a-partition-drained**: A's cache partition is empty for the project.
+- **b-partition-untouched-by-a**: B's cache partition still contains B's entries (isolation).
+- **no-cross-contamination**: Neither call evicts the other working copy's entries.
+
+#### Test: no-internal-lock-across-collaborators (negative — INV-1)
+
+**Given**: Inspection of `invalidate_frames_for_mutation` source.
+
+**When**: Inspected.
+
+**Then**:
+- **no-threading-lock**: No `threading.Lock`, `asyncio.Lock`, or file lock is acquired across the three side-effects.
+- **no-per-project-mutex**: No module-level `_project_locks: dict[Path, Lock]` pattern.
+
+#### Test: negative-times-clipped-to-zero (covers R24)
+
+**Given**: `ranges=[(-1.5, 2.0), (3.0, -0.5), (-2.0, -1.0)]`.
+
+**When**: Handler runs.
+
+**Then**:
+- **first-clipped**: Frame cache receives `(0.0, 2.0)` for the first tuple.
+- **inversion-after-clip**: `(3.0, -0.5)` becomes `(3.0, 0.0)` which is inverted and DROPPED.
+- **all-negative-after-clip**: `(-2.0, -1.0)` becomes `(0.0, 0.0)` — kept (zero-width).
+- **no-negative-values-in-collaborator-args**: Inspecting calls, no negative float ever reaches either cache.
+
+#### Test: unknown-target-silent-noop (covers R25)
+
+**Given**: A `project_dir` / `working_copy` that was never opened.
+
+**When**: Handler runs with any arguments.
+
+**Then**:
+- **returns-zero-counts**: Frame + fragment counts are `0`.
+- **no-warning-logged**: No logging emitted by this function.
+- **no-exception**: No exception raised.
+
+#### Test: large-range-list-1000-accepted (covers R26)
+
+**Given**: `ranges` = 1000 distinct non-overlapping tuples.
+
+**When**: Handler runs.
+
+**Then**:
+- **frame-receives-1000**: Frame cache `invalidate_ranges` receives a list of length 1000.
+- **fragment-receives-1000**: Fragment cache receives a list of length 1000.
+- **bg-requeue-receives-1000**: Coordinator BG requeue receives a list of length 1000.
+- **no-exception-from-size**: No size-related rejection.
+
+#### Test: working-copy-cache-partition-isolation (covers R27, INV-7)
+
+**Given**: Target signature in use; working copy A and working copy B both have entries cached for the same project_dir under different partition keys.
+
+**When**: `invalidate_frames_for_mutation(working_copy_A, [(1.0, 2.0)])`.
+
+**Then**:
+- **a-entries-evicted**: A's cache entries in [1.0, 2.0] are gone.
+- **b-entries-untouched**: B's cache entries in [1.0, 2.0] for the same project_dir remain.
+- **peaks-cache-unchanged**: Peaks cache (project-scoped by design) is untouched (not under this function's scope, but test asserts no collateral eviction).
+
 #### Test: idempotent-on-repeat (covers R23)
 
 **Given**: Caches populated; call once with `[(1.0, 2.0)]` (drains matching entries).
@@ -447,6 +568,20 @@ Boundaries, iterator consumption, ordering, idempotency, and explicitly-flagged 
 ---
 
 ## Open Questions
+
+### Resolved
+
+- **OQ-1 (invalidate during active scrub — flicker?)**: **Resolved 2026-04-27 as codified**. Brief re-render at next-visible-frame; no UI flicker; preview worker re-primes on-demand (R29).
+- **OQ-2 (BG requeue silent failure — cache/DB drift)**: **Resolved 2026-04-27**. Fall back to wholesale `coord.invalidate_project` on BG requeue exception; return tuple gains `coordinator_fallback: bool` third field (R18a, R2).
+- **OQ-3 (non-overlapping ranges during scrub)**: **Resolved 2026-04-27 as codified**. No-op on active fragment (R30).
+- **OQ-4 (wholesale invalidate during active render)**: **Resolved 2026-04-27 as codified**. Render holds schedule snapshot from t=0 (R31). Cross-ref render-pipeline OQ-1.
+- **OQ-5 (concurrent invalidations)**: **Resolved 2026-04-27**. Closed under INV-1 single-writer per (user, project). Different working copies interleave safely per R27 partition isolation; same (user, project) out of scope. Negative-assertion test `no-internal-lock-across-collaborators`.
+- **OQ-6 (negative time values)**: **Resolved 2026-04-27**. Clip to `max(0, t)` at function boundary (R24).
+- **OQ-7 (unknown project_dir)**: **Resolved 2026-04-27 as codified**. Silent no-op (R25).
+- **OQ-8 (very large range lists)**: **Resolved 2026-04-27 as codified**. Accepted without threshold (R26).
+- **INV-7 (per-working-copy cache partitioning)**: Codified via R27, R28, R1 target signature migration. Current `project_dir`-keyed caches transitional; migration to `working_copy` keying tracked as implementation follow-up.
+
+### Open (none remaining)
 
 - **OQ-1 (Behavior Table #21)**: **Invalidate during active scrub — does preview flicker?** When a scrub/seek request is mid-flight (HTTP handler currently computing or streaming a frame for an overlapping time) and `invalidate_frames_for_mutation` fires for the same range, what does the user observe? Possible answers: (a) scrub completes with stale pixels (no visible flicker until next scrub); (b) scrub completes with fresh pixels because re-render is triggered by the schedule rebuild mid-stream; (c) scrub fails / returns an error; (d) brief visible flicker as cache misses force a re-render. Not determinable from this function's code alone — depends on preview-worker scrub orchestration. Needs a design decision or an integration-level spec.
 - **OQ-2 (Behavior Table #22)**: **BG requeue failure — cache vs DB drift.** If `invalidate_ranges_in_background` raises (swallowed by R18), the caches have been drained but the BG renderer queue has NOT been updated. Is the cache now inconsistent with the DB? Technically no: the cache is simply emptier than the DB; subsequent play/seek will re-render from the (already-correct) DB state on demand. But is this acceptable? Or should we fall back to a wholesale `invalidate_project` on the coordinator? Needs confirmation from the preview-worker owner.

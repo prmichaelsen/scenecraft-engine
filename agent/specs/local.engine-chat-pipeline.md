@@ -362,12 +362,12 @@ The following internals are candidates for restructuring. Pure refactor is allow
 | 37 | `_await_generation_job` progress changes | `tool_progress` frame emitted with `pct = completed/total` | `progress-emitted-on-counter-change` |
 | 38 | `_await_generation_job` times out (900s) | Error dict returned; underlying job NOT cancelled | `job-poll-timeout-does-not-cancel-job` |
 | 39 | `_await_generation_job` `send` fails | Failure swallowed; polling continues | `progress-send-failure-swallowed` |
-| 40 | Tool progress broadcast to WS clients not on chat session | `undefined` | → [OQ-1](#open-questions) |
-| 41 | Plugin tool name collides with built-in (bypassing `__` invariant) | `undefined` | → [OQ-2](#open-questions) |
-| 42 | History window filled with tool-use blocks | `undefined` — Claude may see fewer than 50 conversational turns | → [OQ-3](#open-questions) |
-| 43 | Client disconnects while elicitation is awaiting | `undefined` — waiter may leak | → [OQ-4](#open-questions) |
-| 44 | MCP bridge connect succeeds after initial failure (retry?) | `undefined` — currently no retry | → [OQ-5](#open-questions) |
-| 45 | Anthropic SDK pinned version | `undefined` — not pinned in `pyproject.toml` | → [OQ-6](#open-questions) |
+| 40 | Tool progress broadcast to WS clients not on chat session | Only emits on originating session WS; no cross-talk | `tool-progress-session-scoped`, `tool-progress-no-cross-session-broadcast` (covers R58, OQ-1) |
+| 41 | Plugin tool name collides with built-in (bypassing `__` invariant) | Plugin wins (per contract spec); engine emits WARN log at registration | `plugin-builtin-collision-warns` (covers R59, OQ-2) |
+| 42 | History window filled with tool-use blocks | Codified: 50-row-count semantics; callers raise `limit` or pre-summarize if more context needed | `history-window-is-row-count-not-turn-count` (covers R60, OQ-3) |
+| 43 | Client disconnects while elicitation is awaiting | WS-close cancels all pending elicitation futures and purges waiters dict | `disconnect-cancels-and-purges-elicitation-waiters` (covers R61, OQ-4) |
+| 44 | MCP bridge connect succeeds after initial failure (retry?) | Background connect eventually succeeds; engine emits `core__chat__mcp_tools_ready`; next `_stream_response` exposes new tools | `mcp-late-connect-emits-ready-event` (covers R62, OQ-5) |
+| 45 | Anthropic SDK pinned version | Pinned in pyproject.toml; import-time compat check fails fast on mismatch | `anthropic-sdk-pinned`, `anthropic-sdk-import-time-compat-check` (covers R63, OQ-6) |
 
 ---
 
@@ -881,6 +881,79 @@ The following internals are candidates for restructuring. Pure refactor is allow
 **Then**:
 - **merge-called-once**: the merge (`list(TOOLS) + plugin_contributed + mcp_tools`) ran exactly once for the whole `_stream_response` call.
 
+#### Test: tool-progress-session-scoped (covers R58, OQ-1)
+
+**Given**: A chat WS session `S1`; another unrelated WS client `S2` is also connected to the same engine.
+**When**: `_await_generation_job` emits a `tool_progress` frame for a job on `S1`.
+**Then**:
+- **s1-receives**: `S1` receives exactly one `tool_progress` frame.
+- **s2-does-not-receive**: `S2` receives zero `tool_progress` frames tied to `S1`'s job.
+
+#### Test: tool-progress-no-cross-session-broadcast (covers R58, OQ-1)
+
+**Given**: Two chat sessions `S1`, `S2` each running their own generation jobs.
+**When**: Both jobs tick progress simultaneously.
+**Then**:
+- **s1-only-sees-own**: `S1` receives progress only for its own `tool_use_id`.
+- **s2-only-sees-own**: `S2` receives progress only for its own `tool_use_id`.
+
+#### Test: plugin-builtin-collision-warns (covers R59, OQ-2)
+
+**Given**: A plugin attempts to register tool `sql_query` (same name as a built-in).
+**When**: Plugin activation / tool registration runs.
+**Then**:
+- **warn-logged**: a WARN log line mentions the colliding tool name and the plugin id.
+- **plugin-wins-precedence**: per the contract spec, the plugin's tool dispatches (documented; precedence test lives in contract spec).
+
+#### Test: history-window-is-row-count-not-turn-count (covers R60, OQ-3)
+
+**Given**: DB has 50 rows where multiple assistant rows contain JSON-encoded block lists with tool_use entries.
+**When**: `_stream_response` runs `_history_to_claude_messages` on the 50-row window.
+**Then**:
+- **row-count-is-50**: SQL `LIMIT 50` applies.
+- **claude-message-count-may-exceed-50**: `messages` list passed to Claude has length `>=50` after tool_use/tool_result splitting.
+- **documented-as-intended**: test annotation states this is not a bug.
+
+#### Test: disconnect-cancels-and-purges-elicitation-waiters (covers R61, OQ-4)
+
+**Given**: A stream is awaiting an elicitation with entry `elic_X` in `elicitation_waiters`.
+**When**: The WS connection closes.
+**Then**:
+- **waiter-future-cancelled**: the future registered at `elic_X` has `cancelled() == True` (or was resolved to decline via the cancellation path).
+- **dict-empty-after**: `elicitation_waiters` contains no entry for `elic_X` (purged in handler `finally`).
+- **stream-cancelled-error**: the stream task completes with `CancelledError`.
+
+#### Test: mcp-late-connect-emits-ready-event (covers R62, OQ-5)
+
+**Given**: Initial `bridge.connect("remember")` background task fails; later, the engine retries (per `mcp-bridge` OQ-5 resolution elsewhere) and the connect succeeds.
+**When**: Late-connect success fires.
+**Then**:
+- **ready-event-sent**: the chat session WS receives exactly one `core__chat__mcp_tools_ready` frame.
+- **new-tools-visible-next-stream**: the subsequent `_stream_response` call includes the newly-visible bridge tools in `tools_for_claude`.
+
+#### Test: anthropic-sdk-pinned (covers R63, OQ-6)
+
+**Given**: `pyproject.toml` of the engine package.
+**When**: The `[project] dependencies` list is inspected.
+**Then**:
+- **pin-present**: an entry matches `anthropic>=0.39,<1.0` (or the documented current major).
+
+#### Test: anthropic-sdk-import-time-compat-check (covers R63, OQ-6)
+
+**Given**: A mocked `anthropic` module missing the expected streaming event types.
+**When**: Engine boot imports `chat.py`.
+**Then**:
+- **raises-at-boot**: `ImportError` or a clear compat error fires at import time, NOT at first chat request.
+- **error-mentions-version**: the message mentions the expected version range.
+
+#### Negative: no-internal-per-project-mutex (covers INV-1)
+
+**Given**: The chat pipeline source (`chat.py`).
+**When**: Statically inspecting `_stream_response` and `handle_chat_connection`.
+**Then**:
+- **no-threading-lock**: no `threading.Lock` / `asyncio.Lock` held across any API call or persistence operation keyed by `project_dir`.
+- **at-most-one-stream-invariant**: serialization is per-connection only (`current_stream`), not per-(user, project).
+
 #### Negative: no-model-upgrade-silently (covers R32)
 
 **Given**: The `messages.stream(...)` kwargs.
@@ -906,7 +979,56 @@ The following internals are candidates for restructuring. Pure refactor is allow
 
 ---
 
+## Transitional Behavior
+
+Per INV-8, the Requirements in this spec encode the target-ideal pipeline. Divergences in current code, intended to be closed by the FastAPI refactor:
+
+- **INV-4 divergence (bare event names vs `core__chat__*`)**: current code emits bare event types (`chunk`, `tool_call`, `tool_result`, `tool_progress`, `message`, `halted`, `complete`, `error`, `elicitation`, `pong`). Target namespacing is `core__chat__chunk`, `core__chat__tool_call`, `core__chat__tool_result`, `core__chat__tool_progress`, `core__chat__message`, `core__chat__halted`, `core__chat__complete`, `core__chat__error`, `core__chat__elicitation`, `core__chat__pong`, plus `core__chat__mcp_tools_ready` (new). The FastAPI refactor MUST rename at cutover jointly with the contract spec update.
+- **Anthropic SDK unpinned**: `pyproject.toml` does not pin `anthropic`. Target: pin at import time with compat check.
+- **`tool_progress` broadcast**: current code emits only to the originating chat WS (no cross-talk bug observed); target (R58) codifies the boundary explicitly.
+- **Collision warning for plugin tool names**: current silently prefers the first match; target (R59) adds a WARN log at registration.
+- **History window is row-count (50 rows), not turn-count**: intended; callers can raise `limit` or pre-summarize. Codified under R60.
+- **Elicitation waiter leak on disconnect**: current code believed leak-free but adds explicit cancel/purge under R61.
+- **MCP late-connect no notification**: current emits nothing; target (R62) emits `core__chat__mcp_tools_ready` on late success.
+
+## Migration Contract additions
+
+- **Event namespacing**: at cutover, rename all bare event types to `core__chat__*` (per INV-4). Frontend and backend MUST flip together; spec tests MUST be updated to assert the namespaced names.
+- **SDK pin**: `anthropic>=0.39,<1.0` (or current installed major) in `pyproject.toml` as a blocking prereq of the refactor.
+- **uvicorn/FastAPI ws handling**: chunked body + WS framing handled natively; dispatcher spec (`engine-rest-api-dispatcher`) owns the chunked-encoding acceptance for HTTP; this spec is unaffected.
+- **Error body shape (via dispatcher)**: chat errors continue to ship in-band as WS `error` frames (not HTTP JSON); the REST `{error, code}` envelope is orthogonal.
+- **`core__chat__mcp_tools_ready` emission**: emitted once per successful late-connect of the MCP bridge; the client surfaces a subtle toast.
+
+## Requirements (additions for OQ resolutions)
+
+58. **R58 (target, OQ-1) session-scoped `tool_progress`**: `_await_generation_job` MUST emit `tool_progress` only on the originating chat session's WebSocket, never broadcast across sessions. Negative-assertion tests prove no cross-talk.
+59. **R59 (target, OQ-2) collision warning**: when a plugin tool registration produces a name that matches a built-in tool name, the engine MUST emit a WARN log line at registration time (and a dev-only console log). Precedence follows the contract spec (plugin wins on collision).
+60. **R60 (codified, OQ-3) 50-row window semantics**: the history window is 50 SQL rows, NOT 50 conversational turns. A single assistant turn with N tool_use blocks expands to ~1+N Claude messages after `_history_to_claude_messages`. Callers needing more context MUST raise `limit` or pre-summarize. Documented behavior, not a bug.
+61. **R61 (target, OQ-4) elicitation waiters purged on disconnect**: on WS disconnect, `handle_chat_connection` MUST cancel all pending `elicitation_waiters` futures for the session and purge the dict entries. No future may remain un-popped after disconnect.
+62. **R62 (target, OQ-5) MCP late-connect notification**: if the background `bridge.connect` succeeds AFTER the first `_stream_response`, the chat loop MUST emit `core__chat__mcp_tools_ready` to the session WS exactly once. Frontend surfaces a subtle toast; the new tools are visible from the next `_stream_response`.
+63. **R63 (target, OQ-6) SDK pin + import-time compat check**: `pyproject.toml` MUST pin `anthropic` to a specific major version (target `anthropic>=0.39,<1.0` at the time of the refactor). At import, engine verifies the installed version exposes the expected streaming event shapes; mismatch raises at boot, not at first request.
+
+## Negative-Assertion (INV-1 single-writer)
+
+Under INV-1, concurrent chat operations by the same user on the same project are undefined and out of scope. This spec makes no effort to serialize them beyond `current_stream`'s at-most-one-task invariant (R44). Negative-assertion test: `no-internal-per-project-mutex` — inspecting `_stream_response` and `handle_chat_connection`, no `threading.Lock` or `asyncio.Lock` is held across any API call.
+
 ## Open Questions
+
+### Resolved
+
+**OQ-1 (resolved)**: `tool_progress` broadcast to off-session WS clients (audit leak #19). **Decision**: scope events to the originating chat session's WS. Closes the leak by making the boundary explicit (R58). **Tests**: `tool-progress-session-scoped`, `tool-progress-no-cross-session-broadcast`.
+
+**OQ-2 (resolved)**: Plugin tool name collision with built-in (audit leak #20). **Decision**: WARN log at registration (log + dev-only console). Precedence (plugin wins on collision) already decided in scenecraft spec. **Tests**: `plugin-builtin-collision-warns`.
+
+**OQ-3 (resolved)**: History window filled with tool-use blocks. **Decision**: codify the 50-row-count semantics (R60); not a bug; document for callers who need more context. **Tests**: `history-window-is-row-count-not-turn-count`.
+
+**OQ-4 (resolved)**: `elicitation_waiters` leak on client disconnect. **Decision**: on WS disconnect, cancel all pending futures for that session + purge from waiters dict (R61). **Tests**: `disconnect-cancels-and-purges-elicitation-waiters`.
+
+**OQ-5 (resolved)**: MCP bridge connect succeeds after initial failure. **Decision**: on successful late-connect, emit `core__chat__mcp_tools_ready` event (R62). Client surfaces a subtle toast. **Tests**: `mcp-late-connect-emits-ready-event`.
+
+**OQ-6 (resolved)**: Anthropic SDK not pinned. **Decision**: pin in `pyproject.toml` + compat-check at import (R63). **Tests**: `anthropic-sdk-pinned`, `anthropic-sdk-import-time-compat-check`.
+
+### (historical OQ text preserved below for context)
 
 **OQ-1 — `tool_progress` broadcast to off-session WS clients** (audit leak #19)
 Today `_await_generation_job` emits `tool_progress` only on the chat-session WS. If a separate WS client is listening to `/ws/jobs`, does it see a parallel `core__job__*` frame? The engine's `JobManager` publishes its own events on the job bus independently. Whether the frontend de-dupes or double-renders is the frontend's concern; the engine-side question is whether there is accidental cross-talk into the chat-session WS. **Current state**: no known cross-talk in `chat.py` (`_await_generation_job` only sends to the `ws` arg). Flag retained as undefined until the refactor confirms the boundary under the new structure. **Proposed default**: preserve current isolation — chat WS receives `tool_progress` only; job bus receives `core__job__*` only.

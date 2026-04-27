@@ -190,6 +190,35 @@ helpers) and the cross-table invariants the rest of the engine relies on.
     `audio_tracks` row does NOT delete any `track_effects` row with
     `track_id IS NULL`, nor any `effect_curves` attached to master-bus
     effects.
+23. **R23 — unknown `effect_type` preserved, DAL warns** (resolves OQ-1):
+    DAL accepts any non-empty `effect_type` string on insert; if the string
+    is not in the known catalog surfaced from the frontend effect registry,
+    DAL emits a `logging.warning` with the effect id and type. No engine-side
+    rejection. Frontend is responsible for rendering "unknown effect"
+    placeholders for catalog-unknown types.
+24. **R24 — send to deleted bus cascades** (resolves OQ-2): `track_sends.bus_id`
+    has FK `ON DELETE CASCADE` to `project_send_buses.id` (already in R6).
+    When a bus is deleted, all its send rows are removed atomically. An
+    explicit `upsert_track_send` against a non-existent `bus_id` raises
+    `sqlite3.IntegrityError` when `PRAGMA foreign_keys = ON`.
+25. **R25 — `static_params` / `points` JSON validation** (resolves OQ-3):
+    DAL validates on insert/update that the supplied value parses to a
+    JSON **object** for `static_params` (or **list** for curve `points`).
+    Non-object/non-list input (scalar, list-for-params, object-for-points,
+    or invalid JSON) raises `ValueError`. No silent coercion. The raw-UPDATE
+    bypass leak (R20) remains documented and out of DAL enforcement scope.
+26. **R26 — `order_index` gaps permitted; `compact_order_index` reserved**
+    (resolves OQ-4): Gaps in `order_index` sequences after delete are
+    permitted by contract. `ORDER BY order_index ASC` is the stable
+    canonical ordering. A `compact_order_index(table_name, scope_filter)`
+    DAL helper is **reserved for future** implementation to explicitly
+    renumber when the UI requests it; the current spec does NOT require
+    auto-compaction.
+27. **R27 — `delete_effect_curve` is idempotent post cascade** (resolves
+    OQ-5): FK CASCADE on `effect_curves.effect_id` removes the row when
+    the parent effect is deleted. An explicit `delete_effect_curve(stale_id)`
+    against an already-cascade-removed row is a silent idempotent no-op
+    (no exception). Matches `delete_track_effect` idempotency pattern.
 
 ## Interfaces / Data Shapes
 
@@ -358,11 +387,11 @@ delete_track_send(project_dir, track_id: str, bus_id: str) -> None
 | 22 | `_row_to_track_effect` on well-formed row | `enabled` returned as `bool`, `static_params` as decoded `dict` | `row-mapper-hydrates-types` |
 | 23 | Raw `UPDATE track_effects SET static_params = 'not json'` then DAL read | DAL mapper raises on `json.loads` | `raw-update-non-json-breaks-mapper` |
 | 24 | `delete_track_effect` when curves exist for that effect | FK CASCADE removes curves; no dangling curve rows remain | `delete-effect-with-curves-cascades` |
-| 25 | `effect_type` not in frontend registry | `undefined` | → [OQ-1](#open-questions) |
-| 26 | `upsert_track_send` to a deleted bus id | `undefined` | → [OQ-2](#open-questions) |
-| 27 | Non-JSON string written to `static_params` via raw UPDATE | DAL read raises; but behavior at HTTP/tool callers is `undefined` | → [OQ-3](#open-questions) |
-| 28 | Gaps in `order_index` (e.g. 0, 2, 5 after deletes) | `undefined` (ordering still well-defined but no compaction is spec'd) | → [OQ-4](#open-questions) |
-| 29 | `delete_effect_curve` on a curve whose effect was already deleted | `undefined` (curve was already cascade-deleted) | → [OQ-5](#open-questions) |
+| 25 | `effect_type` not in frontend registry | Engine preserves the row; DAL logs warning; frontend renders "unknown effect" placeholder. No engine-side filtering | `unknown-effect-type-preserved-with-warning` |
+| 26 | `upsert_track_send` to a deleted bus id | FK CASCADE on `track_sends.bus_id` already removes send rows when bus is deleted; upsert against a deleted bus id raises `sqlite3.IntegrityError` (FK enforcement ON) | `upsert-send-to-deleted-bus-rejected` |
+| 27 | Non-JSON string written to `static_params` via raw UPDATE | DAL validates JSON object on insert/update and raises `ValueError`; raw-UPDATE bypass remains the documented leak (R20) | `static-params-non-object-rejected` |
+| 28 | Gaps in `order_index` (e.g. 0, 2, 5 after deletes) | Gaps permitted; ordering via `ORDER BY order_index ASC` is stable; `compact_order_index(table, scope)` helper reserved for future explicit renumbering | `order-index-gaps-permitted` |
+| 29 | `delete_effect_curve` on a curve whose effect was already deleted | FK CASCADE on `effect_curves.effect_id` already removes the row; explicit call after is idempotent no-op | `delete-curve-after-effect-delete-idempotent` |
 
 ## Behavior
 
@@ -798,6 +827,51 @@ is called (which generates a new candidate id `curve_B` internally).
 - **note**: Asserts the production default (`get_db` sets `PRAGMA
   foreign_keys = ON`) in a separate positive test.
 
+#### Test: unknown-effect-type-preserved-with-warning (covers R23, resolves OQ-1)
+
+**Given**: An empty `track_effects` table; `effect_type="does_not_exist"`.
+**When**: `add_track_effect(track_id="tA", effect_type="does_not_exist")`.
+**Then** (assertions):
+- **row-inserted**: The row is present in `track_effects`.
+- **warning-emitted**: A `logging.warning` is captured containing the effect id and the string `"does_not_exist"`.
+- **no-exception**: No exception raised.
+
+#### Test: upsert-send-to-deleted-bus-rejected (covers R24, resolves OQ-2)
+
+**Given**: Bus `busA` has been deleted; `PRAGMA foreign_keys = ON`.
+**When**: `upsert_track_send(track_id="tA", bus_id="busA", level=0.5)`.
+**Then** (assertions):
+- **integrity-error**: Raises `sqlite3.IntegrityError` (FK violation on non-existent bus).
+- **no-row-inserted**: `list_track_sends(bus_id="busA") == []`.
+
+#### Test: static-params-non-object-rejected (covers R25, resolves OQ-3)
+
+**Given**: Effect `e1` exists with valid `{"gain": 1.0}` params.
+**When**:
+- `update_track_effect("e1", static_params=[1,2,3])` (list).
+- `update_track_effect("e1", static_params="not-an-object")` (scalar).
+**Then** (assertions):
+- **value-error-on-list**: First call raises `ValueError` with message mentioning JSON object.
+- **value-error-on-scalar**: Second call raises `ValueError`.
+- **row-unchanged**: `get_track_effect("e1").static_params == {"gain": 1.0}` after both.
+
+#### Test: order-index-gaps-permitted (covers R26, resolves OQ-4)
+
+**Given**: Track `tA` with 3 effects at `order_index = 0, 1, 2`.
+**When**: `delete_track_effect(effect_at_index_1.id)` then `list_track_effects("tA")`.
+**Then** (assertions):
+- **gap-present**: Remaining rows have `order_index` values `0` and `2` (no compaction).
+- **order-stable**: Returned rows are in ASC order by `order_index`.
+- **helper-reserved**: `compact_order_index` is not yet implemented; spec reserves the name for future use.
+
+#### Test: delete-curve-after-effect-delete-idempotent (covers R27, resolves OQ-5)
+
+**Given**: Effect `e1` with curve `c1`; `delete_track_effect("e1")` already ran (cascade removed `c1`).
+**When**: `delete_effect_curve(project_dir, "c1")`.
+**Then** (assertions):
+- **no-exception**: Returns cleanly.
+- **row-count-unchanged**: `effect_curves` row count is unchanged (already 0).
+
 ## Non-Goals
 
 - Partial / merge-patch updates of `static_params` or `points`. If needed
@@ -819,6 +893,20 @@ is called (which generates a new candidate id `curve_B` internally).
   scopes to that DB exclusively.
 
 ## Open Questions
+
+### Resolved
+
+- **OQ-1** (effect_type not in frontend registry): **codify** — engine preserves unknown rows; DAL logs warning; frontend renders placeholder. R23, test `unknown-effect-type-preserved-with-warning`.
+- **OQ-2** (upsert send to deleted bus): **fix** — FK CASCADE on `track_sends.bus_id` (already R6); upsert against non-existent bus raises `IntegrityError`. R24, test `upsert-send-to-deleted-bus-rejected`.
+- **OQ-3** (non-JSON in `static_params`): **fix** — DAL validates JSON object on insert/update; `ValueError` on non-object. R25, test `static-params-non-object-rejected`.
+- **OQ-4** (`order_index` gaps after delete): **codify** — gaps permitted; `ORDER BY order_index ASC` stable. `compact_order_index(table, scope)` helper reserved for future. R26, test `order-index-gaps-permitted`.
+- **OQ-5** (delete_effect_curve after effect delete): **codify** — FK cascade already removed; explicit call idempotent no-op. R27, test `delete-curve-after-effect-delete-idempotent`.
+
+### Deferred
+
+(None — all 5 OQs resolved.)
+
+### Historical
 
 - **OQ-1 — effect_type not in frontend registry**: What is the engine's
   responsibility when a row is written with `effect_type = "does_not_exist"`?

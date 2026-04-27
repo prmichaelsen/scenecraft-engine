@@ -73,6 +73,12 @@ Define the exact observable behavior of the `scenecraft` command-line interface 
 24. **R24 (audio-intelligence family)**: `audio-transcribe`, `audio-intelligence`, and `audio-intelligence-multimodel` MUST be registered as siblings on the main group, not as a subgroup, matching the code.
 25. **R25 (exit codes)**: Every admin command in groups init/token/org/user/session/auth MUST exit 0 on success and non-zero with a message to stderr on any of: missing root, missing user, missing key, malformed expiry, existing .scenecraft on init.
 26. **R26 (stability of command surface)**: Adding or removing a top-level command is a breaking change. Renaming a flag is a breaking change. Changing a default value (e.g. session-prune days, server port) is a breaking change. These MUST be reflected in a version bump.
+27. **R27 (target, OQ-1) org create duplicate**: `scenecraft org create <existing>` MUST catch the SQLite UNIQUE violation and exit 1 with message "org '<name>' already exists — use `org update` for metadata changes." No traceback; no `--force` flag.
+28. **R28 (target, OQ-2) user add duplicate**: `scenecraft user add <existing>` MUST catch SQLite UNIQUE and exit 1 with "user '<name>' already exists." When `--org` is passed, membership MUST be idempotently ensured (adding an existing member to the org is a no-op that exits 0 when the user itself is new; when the user already exists, the failure is on the user-row insert).
+29. **R29 (target, OQ-3/OQ-5) admin advisory lock**: mutating admin commands (`org create`, `user add`, `user set-password`, `session prune`, `auth keys issue`, `auth keys revoke`) MUST acquire an advisory `flock` on `<root>/.scenecraft/admin.lock` before mutating. Lock acquisition retries 3 times with 1s backoff; if still held, exits 1 with "another admin operation in progress".
+30. **R30 (target, OQ-5) server holds read lock only**: `scenecraft server` MUST NOT hold the admin.lock exclusively. Reading sessions.db during server runtime must not block CLI admin commands; advisory lock is for CLI-to-CLI coordination.
+31. **R31 (target, OQ-4) filesystem ACL reliance**: CLI does NOT perform UID/ACL checks. OS-level `PermissionError` from DB-open MUST be caught and wrapped as stderr message `cannot access <path>: <errno-name>` with non-zero exit. No stack trace visible to the user.
+32. **R32 (target, OQ-6, deferred commands)**: target command surface includes `scenecraft backup`, `scenecraft restore`, `scenecraft list-projects`, `scenecraft gc`, `scenecraft audit`, `scenecraft export-project`. Each is tracked under its own milestone and spec; none are required to exist for this spec's acceptance. `reset-password` is explicitly a frontend-only command, not part of the CLI surface.
 
 ---
 
@@ -194,17 +200,17 @@ Valid for 5 minutes. Open in your browser (use SSH port-forward if {host-ip} is 
 | 8 | `scenecraft token --open` succeeds opening browser | URL printed AND `webbrowser.open` called; exit 0 | `token-open-calls-webbrowser` |
 | 9 | `scenecraft token --open` when browser not available | URL still printed; webbrowser exception swallowed; exit 0 | `token-open-swallows-errors` |
 | 10 | `scenecraft org create acme` | Inserts orgs row; creates `orgs/acme/` + org.db; prints `Created org: acme` | `org-create-happy-path` |
-| 11 | `scenecraft org create acme` when `acme` exists | `undefined` | → [OQ-1](#open-questions) |
+| 11 | `scenecraft org create acme` when `acme` exists | Exits 1 with "org 'acme' already exists — use `org update` ..." | `org-create-duplicate-friendly-error` (covers R27, OQ-1) |
 | 12 | `scenecraft org list` | One line per org with name + created_at; "No organizations found." if empty | `org-list-happy-path`, `org-list-empty` |
 | 13 | `scenecraft org members acme` on empty org | Prints `No members in org 'acme'.` | `org-members-empty` |
 | 14 | `scenecraft user add alice --role editor --org acme` | Row inserted with role=editor, must_change_password=1; user dir + user.db created; alice joined acme as member | `user-add-happy-path`, `user-add-sets-must-change-password` |
-| 15 | `scenecraft user add alice` when `alice` already exists | `undefined` | → [OQ-2](#open-questions) |
+| 15 | `scenecraft user add alice` when `alice` already exists | Exits 1 with "user 'alice' already exists." `--org` membership is idempotently ensured when adding a new user | `user-add-duplicate-friendly-error`, `user-add-org-membership-idempotent` (covers R28, OQ-2) |
 | 16 | `scenecraft user set-password nobody` | Exits non-zero with `user 'nobody' not found` | `user-set-password-missing-user` |
 | 17 | `scenecraft user set-password alice` (exists) | `must_change_password` cleared to 0; prints confirmation | `user-set-password-clears-flag` |
 | 18 | `scenecraft session list` with none active | Prints `No active sessions.`; exit 0 | `session-list-empty` |
 | 19 | `scenecraft session prune` with 7d default | Removes sessions inactive >7 days and their working-copy files; prints count | `session-prune-default-7-days` |
 | 20 | `scenecraft session prune --days 0` | Removes all sessions regardless of activity | `session-prune-zero-days-removes-all` |
-| 21 | `scenecraft session prune` while a session is in-use by a running server | `undefined` | → [OQ-3](#open-questions) |
+| 21 | `scenecraft session prune` while a session is in-use by a running server | Acquires `.scenecraft/admin.lock` (server holds only read locks on sessions.db); prune proceeds against committed rows | `admin-lock-blocks-concurrent-mutation` (covers R29, R30, OQ-3) |
 | 22 | `scenecraft auth keys issue alice --expires 2027-01-01` | Raw key printed exactly once with issue-once banner; DB row stores hash+salt, not raw; id format `ak_<12hex>` | `keys-issue-happy-path`, `keys-issue-raw-not-persisted`, `keys-issue-id-format` |
 | 23 | `scenecraft auth keys issue nobody --expires 2027-01-01` | `undefined` — currently exits non-zero with "user not found"; spec pins this as the required behavior | `keys-issue-missing-user` |
 | 24 | `scenecraft auth keys issue alice --expires 2027/01/01` | Exits non-zero with "must be YYYY-MM-DD format" | `keys-issue-bad-date-format` |
@@ -216,9 +222,9 @@ Valid for 5 minutes. Open in your browser (use SSH port-forward if {host-ip} is 
 | 30 | `scenecraft server` without configured projects_dir, no `--work-dir` | Prompts with `click.prompt`, default `~/.scenecraft/projects`; persists via `set_projects_dir` | `server-prompts-for-projects-dir` |
 | 31 | `SCENECRAFT_ROOT` set to a valid `.scenecraft/` | Any admin command uses that root without needing `--root` | `env-root-resolves` |
 | 32 | `--root <bad-path>` explicit | Exits non-zero with `no .scenecraft directory at <path>` | `root-flag-invalid` |
-| 33 | CLI run from user whose UID does not own `.scenecraft/` | `undefined` — relies on filesystem ACLs only | → [OQ-4](#open-questions) |
-| 34 | Two `scenecraft session prune` invocations against same root concurrently | `undefined` — SQLite locking behavior unspecified at CLI layer | → [OQ-5](#open-questions) |
-| 35 | Expected commands not present: `backup`, `restore`, user-facing `reset-password`, `list-projects`, `gc`, `audit`, `export-project` | `undefined` — intentionally missing from this release | → [OQ-6](#open-questions) |
+| 33 | CLI run from user whose UID does not own `.scenecraft/` | OS `PermissionError` caught; stderr "cannot access <path>: <errno>"; exit non-zero; no stack trace | `cli-db-permission-error-wrapped` (covers R31, OQ-4) |
+| 34 | Two `scenecraft session prune` invocations against same root concurrently | Second retries advisory lock 3× at 1s; if still held, exits 1 with "another admin operation in progress" | `admin-lock-retries-then-surfaces` (covers R29, OQ-5) |
+| 35 | Deferred commands `backup`, `restore`, `list-projects`, `gc`, `audit`, `export-project` | Absent from current CLI; tracked under separate milestones | `deferred-commands-absent-for-now` (covers R32, OQ-6 deferred) |
 | 36 | `scenecraft resolve status` | Either prints Resolve connection status or reports Resolve not reachable; exit reflects reachability | `resolve-status-reports` |
 | 37 | `scenecraft narrative assemble DIR` | Invokes `scenecraft.render.narrative.assemble_final(DIR, output)` with default output `narrative_output.mp4` | `narrative-assemble-delegates` |
 | 38 | `scenecraft crossfade VIDEO` with no transitions in project | Exits non-zero with `No transitions found in project` | `crossfade-empty-project-fails` |
@@ -653,6 +659,70 @@ The core CLI contract: entry-point registration, admin happy paths, and the issu
 **Then** (assertions):
 - **delegates**: `scenecraft.render.narrative.assemble_final` is called exactly once with `(P, 'out.mp4')`.
 
+#### Test: org-create-duplicate-friendly-error (covers R27, OQ-1)
+
+**Given**: org `acme` already exists.
+**When**: `scenecraft org create acme`.
+**Then**:
+- **nonzero-exit**: exit != 0.
+- **stderr-message**: stderr contains `org 'acme' already exists`.
+- **no-traceback**: stderr does NOT contain `IntegrityError` or `Traceback`.
+- **no-mutation**: orgs row count unchanged.
+
+#### Test: user-add-duplicate-friendly-error (covers R28, OQ-2)
+
+**Given**: user `alice` already exists.
+**When**: `scenecraft user add alice`.
+**Then**:
+- **nonzero-exit**: exit != 0.
+- **stderr-message**: stderr contains `user 'alice' already exists`.
+- **no-traceback**: no `Traceback` on stderr.
+
+#### Test: user-add-org-membership-idempotent (covers R28, OQ-2)
+
+**Given**: user `alice` is new; org `acme` exists with no members.
+**When**: `scenecraft user add alice --org acme` is run, then run again (same command).
+**Then**:
+- **first-succeeds**: first invocation exits 0; alice is a member of acme.
+- **second-friendly-dupe**: second invocation exits non-zero on user-row dupe (per R28) — not an org-membership error.
+
+#### Test: admin-lock-blocks-concurrent-mutation (covers R29, R30, OQ-3)
+
+**Given**: a `scenecraft server` process is running on the same `work_dir`.
+**When**: `scenecraft session prune` is invoked.
+**Then**:
+- **prune-succeeds**: prune acquires `.scenecraft/admin.lock` and completes (server does not hold admin.lock exclusively).
+- **committed-rows-pruned**: stale rows deleted.
+
+Separately: when a concurrent `scenecraft org create` is in progress and holds admin.lock:
+- **second-mutation-waits**: second admin command retries 3×1s.
+- **eventually-acquires-or-fails**: if the first releases within 3s, second proceeds; else second exits 1.
+
+#### Test: admin-lock-retries-then-surfaces (covers R29, OQ-5)
+
+**Given**: `.scenecraft/admin.lock` is held by another process (simulated via a helper that holds the flock for >5s).
+**When**: `scenecraft session prune` is invoked.
+**Then**:
+- **retries-three-times**: the CLI attempts `flock` three times with ~1s backoff.
+- **exits-with-friendly-error**: after retries, exit 1 with stderr containing `another admin operation in progress`.
+
+#### Test: cli-db-permission-error-wrapped (covers R31, OQ-4)
+
+**Given**: `.scenecraft/server.db` is owned by another user with mode 0600; running CLI user cannot read.
+**When**: `scenecraft user list`.
+**Then**:
+- **nonzero-exit**: exit != 0.
+- **stderr-friendly**: stderr contains `cannot access` and a path and an errno-name (e.g. `EACCES`).
+- **no-traceback**: no Python traceback on stderr.
+
+#### Test: deferred-commands-absent-for-now (covers R32, OQ-6 deferred)
+
+**Given**: current CLI surface.
+**When**: `scenecraft backup`, `scenecraft restore`, `scenecraft list-projects`, `scenecraft gc`, `scenecraft audit`, `scenecraft export-project`, and `scenecraft reset-password` are invoked.
+**Then**:
+- **not-found**: each of the six operator commands exits non-zero with Click "No such command" (their milestone specs will define them).
+- **reset-password-stays-frontend-only**: `scenecraft reset-password` exits non-zero; there is no CLI surface for it now or in the target.
+
 #### Test: crossfade-empty-project-fails (covers R21)
 
 **Given**: Video file whose project YAML has no `transitions`.
@@ -674,14 +744,30 @@ The core CLI contract: entry-point registration, admin happy paths, and the issu
 
 ---
 
+## Transitional Behavior
+
+Per INV-8, target Requirements (R27–R32) encode the target-ideal state. Current code divergences:
+- `org create`/`user add` duplicates raise uncaught SQLite UNIQUE violations with Python tracebacks (R27/R28 target: catch + friendly exit 1).
+- No advisory lock on admin mutations (R29 target: `flock` on `.scenecraft/admin.lock`).
+- No retry-with-backoff on SQLite busy during concurrent CLI invocations (R30 target: 3 attempts × 1s).
+- No friendly wrapping of permission errors on DB open (R31 target).
+- Missing operator-facing commands (`backup`, `restore`, `list-projects`, `gc`, `audit`, `export-project`) deferred to separate milestones.
+
 ## Open Questions
 
-- **OQ-1 (org-create duplicate)**: Should `scenecraft org create <existing>` fail (IntegrityError-style), update metadata, or silently no-op? Current code will raise a SQLite UNIQUE violation uncaught; the user sees a Python traceback rather than a clean error. Decision needed: (a) catch and exit 1 with a friendly message, (b) `--force` to re-init, (c) silent idempotent. Recommendation: (a).
-- **OQ-2 (user-add duplicate)**: `user add alice` when `alice` exists currently raises uncaught SQLite UNIQUE. Same options as OQ-1; should also decide whether `--org` membership is idempotently ensured even if the user row already exists.
-- **OQ-3 (prune during active server)**: If the engine is running and holds sessions.db connections, does `session prune` from a second process: (a) block on the SQLite busy timeout, (b) succeed against stale rows while the server holds WALs, (c) refuse if a server lockfile is present? Today: unspecified — relies on SQLite default busy handling. Recommendation: add a fcntl advisory lock on `.scenecraft/sessions.db` and fail fast with a clear message when another writer holds it.
-- **OQ-4 (cross-user CLI invocation)**: Today the CLI does no UID/ACL check — it trusts filesystem permissions (DB opens will fail at OS level if unreadable, producing a stack trace). Should this be formalized as a spec'd behavior (R27: "CLI relies on OS filesystem ACLs; no additional check") or upgraded to a friendly error? Recommendation: formalize as R27 and wrap DB-open permission errors in a friendly message.
-- **OQ-5 (concurrent CLI invocations)**: Two simultaneous `session prune` or `keys revoke` invocations → SQLite busy errors percolate. Recommendation: add a top-level retry with 1s backoff (3 attempts) before surfacing.
-- **OQ-6 (missing commands)**: The CLI lacks `backup`, `restore`, user-facing `reset-password`, `list-projects`, `gc`, `audit`, `export-project`. Decision needed: which belong in the CLI vs. the REST API vs. the frontend? Recommendation: `backup`/`restore`/`list-projects`/`gc`/`audit`/`export-project` should be CLI commands (operator-facing); `reset-password` should be in the frontend (user-facing). Track each as its own spec.
+### Resolved
+
+**OQ-1 (resolved)**: Should `scenecraft org create <existing>` fail, update metadata, or silently no-op? **Decision**: catch SQLite UNIQUE, exit 1 with "org already exists — use `org update` for metadata changes." No `--force`. **Tests**: `org-create-duplicate-friendly-error`.
+
+**OQ-2 (resolved)**: `user add alice` when `alice` exists. **Decision**: same pattern as OQ-1. Org membership is idempotent via implicit `--ensure-org-membership` semantic (add-user-to-org is a no-op if already a member). **Tests**: `user-add-duplicate-friendly-error`, `user-add-org-membership-idempotent`.
+
+**OQ-3 (resolved)**: `session prune` during active server. **Decision**: advisory `flock` on `.scenecraft/admin.lock`. Mutating CLI commands (prune, keys issue/revoke, user add, org create) acquire the lock; fail fast with "another admin operation in progress" if held. Server holds read lock only on sessions.db (no blocking). **Tests**: `admin-lock-blocks-concurrent-mutation`.
+
+**OQ-4 (resolved)**: Cross-user CLI invocation — no UID/ACL check. **Decision**: formalize as R31: "CLI relies on OS filesystem ACLs; no UID/ACL check; DB-open permission errors wrapped with friendly 'cannot access <path>: <errno>' message." **Tests**: `cli-db-permission-error-wrapped`.
+
+**OQ-5 (resolved)**: Concurrent CLI invocations → SQLite busy. **Decision**: closed via OQ-3 advisory lock. CLI retries lock-acquire with 1s backoff (3 attempts) before surfacing. **Tests**: `admin-lock-retries-then-surfaces`.
+
+**OQ-6 (deferred)**: Missing operator commands. **Decision**: target command surface includes `scenecraft backup`, `restore`, `list-projects`, `gc`, `audit`, `export-project`. Implementation paced per separate milestones. `reset-password` belongs in the frontend (user-facing), explicitly NOT a CLI command. **Deferred**: each new command has its own spec/milestone; not blocking the FastAPI refactor or current CLI surface.
 
 ---
 
