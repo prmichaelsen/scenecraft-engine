@@ -67,7 +67,7 @@ class ApiError(HTTPException):
 
 
 def _envelope(code: str, message: str) -> dict[str, str]:
-    return {"error": code, "message": message}
+    return {"error": message, "code": code}
 
 
 async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:

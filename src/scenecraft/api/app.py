@@ -73,6 +73,7 @@ def create_app(
         openapi_url="/openapi.json",
         docs_url="/docs" if enable_docs else None,
         redoc_url="/redoc" if enable_docs else None,
+        redirect_slashes=False,
     )
     install_cors(app)
     install_exception_handlers(app)
