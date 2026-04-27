@@ -23,6 +23,32 @@ from scenecraft.api.errors import ApiError
 router = APIRouter(tags=["auth"])
 
 
+def _cookie_kwargs() -> dict:
+    """Cookie parameters driven by env vars. Provisioning sets these per-instance.
+
+    SCENECRAFT_COOKIE_DOMAIN  — e.g. ``.patrycllc.scenecraft.online``
+      Shares the cookie across subdomains of one tenant (frontend + API).
+      Unset in local dev → cookie scoped to the response origin only.
+
+    When SCENECRAFT_COOKIE_DOMAIN is set, SameSite=none is required because
+    the frontend and API are on different subdomains (cross-origin fetch).
+    CSRF is foreclosed by SCENECRAFT_CORS_ORIGINS restricting which origins
+    can make credentialed requests.
+
+    When unset (local dev), SameSite=lax is fine — same origin.
+    """
+    import os
+
+    domain = os.environ.get("SCENECRAFT_COOKIE_DOMAIN", "").strip() or None
+    return {
+        "httponly": True,
+        "secure": True,
+        "samesite": "none" if domain else "lax",
+        "path": "/",
+        "domain": domain,
+    }
+
+
 def _sc_root_from_request(request: Request) -> Path | None:
     from scenecraft.vcs.bootstrap import find_root
 
@@ -142,10 +168,7 @@ async def auth_email_login(request: Request, body: LoginBody) -> Response:
         SESSION_COOKIE,
         token,
         max_age=SESSION_TTL_DAYS * 86400,
-        httponly=True,
-        secure=True,
-        samesite="lax",
-        path="/",
+        **_cookie_kwargs(),
     )
     return resp
 
@@ -177,10 +200,7 @@ async def auth_email_logout(request: Request) -> Response:
         SESSION_COOKIE,
         "",
         max_age=0,
-        httponly=True,
-        secure=True,
-        samesite="lax",
-        path="/",
+        **_cookie_kwargs(),
     )
     return resp
 

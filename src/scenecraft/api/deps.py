@@ -39,24 +39,38 @@ _ALLOW_HEADERS = ["Content-Type", "Authorization", "X-Scenecraft-Branch"]
 
 
 def install_cors(app: FastAPI) -> None:
-    """Attach CORSMiddleware with legacy-equivalent configuration (R49, R50).
+    """Attach CORSMiddleware with per-instance origin allowlist.
 
-    Why ``allow_origin_regex`` instead of ``allow_origins=["*"]``:
-      FastAPI's CORSMiddleware explicitly rejects ``allow_origins=["*"]`` when
-      ``allow_credentials=True`` (the browser-side CORS spec forbids that
-      combo). The regex form tells the middleware to echo whichever origin
-      matches — for ``.*`` that's *every* origin — which is identical to the
-      legacy server's "echo the request Origin" behavior, and the middleware
-      emits ``Access-Control-Allow-Credentials: true`` only when the origin
-      was echoed. That matches legacy exactly.
+    ``SCENECRAFT_CORS_ORIGINS`` (comma-separated) restricts which origins
+    can make credentialed requests.  When set, only listed origins receive
+    ``Access-Control-Allow-Origin`` + ``Allow-Credentials: true``.  This
+    forecloses CSRF when using ``SameSite=none`` cross-subdomain cookies.
+
+    When unset (local dev), falls back to ``allow_origin_regex=".*"`` which
+    echoes any origin — matches the legacy server's behavior and keeps the
+    local dev loop working without configuration.
     """
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origin_regex=".*",
-        allow_credentials=True,
-        allow_methods=_ALLOW_METHODS,
-        allow_headers=_ALLOW_HEADERS,
-    )
+    import os
+
+    origins_env = os.environ.get("SCENECRAFT_CORS_ORIGINS", "").strip()
+
+    if origins_env:
+        origins = [o.strip() for o in origins_env.split(",") if o.strip()]
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_credentials=True,
+            allow_methods=_ALLOW_METHODS,
+            allow_headers=_ALLOW_HEADERS,
+        )
+    else:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origin_regex=".*",
+            allow_credentials=True,
+            allow_methods=_ALLOW_METHODS,
+            allow_headers=_ALLOW_HEADERS,
+        )
 
 
 # ---------------------------------------------------------------------------
