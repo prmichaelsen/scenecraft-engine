@@ -118,13 +118,10 @@ async def plugin_dispatch(
     from scenecraft.plugin_host import PluginHost
 
     try:
-        result = PluginHost.dispatch_rest(full_path, pd, name, body)
+        result = PluginHost.dispatch_rest("POST", full_path, pd, name, body)
     except ApiError:
-        # A plugin may raise our own envelope explicitly — let it pass.
         raise
     except Exception as exc:
-        # Mirror legacy: wrap arbitrary plugin exceptions in a PLUGIN_ERROR
-        # envelope so the FE can tell "plugin failed" from "server bug".
         raise ApiError(
             "PLUGIN_ERROR",
             str(exc),
@@ -156,7 +153,7 @@ async def plugin_dispatch_get(
     full_path = request.url.path
     from scenecraft.plugin_host import PluginHost
     try:
-        result = PluginHost.dispatch_rest(full_path, pd, name, {})
+        result = PluginHost.dispatch_rest("GET", full_path, pd, name, {})
     except ApiError:
         raise
     except Exception as exc:
