@@ -1110,6 +1110,22 @@ class TestEndToEnd:
         )
         assert status == 404, f"missing-project-404: got {status} {body!r}"
 
+    def test_e2e_get_settings_missing_project_returns_404(self, engine_server):
+        """covers R17/R18 (task-91) — GET /settings on unknown project returns 404 (e2e).
+
+        Regression: previously returned 200 with default settings payload,
+        masking typo'd project names. Must follow the same project_dir
+        resolution contract as every other project-scoped endpoint.
+        """
+        status, body = engine_server.json(
+            "GET",
+            "/api/projects/does_not_exist_xyz/settings",
+        )
+        assert status == 404, f"missing-project-404: got {status} {body!r}"
+        assert isinstance(body, dict) and "error" in body, (
+            f"error-envelope: got {body!r}"
+        )
+
     def test_e2e_multiple_requests_migrated_once(self, engine_server, project_name):
         """covers R7, R8 — after many hits, db_path appears once in _migrated_dbs (e2e)."""
         for _ in range(5):

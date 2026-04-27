@@ -3204,9 +3204,15 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 return
 
             kf_id = body.get("keyframeId")
+            # Accept both 'newTimestamp' (legacy) and 'timestamp' (canonical, project-wide convention).
+            # Prefer 'newTimestamp' when both are present to preserve in-flight callers passing both.
+            # See task-92: surfaced by M18-88; 'timestamp' is canonical going forward, 'newTimestamp'
+            # is a deprecated legacy alias.
             new_timestamp = body.get("newTimestamp")
+            if new_timestamp is None:
+                new_timestamp = body.get("timestamp")
             if not kf_id or new_timestamp is None:
-                return self._error(400, "BAD_REQUEST", "Missing 'keyframeId' or 'newTimestamp'")
+                return self._error(400, "BAD_REQUEST", "Missing 'keyframeId' or 'timestamp' (alias: 'newTimestamp')")
 
             project_dir = self._require_project_dir(project_name)
             if project_dir is None:
@@ -8578,6 +8584,8 @@ def make_handler(work_dir: Path, no_auth: bool = False):
         def _handle_get_settings(self, project_name: str):
             """GET /api/projects/:name/settings — read project settings from settings.json."""
             _log(f"get-settings: {project_name}")
+            if self._require_project_dir(project_name) is None:
+                return
             settings_path = work_dir / project_name / "settings.json"
             defaults = {
                 "preview_quality": 50,
