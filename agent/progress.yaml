@@ -1075,6 +1075,50 @@ unassigned:
       completed_date: null
       dependencies: []
       notes: "Production bug surfaced by M18 task-71 regression tests: get_audio_clips SELECT uses `\"from\"`/`\"to\"` double-quoted identifiers that SQLite silently treats as string literals, breaking R25 playback_rate + effective_source_offset derivations for linked clips. One-line SQL fix; flips xfailed witness test to pass."
+    - id: task-90
+      name: "Fix POST /bounce-upload orphan WAV — no audio_bounces DAL row"
+      status: not_started
+      started: null
+      file: agent/tasks/unassigned/task-90-fix-bounce-upload-orphan-wav.md
+      estimated_hours: 2
+      actual_hours: null
+      completed_date: null
+      dependencies: []
+      notes: |
+        Surfaced by M18 task-74 (4b9c06b). POST /bounce-upload writes WAV to pool/bounces/ but never INSERTs audio_bounces row; only the WS chat path does. Direct HTTP uploads produce orphan WAVs with no DB record and no retrievable id. Fix: upload handler upserts audio_bounces row keyed on composite_hash.
+    - id: task-91
+      name: "GET /api/projects/:name/settings must 404 on missing project"
+      status: not_started
+      started: null
+      file: agent/tasks/unassigned/task-91-settings-get-404-on-missing-project.md
+      estimated_hours: 0.5
+      actual_hours: null
+      completed_date: null
+      dependencies: []
+      notes: |
+        Surfaced by M18 task-88 (04aa3e9). Settings GET handler returns 200 with default payload on missing project instead of 404; every other project-scoped endpoint uses _require_project_dir. One-line fix adding the check.
+    - id: task-92
+      name: "Fix update-timestamp handler body key inconsistency (newTimestamp vs timestamp)"
+      status: not_started
+      started: null
+      file: agent/tasks/unassigned/task-92-update-timestamp-body-key-inconsistency.md
+      estimated_hours: 0.5
+      actual_hours: null
+      completed_date: null
+      dependencies: []
+      notes: |
+        Surfaced by M18 task-88 (04aa3e9). update-timestamp handler requires body key 'newTimestamp' while project-wide convention is 'timestamp'. Fix: accept both, prefer newTimestamp if present, document timestamp as canonical.
+    - id: task-93
+      name: "Purge undo_log orphan rows under undo_group=0 at get_db bootstrap"
+      status: not_started
+      started: null
+      file: agent/tasks/unassigned/task-93-undo-log-group-zero-orphans.md
+      estimated_hours: 1
+      actual_hours: null
+      completed_date: null
+      dependencies: []
+      notes: |
+        Surfaced by M18 task-73 (46ac600). undo_begin's R10 orphan sweep ignores undo_group=0 rows produced by pre-session seed inserts; they accumulate forever. Fix: add idempotent startup sweep in get_db bootstrap.
 
 documentation:
   design_documents: 8
