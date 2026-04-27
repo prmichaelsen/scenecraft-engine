@@ -836,12 +836,227 @@ milestones:
         actual_hours: null
         dependencies: []
 
+  - id: M18
+    title: "Engine Regression Test Suite"
+    file: agent/milestones/milestone-18-engine-regression-test-suite.md
+    status: not_started
+    estimated_weeks: 4
+    tasks_total: 18
+    tasks_completed: 0
+    tasks:
+      - id: task-70
+        title: "engine-connection-and-transactions regression tests"
+        file: agent/tasks/milestone-18-engine-regression-test-suite/task-70-engine-connection-and-transactions.md
+        status: not_started
+        estimated_hours: 3.5
+        started: null
+        actual_hours: null
+        completed_date: null
+        dependencies: []
+        notes: "Seeds the shared tests/specs/ conftest fixtures (project_dir, db_conn, thread_pool, engine_server) reused by every M18 task."
+      - id: task-71
+        title: "engine-db-schema-core-entities regression tests"
+        file: agent/tasks/milestone-18-engine-regression-test-suite/task-71-engine-db-schema-core-entities.md
+        status: not_started
+        estimated_hours: 3.5
+        started: null
+        actual_hours: null
+        completed_date: null
+        dependencies:
+          - task-70
+        notes: "Schema tests for projects/clips/tracks/keyframes/transitions/pool_segments/audio_tracks/audio_clips."
+      - id: task-72
+        title: "engine-db-effects-and-curves regression tests"
+        file: agent/tasks/milestone-18-engine-regression-test-suite/task-72-engine-db-effects-and-curves.md
+        status: not_started
+        estimated_hours: 3.5
+        started: null
+        actual_hours: null
+        completed_date: null
+        dependencies:
+          - task-70
+          - task-71
+        notes: "Schema + DAO tests for track_effects, effect_params, effect_curves, volume_curves, macro_params."
+      - id: task-73
+        title: "engine-db-undo-redo regression tests"
+        file: agent/tasks/milestone-18-engine-regression-test-suite/task-73-engine-db-undo-redo.md
+        status: not_started
+        estimated_hours: 5
+        started: null
+        actual_hours: null
+        completed_date: null
+        dependencies:
+          - task-70
+          - task-71
+        notes: "Trigger-based inverse-SQL capture + BEGIN/END groups + redo-stack invalidation."
+      - id: task-74
+        title: "engine-db-analysis-caches regression tests"
+        file: agent/tasks/milestone-18-engine-regression-test-suite/task-74-engine-db-analysis-caches.md
+        status: not_started
+        estimated_hours: 5
+        started: null
+        actual_hours: null
+        completed_date: null
+        dependencies:
+          - task-70
+          - task-71
+        notes: "mix_analysis_runs, mix_datapoints, mix_sections, mix_scalars — composite-key + cache-hit contract."
+      - id: task-75
+        title: "engine-migrations-framework regression tests"
+        file: agent/tasks/milestone-18-engine-regression-test-suite/task-75-engine-migrations-framework.md
+        status: not_started
+        estimated_hours: 5
+        started: null
+        actual_hours: null
+        completed_date: null
+        dependencies:
+          - task-70
+        notes: "Forward-only ordering, PRAGMA-detected in-place ALTER, idempotence, schema-version."
+      - id: task-76
+        title: "engine-plugin-loading-lifecycle regression tests"
+        file: agent/tasks/milestone-18-engine-regression-test-suite/task-76-engine-plugin-loading-lifecycle.md
+        status: not_started
+        estimated_hours: 5
+        started: null
+        actual_hours: null
+        completed_date: null
+        dependencies:
+          - task-70
+        notes: "plugin.yaml manifest + sidecar tables (<plugin_id>__<table>) + route ordering vs catch-all."
+      - id: task-77
+        title: "engine-mcp-bridge regression tests"
+        file: agent/tasks/milestone-18-engine-regression-test-suite/task-77-engine-mcp-bridge.md
+        status: not_started
+        estimated_hours: 5
+        started: null
+        actual_hours: null
+        completed_date: null
+        dependencies:
+          - task-70
+          - task-76
+        notes: "Parity with direct-call path; auth passthrough; error-envelope preservation."
+      - id: task-78
+        title: "engine-cache-invalidation regression tests"
+        file: agent/tasks/milestone-18-engine-regression-test-suite/task-78-engine-cache-invalidation.md
+        status: not_started
+        estimated_hours: 5
+        started: null
+        actual_hours: null
+        completed_date: null
+        dependencies:
+          - task-70
+        notes: "Render-frame L1, fragment cache, mix-analysis cache — range composition + encoder_generation bump."
+      - id: task-79
+        title: "engine-providers-typed-and-legacy regression tests"
+        file: agent/tasks/milestone-18-engine-regression-test-suite/task-79-engine-providers-typed-and-legacy.md
+        status: not_started
+        estimated_hours: 7
+        started: null
+        actual_hours: null
+        completed_date: null
+        dependencies:
+          - task-70
+        notes: "Dual registration + dispatch parity between typed and legacy provider paths."
+      - id: task-80
+        title: "engine-generation-pipelines regression tests"
+        file: agent/tasks/milestone-18-engine-regression-test-suite/task-80-engine-generation-pipelines.md
+        status: not_started
+        estimated_hours: 8
+        started: null
+        actual_hours: null
+        completed_date: null
+        dependencies:
+          - task-70
+          - task-79
+        notes: "Candidate pattern, job tracking, WS broadcast, 'survives WS disconnect' invariant."
+      - id: task-81
+        title: "engine-render-pipeline regression tests"
+        file: agent/tasks/milestone-18-engine-regression-test-suite/task-81-engine-render-pipeline.md
+        status: not_started
+        estimated_hours: 8
+        started: null
+        actual_hours: null
+        completed_date: null
+        dependencies:
+          - task-70
+        notes: "build_schedule + render_frame_at + proxies + fragment cache + /render-frame byte-identical golden."
+      - id: task-82
+        title: "engine-analysis-handlers regression tests"
+        file: agent/tasks/milestone-18-engine-regression-test-suite/task-82-engine-analysis-handlers.md
+        status: not_started
+        estimated_hours: 7
+        started: null
+        actual_hours: null
+        completed_date: null
+        dependencies:
+          - task-70
+          - task-74
+        notes: "Handler dispatch + cache-key derivation + WS completion event + error path."
+      - id: task-83
+        title: "engine-chat-pipeline regression tests"
+        file: agent/tasks/milestone-18-engine-regression-test-suite/task-83-engine-chat-pipeline.md
+        status: not_started
+        estimated_hours: 8
+        started: null
+        actual_hours: null
+        completed_date: null
+        dependencies:
+          - task-70
+          - task-79
+        notes: "Tool dispatch + streaming order + undo-group atomicity + destructive gating."
+      - id: task-84
+        title: "engine-file-serving-and-uploads regression tests"
+        file: agent/tasks/milestone-18-engine-regression-test-suite/task-84-engine-file-serving-and-uploads.md
+        status: not_started
+        estimated_hours: 7
+        started: null
+        actual_hours: null
+        completed_date: null
+        dependencies:
+          - task-70
+        notes: "Range GET, HEAD, multipart, path-traversal rejection, MIME — mirrors M16 T57 + T63."
+      - id: task-85
+        title: "engine-server-bootstrap regression tests"
+        file: agent/tasks/milestone-18-engine-regression-test-suite/task-85-engine-server-bootstrap.md
+        status: not_started
+        estimated_hours: 7
+        started: null
+        actual_hours: null
+        completed_date: null
+        dependencies:
+          - task-70
+        notes: "CLI entry → config → DB → plugins → routes → signal handling; graceful SIGTERM."
+      - id: task-86
+        title: "engine-cli-admin-commands regression tests"
+        file: agent/tasks/milestone-18-engine-regression-test-suite/task-86-engine-cli-admin-commands.md
+        status: not_started
+        estimated_hours: 7
+        started: null
+        actual_hours: null
+        completed_date: null
+        dependencies:
+          - task-70
+        notes: "Click CliRunner + subprocess e2e for --help, start/stop/status, project management."
+      - id: task-87
+        title: "engine-rest-api-dispatcher regression tests"
+        file: agent/tasks/milestone-18-engine-regression-test-suite/task-87-engine-rest-api-dispatcher.md
+        status: not_started
+        estimated_hours: 9
+        started: null
+        actual_hours: null
+        completed_date: null
+        dependencies:
+          - task-70
+          - task-84
+          - task-85
+        notes: "M18's highest-stakes task — locks every invariant the M16 FastAPI replacement must preserve (164 routes, auth, plugin catch-all, unknown-route 404, CORS, structural lock)."
+
 documentation:
   design_documents: 8
-  spec_documents: 3
-  milestone_documents: 15
+  spec_documents: 21
+  milestone_documents: 16
   pattern_documents: 0
-  task_documents: 67
+  task_documents: 85
 
 progress:
   planning: 100
@@ -895,6 +1110,7 @@ recent_work:
     description: "M9 complete — Wan2.1 + FILM pipeline. wan.py, film.py, wan_pipeline.py, --engine wan/--preview flags, AI plan wan_denoise/transition_frames."
 
 next_steps:
+  - "M18 Engine Regression Test Suite (18 tasks T70-T87, ~100h) — prerequisite safety net for M16 FastAPI refactor. One test file per engine spec at tests/specs/test_engine_<slug>.py with unit + e2e, target-state rows as @pytest.mark.xfail(reason='target-state; awaits M16 FastAPI refactor', strict=False). T70 seeds shared fixtures; foundational DB specs first, then plugin/MCP/cache infra, then pipelines, then HTTP/WS/chat/server/CLI/REST."
   - "M16 Phase A done in worktrees (wave3 = T57-T64 integrated, T65 partial on m16-t65-cutover). Remaining: native-port ~50 legacy-proxied keyframe/transition routes from _legacy_proxy.py so api_server.py can be deleted. Phase B (T66-T68 codegen) cancelled — tools are aggregate dispatchers, not 1:1 route mirrors."
   - "Backfill M14/M15 as formal milestone docs — significant work has shipped (M15 AudioBuffer mixer, analyze_master_bus, master-bus effect chain, bounce_audio) without milestone rows in progress.yaml. Covered in recent_work entries; milestone docs remain TODO. M15 specifically spans 9 logical tasks and is the defining 'source of truth' infrastructure; worth capturing formally."
   - "M14 rotoscope plan (clarification-8) remains unimplemented — no code shipped. The commit labels 'M14' were retrospective tags for mix-graph-hash work and do NOT reflect rotoscope. Either rename the clarification's target milestone (M17+) or resolve the label collision before planning."
@@ -907,6 +1123,7 @@ notes:
   - "M1-M3, M5-M13 tracked. M11 still open (task-35, task-36 not started). M4 (Resolve integration) deferred."
   - "M14 + M15 work exists in git commits (mix-graph-hash, M15 mix analysis cache, analyze_master_bus chat tool, master-bus effects backend) but is NOT tracked in progress.yaml. Commit messages use per-milestone internal numbering (task 7, task 8) rather than the global scheme. Backfill is a separate concern."
   - "M16 task IDs 57-68 (12 planned, T66-T68 cancelled). Phase A (T57-T64) done in worktrees. T65 partial. Phase B (T66-T68 codegen) cancelled — tools ≠ routes."
+  - "M18 task IDs 70-87 (18 tasks). Note: user plan asked for task IDs 69-86 but task-69 is already owned by M17 (Voice agent feature-matrix). Renumbered to 70-87 to preserve the global task-id invariant."
   - "M11 task IDs 32-36 (30/31/37/38 are unassigned one-offs in agent/tasks/unassigned/)"
   - "M12 task IDs 39-44; 37 (unified WS) is a prereq for task-43's live UI push; task-44 (chunked proxies) extends task-39"
   - "M13 task IDs 45-56 (12 tasks); source: clarification-7 → design/local.effect-curves-macro-panel.md → specs/local.effect-curves-macro-panel.md (54 requirements, 29 tests)"
