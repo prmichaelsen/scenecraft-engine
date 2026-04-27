@@ -1337,7 +1337,7 @@ def server(port: int, host: str, work_dir: str | None, no_auth: bool):
     from scenecraft.interactive_console import start_if_tty as _start_console
     _start_console()
 
-    app = create_app(work_dir=wd)
+    app = create_app(work_dir=wd, no_auth=no_auth)
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 

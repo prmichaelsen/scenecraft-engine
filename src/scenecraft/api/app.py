@@ -52,6 +52,7 @@ def create_app(
     *,
     enable_docs: bool = True,
     testing: bool = False,
+    no_auth: bool = False,
 ) -> FastAPI:
     """Build a configured FastAPI app rooted at ``work_dir``.
 
@@ -112,6 +113,7 @@ def create_app(
     app.include_router(plugins.router)
     app.state.work_dir = Path(work_dir) if work_dir is not None else None
     app.state.testing = bool(testing)
+    app.state.no_auth = bool(no_auth)
     if app.state.testing:
         # Imported lazily so production boots never pay the cost or
         # expose the module to module-level side-effects.

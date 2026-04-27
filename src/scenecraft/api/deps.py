@@ -108,17 +108,17 @@ async def current_user(request: Request) -> User:
     """Authenticate the request via Authorization bearer or session cookie.
 
     Mirrors ``api_server.py::_authenticate``:
+      0. If ``--no-auth`` was passed (app.state.no_auth), skip auth entirely.
       1. If ``.scenecraft`` is absent, auth is disabled and a synthetic
-         "local" user is returned. This matches the legacy "no .scenecraft =
-         no auth" carve-out (line 126-127 of api_server.py) which keeps the
-         dev loop working when a user runs ``scenecraft serve`` outside a
-         project tree.
+         "local" user is returned.
       2. Try ``Authorization: Bearer <token>`` first.
       3. Fall back to the ``scenecraft_jwt`` cookie.
       4. Validate via ``scenecraft.vcs.auth.validate_token``.
-      5. Raise 401 on any failure — exception handler converts to the
-         ``{"error": "UNAUTHORIZED", "message": ...}`` envelope.
+      5. Raise 401 on any failure.
     """
+    if getattr(request.app.state, "no_auth", False):
+        return User(id="local")
+
     from scenecraft.vcs.auth import (
         extract_bearer_token,
         extract_cookie_token,
