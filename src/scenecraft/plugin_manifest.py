@@ -64,6 +64,23 @@ class MCPToolManifest:
 
 
 @dataclass
+class RESTEndpointManifest:
+    """One plugin-declared HTTP endpoint.
+
+    ``suffix`` is the path tail appended to the plugin's automatic prefix:
+    ``/api/projects/(?P<project>[^/]+)/plugins/{plugin_name}/``. So
+    ``suffix: /run`` resolves to
+    ``^/api/projects/[^/]+/plugins/transcribe/run$`` for the transcribe
+    plugin. The suffix may contain named regex groups for path params:
+    ``suffix: /runs/(?P<run_id>[^/]+)`` — those groups are passed to the
+    handler as ``path_groups``.
+    """
+    method: str                       # "GET" | "POST" | "PUT" | "DELETE" | "PATCH"
+    suffix: str                       # appended to `/api/projects/:name/plugins/:plugin/`
+    handler_ref: str
+
+
+@dataclass
 class SettingSpec:
     name: str
     type: str                     # "enum" | "string" | "boolean" | "number"
@@ -99,6 +116,7 @@ class PluginManifest:
     # Declarative contributions
     operations: list[OperationManifest] = field(default_factory=list)
     mcp_tools: list[MCPToolManifest] = field(default_factory=list)
+    rest_endpoints: list[RESTEndpointManifest] = field(default_factory=list)
     settings: list[SettingSpec] = field(default_factory=list)
     context_menus: list[ContextMenuBinding] = field(default_factory=list)
     activation_events: list[str] = field(default_factory=list)
@@ -134,6 +152,32 @@ def _parse_operation(raw: dict) -> OperationManifest:
         handler_ref=str(raw["handler"]),
         panel_ref=str(raw["panel"]) if raw.get("panel") else None,
         outputs=list(raw.get("outputs") or []),
+    )
+
+
+_VALID_REST_METHODS = {"GET", "POST", "PUT", "DELETE", "PATCH"}
+
+
+def _parse_rest_endpoint(raw: dict) -> RESTEndpointManifest:
+    if not isinstance(raw, dict):
+        raise PluginManifestError(f"restEndpoints entry must be a mapping, got {type(raw).__name__}")
+    for req in ("method", "suffix", "handler"):
+        if req not in raw:
+            raise PluginManifestError(f"restEndpoints entry missing required field: {req!r}")
+    method = str(raw["method"]).upper()
+    if method not in _VALID_REST_METHODS:
+        raise PluginManifestError(
+            f"restEndpoints: method {method!r} not in {sorted(_VALID_REST_METHODS)}"
+        )
+    suffix = str(raw["suffix"])
+    if not suffix.startswith("/"):
+        raise PluginManifestError(
+            f"restEndpoints.suffix must start with '/' (got {suffix!r})"
+        )
+    return RESTEndpointManifest(
+        method=method,
+        suffix=suffix,
+        handler_ref=str(raw["handler"]),
     )
 
 
@@ -215,6 +259,7 @@ def parse_manifest(data: dict) -> PluginManifest:
     contributes = data.get("contributes") or {}
     operations = [_parse_operation(o) for o in _as_list(contributes.get("operations"))]
     mcp_tools = [_parse_mcp_tool(t) for t in _as_list(contributes.get("mcpTools"))]
+    rest_endpoints = [_parse_rest_endpoint(r) for r in _as_list(contributes.get("restEndpoints"))]
     context_menus = [_parse_context_menu(m) for m in _as_list(contributes.get("contextMenus"))]
 
     raw_settings = data.get("settings") or {}
@@ -231,6 +276,7 @@ def parse_manifest(data: dict) -> PluginManifest:
         license_=str(data.get("license", "")),
         operations=operations,
         mcp_tools=mcp_tools,
+        rest_endpoints=rest_endpoints,
         settings=settings,
         context_menus=context_menus,
         activation_events=[str(e) for e in _as_list(data.get("activationEvents"))],
