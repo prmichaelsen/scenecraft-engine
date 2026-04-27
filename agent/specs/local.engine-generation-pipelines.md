@@ -76,7 +76,7 @@ Prep context: `acp.spec.md`; `agent/reports/audit-2-architectural-deep-dive.md` 
 
 - **R8**. Variant numbering MUST be **append-only**: new variants take indices `existing_count + 1 … existing_count + count` so prior variants are never overwritten. (Keyframe path.)
 - **R9**. If an output file already exists at the target path, the worker MUST treat it as a cached success — no provider call, progress still advances.
-- **R10**. **(DEFERRED — known issue)** Spend MUST be recorded for every successful image and video generation via `plugin_api.record_spend`. *Current code does not record spend for Imagen, Veo, or Runway; this requirement is flagged DEFERRED pending provider-surface unification. Tests in the Base Cases for spend recording are marked `SKIP-DEFERRED` and MUST remain in the suite.*
+- **R10 (target, per INV-3)**. Spend MUST be recorded for every successful image and video generation via `plugin_api.providers.<name>.record_spend` before the downstream pool_segments INSERT / update_keyframe call (idempotent ledger write). Target surface: all providers (Imagen, Veo, Runway, Kling, Musicful, Anthropic, Google GenAI) migrate to the typed `plugin_api.providers` namespace with mandatory `record_spend` per block 4 providers decisions. **Current state is transitional**: direct-SDK calls, no spend recorded; the `record-spend-not-invoked-deferred` test asserts the transitional absence and MUST flip to positive-assertion once provider migration lands.
 - **R11**. Per-attempt retry MUST be bounded: keyframe Imagen = 3 attempts with backoff `5 * tries` seconds; transition Veo = 3 attempts with backoff `10 * tries` seconds (chat path). The third failure MUST surface as a job/task failure rather than silent drop.
 - **R12**. The chat transition path MUST use `RunwayVideoClient(model=<runway_model>)` when `meta.video_backend` starts with `runway/`; otherwise `GoogleVideoClient(vertex=True)`.
 - **R13**. The chat keyframe path MUST read `meta.image_model` and pass it through as `image_model` to `client.stylize_image`; default `replicate/nano-banana-2`.
@@ -130,6 +130,11 @@ Prep context: `acp.spec.md`; `agent/reports/audit-2-architectural-deep-dive.md` 
 - **R39**. Neither path MAY import `scenecraft.db` from a plugin boundary (R9a from audit-2); in-engine use is fine.
 - **R40**. Neither path MAY perform a post-generation file rename on the transition output path (see R22).
 - **R41**. The chat path MUST NOT throw through the tool return; all errors surface as `{error: "..."}` (pre-flight) or via `job_manager.fail_job` (mid-flight).
+- **R42 (partial slot success — closes OQ-1)**. On partial batch failure (e.g., slot 0 succeeds + slot 1 fails after its retry budget), the already-committed `pool_segments` rows + `tr_candidates` links for successful slots are KEPT. The generation row gains `status='partial'` and a `completed_slots: list[int]` field identifying which slot indices succeeded. The job is marked `complete_job` with `{status:'partial', completed_slots:[...], failed_slots:[...]}` — NOT `fail_job`. User may retry only the failed slots. Applies to both chat and CLI paths.
+- **R43 (intermediate slot-keyframe disappears — closes OQ-2)**. If an intermediate slot-keyframe file is present at job start but disappears before the slot worker reads it (rare race), the dependent slot fails with `SlotDependencyError("slot keyframe for slot <i> disappeared mid-generation")`. The slot does NOT fall back to the boundary image in this race case. Partial generation semantics per R42 apply: prior successful slots persist. (Distinguish from R16: R16 covers the case where the file is ABSENT AT JOB START, which falls back; R43 covers mid-generation disappearance.)
+- **R44 (PromptRejectedError on chat path — closes OQ-3)**. On chat, a `PromptRejectedError` from Veo / Imagen surfaces as a `tool_result` with `isError:true, reason:"prompt_rejected", details:<rejection_reason>`. The slot is marked failed; partial-success semantics (R42) apply. The job is NOT retried — rejection is treated as permanent. The chat path's `complete_job` summary includes `rejected_slots: list[int]`. CLI path unchanged (R34).
+- **R45 (Veo 0-byte file — closes OQ-4)**. After `generate_video` returns success, the worker MUST stat the downloaded file; if `size_bytes == 0`, raise `DownloadFailed("veo returned 0-byte mp4 for slot <i>")`. This counts as a slot-level failure (partial semantics per R42) — NOT retried by R11's transient-retry budget, since Veo reported success. Spend is recorded once R10 target lands (providers migration) — the idempotent ledger write ensures no double-counting even if retried at a higher level.
+- **R46 (concurrent start for same entity — closes OQ-5, INV-1)**. Closed under INV-1 single-writer per (user, project). Concurrent `start_keyframe_generation` / `start_transition_generation` calls for the same (user, project) entity are out of scope — undefined behavior. Different users on the same project (different working copies) operate on isolated DB writes per INV-1 and produce correct results independently. Negative-assertion test: "no per-entity lock is held by `start_*_generation`; the pool's working-copy isolation is the enforcement mechanism."
 
 ---
 
@@ -261,11 +266,11 @@ RunwayVideoClient(...).generate_video(...)  # same shape
 | 24 | Output file already exists | Worker skips provider call; treats as cached success; progress still advances | `both-paths-cached-output-skipped` |
 | 25 | Spend recording **(DEFERRED / R10)** | `record_spend` is NOT called today; test asserts absence to track regression | `record-spend-not-invoked-deferred` |
 | 26 | Direct `scenecraft.db` imports from plugin boundary | Not present | `no-plugin-db-import` (static) |
-| 27 | Partial slot success (slot 0 succeeds, slot 1 fails) — should job complete partial or fail whole? | `undefined` | → [OQ-1](#open-questions) |
-| 28 | Intermediate slot-keyframe file disappears **mid-generation** (between job start and slot worker call) | `undefined` | → [OQ-2](#open-questions) |
-| 29 | `PromptRejectedError` on chat transition path (chat has no CLI-like "collect + continue" logic) | `undefined` | → [OQ-3](#open-questions) |
-| 30 | Veo reports success but downloaded `.mp4` is 0 bytes | `undefined` | → [OQ-4](#open-questions) |
-| 31 | Two concurrent `start_keyframe_generation` calls for the same `kf_id` | `undefined` | → [OQ-5](#open-questions) |
+| 27 | Partial slot success (slot 0 succeeds, slot 1 fails) | Keep partials; job completes with `status='partial'`, `completed_slots=[0]`, `failed_slots=[1]`; user retries failed slots only (R42) | `partial-slot-success-keeps-partials` |
+| 28 | Intermediate slot-keyframe file disappears **mid-generation** (between job start and slot worker call) | Dependent slot fails with `SlotDependencyError`; partial-success semantics preserved per R42 (R43) | `slot-keyframe-disappears-mid-job-raises` |
+| 29 | `PromptRejectedError` on chat transition path | Surface as `tool_result` with `isError:true, reason:"prompt_rejected"`; slot marked failed; no retry; partial-success semantics (R44) | `chat-prompt-rejected-tool-result-error` |
+| 30 | Veo reports success but downloaded `.mp4` is 0 bytes | Stat-check post-download; raise `DownloadFailed`; slot-level failure, partial semantics (R45) | `veo-zero-byte-download-raises-download-failed` |
+| 31 | Two concurrent `start_keyframe_generation` calls for the same `kf_id` | Same (user, project): out of scope, undefined (INV-1). Different working copies: isolated per INV-1 (R46) | `concurrent-start-same-entity-no-entity-lock` |
 
 ---
 
@@ -760,25 +765,65 @@ Follows `narrative.py` current behavior; see Requirements R17, R20, R25, R26, R3
 - **thread-alive-and-daemon**: the spawned thread's `daemon` attribute is True.
 - **tool-returns-before-worker-done**: the return happened before any provider call completed (observed via provider stub delay).
 
-#### Test: chat-partial-slot-success (covers OQ-1)
+#### Test: partial-slot-success-keeps-partials (covers R42)
 
-`undefined` — see [Open Questions](#open-questions). Do NOT add an assertion-based test until OQ-1 is resolved.
+**Given**: Transition `tr_200` with `slots=3`, `count=1`; Veo stub succeeds for slots 0 and 2, raises `RuntimeError("transient")` on all 3 attempts for slot 1.
 
-#### Test: chat-intermediate-slot-key-disappears-mid-job (covers OQ-2)
+**When**: `start_transition_generation(..., "tr_200", count=1)` runs to completion.
 
-`undefined` — see [Open Questions](#open-questions).
+**Then**:
+- **slot-0-pool-row**: `pool_segments` has a row for slot 0's segment.
+- **slot-2-pool-row**: `pool_segments` has a row for slot 2's segment.
+- **slot-1-no-pool-row**: no `pool_segments` row created for slot 1.
+- **tr-candidates-0-and-2**: `tr_candidates` rows exist for slots 0 and 2 only.
+- **job-status-partial**: `complete_job` summary contains `status='partial'`, `completed_slots=[0,2]`, `failed_slots=[1]`.
+- **fail-job-not-called**: `fail_job` NOT called (partial ≠ fail).
 
-#### Test: chat-prompt-rejected-error (covers OQ-3)
+#### Test: slot-keyframe-disappears-mid-job-raises (covers R43)
 
-`undefined` — see [Open Questions](#open-questions).
+**Given**: Transition `tr_210` with `slots=2`; `tr_210_slot_0.png` exists at job start; a fixture deletes the file after slot 0 completes but before slot 1's worker reads it.
 
-#### Test: chat-veo-returns-zero-byte-file (covers OQ-4)
+**When**: Transition generation runs.
 
-`undefined` — see [Open Questions](#open-questions).
+**Then**:
+- **slot-1-slot-dependency-error**: `fail_job` or per-slot failure record contains `SlotDependencyError` with message referencing slot 1 and "disappeared mid-generation".
+- **no-fallback-to-boundary**: the slot 1 worker did NOT fall back to `selected_keyframes/<from>.png`.
+- **slot-0-partial-retained**: slot 0's pool_segments row persists (R42 applies).
 
-#### Test: chat-concurrent-start-same-keyframe (covers OQ-5)
+#### Test: chat-prompt-rejected-tool-result-error (covers R44)
 
-`undefined` — see [Open Questions](#open-questions).
+**Given**: Veo stub raises `PromptRejectedError("nsfw content detected")` on slot 1 of a `slots=2` transition; slot 0 succeeds.
+
+**When**: Transition generation runs.
+
+**Then**:
+- **tool-result-is-error**: the surfaced `tool_result` (or fail_job payload) has `isError: True`, `reason: "prompt_rejected"`, `details: "nsfw content detected"`.
+- **no-retry**: provider stub was called exactly once for slot 1 (no R11 retry budget applied to rejections).
+- **slot-0-retained**: slot 0's pool row + tr_candidate persist.
+- **summary-includes-rejected-slots**: `complete_job` summary has `rejected_slots: [1]`.
+
+#### Test: veo-zero-byte-download-raises-download-failed (covers R45)
+
+**Given**: `generate_video` stub returns success but writes a 0-byte file to the target path.
+
+**When**: Transition generation runs for a single slot.
+
+**Then**:
+- **raises-download-failed**: the slot worker raises `DownloadFailed` with message referencing "0-byte".
+- **no-pool-insert**: no `pool_segments` row created for the 0-byte file.
+- **no-tr-candidate**: no `tr_candidates` row linked.
+- **partial-semantics**: if this was one of multiple slots, prior successes retained per R42.
+
+#### Test: concurrent-start-same-entity-no-entity-lock (covers R46, INV-1 — negative assertion)
+
+**Given**: Inspection of `start_keyframe_generation` and `start_transition_generation` source.
+
+**When**: Inspected.
+
+**Then**:
+- **no-per-entity-lock**: no `threading.Lock` keyed by `kf_id` / `tr_id`; no module-level `_entity_locks: dict` pattern.
+- **no-rejection-on-concurrent-call**: handler does NOT reject a second call with `"generation already in progress"`; the INV-1 contract says concurrent same-(user, project) is out of scope.
+- **different-working-copies-isolated**: separate pools / working copies have independent `pool_segments` writes (integration-level assertion, optional).
 
 ---
 
@@ -797,7 +842,16 @@ Follows `narrative.py` current behavior; see Requirements R17, R20, R25, R26, R3
 
 ## Open Questions
 
-### OQ-1 — Partial slot success: keep partials or roll back?
+### Resolved
+
+- **OQ-1 (partial slot success)**: **Resolved 2026-04-27**. Keep partials; generation row gains `status='partial'` + `completed_slots`; job completes with partial marker (R42). Applies to both paths.
+- **OQ-2 (intermediate slot-keyframe disappears mid-generation)**: **Resolved 2026-04-27**. Mid-generation disappearance fails the dependent slot with `SlotDependencyError`; no fallback to boundary in the race case (R43). R16 still applies to absent-at-start.
+- **OQ-3 (PromptRejectedError on chat path)**: **Resolved 2026-04-27**. Surface as tool_result with `isError:true, reason:"prompt_rejected"`; no retry; partial-success semantics (R44). CLI path unchanged.
+- **OQ-4 (Veo 0-byte download)**: **Resolved 2026-04-27**. Stat-check post-download; raise `DownloadFailed`; slot-level failure with partial semantics (R45). Spend recording per INV-3 applies once provider migration lands.
+- **OQ-5 (concurrent start for same entity)**: **Resolved 2026-04-27**. Closed under INV-1 single-writer. Same-(user, project) is out of scope / undefined; different working copies isolated (R46). Negative-assertion test `concurrent-start-same-entity-no-entity-lock`.
+- **R10 (spend tracking DEFERRED)**: **Reframed 2026-04-27 under INV-3**. Target = providers typed namespace with mandatory `record_spend` per block 4 providers decisions; current direct-SDK un-tracked state transitional. Regression test flips when provider migration lands.
+
+### OQ-1 — Partial slot success: keep partials or roll back? — RESOLVED, see Resolved section
 
 If transition generation has `slots=3` and slot 1 fails after slot 0 succeeded, what is the desired end state?
 - **Option A**: Keep slot 0's `pool_segments` row + `tr_candidates` link; mark job failed; user can retry just the failed slot.

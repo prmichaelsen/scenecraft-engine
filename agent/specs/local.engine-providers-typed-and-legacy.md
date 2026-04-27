@@ -154,8 +154,19 @@
 
 ### Cross-provider behaviors / simultaneity
 
-- **R59**: There is **no per-provider queue, rate-limit bucket, or semaphore** in the engine today. Two plugins calling the same provider simultaneously will each make independent HTTP calls; whatever rate limit the provider enforces is the only coordination. See OQ-6.
+- **R59**: Per INV-1, concurrent provider calls from different (user, project) pairs are supported. Same-(user, project) concurrent calls are undefined and out of scope. There is no per-provider queue, rate-limit bucket, or semaphore in the engine — callers rely on provider-side rate limiting.
 - **R60**: All provider calls originate in in-process Python. Cross-process concerns (e.g., the out-of-process MCP server) do not issue provider calls — they delegate back to the engine via HTTP.
+
+### Target-State Requirements (per INV-8)
+
+- **R61 (target — unified namespace)**: All nine cost-bearing external providers MUST be exposed under `plugin_api.providers.<name>` as typed providers, following the Replicate shape (R4–R9). Target namespace entries: `replicate` (done), `musicful`, `imagen`, `veo`, `kling`, `runway`, `anthropic`, `google_genai`.
+- **R62 (target — mandatory spend tracking)**: Every typed provider MUST call `plugin_api.record_spend()` exactly once per successful operation, **before** artifact download. Per INV-3, `record_spend` is idempotent keyed on `(plugin_id, job_ref, operation)`; a retried provider call with the same `job_ref` MUST NOT double-write. The `plugin_id` is derived from stack-frame introspection at call time, not from a caller-provided argument (stack-frame derivation prevents the M16 trust-boundary gap documented in R57).
+- **R63 (target — bounded retry)**: Every typed provider MUST cap retries at 5 attempts with exponential backoff and a 60s between-attempt cap (`min(2^attempt, 60)` seconds with jitter). On exhaustion, the provider MUST raise a typed `<Provider>RateLimitExhausted` exception. No infinite retry loops.
+- **R64 (target — exception hierarchy)**: Every typed provider MUST expose a consistent exception hierarchy rooted at `<Provider>Error`, with at minimum `<Provider>NotConfigured` (missing env var / auth), `<Provider>PredictionFailed` (upstream returned failed/canceled), `<Provider>DownloadFailed` (post-spend download error, carrying `spend_ledger_id`), and `<Provider>RateLimitExhausted` (R63).
+- **R65 (target — Musicful timeout)**: Musicful poll worker MUST enforce a 30-minute wall-clock timeout. On expiry the generation row is marked `status='failed', error='polling timeout'`; `record_spend` is NOT called (no completion). User may retry.
+- **R66 (target — SDK version pins)**: `google-genai`, `anthropic`, and `replicate` SDK versions MUST be pinned in `pyproject.toml` with a tested-against upper bound. Engine MUST perform a compat check at import time and fail fast with a clear error if the installed version falls outside the supported range.
+- **R67 (target — Anthropic consolidation)**: All six current Anthropic call sites (R41) MUST converge to one `plugin_api.providers.anthropic` module. Direct `anthropic.Anthropic()` / `anthropic.AsyncAnthropic()` instantiation outside that module is forbidden after consolidation.
+- **R68 (target — `ai/provider.py` relation)**: `ai/provider.py::AnthropicProvider` becomes a deprecation shim that delegates to `plugin_api.providers.anthropic`; new code MUST use the typed provider directly.
 
 ---
 
@@ -331,12 +342,15 @@ def record_spend(
 | 32 | Two plugins call `plugin_api.providers.replicate.run_prediction` simultaneously | Both independently issue HTTP; no per-provider queue or rate-limit bucket | `replicate-simultaneous-no-queue` |
 | 33 | Two plugins call `call_service("musicful", ...)` simultaneously | Same — both independent | `musicful-simultaneous-no-queue` |
 | 34 | Plugin attempts to write to `spend_ledger` without going through `record_spend` | Not prevented by code; prevented only by R9a convention | `r9a-convention-only` |
-| 35 | Veo 429 cycle — spec-time: when should infinite retry give up? | `undefined` | → [OQ-1](#open-questions) |
-| 36 | Kling prediction runs on Replicate infra — is Replicate spend reconciled into scenecraft's ledger? | `undefined` | → [OQ-2](#open-questions) |
-| 37 | Anthropic key rotates mid-stream — should the in-flight stream be restarted with the new key? | `undefined` | → [OQ-3](#open-questions) |
-| 38 | `google-genai` SDK version pin — what version is guaranteed to work? | `undefined` | → [OQ-4](#open-questions) |
-| 39 | Musicful poll worker task never reaches terminal status — should there be a wall-clock give-up? | `undefined` | → [OQ-5](#open-questions) |
-| 40 | Simultaneous calls to same provider from different plugins — per-provider queue or shared bucket needed? | `undefined` | → [OQ-6](#open-questions) |
+| 35 | Veo / Imagen 429 exhaustion (target) | After 5 attempts with exp backoff (cap 60s), raises `<Provider>RateLimitExhausted` (typed, non-infinite) | `imagen-429-exhaustion-raises-typed` |
+| 36 | Kling prediction (target) | Migrated to `plugin_api.providers.kling`; `record_spend()` called before download (idempotent on retry per INV-3) | `kling-typed-writes-ledger` |
+| 37 | Anthropic token rotation mid-stream | Key read per-call at `_auth_headers()`; rotation takes effect on next HTTP attempt — documented contract | `anthropic-token-read-per-call` |
+| 38 | `google-genai` SDK version pin (target) | Pinned in `pyproject.toml`; import-time compat check fails fast on incompatible version | `google-genai-compat-check-fails-fast` |
+| 39 | Musicful poll worker 30-min timeout (target) | On expiry, generation marked `status='failed'`, `error='polling timeout'`; no `record_spend` call | `musicful-30min-timeout-no-spend` |
+| 40 | Simultaneous calls to same provider (INV-1) | No per-provider lock; different (user, project) pairs are supported; same-(user, project) concurrent is undefined | `providers-no-internal-lock-per-provider` |
+| 41 | All 9 providers under `plugin_api.providers.<name>` (target) | Each namespace entry exports `run_prediction` / equivalent + exception hierarchy | `all-providers-under-typed-namespace` |
+| 42 | `record_spend` called with `plugin_id="bar"` from a plugin registered as `foo` (target) | `plugin_id` derived from stack frame; mismatch logged / rejected per INV-3 | `record-spend-derives-plugin-id-from-stack` |
+| 43 | `record_spend` called twice with same `(plugin_id, job_ref, operation)` (INV-3 idempotency) | Second call is a no-op; returns same ledger row id as first | `record-spend-idempotent-on-retry` |
 
 ---
 
@@ -685,6 +699,86 @@ def record_spend(
 - **no-spend**: `record_spend` is NOT called.
 - **no-pool-segments**: No `pool_segments` are created.
 
+#### Test: imagen-429-exhaustion-raises-typed (covers R63, R64 target)
+
+**Given**: Mock SDK raises 429 on every call; typed `plugin_api.providers.imagen` wraps the call.
+**When**: The wrapper retries to exhaustion.
+**Then** (assertions):
+- **bounded-retries**: observed `time.sleep` values match `[2, 4, 8, 16, 32]` capped at 60s; exactly 5 attempts.
+- **raises-typed**: on exhaustion raises `ImagenRateLimitExhausted` (subclass of `ImagenError`).
+- **no-infinite-loop**: total wall time < 5 minutes; no post-exhaustion 60s sleep-and-reset cycle.
+
+#### Test: kling-typed-writes-ledger (covers R61, R62 target)
+
+**Given**: `plugin_api.providers.kling.run_prediction(...)` with valid token; mock Replicate returns succeeded with a downloadable URL.
+**When**: A plugin invokes the typed Kling provider.
+**Then** (assertions):
+- **ledger-written-once**: exactly one `spend_ledger` row with `plugin_id=<calling plugin id>`, `source="replicate"`, `operation="kling.run_prediction"`, `job_ref=<prediction id>`.
+- **ledger-before-download**: ledger row committed before the CDN GET.
+- **typed-result**: returns `KlingPredictionResult` with `spend_ledger_id` populated.
+
+#### Test: anthropic-token-read-per-call (covers R37, R63 behavior)
+
+**Given**: `plugin_api.providers.anthropic._auth_headers()` is a function that reads `ANTHROPIC_API_KEY` at call time.
+**When**: A streaming turn is in flight and `ANTHROPIC_API_KEY` is rotated in the process environment mid-stream.
+**Then** (assertions):
+- **next-http-uses-new-key**: the next retry / tool-use roundtrip reads the rotated key.
+- **in-flight-http-unchanged**: an HTTP request already sent continues with the old key (can't be rescinded mid-flight).
+- **no-client-caching**: there is no long-lived `AsyncAnthropic` client caching the key beyond one HTTP attempt.
+
+#### Test: google-genai-compat-check-fails-fast (covers R66 target)
+
+**Given**: `pyproject.toml` pins `google-genai>=1.2,<2.0`; installed version is `2.1.0`.
+**When**: Engine imports `plugin_api.providers.google_genai`.
+**Then** (assertions):
+- **import-fails**: an `IncompatibleProviderSDKError` is raised with a message naming `google-genai` and the tested-against range.
+- **no-partial-import**: the provider module is not usable.
+
+#### Test: musicful-30min-timeout-no-spend (covers R65 target)
+
+**Given**: A Musicful poll worker running for 31 wall-clock minutes with no terminal status (mock clock).
+**When**: The 30-minute timeout fires.
+**Then** (assertions):
+- **status-failed**: `update_music_generation_status(..., "failed", error="polling timeout")` is called.
+- **no-record-spend**: `plugin_api.record_spend` is NOT called.
+- **pool-segments-unchanged**: no `pool_segments` are created.
+- **retry-path-available**: the generation row is eligible for a user-initiated retry.
+
+#### Test: providers-no-internal-lock-per-provider (covers INV-1, R59)
+
+**Given**: Two coroutines in the same process call `plugin_api.providers.replicate.run_prediction(...)` with different (user, project) pairs.
+**When**: Both run concurrently.
+**Then** (assertions):
+- **no-shared-lock**: neither call blocks on the other; total wall time ≈ max, not sum.
+- **negative-no-internal-lock**: inspecting the provider module reveals no `asyncio.Lock` / `threading.Lock` / semaphore guarding the call path.
+- **invariant-INV-1**: per INV-1, same-(user, project) concurrent is undefined; this test covers the supported different-pair case.
+
+#### Test: all-providers-under-typed-namespace (covers R61 target)
+
+**Given**: Post-consolidation `plugin_api.providers` module.
+**When**: Enumerate the namespace.
+**Then** (assertions):
+- **members-present**: `plugin_api.providers` exposes `replicate`, `musicful`, `imagen`, `veo`, `kling`, `runway`, `anthropic`, `google_genai`.
+- **each-has-exception-hierarchy**: each module exports a `<Provider>Error` root + subclasses per R64.
+- **each-has-run-prediction-or-equivalent**: each module exports at least one primary call function.
+
+#### Test: record-spend-derives-plugin-id-from-stack (covers R62 target, INV-3)
+
+**Given**: A plugin registered as `plugin_A` calls `plugin_api.providers.replicate.run_prediction(...)`; the typed provider internally calls `plugin_api.record_spend(...)` without a caller-supplied `plugin_id`.
+**When**: The ledger write executes.
+**Then** (assertions):
+- **derived-from-stack**: the written row has `plugin_id="plugin_A"`, derived by walking the Python stack to the outermost plugin frame.
+- **no-mismatch-trust**: even if a plugin-inner caller passes `plugin_id="plugin_B"`, the derivation overrides (or raises `InvalidPluginIdClaimError`, per INV-3 contract).
+
+#### Test: record-spend-idempotent-on-retry (covers INV-3 idempotency)
+
+**Given**: A typed provider retries a download after a transient failure; both attempts carry the same `(plugin_id, job_ref, operation)` key.
+**When**: Both `record_spend` calls execute.
+**Then** (assertions):
+- **single-row-written**: `spend_ledger` contains exactly one row with that `job_ref`.
+- **same-ledger-id-returned**: both calls return the same ledger row id.
+- **no-double-charge**: aggregated spend for the operation equals a single unit.
+
 #### Test: r9a-convention-only (covers R3, R54)
 
 **Given**: A hypothetical plugin imports `scenecraft.db` directly (violating R9a).
@@ -711,9 +805,47 @@ def record_spend(
 
 ---
 
+## Transitional Behavior
+
+Per INV-8, Requirements R61–R68 describe the **target-ideal** provider surface: all nine cost-bearing providers unified under `plugin_api.providers.<name>` with mandatory `record_spend()`, bounded retry, and a consistent exception hierarchy. Today the engine ships a three-pattern scatter (R1) that regression tests above preserve until the migration sequence completes.
+
+**Current shipping state** (see R4–R53):
+- **Replicate** (done): typed provider with mandatory `record_spend`, bounded retry (3× on HTTP), typed exceptions, `attach_polling` for disconnect survival.
+- **Musicful**: legacy `call_service` shim with caller-side backoff schedule, caller-side `record_spend` at `_finalize`, no wall-clock timeout, plugin-daemon disconnect survival.
+- **Imagen, Veo, Kling, Runway, Anthropic, Google GenAI**: direct-SDK / direct-HTTP scatter. No `record_spend`. Mix of infinite retry (Imagen `_retry_on_429`, Runway infinite poll), bounded timeout (Kling 600s, Veo 8× attempts), and no retry (Kling submit-time, Anthropic SDK defaults). No typed exceptions.
+
+**Migration sequence** from current to target (R61–R68):
+1. **Replicate**: already on target pattern; baseline reference.
+2. **Musicful**: replace `call_service("musicful", ...)` with `plugin_api.providers.musicful`. Move `record_spend` from plugin `_finalize` into the provider's success path (still counting only successful songs). Add 30-minute poll timeout (R65). Retain plugin-daemon execution model for disconnect survival.
+3. **Imagen + Veo**: collapse `GoogleVideoClient` into two typed providers `plugin_api.providers.imagen` and `plugin_api.providers.veo`. Replace `_retry_on_429` infinite loop with bounded 5-attempt retry (R63). Wire `record_spend` before download. Port `PromptRejectedError` into the Imagen/Veo exception hierarchy (R64).
+4. **Kling**: wrap as `plugin_api.providers.kling` — internally may still use the Replicate predictions endpoint (R31) but MUST route spend through the typed provider's `record_spend` with `source="replicate"`, `operation="kling.run_prediction"`. Add typed `KlingError` hierarchy.
+5. **Runway**: wrap as `plugin_api.providers.runway`. Add 30-minute terminal poll timeout (replace infinite poll, R37). Wire `record_spend`. Add `RunwayError` hierarchy.
+6. **Anthropic**: consolidate all 6 call sites (R41) under `plugin_api.providers.anthropic`. Enforce module-level `_auth_headers()` reading env per-call (R37, OQ-3). Wire `record_spend` per successful streaming turn (unit: `token`, amount: total tokens from Anthropic usage block).
+7. **Google GenAI** (`audio_intelligence.py`): wrap as `plugin_api.providers.google_genai`. Pin SDK version + compat check (R66). Replace broad `except Exception` with typed `GoogleGenAIError` hierarchy; wire `record_spend` per successful `generate_content` call.
+
+Transitional tests (all Base Cases + Edge Cases tests 1–34 above) regression-lock today's scatter. Target tests (`imagen-429-exhaustion-raises-typed`, `kling-typed-writes-ledger`, `all-providers-under-typed-namespace`, etc.) begin passing as each provider migrates.
+
+---
+
 ## Open Questions
 
-### OQ-1 — Veo / Imagen infinite retry cycle: when should it give up?
+### Resolved
+
+- **OQ-1 (Veo/Imagen infinite retry)** — **Resolved** (fix): cap at 5 attempts × exponential backoff with jitter, max 60s between attempts. Typed `<Provider>RateLimitExhausted` on exhaustion. `ReplicateError`-style hierarchy ported. See R63, R64.
+- **OQ-2 (Kling spend attribution)** — **Resolved** (fix): migrate Kling to `plugin_api.providers.kling` typed namespace with mandatory `record_spend()` before download (INV-3 idempotent). See R61, R62, migration step 4.
+- **OQ-3 (Anthropic token rotation mid-stream)** — **Resolved** (codify): token read per-call at `_auth_headers()`; rotation takes effect on next HTTP attempt. Documented contract (matches Replicate pattern). See R37 behavior row + `anthropic-token-read-per-call` test.
+- **OQ-4 (google-genai SDK version pin)** — **Resolved** (fix): pin in `pyproject.toml` + import-time compat check. See R66.
+- **OQ-5 (Musicful poll worker never terminal)** — **Resolved** (fix): 30-minute wall-clock timeout; on expiry row marked `status='failed', error='polling timeout'`; spend NOT recorded; user can retry. See R65.
+- **OQ-6 (simultaneous calls to same provider)** — **Resolved** (close per INV-1): concurrent calls from different (user, project) pairs supported; same-pair concurrent undefined. No per-provider lock. See R59 + `providers-no-internal-lock-per-provider` negative-assertion test.
+- **OQ-7 (ai/provider.py vs chat.py Anthropic duplication — 6 call sites)** — **Resolved** (fix): consolidate all Anthropic calls behind `plugin_api.providers.anthropic` typed namespace. 6 call sites converge to one provider module. `ai/provider.py::AnthropicProvider` becomes a deprecation shim. See R67, R68, migration step 6.
+
+### Deferred
+
+_(none — all OQs resolved in the 2026-04-27 pass)_
+
+### Historical (retained for audit trail)
+
+#### OQ-1 — Veo / Imagen infinite retry cycle: when should it give up?
 
 The `_retry_on_429` helper (used by Imagen calls) and the Veo `_retry_video_generation` wrapper both have a pattern of retrying indefinitely after the initial attempt schedule is exhausted. `_retry_on_429` sleeps 60s and resets its counter; `_retry_video_generation` has a hard 8-attempt cap, but inside each attempt the 600s poll can itself be interrupted by 429 retries up to 60s each. The net effect is calls can block for hours without terminal failure.
 
@@ -721,7 +853,7 @@ The `_retry_on_429` helper (used by Imagen calls) and the Veo `_retry_video_gene
 - Should exhaustion raise a typed `RateLimitExhausted` exception that callers can surface to the user?
 - Should the backoff be capped at a finite total number of cycles (e.g. 3 full 5-attempt cycles = ~5 minutes)?
 
-### OQ-2 — Kling prediction spend attribution
+#### OQ-2 — Kling prediction spend attribution
 
 Kling predictions run on Replicate infrastructure and are billed to the Replicate account that owns `REPLICATE_API_TOKEN`. Scenecraft has access to the same token, but today `KlingClient` does NOT write a `spend_ledger` row — partly because Kling is not registered as a "Replicate provider" (`KlingClient` uses raw `urllib`, not `plugin_api.providers.replicate`), partly because the unit and amount are undecided.
 
@@ -729,7 +861,7 @@ Kling predictions run on Replicate infrastructure and are billed to the Replicat
 - If not, should `KlingClient` call `plugin_api.record_spend` directly with `source="replicate"` and a Kling-specific operation id?
 - Is Replicate's billing granularity (per-prediction) compatible with the `unit="prediction"` convention Replicate provider uses?
 
-### OQ-3 — Anthropic token rotation mid-stream
+#### OQ-3 — Anthropic token rotation mid-stream
 
 If `ANTHROPIC_API_KEY` is rotated while a WS chat stream is active, the in-flight `AsyncAnthropic` client continues with the old key. If the old key has been revoked, the stream may fail mid-turn with an auth error from Anthropic.
 
@@ -737,7 +869,7 @@ If `ANTHROPIC_API_KEY` is rotated while a WS chat stream is active, the in-fligh
 - Is it acceptable for the stream to fail cleanly on revocation (partial message persisted, user sees an error frame)?
 - Is there a usage signal (token refresh event, env-var watch) that should trigger rotation without waiting for a failure?
 
-### OQ-4 — `google-genai` SDK version pin
+#### OQ-4 — `google-genai` SDK version pin
 
 The `google-genai` SDK is imported lazily from multiple files (`GoogleVideoClient`, `_gemini_describe_chunk`, `_gemini_describe_chunk_structured`). There is no version pin documented in `pyproject.toml` that we confirmed, and the models referenced (`gemini-2.5-flash`, `gemini-2.5-pro`, `imagen-3.0-generate-002`) depend on specific SDK support.
 
@@ -745,7 +877,7 @@ The `google-genai` SDK is imported lazily from multiple files (`GoogleVideoClien
 - Should this be pinned in `pyproject.toml` with a tested-against range?
 - Should there be a startup-time compatibility check that fails fast on incompatible SDK versions?
 
-### OQ-5 — Musicful poll worker task never terminal
+#### OQ-5 — Musicful poll worker task never terminal
 
 If a Musicful task never reaches a terminal status (no `audio_url`, no `fail_reason`, no `fail_code > 0`, no 429), the `_poll_worker` loops indefinitely. There is no wall-clock give-up and no orphan-detection pass.
 
@@ -753,7 +885,7 @@ If a Musicful task never reaches a terminal status (no `audio_url`, no `fail_rea
 - Should there be a periodic health check that cancels stuck generations?
 - Should the Musicful status code itself be inspected more carefully to detect "stuck" states?
 
-### OQ-6 — Simultaneous calls to same provider
+#### OQ-6 — Simultaneous calls to same provider
 
 Today every provider allows unbounded parallelism from any caller in-process. The engine does NOT implement:
 
@@ -769,7 +901,7 @@ If two plugins call Anthropic simultaneously and the combined rate exceeds the a
 - Should there be a system-wide "in-flight provider calls" inspector for debugging?
 - How should back-pressure surface to plugins — `BackpressureError`, or silent wait-and-retry?
 
-### OQ-7 — `ai/provider.py` vs `chat.py` Anthropic duplication
+#### OQ-7 — `ai/provider.py` vs `chat.py` Anthropic duplication
 
 `ai/provider.py::AnthropicProvider` is a sync abstraction intended to be the single place Anthropic is called, but six other call sites instantiate Anthropic clients directly. Is `AnthropicProvider` dead code, the target future abstraction, or a parallel implementation that never got adopted? This is not strictly a behavior question — it affects decisions in the future-looking unification design doc.
 

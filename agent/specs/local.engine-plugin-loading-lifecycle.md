@@ -609,7 +609,44 @@ functions.
 
 ---
 
+## Transitional Behavior
+
+Per INV-8, Requirements R20–R25 describe the **target-ideal** plugin-loading contract. Until the FastAPI refactor milestone lands, the following **transitional** behavior ships today:
+
+- **Dual hardcoded import lists**: `api_server.run_server` and `mcp_server.py` each maintain their own `from scenecraft.plugins import ...` + `PluginHost.register(...)` sequence. Drift between the two is prevented only by code review. Target (R24): single filesystem-scan helper shared by both paths.
+- **Fatal activation**: if any plugin's `activate()` raises, the exception propagates out of `PluginHost.register` → out of `run_server` → crashes the engine process. Subsequent plugins in the hardcoded list never register. Regression-locked by Tests `activate-raises-crashes-engine` and `activate-failure-blocks-later-plugins`. Target (R21): atomic activation with LIFO dispose + continue-to-next-plugin.
+- **No shutdown hook**: `server.shutdown()` on KeyboardInterrupt closes the HTTP socket but does not call `deactivate_all()`. Daemon threads, file watchers, and open handles registered as Disposables leak on process exit. Regression-locked by `shutdown-does-not-deactivate-plugins`. Target (R22): SIGINT + SIGTERM both call `deactivate_all()`.
+- **No dependency analysis**: plugin load order is fixed by hardcoded import list position. If plugin A depends on plugin B's sidecar table and A is listed first, A's `activate()` raises a SQL error and crashes boot (per fatal-activation behavior). Regression-locked by `cross-plugin-dependency-wrong-order-crashes`. Target (R20): `requires:` field on `plugin.yaml` + topological sort.
+- **`register_migration` absent**: plugins create their sidecar tables inline via `plugin_api.create_table` / `add_column` inside `activate()`, or (today) via hardcoded DDL in core `db.py`. Regression-locked by `no-register-migration-api`. Target (R23): `plugin_api.register_migration(version, up_fn, down_fn)` per `engine-migrations-framework` R20.
+- **`generate_foley` not registered**: the module exists under `src/scenecraft/plugins/generate_foley/` with a valid `plugin.yaml` but is absent from both hardcoded lists. **Immediate transitional fix**: add `generate_foley` to both `api_server.run_server` and `mcp_server.py` import/register blocks until R24 filesystem scan lands. Target (R25): automatic via R24.
+
+**Migration sequence** to the target:
+1. Add `generate_foley` to both hardcoded lists (immediate bugfix).
+2. Extract a single `register_first_party_plugins(host)` helper; call from both paths.
+3. Replace helper with filesystem-scan discovery (R24).
+4. Implement atomic activation in `PluginHost.register` (R21).
+5. Add `requires:` field + topological sort (R20).
+6. Install SIGTERM handler + `deactivate_all()` shutdown hook (R22).
+7. Expose `plugin_api.register_migration` once `engine-migrations-framework` target lands (R23).
+
+---
+
 ## Open Questions
+
+### Resolved
+
+- **OQ-1 (dependency ordering)** — **Resolved** (fix): `plugin.yaml` gains `requires: [plugin_id]` field; `PluginHost` topologically sorts on activation; cycles raise `PluginCycleError`. See R20.
+- **OQ-2 (activate exceptions — intended contract?)** — **Resolved** (fix): atomic activation — catch, LIFO-dispose partial state, log with cause, continue to next plugin. Engine boot succeeds with partial plugin set. Aligns with scenecraft frontend spec R31. See R21.
+- **OQ-3 (shutdown hook worth adding?)** — **Resolved** (fix): `PluginHost.deactivate_all()` on SIGINT/SIGTERM; Disposables LIFO; daemon threads joined with 5s timeout. See R22.
+- **OQ-4 (register_migration API)** — **Resolved** (close via migrations-framework OQ-2): exposed via `plugin_api.register_migration` once target migration framework lands. See R23.
+- **OQ-5 (generate_foley activation)** — **Resolved** (fix): immediate — add to both hardcoded import lists; target — filesystem scan replaces both lists. See R25.
+- **OQ-7 (two activation paths — which wins?)** — **Resolved** (fix): consolidate to single filesystem-scan discovery helper; core allowlist overrides scan. See R24.
+
+### Deferred
+
+- **OQ-6 (hot reload in dev)** — **Deferred**: dev-mode feature; not blocking the FastAPI refactor. `plugin_host.reload(name)` API reserved for a future dev-mode milestone.
+
+### Historical (retained for audit trail)
 
 - **OQ-1 (dependency ordering)**: Plugin A depends on plugin B's table,
   but the hardcoded import list puts A before B. Today this surfaces as

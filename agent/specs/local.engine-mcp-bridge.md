@@ -80,6 +80,16 @@ session.
 19. **R19** — Until the background connect finishes, `bridge.all_tools()` returns `[]`; subsequent `_stream_response` invocations pick up newly-discovered tools on their next read of `all_tools()`.
 20. **R20** — Any exception raised inside `_bg_connect_service` (including unexpected ones that `connect` would normally convert to `False`) is caught and logged; the chat loop continues.
 
+### Target-State Requirements (per INV-8)
+
+21. **R21 (target — OAuth refresh on 401)** — When an upstream MCP `call_tool` returns a 401 (or the SSE session raises an auth error), the bridge MUST: (a) invoke `get_valid_access_token(user_id, service, force_refresh=True)` to fetch a new token via OAuth refresh flow, (b) tear down the current `AsyncExitStack` + re-enter with the new token, (c) retry the call once. On refresh failure or a second 401, the bridge MUST enter degraded mode for that service — tools hidden from `all_tools()`, existing routing entries cleared.
+22. **R22 (target — skip malformed tool schemas)** — During `list_tools()` processing, if a tool's `name` is not a non-empty string OR `inputSchema` is not `None` and not a JSON-object dict, the bridge MUST skip that tool, log a warning with a snippet of the malformed schema, and continue with the remaining valid tools. The connect itself MUST still return `True` so long as at least one valid tool or no tools at all are returned.
+23. **R23 (target — universal `{service}__` namespace)** — All MCP tool names exposed to Claude MUST be `{service}__{tool_name}` (double-underscore separator). The `remember` service retains its current unprefixed names as a **transitional** exception for one release cycle; after that, `remember` tools also adopt the prefix. New services MUST use the prefix from day one.
+24. **R24 (target — 300s `call_tool` timeout)** — Default `call_tool` timeout MUST be raised from 60s to 300s to accommodate legitimate long-running Remember queries. The timeout remains a single global default; per-tool overrides are out of scope.
+25. **R25 (target — backoff retry for initial connect)** — If `_bg_connect_service` initial `connect(...)` returns `False`, the bridge MUST retry with exponential backoff (starting 5s, doubling to a 60s cap) for up to 5 minutes total wall-clock. On eventual success, the bridge MUST emit a `core__chat__mcp_tools_ready` event on the originating chat session's WS (per INV-4) so the client can refresh its tool surface.
+26. **R26 (target — `asyncio.Lock` per service)** — `connect(service, user_id)` MUST acquire a per-service `asyncio.Lock` before the early-return check against `self._sessions`. Concurrent callers for the same service MUST serialize; the second caller awaits the first and then observes the `service in self._sessions` short-circuit, returning `True` without re-entering SSE.
+27. **R27 (target — `core__chat__mcp_tools_ready` event on late-connect)** — Per INV-4, when `_bg_connect_service` succeeds after an initial failure (R25 retry path) OR when the first-attempt connect completes AFTER the WS loop has already processed user messages, the bridge MUST emit `core__chat__mcp_tools_ready` with payload `{service, tool_count}` scoped to the originating chat session. Client surfaces this as a subtle toast.
+
 ---
 
 ## Interfaces / Data Shapes
@@ -167,11 +177,13 @@ class MCPSession:
 | 30 | Remember token missing at chat start | Chat still accepts the first user message; `bridge.all_tools()` stays `[]`; no raise propagates to the ws loop | `chat-still-works-when-remember-unavailable` |
 | 31 | Remember connect completes after first user message sent | The NEXT `_stream_response` invocation sees the discovered tools via `all_tools()` | `tools-become-available-on-next-stream` |
 | 32 | `_bg_connect_service` hits an unexpected raise from `bridge.connect` | Exception caught and logged; chat loop unaffected | `bg-connect-swallows-exceptions` |
-| 33 | OAuth token expires mid-session (already-live SSE) | `undefined` | → [OQ-1](#open-questions) |
-| 34 | MCP server returns a tool with a malformed / non-conforming schema | `undefined` | → [OQ-2](#open-questions) |
-| 35 | Two non-remember services both expose a tool named `search` | `undefined` | → [OQ-3](#open-questions) |
-| 36 | Remember query legitimately needs > 60s | `undefined` | → [OQ-4](#open-questions) |
-| 37 | Initial `connect` fails; chat session continues for hours | `undefined` | → [OQ-5](#open-questions) |
+| 33 | OAuth token expires mid-session (target) | Bridge detects 401, force-refreshes token, reconnects session, retries call once; on second 401, degraded mode for that service | `call-tool-refreshes-on-401` |
+| 34 | MCP server returns a tool with a malformed / non-conforming schema (target) | Tool skipped, warning logged with schema snippet; other tools still registered; connect returns True | `connect-skips-malformed-tool-schema` |
+| 35 | Two non-remember services expose colliding tool names (target) | Universal `{service}__{tool}` prefix prevents collision regardless of upstream name | `universal-service-prefix-prevents-collision` |
+| 36 | Remember query legitimately needs > 60s (target) | 300s default timeout accommodates long queries | `call-tool-300s-default-timeout` |
+| 37 | Initial `connect` fails; chat session continues (target) | Exponential backoff retry (5s→60s cap, 5min total); on eventual success, `core__chat__mcp_tools_ready` emitted | `bg-connect-backoff-retry-then-ready-event` |
+| 38 | Concurrent connect to same service (target) | `asyncio.Lock` per service serializes; second caller sees cached session | `concurrent-connect-serialized-by-lock` |
+| 39 | Late-connect succeeds after WS loop already running (INV-4) | `core__chat__mcp_tools_ready` emitted on originating session's WS with `{service, tool_count}` | `late-connect-emits-tools-ready-event` |
 
 ---
 
@@ -510,6 +522,78 @@ Boundaries, concurrency, content-shape corner cases, and teardown resilience.
 **Then**:
 - **arguments-unmutated**: `args` is still `{"k": "v"}` afterwards (no keys added, none removed).
 
+#### Test: call-tool-refreshes-on-401 (covers R21 target)
+**Given**: Live remember session; upstream `call_tool` raises an auth error (simulated 401) on first attempt; `get_valid_access_token(user_id, "remember", force_refresh=True)` returns a new valid token; reconnect succeeds; retry returns one text item `"ok"`.
+**When**: `await bridge.call_tool("remember_search", {})`.
+**Then**:
+- **refresh-attempted**: `get_valid_access_token` was called with `force_refresh=True` exactly once.
+- **session-rebuilt**: the old `AsyncExitStack` was `aclose()`d and a new one entered with the new token.
+- **retry-succeeds**: return is `({"output": "ok"}, False)`.
+- **no-raise**: no exception propagated.
+
+#### Test: call-tool-degraded-on-second-401 (covers R21 target)
+**Given**: Upstream raises 401 on first call; token refresh succeeds; retry also raises 401.
+**When**: Bridge processes the call.
+**Then**:
+- **service-hidden**: tools for the failing service are removed from `all_tools()`.
+- **routing-cleared**: routing entries for that service are purged.
+- **error-tuple**: return is `({"error": "MCP tool <name> auth failed after refresh"}, True)`.
+
+#### Test: connect-skips-malformed-tool-schema (covers R22 target)
+**Given**: Upstream `list_tools` returns 3 tools: `{name: "good", inputSchema: {...}}`, `{name: None, ...}`, `{name: "bad", inputSchema: "not-a-dict"}`.
+**When**: Connect runs.
+**Then**:
+- **returns-true**: connect returns `True`.
+- **only-valid-registered**: `all_tools()` contains only `good` (after any service-prefix rule).
+- **warnings-logged**: stderr has one warning per skipped tool with a snippet of the offending schema.
+
+#### Test: universal-service-prefix-prevents-collision (covers R23 target)
+**Given**: Post-transition world — `remember` adopts the `{service}__` prefix. Services `remember` and `gmail` both expose an upstream tool named `search`.
+**When**: Both connect.
+**Then**:
+- **remember-prefixed**: emitted Claude name is `remember__search`.
+- **gmail-prefixed**: emitted Claude name is `gmail__search`.
+- **no-collision**: `has_tool("remember__search")` and `has_tool("gmail__search")` are both True; `has_tool("search")` is False.
+
+#### Test: call-tool-300s-default-timeout (covers R24 target)
+**Given**: A live session; upstream `call_tool` completes at the 250s mark.
+**When**: `await bridge.call_tool("remember_search", {})`.
+**Then**:
+- **completes-successfully**: return is `({"output": ...}, False)`.
+- **default-timeout-300s**: inspection of the `asyncio.wait_for` timeout parameter inside `call_tool` reads `300` seconds.
+
+#### Test: bg-connect-backoff-retry-then-ready-event (covers R25 target, R27, INV-4)
+**Given**: `bridge.connect("remember", user)` returns `False` on first 3 attempts, then `True` on the 4th (stubbed). A WS session is open.
+**When**: `_bg_connect_service("remember")` runs with 5s→60s backoff (fake clock).
+**Then**:
+- **retries-observed**: exactly 4 attempts; sleep durations `[5, 10, 20]` (doubling, capped at 60s).
+- **wall-clock-bounded**: total retry window ≤ 5 minutes.
+- **ready-event-emitted**: a WS frame `{"event": "core__chat__mcp_tools_ready", "service": "remember", "tool_count": <n>}` is sent to the originating session's WS exactly once after the 4th attempt succeeds.
+
+#### Test: concurrent-connect-serialized-by-lock (covers R26 target)
+**Given**: Two coroutines simultaneously call `bridge.connect("remember", user)`. Upstream SSE handshake takes 1s (mock).
+**When**: Both awaited in parallel.
+**Then**:
+- **lock-acquired**: per-service `asyncio.Lock` serializes; SSE handshake occurs once, not twice.
+- **one-session-registered**: `_sessions["remember"]` contains exactly one `MCPSession`.
+- **both-return-true**: both coroutines observe `True` as return value.
+
+#### Test: late-connect-emits-tools-ready-event (covers R27 target, INV-4)
+**Given**: Chat WS loop has processed one user message; `_bg_connect_service("remember")` is still pending. Connect then completes, discovering 5 tools.
+**When**: The bg task resolves successfully.
+**Then**:
+- **event-emitted**: exactly one WS frame with `"event": "core__chat__mcp_tools_ready"`, `"service": "remember"`, `"tool_count": 5`.
+- **scoped-to-origin-session**: event sent only to the session that created this `MCPBridge`; other concurrent sessions do NOT receive it.
+- **subsequent-stream-sees-tools**: the next `_stream_response` call reads 5 tools via `all_tools()`.
+
+#### Test: negative-no-shared-lock-across-services (covers INV-1, R26)
+**Given**: Two coroutines — one calling `connect("remember", user_A)` and one calling `connect("gmail", user_B)` — start simultaneously.
+**When**: Both run.
+**Then**:
+- **independent-locks**: the per-service locks do NOT block each other; both SSE handshakes proceed in parallel.
+- **both-sessions-registered**: `_sessions` ends with both entries.
+- **invariant-INV-1**: per INV-1, the `asyncio.Lock` is scoped per `(service)` within a single-user bridge; cross-user bridges are per-WS and never share state.
+
 #### Test: no-concurrency-primitives-in-bridge (negative — covers R1, R2)
 **Given**: Source inspection of `MCPBridge`.
 **When**: Enumerate bridge attributes and usage.
@@ -530,26 +614,63 @@ Boundaries, concurrency, content-shape corner cases, and teardown resilience.
 
 ---
 
+## Transitional Behavior
+
+Per INV-8, Requirements R21–R27 describe the **target-ideal** MCP bridge contract. Until the FastAPI refactor milestone lands, the following **transitional** behavior ships today:
+
+- **No token refresh**: tokens are fetched once at `connect` and never re-read. An upstream 401 mid-session becomes a single `{"error": ...}` tuple from `call_tool`; the session stays registered in a broken state. Regression-locked by today's `call-tool-upstream-exception` test. Target (R21): detect 401, force-refresh, reconnect, retry once; degrade on second failure.
+- **No schema validation on tool discovery**: tools are accepted as-is from `list_tools()`; `description=None` and `inputSchema=None` are filled with defaults (R7), but other malformations (non-string name, non-dict schema) reach Claude unchanged. Target (R22): validate during discovery, skip malformed with a warning.
+- **`remember` unprefixed; others `<service>_<tool>` single-underscore**: per R6, `remember` tools pass through unchanged, other services use `{service}_{tool}` single-underscore. Regression-locked by `connect-remember-keeps-names`, `connect-non-remember-prefixes-names`. Target (R23): universal `{service}__{tool}` double-underscore for all services; `remember` retains current unprefixed names for one release cycle as a transitional exception.
+- **60s `call_tool` timeout**: per R12, the default is 60s and legitimate long Remember queries time out. Regression-locked by `call-tool-timeout`. Target (R24): raise default to 300s.
+- **No retry on initial connect failure**: if `_bg_connect_service` fails, the chat session runs without MCP tools until the next chat reconnect. No backoff, no late-ready event. Regression-locked by `chat-still-works-when-remember-unavailable`. Target (R25 + R27): exp backoff 5s→60s over 5min; on success emit `core__chat__mcp_tools_ready`.
+- **No per-service lock on connect**: two concurrent calls to `connect(service, user)` race between the early-return check and the eventual session insert. In practice only `_bg_connect_service` calls this, once. Regression-locked by `no-concurrency-primitives-in-bridge`. Target (R26): per-service `asyncio.Lock`.
+- **No `core__chat__mcp_tools_ready` event**: per-INV-4, all new events are `core__chat__*` namespaced; currently the bridge emits no late-ready signal. Target (R27): event emitted on late-connect success.
+
+**Migration sequence** to the target:
+1. Bump `call_tool` default timeout 60s → 300s (R24) — trivial, non-breaking.
+2. Add per-service `asyncio.Lock` to `connect` (R26).
+3. Add backoff retry + `core__chat__mcp_tools_ready` emission in `_bg_connect_service` (R25, R27).
+4. Wire 401 detection + token refresh in `call_tool` (R21).
+5. Add schema validation + skip-on-malformed in `list_tools` processing (R22).
+6. Migrate `remember` tools to the universal `{service}__` prefix (R23) — coordinate with client-side tool-resolution code for one release cycle of back-compat.
+
+---
+
 ## Open Questions
 
-### OQ-1: OAuth token expiry mid-session
+### Resolved
+
+- **OQ-1 (OAuth token expiry mid-session)** — **Resolved** (fix): detect 401 from MCP server; re-fetch token via OAuth refresh flow; retry the call once. On refresh failure, degraded-mode (tools hidden). See R21.
+- **OQ-2 (malformed tool schema)** — **Resolved** (fix): skip that tool, log warning with schema snippet; bridge continues with valid tools; connect returns True. See R22.
+- **OQ-3 (cross-service tool name collision)** — **Resolved** (fix): namespace everything as `{service}__{tool}` (double-underscore). Remember tools stay un-prefixed for back-compat through one release cycle; future services MUST use the prefix. See R23.
+- **OQ-4 (legitimate long Remember queries)** — **Resolved** (fix): raise `call_tool` timeout from 60s to 300s. Matches elicitation timeout. See R24.
+- **OQ-5 (initial connect failure + long-lived session)** — **Resolved** (fix): retry with exponential backoff up to 5 min total. On eventual success, emit `core__chat__mcp_tools_ready` (matches chat-pipeline OQ-5 resolution). See R25, R27.
+- **OQ-6 (concurrent connect same service)** — **Resolved** (fix): idempotent — `asyncio.Lock` per service prevents concurrent connects; second caller awaits the first's result. See R26.
+
+### Deferred
+
+_(none — all OQs resolved in the 2026-04-27 pass)_
+
+### Historical (retained for audit trail)
+
+#### OQ-1: OAuth token expiry mid-session
 The bridge fetches a token once in `connect` and holds the SSE session open for the chat lifetime. If the Remember access token expires after connect, does the bridge:
 (a) silently continue and let the next `call_tool` fail with an upstream 401,
 (b) detect upstream 401 and attempt a single token refresh + session reconnect, or
 (c) tear the session down on first auth failure so the next chat reconnect re-establishes it?
 **Today**: path (a) — any upstream failure becomes a one-shot `{"error": ...}` and the session stays registered. The user likely wants at least (c). Needs a decision before this spec can close rows #33.
 
-### OQ-2: Malformed tool schema from MCP server
+#### OQ-2: Malformed tool schema from MCP server
 `list_tools()` returns tools with `name`, `description`, `inputSchema`. The current code is tolerant of `description=None` and `inputSchema=None` but not of, e.g., `name=None`, a non-string name, or an `inputSchema` that is not a dict (wrong JSON Schema shape, wrong type). Should the bridge:
 (a) skip malformed tools and keep the valid ones,
 (b) hard-fail the whole connect (return `False`) on any malformed tool,
 (c) accept them as-is and let Claude reject them?
 **Today**: (c) — no validation. Row #34.
 
-### OQ-3: Collision across two non-remember services
+#### OQ-3: Collision across two non-remember services
 The prefixing rule makes cross-service collisions impossible *by name* (every non-remember tool gets its service prefix). But what if service `gmail` exposes `gmail_search` and service `gdrive` exposes `gdrive_search`? That's fine. What if `gmail` exposes a raw tool called `gdrive_something` (unlikely but legal)? Today the bridge writes `_tool_routing["gdrive_something"] = "gmail"` since it already starts with `gdrive_` — but it is actually a gmail tool. Should the prefix rule be: "prefix unless it already starts with the service's OWN prefix" (current), or "always prefix with the owning service's name" (stricter)? Row #35.
 
-### OQ-4: Legitimate long Remember queries
+#### OQ-4: Legitimate long Remember queries
 The 60s `call_tool` timeout is hard-coded. Some Remember queries (deep-search, large summarization) may legitimately take > 60s. Options:
 (a) bump the default,
 (b) make it per-tool configurable from the upstream tool metadata,
@@ -557,14 +678,14 @@ The 60s `call_tool` timeout is hard-coded. Some Remember queries (deep-search, l
 (d) leave as-is and accept that long queries fail.
 **Today**: (d). Row #36.
 
-### OQ-5: Initial connect failure + long-lived chat session
+#### OQ-5: Initial connect failure + long-lived chat session
 If `_bg_connect_service("remember")` fails on startup (network blip, token refresh race), the chat session runs for hours without Remember tools and with no automatic retry. Options:
 (a) leave as-is (next chat reconnect tries again),
 (b) schedule a delayed retry (e.g. exponential backoff capped at N attempts),
 (c) expose a "reconnect MCP" command from the UI.
 **Today**: (a). Row #37.
 
-### OQ-6: Concurrent connect to the same service
+#### OQ-6: Concurrent connect to the same service
 `connect` is not guarded by a lock. Two concurrent calls for the same service race between the `if service in self._sessions` check and the eventual insert, potentially creating two live SSE sessions where only one is reachable via `_sessions`. In practice only `_bg_connect_service` calls this today, and only once. If the surface ever expands (e.g. a UI-triggered reconnect), does the bridge need an `asyncio.Lock` per service? Flagged by `no-concurrency-primitives-in-bridge`.
 
 ---

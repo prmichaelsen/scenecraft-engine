@@ -155,26 +155,79 @@ All requirements are testable and traceable.
   `audio_bounces`, analysis caches, plugin sidecars) MUST NOT write to
   `undo_log`, regardless of `active` state.
 - **R17** — Mutations performed while `undo_state.current_group = 0`
-  (before any `undo_begin`) are `undefined` (see OQ-2).
+  (before any `begin_undo_group`) MUST skip undo capture entirely. The
+  trigger body checks `current_group != 0`; when zero, no `undo_log` row
+  is written. The mutation itself proceeds normally but is not undoable.
+  (Resolves OQ-2.)
+- **R18** — `begin_undo_group` / `end_undo_group` / `is_undo_capturing` are
+  the target public API names. Legacy aliases `undo_begin` / (no legacy
+  end) remain importable through one release cycle. `is_undo_capturing()`
+  returns `True` iff `undo_state.active = 1` AND
+  `undo_state.current_group != 0`. (Resolves OQ-1.)
+- **R19** — On a new tracked mutation outside a `begin_undo_group`
+  (i.e. `current_group = 0`), any existing `undone = 1` groups in
+  `undo_groups` are discarded along with their `redo_log` rows before
+  the mutation proceeds. This preserves the "new mutation discards redo
+  stack" invariant even when the caller forgets to open a group.
+  (Resolves OQ-3.)
+- **R20** — Each `undo_groups` row MUST be capped at 10,000
+  `undo_log` rows. When a tracked mutation would push the count above
+  the cap, the oldest `undo_log` row for that group is deleted before
+  the new row is appended. The group is documented as "partially
+  un-undoable" and a subsequent `undo_execute` on that group produces
+  a partial undo. (Resolves OQ-4.)
+- **R21** — Every `undo_log` row MUST carry a `schema_version` column
+  populated from the project's `schema_migrations` table
+  (see `local.engine-migrations-framework`). On `undo_execute`, if the
+  group's rows reference a `schema_version` lower than the DB's current
+  `schema_version`, replay aborts with
+  `UndoReplaySchemaVersionMismatch`. The caller is expected to discard
+  the undo history rather than attempt replay. (Resolves OQ-5.)
+- **R22** — `undo_groups` gains a `completed_at TEXT` column. A group is
+  considered complete when (a) `undo_execute` runs on it, OR (b) the
+  next `begin_undo_group` is called, OR (c) `end_undo_group` is
+  called. On engine startup, a sweep MUST close every `undo_groups` row
+  whose `completed_at IS NULL` AND whose `timestamp` is older than
+  1 hour, setting `completed_at = now(UTC ISO)`. (Resolves OQ-6.)
+- **R23** — The undo subsystem holds no internal lock spanning multiple
+  API calls. Concurrent writes from the same user on the same project
+  are undefined per INV-1. (Resolves OQ-7.)
+- **R24** — `undo_execute` MUST wrap the replay loop in a SAVEPOINT.
+  On any exception during replay, the SAVEPOINT is rolled back, the
+  `undo_groups.replay_failed` column is set to 1, and the error is
+  surfaced to the caller. The group remains in `undo_groups` but is
+  no longer replayable (excluded from the `undone = 0` candidate list
+  for future `undo_execute` calls). (Resolves OQ-8.)
 
 ---
 
 ## Interfaces / Data Shapes
 
-### Public Python API (in `scenecraft.db`)
+### Public Python API (in `scenecraft.db`) — Target
 
 ```
-undo_begin(project_dir: Path, description: str) -> int
+begin_undo_group(project_dir: Path, description: str) -> int
+end_undo_group(project_dir: Path) -> None
+is_undo_capturing(project_dir: Path) -> bool
 undo_execute(project_dir: Path) -> dict | None   # {id, description, timestamp}
 redo_execute(project_dir: Path) -> dict | None   # {id, description, timestamp}
 undo_history(project_dir: Path, limit: int = 50) -> list[dict]
 ```
 
-Note: the prompt references `begin_undo_group` / `end_undo_group` /
-`is_undo_capturing`; the actual code uses `undo_begin` (no explicit end —
-groups are implicitly closed by the next `undo_begin` or by
-`undo_execute`) and exposes capture state only via `undo_state.active`.
-See OQ-1.
+**Transitional API aliases** (INV-8): through one release cycle, the legacy
+names MUST remain importable and behave identically:
+
+```
+undo_begin    → alias for begin_undo_group
+undo_execute  → kept as-is (new name not needed)
+redo_execute  → kept as-is
+```
+
+There is no explicit `undo_end` in the current code; `end_undo_group` is a
+new target API added as part of this renaming. Groups are still implicitly
+closed by the next `begin_undo_group` or by `undo_execute` for
+back-compat. `is_undo_capturing()` returns `undo_state.active == 1 AND
+current_group != 0`.
 
 ### Schema
 
@@ -248,13 +301,13 @@ END;
 | 15 | Composite-PK insert (`track_sends`) | Inverse SQL `DELETE` uses full composite key | `track-sends-composite-capture` |
 | 16 | `undo_groups` count exceeds 1000 | Oldest groups + their `undo_log` rows pruned on next `undo_begin` | `history-pruned-to-1000` |
 | 17 | `undo_history(limit)` | Returns up to `limit` rows, newest first, with `undone` bool | `undo-history-shape-and-order` |
-| 18 | Redo available, then a new mutation happens | `undefined` — prompt says "branch point lost?" | → [OQ-3](#open-questions) |
-| 19 | `undo_log` growth unbounded mid-session (no `undo_begin` called before many writes) | `undefined` — pruning only runs inside `undo_begin` | → [OQ-4](#open-questions) |
-| 20 | Undo replay across a schema migration that added a column | `undefined` — stored `sql_text` was authored against old schema | → [OQ-5](#open-questions) |
-| 21 | Process dies after `undo_begin` with mutations captured but before any `undo_execute` | `undefined` — no explicit `undo_end`; group remains live | → [OQ-6](#open-questions) |
-| 22 | Mutation with `current_group = 0` (before any `undo_begin` ever ran) | `undefined` — triggers still fire and write `undo_group = 0`; no corresponding `undo_groups` row exists | → [OQ-2](#open-questions) |
-| 23 | Two concurrent writers to the same project DB | `undefined` — system assumes single writer, but not enforced | → [OQ-7](#open-questions) |
-| 24 | `undo_execute` fails mid-replay (e.g. constraint violation on inverse SQL) | `undefined` — no explicit rollback path in current code | → [OQ-8](#open-questions) |
+| 18 | Redo available, then a new mutation happens | Redo stack discarded on new mutation outside `begin_undo_group` (current behavior codified) | `redo-discarded-on-new-mutation` |
+| 19 | `undo_log` growth within a single group | Cap at 10,000 rows per group; oldest log entry dropped on overflow (group becomes partially un-undoable) | `undo-log-capped-per-group` |
+| 20 | Undo replay across a schema migration | `undo_log` rows tagged with `schema_version`; replay fails on mismatch with `UndoReplaySchemaVersionMismatch` error; user guided to discard undo history | `undo-replay-schema-mismatch-fails` |
+| 21 | Process dies after `undo_begin` with mutations captured | Startup sweep closes `undo_groups` with `completed_at IS NULL` older than 1 hour | `startup-sweep-closes-orphan-groups` |
+| 22 | Mutation with `current_group = 0` | Skip capture (treat as "not in a group"); mutation proceeds, not undoable | `current-group-zero-skips-capture` |
+| 23 | Two concurrent writers to the same project DB | Undefined by INV-1 (single-writer per (user, project)); no internal lock held | `concurrent-writers-no-internal-lock` |
+| 24 | `undo_execute` fails mid-replay | Replay wrapped in transaction; on failure, rollback + mark `undo_group.replay_failed=1` + surface error | `undo-replay-failure-rolls-back` |
 
 ---
 
@@ -579,6 +632,82 @@ scenarios.
   test is a negative assertion so future changes that add concurrent
   writers must update the spec.
 
+#### Test: current-group-zero-skips-capture (covers R17, resolves OQ-2)
+
+**Given**: Fresh DB; `undo_state.current_group = 0`; `active = 1`; no
+  `begin_undo_group` ever called.
+**When**: `INSERT INTO keyframes(id, ...) VALUES ('k1', ...)` runs.
+**Then** (assertions):
+- **no-undo-row**: `undo_log` has zero rows.
+- **row-inserted**: The keyframe exists; mutation proceeded.
+
+#### Test: redo-discarded-on-new-mutation (covers R19, resolves OQ-3)
+
+**Given**: Group `g1` undone with populated `redo_log`; caller issues a
+  tracked mutation WITHOUT first calling `begin_undo_group`
+  (`current_group = 0`).
+**When**: The mutation fires.
+**Then** (assertions):
+- **redo-stack-cleared**: `redo_log` has no rows for any group.
+- **undone-groups-gone**: `undo_groups` has no rows with `undone = 1`.
+- **mutation-applied**: The new row is present in the target table.
+
+#### Test: undo-log-capped-per-group (covers R20, resolves OQ-4)
+
+**Given**: Group `g` has 10,000 rows in `undo_log`.
+**When**: A 10,001st tracked mutation occurs under `g`.
+**Then** (assertions):
+- **cap-enforced**: `SELECT COUNT(*) FROM undo_log WHERE undo_group=g`
+  equals 10,000.
+- **oldest-dropped**: The row with the lowest `seq` for `g` before the
+  mutation is gone.
+- **newest-present**: The latest mutation's row is present.
+
+#### Test: undo-replay-schema-mismatch-fails (covers R21, resolves OQ-5)
+
+**Given**: An `undo_log` row with `schema_version = 3`; the DB's
+  `schema_migrations` current version is `4`.
+**When**: `undo_execute` picks up that row's group.
+**Then** (assertions):
+- **error-raised**: `UndoReplaySchemaVersionMismatch` raised.
+- **no-partial-replay**: No mutation applied; SAVEPOINT rolled back.
+- **group-unchanged**: `undo_groups.undone` for that group remains `0`.
+
+#### Test: startup-sweep-closes-orphan-groups (covers R22, resolves OQ-6)
+
+**Given**: Two `undo_groups` rows with `completed_at IS NULL` — one with
+  `timestamp` 2 hours ago, one with `timestamp` 10 minutes ago.
+**When**: The engine startup sweep runs.
+**Then** (assertions):
+- **old-closed**: The 2-hour-old group's `completed_at` is a UTC ISO
+  timestamp.
+- **recent-kept-open**: The 10-minute-old group's `completed_at` is
+  still NULL.
+
+#### Test: concurrent-writers-no-internal-lock (covers R23, resolves OQ-7, INV-1 negative-assertion)
+
+**Given**: The undo API is invoked with a mock that asserts no named
+  mutex or module-level lock is acquired across the call boundary.
+**When**: `begin_undo_group` / `undo_execute` / `redo_execute` each run.
+**Then** (assertions):
+- **no-internal-lock-held**: No `threading.Lock` or `asyncio.Lock` is
+  acquired or released during these calls.
+- **concurrency-undefined**: Spec asserts concurrency is undefined per
+  INV-1; SQLite's own writer serialization is the only contention
+  surface.
+
+#### Test: undo-replay-failure-rolls-back (covers R24, resolves OQ-8)
+
+**Given**: `undo_log` contains a row whose replay will raise (e.g. a
+  UNIQUE conflict).
+**When**: `undo_execute` hits that row mid-replay.
+**Then** (assertions):
+- **savepoint-rolled-back**: No partial mutation visible after the call.
+- **group-flagged**: `undo_groups.replay_failed = 1` for that group.
+- **excluded-from-future**: A subsequent `undo_execute` does NOT pick up
+  this group.
+- **error-surfaced**: The original exception is raised to the caller.
+
 #### Test: undo-across-schema-migration *(undefined — see OQ-5)*
 
 **Given**: `undo_log.sql_text` authored against schema v1; a migration
@@ -651,7 +780,49 @@ scenarios.
 
 ---
 
+## Transitional Behavior (INV-8)
+
+Target-ideal API is `begin_undo_group` / `end_undo_group` /
+`is_undo_capturing` (see R18). Current code ships only `undo_begin`
+(no explicit end; capture state accessed via raw `undo_state.active`
+reads). The following divergences are documented, not codified as the
+eventual contract:
+
+- **API aliases**: `undo_begin` is kept importable and dispatches to
+  `begin_undo_group` through one release cycle. Callers migrating to
+  the target API should switch names and adopt explicit
+  `end_undo_group` calls where the intent is to close a group without
+  undoing it.
+- **`schema_version` column on `undo_log`**: target requires tagging
+  rows with the project's current `schema_migrations` version; current
+  code has no `schema_migrations` table (see
+  `local.engine-migrations-framework` OQ-1). Until the migrations
+  framework lands, `schema_version` column may be NULL; mismatch check
+  in R21 is a no-op pending implementation.
+- **`completed_at` column on `undo_groups`**: target adds this column;
+  legacy DBs require an additive ALTER (safe). Startup sweep
+  (R22) requires the column to exist.
+- **`replay_failed` column on `undo_groups`**: target adds this
+  column; additive ALTER.
+
 ## Open Questions
+
+### Resolved
+
+- **OQ-1** (API naming): **fix** — rename to `begin_undo_group` / `end_undo_group` / `is_undo_capturing`; keep `undo_begin` / `undo_execute` / `redo_execute` as back-compat aliases through one release cycle. R18, Transitional Behavior.
+- **OQ-2** (mutation with `current_group=0`): **codify** — skip capture entirely; mutation proceeds but not undoable. R17, test `current-group-zero-skips-capture`.
+- **OQ-3** (redo after new non-undo mutation): **codify** — discard redo stack on new mutation outside `begin_undo_group`. R19, test `redo-discarded-on-new-mutation`.
+- **OQ-4** (`undo_log` growth within single group): **fix** — cap 10,000 rows per group; drop oldest on overflow; group partially un-undoable. R20, test `undo-log-capped-per-group`.
+- **OQ-5** (replay across schema migrations): **fix** — `undo_log` rows tagged with `schema_version` from `schema_migrations`; replay fails with `UndoReplaySchemaVersionMismatch` on mismatch. R21, test `undo-replay-schema-mismatch-fails`.
+- **OQ-6** (orphan group after process death): **fix** — startup sweep closes `undo_groups.completed_at IS NULL` older than 1 hour. R22, test `startup-sweep-closes-orphan-groups`.
+- **OQ-7** (multi-writer): closed per INV-1. R23 + negative-assertion test `concurrent-writers-no-internal-lock`.
+- **OQ-8** (replay failure recovery): **fix** — replay wrapped in SAVEPOINT; rollback + mark `undo_groups.replay_failed=1` + surface error; group no longer replayable. R24, test `undo-replay-failure-rolls-back`.
+
+### Deferred
+
+(None — all 8 OQs resolved.)
+
+### Historical
 
 ### OQ-1 — API naming mismatch
 

@@ -439,7 +439,7 @@ Behavior rows cover the dispatcher contract (cross-cutting concerns + representa
 | 37 | GET files with fresh `If-Modified-Since` | 304 | `file-serve-ims-304` |
 | 38 | GET files with malformed `If-Modified-Since` | 200 full (fallback) | `file-serve-ims-malformed-fallback` |
 | 39 | GET `/api/projects/:p/files/../../etc/passwd` | 403 `{code:"FORBIDDEN", error:"Path traversal denied"}` | `file-serve-traversal-403` |
-| 40 | GET files where target is a symlink to `/etc/passwd` | `undefined` — startswith guard does not re-check after readlink | → [OQ-3](#open-questions) |
+| 40 | GET files where target is a symlink to `/etc/passwd` | 403 via `Path.relative_to` guard (delegated to file-serving spec) | covered by `engine-file-serving-and-uploads` tests `traversal-guard-uses-relative-to`, `pool-symlink-escape-rejected` (covers OQ-3) |
 | 41 | GET files missing | 404 `{code:"NOT_FOUND"}` | `file-serve-missing-404` |
 | 42 | HEAD `/api/projects/:p/files/existing` | 200 + headers, empty body | `head-existing-file-200` |
 | 43 | HEAD missing file | 404 empty body (NOT `{error,code}`) | `head-missing-empty-404` |
@@ -455,8 +455,8 @@ Behavior rows cover the dispatcher contract (cross-cutting concerns + representa
 | 53 | POST plugin with empty body | Dispatcher passes `{}` (not 400) | `plugin-empty-body-defaulted-to-object` |
 | 54 | Plugin route with named regex groups `(?P<id>\d+)` | Handler receives `path_groups={id:"…"}` | `plugin-named-groups-propagated` |
 | 55 | Plugin route without named groups | Handler receives NO `path_groups` kwarg | `plugin-no-groups-no-kwarg` |
-| 56 | DELETE plugin route | `undefined` — dispatcher only forwards GET/POST to plugin fallback | → [OQ-4](#open-questions) |
-| 57 | Any endpoint decorated `@require_paid_plugin_auth` | Currently none exist; behavior is `undefined` as applied | → [OQ-1](#open-questions) |
+| 56 | DELETE plugin route | Dispatcher forwards DELETE (also PATCH, PUT) to `PluginHost.dispatch_rest` | `plugin-forwards-delete`, `plugin-forwards-patch`, `plugin-forwards-put` (covers R52, OQ-4) |
+| 57 | Any endpoint decorated `@require_paid_plugin_auth` | Decorator preserved; no endpoints apply it today; when applied (flagged `paid:true` in plugin.yaml), double-gate enforced | `paid-plugin-decorator-preserved`, `paid-plugin-not-auto-applied` (covers R61, OQ-1) |
 | 58 | Paid-plugin handler: valid JWT + valid API key | 200 + `_paid_auth_ctx` attached (tested via unit test of the decorator) | `paid-auth-happy-path` |
 | 59 | Paid-plugin handler: missing `X-Scenecraft-API-Key` | 401 `{code:"UNAUTHORIZED"}` | `paid-auth-missing-key-401` |
 | 60 | Paid-plugin handler: unknown API key | 401 `{code:"UNAUTHORIZED"}` | `paid-auth-bad-key-401` |
@@ -483,20 +483,20 @@ Behavior rows cover the dispatcher contract (cross-cutting concerns + representa
 | 81 | `bounce-upload` invalid WAV header | 400 + file deleted | `bounce-upload-invalid-wav-400` |
 | 82 | `mix-render-upload` happy | 200 | `mix-render-upload-200` |
 | 83 | `bench/upload` happy | 200 | `bench-upload-200` |
-| 84 | POST body exceeds N MB | `undefined` — no enforced cap | → [OQ-5](#open-questions) |
-| 85 | Concurrent uploads to same `pool/upload` path | `undefined` — no explicit mutex, filesystem last-writer-wins | → [OQ-6](#open-questions) |
+| 84 | POST body exceeds 200 MB multipart or 1 MB JSON | 413 PAYLOAD_TOO_LARGE via FastAPI request-size middleware | covered by `engine-file-serving-and-uploads` tests `multipart-over-200mb-413`, `json-over-1mb-413` (covers R53, OQ-5) |
+| 85 | Concurrent uploads to same `pool/upload` path | Same-user same-project concurrent is out of scope (INV-1); cross-user/writer atomicity via write-to-tmp + rename | `no-dispatcher-lock-on-plugin-or-file-handlers` (covers INV-1, OQ-6) |
 | 86 | URL with trailing slash `/api/projects/` | 404 `{code:"NOT_FOUND"}` | `trailing-slash-404` |
 | 87 | URL-encoded project name `/api/projects/my%20proj/keyframes` | Handler sees decoded name `"my proj"` | `url-decoded-project-name` |
 | 88 | Project name contains `..` | 404 on project dir resolve (no match against real dir) | `project-name-dotdot-404` |
 | 89 | `Authorization: Basic …` | 401 (only Bearer scheme recognized) | `non-bearer-scheme-401` |
 | 90 | Cookie named wrong (`jwt=…` without `scenecraft_jwt`) | 401 (no token extracted) | `wrong-cookie-name-401` |
-| 91 | Two cookies: invalid scenecraft_jwt first, valid second | Valid extracted (first match wins per Cookie spec) — `undefined` which one | → [OQ-7](#open-questions) |
+| 91 | Two cookies: invalid scenecraft_jwt first, valid second | 400 MALFORMED_REQUEST — duplicate `scenecraft_jwt` cookies rejected; first value accepted only when unique | `duplicate-jwt-cookies-400` (covers R59, OQ-7) |
 | 92 | Cookie refresh fails (DB error mid-request) | Original response still succeeds; no Set-Cookie | `cookie-refresh-failure-graceful` |
 | 93 | 304 response | Includes CORS + ETag; no body | `304-has-cors-and-etag` |
-| 94 | Range with `end < start` | `undefined` — current regex accepts it | → [OQ-8](#open-questions) |
+| 94 | Range with `end < start` | 416 Range Not Satisfiable (delegated to file-serving spec) | covered by `engine-file-serving-and-uploads` test `invalid-range-syntax-416` (covers OQ-8) |
 | 95 | Range past EOF (`bytes=99999-`) | Server clamps `end = file_size - 1`; Content-Length may be negative | `range-past-eof-clamped` |
-| 96 | Multiple Range headers (e.g. `0-100,200-300`) | `undefined` — regex only matches the first | → [OQ-9](#open-questions) |
-| 97 | Very long URL (>8KB) | `undefined` — Python stdlib limits apply | → [OQ-10](#open-questions) |
+| 96 | Multiple Range headers (e.g. `0-100,200-300`) | 206 multipart/byteranges (delegated to file-serving spec) | covered by `engine-file-serving-and-uploads` test `multi-range-returns-multipart-byteranges` (covers OQ-9) |
+| 97 | Very long URL (>8KB) | 414 URI Too Long; uniform across routes | `url-over-8kb-414` (covers R60, OQ-10) |
 | 98 | Handler returns non-JSON-serializable value | Raises, caught as 500 INTERNAL_ERROR | `handler-returns-unserializable-500` |
 | 99 | Two concurrent cookie-refresh races | Both get fresh cookies; either is valid | `concurrent-cookie-refresh-both-valid` |
 | 100 | POST `/checkpoint` validation warns | 200 + WS warning; response not affected | `checkpoint-validation-warn-passthrough` |
@@ -510,7 +510,7 @@ Behavior rows cover the dispatcher contract (cross-cutting concerns + representa
 | 108 | Any 401 response | Contains `code:"UNAUTHORIZED"` — never 403 | `missing-auth-is-401-not-403` |
 | 109 | Any 403 response | Reserved for path traversal + `PASSWORD_CHANGE_REQUIRED` only | `403-reserved-for-forbidden-semantics` |
 | 110 | CORS `Access-Control-Allow-Headers` includes `X-Scenecraft-Branch` | Always | `cors-allows-x-scenecraft-branch` |
-| 111 | CORS `Access-Control-Allow-Headers` includes `X-Scenecraft-API-Key` | `undefined` — not in current list | → [OQ-11](#open-questions) |
+| 111 | CORS `Access-Control-Allow-Headers` includes `X-Scenecraft-API-Key` and `X-Scenecraft-Org` | Both present in the Allow-Headers list | `cors-allow-headers-includes-paid-plugin-headers` (covers R57, OQ-11) |
 | 112 | All enumerated GET endpoints with project-not-found project | 404 `{code:"NOT_FOUND"}` | `all-get-routes-project-404` (parametric) |
 | 113 | All enumerated POST endpoints with empty body | 400 `{code:"BAD_REQUEST"}` (except plugin routes) | `all-post-routes-empty-body-400` (parametric) |
 | 114 | All enumerated POST endpoints with bad JSON | 400 `{code:"BAD_REQUEST"}` | `all-post-routes-bad-json-400` (parametric) |
@@ -523,7 +523,7 @@ Behavior rows cover the dispatcher contract (cross-cutting concerns + representa
 | 121 | Handler emits 200 but then raises mid-write | Swallowed (BrokenPipe path); partial body delivered | `handler-raises-mid-write-swallowed` |
 | 122 | Locked-route handler success + validation raises | Validation exception logged, response still 200 | `validation-exception-does-not-affect-response` |
 | 123 | JWT secret rotated mid-session | Existing cookies invalidated → 401 | `jwt-secret-rotation-invalidates-cookies` |
-| 124 | Sliding refresh retains original `last_active_org` claim | `undefined` — `generate_token` uses DB row, not old payload | → [OQ-12](#open-questions) |
+| 124 | Sliding refresh retains original `last_active_org` claim | Target: new token carries forward `last_active_org` from refreshed cookie's payload | `cookie-refresh-preserves-last-active-org` (covers R63, OQ-12) |
 | 125 | Bearer token past 24h hard expiry | 401 (no refresh path exists for bearer) | `bearer-hard-expiry-24h` |
 | 126 | Request on `/auth/login` carries cookie | Cookie ignored (exempt path skips auth) | `exempt-ignores-cookie` |
 | 127 | Request logs contain JWT | MUST NOT — JWT is not in `_log` output | `no-jwt-in-logs` |
@@ -531,8 +531,8 @@ Behavior rows cover the dispatcher contract (cross-cutting concerns + representa
 | 129 | Non-existent plugin id in path | 404 `{code:"NOT_FOUND"}` (no plugin pattern matches) | `plugin-unknown-id-404` |
 | 130 | Plugin dispatch when `project_dir` missing | 404 `{code:"NOT_FOUND"}` before plugin invocation | `plugin-project-dir-check-first` |
 | 131 | Timeline validation finds >10 warnings | First 10 logged, ALL broadcast over WS | `timeline-validation-log-cap-10` |
-| 132 | Dispatcher receives `Expect: 100-continue` | `undefined` — not explicitly handled | → [OQ-13](#open-questions) |
-| 133 | Dispatcher receives chunked transfer encoding POST | `undefined` — `_read_json_body` only reads `Content-Length` bytes | → [OQ-14](#open-questions) |
+| 132 | Dispatcher receives `Expect: 100-continue` | Accepted natively by uvicorn; 100 sent before body read | `expect-100-continue-accepted` (covers R55, OQ-13) |
+| 133 | Dispatcher receives chunked transfer encoding POST | Accepted natively by FastAPI/uvicorn; body read via streaming | `chunked-transfer-encoding-accepted` (covers R55, OQ-14) |
 | 134 | Bearer token with different signing algorithm | 401 (`validate_token` only accepts HS256) | `bearer-wrong-alg-401` |
 | 135 | Bearer token with `alg: none` | 401 | `bearer-alg-none-rejected-401` |
 | 136 | Duplicate path + method registration within builtin routes | First match wins (top-down in do_GET/do_POST) | `builtin-first-match-wins` |
@@ -546,7 +546,7 @@ Behavior rows cover the dispatcher contract (cross-cutting concerns + representa
 | 144 | GET with query `?limit=NaN` on chat | `ValueError` caught, default 50 used | `chat-bad-limit-defaults-50` |
 | 145 | GET `/api/projects/:p/chat` without limit | Defaults to 50 messages | `chat-default-limit-50` |
 | 146 | GET `/api/projects/:p/workspace-views/:unknown` | 404 `{code:"NOT_FOUND"}` | `workspace-view-unknown-404` |
-| 147 | POST `/api/projects/:p/workspace-views/:view/delete` when missing | `undefined` — depends on DAL idempotency | → [OQ-15](#open-questions) |
+| 147 | POST `/api/projects/:p/workspace-views/:view/delete` when missing | 200 `{deleted:false}` — idempotent per M13 DELETE pattern | `delete-missing-workspace-view-idempotent` (covers R62, OQ-15) |
 | 148 | Status 501 only for `AUTH_DISABLED` on `/auth/login` | Canonical use | `501-reserved-for-auth-disabled` |
 | 149 | Response `Content-Type` for error | `application/json` | `error-content-type-json` |
 | 150 | Response `Content-Type` for HTML callback | `text/html; charset=utf-8` | `oauth-callback-content-type-html` |
@@ -556,7 +556,7 @@ Behavior rows cover the dispatcher contract (cross-cutting concerns + representa
 | 154 | GET `/api/projects` after project deleted between list and fetch | Subsequent fetch returns 404 (race acknowledged, not prevented) | `project-deleted-race-404` |
 | 155 | Two parallel `delete-keyframe` for same kf_id | First wins; second runs under lock, sees already-deleted state | `delete-keyframe-double-delete` |
 | 156 | 500 emitted with `{code:"INTERNAL_ERROR"}` | Dispatcher-level catch of unexpected exceptions | `internal-error-500` |
-| 157 | Uncaught exception in handler | `undefined` — current dispatcher has NO top-level try/except around handlers (only plugin fallback); stdlib returns 500 with empty body | → [OQ-16](#open-questions) |
+| 157 | Uncaught exception in handler | FastAPI exception handler emits `{error:{code:"INTERNAL_ERROR", message:"..."}}` with HTTP 500 | `uncaught-handler-exception-500-internal-error` (covers R54, OQ-16) |
 | 158 | Sliding refresh keeps user authenticated beyond 24h | Yes (cookie-only path) | `sliding-refresh-extends-session` |
 | 159 | Bearer token 24h expiry hits mid-long-running upload | Handler already authenticated; request completes | `auth-check-at-request-start-only` |
 | 160 | Response status on successful delete of existing effect | 200 | `delete-existing-effect-200` |
@@ -574,12 +574,12 @@ Behavior rows cover the dispatcher contract (cross-cutting concerns + representa
 | 172 | Project name with `%2F` (encoded slash) | After decode contains `/`; regex `[^/]+` fails to match — 404 | `encoded-slash-in-project-404` |
 | 173 | Simultaneous 200 + Timeline Warning WS broadcast | Response returned first, broadcast async-safe | `ordering-response-then-broadcast` |
 | 174 | Empty `Origin` header | Treated as absent; wildcard ACAO applied | `empty-origin-treated-absent` |
-| 175 | OPTIONS response includes `Access-Control-Max-Age` | `undefined` — current code does not set it | → [OQ-17](#open-questions) |
+| 175 | OPTIONS response includes `Access-Control-Max-Age` | `Access-Control-Max-Age: 3600` always present on OPTIONS | `options-access-control-max-age-3600` (covers R56, OQ-17) |
 | 176 | Response `Set-Cookie` has `SameSite=Lax` | Always | `cookie-samesite-lax` |
 | 177 | Response `Set-Cookie` has `Secure` flag | Only when configured by deployment (default: absent) | `cookie-secure-optional` |
 | 178 | Response `Set-Cookie` has `HttpOnly` | Always | `cookie-httponly-always` |
 | 179 | JWT sub claim with special characters | Passed through to `_authenticated_user` unchanged | `jwt-sub-preserved` |
-| 180 | JWT missing `sub` claim after validation | `undefined` — dispatcher treats as authenticated with `None` user; downstream may misbehave | → [OQ-18](#open-questions) |
+| 180 | JWT missing `sub` claim after validation | 401 `{code:"MALFORMED_TOKEN"}`; `_authenticated_user` never `None` on authenticated request | `jwt-missing-sub-401-malformed-token` (covers R58, OQ-18) |
 | 181 | Two requests with identical `Set-Cookie` refresh content | Both are valid JWTs; either accepted | `refresh-cookie-independence` |
 | 182 | POST empty object body `{}` | Handler decides; dispatcher returns 200 from `_read_json_body` | `empty-object-body-passes-dispatcher` |
 
@@ -1100,6 +1100,150 @@ The tests here define the HTTP-level contract. Implementations translate each in
 - **httponly**: `HttpOnly`
 - **path**: `Path=/`
 
+#### Test: cors-allowlist-rejects-unknown-origin (covers R51, OQ-2)
+
+**Given**: `config.json:cors_origins = ["http://localhost:5173"]`; `Origin: https://evil.example`
+**When**: GET `/api/projects`
+**Then**:
+- **no-acao-echo**: response does NOT include `Access-Control-Allow-Origin: https://evil.example`
+- **no-acac**: no `Access-Control-Allow-Credentials: true`
+- **preflight-rejected**: OPTIONS with the same Origin returns 403 or does not emit CORS headers (XSRF exposure closed)
+
+#### Test: cors-allowlist-accepts-configured-origin (covers R51, OQ-2)
+
+**Given**: `config.json:cors_origins = ["http://localhost:5173"]`; `Origin: http://localhost:5173`
+**When**: GET `/api/projects`
+**Then**:
+- **acao-echoed**: `Access-Control-Allow-Origin: http://localhost:5173`
+- **acac-true**: `Access-Control-Allow-Credentials: true`
+- **vary-origin**: `Vary: Origin`
+
+#### Test: plugin-forwards-delete (covers R52, OQ-4)
+
+**Given**: plugin `x` registered DELETE handler for a pattern
+**When**: DELETE on the matching path
+**Then**:
+- **handler-invoked**: plugin handler receives the request.
+- **status-200**: 200 on handler-returned dict.
+
+#### Test: plugin-forwards-patch (covers R52, OQ-4)
+
+**Given**: plugin `x` registered PATCH handler.
+**When**: PATCH on the matching path.
+**Then**:
+- **handler-invoked**: plugin handler receives the request; 200 on success.
+
+#### Test: plugin-forwards-put (covers R52, OQ-4)
+
+**Given**: plugin `x` registered PUT handler.
+**When**: PUT on the matching path.
+**Then**:
+- **handler-invoked**: plugin handler receives the request; 200 on success.
+
+#### Negative: no-dispatcher-lock-on-plugin-or-file-handlers (covers INV-1, OQ-6)
+
+**Given**: dispatcher source.
+**When**: statically inspecting the plugin-REST fallback and file-serving code paths.
+**Then**:
+- **no-threading-lock**: no `threading.Lock` / `asyncio.Lock` is held around plugin or file handlers (the 11-route structural lock is unrelated and scoped to those specific POSTs).
+- **inv-1-applies**: concurrent same-user same-project requests are out of scope by design.
+
+#### Test: duplicate-jwt-cookies-400 (covers R59, OQ-7)
+
+**Given**: request with two `scenecraft_jwt=` values in the Cookie header.
+**When**: dispatcher inspects cookies.
+**Then**:
+- **status-400**: 400.
+- **code-malformed-request**: body has `code: "MALFORMED_REQUEST"`.
+
+#### Test: url-over-8kb-414 (covers R60, OQ-10)
+
+**Given**: a URL whose request-line length exceeds 8192 bytes.
+**When**: the request is received.
+**Then**:
+- **status-414**: 414 URI Too Long.
+
+#### Test: cors-allow-headers-includes-paid-plugin-headers (covers R57, OQ-11)
+
+**Given**: any CORS preflight or response.
+**When**: `Access-Control-Allow-Headers` is inspected.
+**Then**:
+- **contains-api-key**: includes `X-Scenecraft-API-Key`.
+- **contains-org**: includes `X-Scenecraft-Org`.
+- **retains-existing**: still includes `Content-Type`, `Authorization`, `X-Scenecraft-Branch`.
+
+#### Test: cookie-refresh-preserves-last-active-org (covers R63, OQ-12)
+
+**Given**: a cookie-authenticated request; the decoded cookie's JWT payload contains `last_active_org: "org_A"`; DB row for the user shows `last_active_org: "org_B"` (stale).
+**When**: dispatcher slides the cookie refresh.
+**Then**:
+- **new-token-carries-forward**: new JWT's `last_active_org` claim is `"org_A"` (from the refreshed payload, NOT the DB).
+
+#### Test: expect-100-continue-accepted (covers R55, OQ-13)
+
+**Given**: a large POST with `Expect: 100-continue`.
+**When**: dispatcher receives.
+**Then**:
+- **100-before-body**: uvicorn/FastAPI responds with 100 Continue before reading the body.
+- **status-final-2xx-or-4xx-as-usual**: final response matches the route's normal behavior.
+
+#### Test: chunked-transfer-encoding-accepted (covers R55, OQ-14)
+
+**Given**: a POST with `Transfer-Encoding: chunked` and no `Content-Length`.
+**When**: dispatcher reads body.
+**Then**:
+- **body-parsed**: the route handler observes the full parsed body.
+- **no-empty-body-400**: no `"Empty body"` 400 is returned for a non-empty chunked body.
+
+#### Test: delete-missing-workspace-view-idempotent (covers R62, OQ-15)
+
+**Given**: workspace view `:view` does NOT exist for project `p`.
+**When**: POST `/api/projects/p/workspace-views/:view/delete`.
+**Then**:
+- **status-200**: 200.
+- **body-shape**: body `{deleted: false}`.
+
+#### Test: uncaught-handler-exception-500-internal-error (covers R54, OQ-16)
+
+**Given**: a handler patched to raise `RuntimeError("boom")`.
+**When**: matching request arrives.
+**Then**:
+- **status-500**: 500.
+- **body-shape**: `{error: {code: "INTERNAL_ERROR", message: ...}}`.
+- **no-detail-key**: body has no `detail` key (FastAPI default overridden).
+
+#### Test: options-access-control-max-age-3600 (covers R56, OQ-17)
+
+**Given**: any OPTIONS preflight request.
+**When**: response is inspected.
+**Then**:
+- **header-present**: `Access-Control-Max-Age: 3600` is in the response headers.
+
+#### Test: jwt-missing-sub-401-malformed-token (covers R58, OQ-18)
+
+**Given**: a JWT that validates signature + expiry but omits the `sub` claim.
+**When**: used on any authed endpoint.
+**Then**:
+- **status-401**: 401.
+- **code-malformed-token**: body `code: "MALFORMED_TOKEN"`.
+- **handler-never-invoked**: the endpoint's handler is never called (so `_authenticated_user` never becomes `None`).
+
+#### Test: paid-plugin-decorator-preserved (covers R61, OQ-1)
+
+**Given**: the FastAPI port / auth_middleware module.
+**When**: inspecting the module surface.
+**Then**:
+- **decorator-defined**: `require_paid_plugin_auth` (or equivalent FastAPI dependency) is importable.
+- **not-silently-applied**: grepping registered endpoints, zero endpoints apply the decorator unless their plugin.yaml flags `paid: true`.
+
+#### Test: paid-plugin-not-auto-applied (covers R61, OQ-1)
+
+**Given**: a non-paid plugin endpoint (plugin.yaml has no `paid: true`).
+**When**: the endpoint is registered at boot.
+**Then**:
+- **no-paid-gate**: the registered route does NOT wrap the handler with the paid-plugin dependency.
+- **jwt-only**: standard JWT gate applies.
+
 ---
 
 ## Migration Contract
@@ -1166,26 +1310,83 @@ Places where the rewrite must explicitly override FastAPI to preserve current co
 
 ---
 
+## Transitional Behavior
+
+Per INV-8, the Requirements R51–R63 below encode the target-ideal dispatcher contract. Current `BaseHTTPRequestHandler` divergences flagged for the FastAPI refactor:
+
+- **CORS has no allowlist** — current echoes any Origin; target allowlists per `config.json:cors_origins` (R51).
+- **Plugin REST dispatch only forwards GET/POST** — target forwards GET/POST/DELETE/PATCH/PUT (R52).
+- **No body-size cap** — target caps per file-serving spec (200 MB multipart, 1 MB JSON), 413 on exceed (R53).
+- **Error shape `{error, code}`** — FastAPI default `{detail}` MUST be overridden; uncaught exceptions MUST surface as `{code:"INTERNAL_ERROR"}` (R54, binds Migration Contract item 22).
+- **Chunked transfer-encoding POSTs** — current rejects (0-byte read). Target: accept natively via uvicorn/FastAPI (R55).
+- **OPTIONS has no `Access-Control-Max-Age`** — target adds 3600 (R56).
+- **CORS Allow-Headers missing paid-plugin headers** — target adds `X-Scenecraft-API-Key`, `X-Scenecraft-Org` (R57).
+- **JWT `sub` missing** — current lets `_authenticated_user = None`; target 401 `MALFORMED_TOKEN` at dispatcher level (R58).
+- **Duplicate `scenecraft_jwt` cookies** — current platform-dependent; target 400 `MALFORMED_REQUEST` when multiple present (R59).
+- **Very long URLs** — target 8 KB cap, 414 URI Too Long (R60).
+- **Paid-plugin decorator `@require_paid_plugin_auth`** — target: preserved and applied at FastAPI port when paid plugins ship; no endpoints today use it (R61).
+- **DELETE `/workspace-views/:view/delete` when missing** — target: idempotent 200 `{deleted:false}` matching M13 pattern (R62).
+- **Cookie refresh `last_active_org` claim** — target: refreshed token carries forward the `last_active_org` claim from the refreshed cookie's payload (not re-derived from DB) (R63).
+
+Per INV-1: concurrent POSTs from same user on same project to the same route are out of scope. Structural locking on the 11 routes (R28) remains in place; all other routes race freely per R30. Negative-assertion test: no dispatcher-level lock is held across plugin-REST or file-serving handlers.
+
+Path-traversal guard migration is delegated to `engine-file-serving-and-uploads.md` (R23 there); this spec cross-references (R33–R34 updated to point at the target `Path.relative_to` guard).
+
+## Requirements (additions for OQ resolutions)
+
+51. **R51 (target, OQ-2) CORS allowlist**: origins MUST be allowlisted via `config.json:cors_origins` array. Default `["http://localhost:5173"]` plus any configured tunnel domain. Requests from non-allowlisted origins MUST receive a 403 for the preflight AND the actual request MUST NOT carry `Access-Control-Allow-Origin` / `Access-Control-Allow-Credentials` headers echoing the origin.
+52. **R52 (target, OQ-4) plugin REST dispatch methods**: dispatcher MUST forward GET, POST, DELETE, PATCH, and PUT to `PluginHost.dispatch_rest`. Current GET/POST-only is a shipped bug.
+53. **R53 (target, OQ-5) body-size caps**: enforced via FastAPI request-size middleware — 200 MB multipart, 1 MB JSON. Exceed → 413 `{error:{code:"PAYLOAD_TOO_LARGE", message:"..."}}`. Matches `engine-file-serving-and-uploads` R22.
+54. **R54 (target, OQ-16) uncaught exception handler**: FastAPI registers a global exception handler emitting `{error: {code:"INTERNAL_ERROR", message:"..."}}` with HTTP 500 for any uncaught handler exception. Migration Contract item 22 is binding.
+55. **R55 (target, OQ-13, OQ-14) `Expect: 100-continue` and `Transfer-Encoding: chunked`**: uvicorn handles both natively. Dispatcher MUST accept `Expect: 100-continue` (honoring 100 before body read) and chunked transfer-encoding POSTs. Current 400-on-chunked is transitional.
+56. **R56 (target, OQ-17) OPTIONS cache**: OPTIONS responses MUST include `Access-Control-Max-Age: 3600`.
+57. **R57 (target, OQ-11) Allow-Headers includes paid-plugin headers**: `Access-Control-Allow-Headers` MUST list `Content-Type, Authorization, X-Scenecraft-Branch, X-Scenecraft-API-Key, X-Scenecraft-Org`.
+58. **R58 (target, OQ-18) JWT missing `sub`**: dispatcher MUST treat a JWT that validates but lacks `sub` as 401 `{code:"MALFORMED_TOKEN", error:"..."}`. `_authenticated_user` MUST never be `None` on a request that passed the auth gate.
+59. **R59 (target, OQ-7) duplicate `scenecraft_jwt` cookies**: if the Cookie header contains more than one `scenecraft_jwt=` value, dispatcher MUST accept the first and reject the rest with 400 `{code:"MALFORMED_REQUEST"}`. Documented deterministic precedence replaces platform-dependent behavior.
+60. **R60 (target, OQ-10) URL length cap**: URLs longer than 8 KB MUST be rejected with 414 URI Too Long. Uniform cap across all routes.
+61. **R61 (target, OQ-1) paid-plugin gate preserved**: `@require_paid_plugin_auth` decorator is preserved in the FastAPI port (or equivalent dependency). Endpoints flagged `paid: true` in `plugin.yaml` MUST require the double-gate (JWT + X-Scenecraft-API-Key + org resolution). No endpoints today apply it; port MUST NOT silently auto-apply.
+62. **R62 (target, OQ-15) DELETE idempotency for workspace-views**: `POST /api/projects/:name/workspace-views/:view/delete` with a missing view MUST return 200 with `{deleted: false}`. Matches the M13 DELETE idempotency pattern.
+63. **R63 (target, OQ-12) cookie refresh preserves `last_active_org`**: on cookie-based sliding refresh, the new JWT carries forward the `last_active_org` claim from the refreshed cookie's decoded payload. It MUST NOT be re-derived from the DB row.
+
 ## Open Questions
 
-- **OQ-1** — `@require_paid_plugin_auth` is defined but applied to zero endpoints. Should the FastAPI port (a) delete it as dead code, (b) preserve it as-is and leave it unused, or (c) apply it to specific paid-plugin endpoints (which?)? Blocks rows 57–64.
-- **OQ-2** — CORS has no Origin allowlist. Should the port add one? If so, which origins? (Frontend dev + tunnel domain are the known consumers.) Audit leak #5.
-- **OQ-3** — Path-traversal guard uses `startswith` on the resolved path but does not re-validate the real target if the final component is a symlink into work_dir that points outside. Accept the current behavior or add `resolve(strict=True)` + `relative_to` check? Audit leak #11.
-- **OQ-4** — Plugin REST dispatch only forwards GET and POST. Should DELETE, PATCH, PUT forward too? No current plugin uses them, but a `stem_splitter` or future plugins may.
-- **OQ-5** — No body-size cap exists. Should the port add one globally (e.g., 200MB for multipart, 1MB for JSON)? At what status code — 413 Payload Too Large?
-- **OQ-6** — Concurrent uploads to the same `pool/upload` destination: no mutex; filesystem last-writer-wins. Acceptable or add per-target lock?
-- **OQ-7** — Request carries two `scenecraft_jwt` cookies (malicious or accidental). Which wins? Current: first matching segment in `Cookie:` header (platform-dependent).
-- **OQ-8** — Range with `end < start`: current regex accepts, behavior undefined. Reject as 416?
-- **OQ-9** — Multiple byte-ranges in one header (`Range: bytes=0-100,200-300`). Should server support multipart/byteranges response or keep current first-range-only?
-- **OQ-10** — Very long URLs (>8KB): Python stdlib limits apply in current code. FastAPI's limits differ. Document the operative cap.
-- **OQ-11** — `Access-Control-Allow-Headers` currently lacks `X-Scenecraft-API-Key` and `X-Scenecraft-Org` (referenced by paid-plugin decorator). Add them to unblock future paid-plugin routes, or defer until OQ-1 resolves?
-- **OQ-12** — On cookie refresh, `generate_token` builds the payload from the DB row — not from the old payload. `last_active_org` claim behavior: does it survive refresh? Likely no. Spec handler behavior.
-- **OQ-13** — `Expect: 100-continue`: Python stdlib `BaseHTTPRequestHandler` supports it. Does FastAPI/uvicorn? Behavior for large bodies.
-- **OQ-14** — `Transfer-Encoding: chunked` POSTs: `_read_json_body` reads `Content-Length` bytes, which is absent for chunked. Current behavior: reads 0 bytes → 400 Empty body. FastAPI/uvicorn will handle chunked natively. Intentional regression-parity (reject) or bug-fix (accept)?
-- **OQ-15** — DELETE semantics of `/workspace-views/:view/delete` when view missing. Idempotent 200 (match M13 DELETE pattern) or 404?
-- **OQ-16** — Uncaught exceptions inside a handler: current code has NO try/except at dispatcher level, stdlib default is "500 with empty body". Should the port wrap handlers with a try/except that emits `{code:"INTERNAL_ERROR"}`? If yes, Migration Contract item 22 becomes binding.
-- **OQ-17** — Should OPTIONS responses include `Access-Control-Max-Age` (preflight caching)? Current: absent. Adding it is a performance win, not a correctness change.
-- **OQ-18** — JWT validates but lacks `sub` claim: `_authenticated_user` becomes `None`. Downstream handlers may attribute actions to `None`. Treat as 401 `MALFORMED_TOKEN` at dispatcher level?
+### Resolved
+
+**OQ-1 (resolved)**: `@require_paid_plugin_auth` applied to zero endpoints. **Decision**: preserve decorator; spec captures policy that endpoints flagged `paid: true` in plugin.yaml MUST require the double-gate. Decorator applied at FastAPI port when paid plugins ship. No endpoints today. (R61) **Tests**: `paid-plugin-decorator-preserved`, `paid-plugin-not-auto-applied`.
+
+**OQ-2 (resolved)**: CORS no allowlist. **Decision**: allowlist from `config.json:cors_origins` array. Default `["http://localhost:5173"]` plus configured tunnel domain. Reject all others. (R51) **Tests**: `cors-allowlist-rejects-unknown-origin`, `cors-allowlist-accepts-configured-origin`.
+
+**OQ-3 (resolved)**: Path-traversal guard (`startswith` — audit leak #11). **Decision**: close per `engine-file-serving-and-uploads.md` OQ-9 (switch to `Path.relative_to`). This spec cross-references. **Tests**: covered by file-serving spec's `traversal-guard-uses-relative-to`.
+
+**OQ-4 (resolved)**: Plugin REST GET/POST only. **Decision**: forward GET, POST, DELETE, PATCH, PUT. Current limit is a shipped bug. (R52) **Tests**: `plugin-forwards-delete`, `plugin-forwards-patch`, `plugin-forwards-put`.
+
+**OQ-5 (resolved)**: No body-size cap. **Decision**: close per `engine-file-serving-and-uploads.md` OQ-7 (200 MB multipart, 1 MB JSON). (R53) **Tests**: covered by file-serving spec.
+
+**OQ-6 (resolved)**: Concurrent uploads same dest. **Decision**: close per INV-1 (same-user same-project concurrent is out of scope). Cross-user atomicity via write-to-tmp + rename per file-serving R24. **Tests**: `no-dispatcher-lock-on-plugin-or-file-handlers` (negative assertion).
+
+**OQ-7 (resolved)**: Duplicate `scenecraft_jwt` cookies. **Decision**: accept first, reject rest with 400 `MALFORMED_REQUEST`. (R59) **Tests**: `duplicate-jwt-cookies-400`.
+
+**OQ-8 (resolved)**: Range end < start. **Decision**: close per `engine-file-serving-and-uploads.md` OQ-3 (416). **Tests**: covered by file-serving spec.
+
+**OQ-9 (resolved)**: Multi-range. **Decision**: close per `engine-file-serving-and-uploads.md` OQ-2 (multipart/byteranges). **Tests**: covered by file-serving spec.
+
+**OQ-10 (resolved)**: Very long URLs > 8 KB. **Decision**: 8 KB hard cap; 414 URI Too Long. (R60) **Tests**: `url-over-8kb-414`.
+
+**OQ-11 (resolved)**: ACL missing paid-plugin headers. **Decision**: add `X-Scenecraft-API-Key` + `X-Scenecraft-Org` to `Access-Control-Allow-Headers`. (R57) **Tests**: `cors-allow-headers-includes-paid-plugin-headers`.
+
+**OQ-12 (resolved)**: Cookie refresh — `last_active_org` claim. **Decision**: new token carries forward `last_active_org` from refreshed cookie's payload. Not re-derived from DB. (R63) **Tests**: `cookie-refresh-preserves-last-active-org`.
+
+**OQ-13 (resolved)**: `Expect: 100-continue`. **Decision**: uvicorn handles natively; spec accepts. (R55) **Tests**: `expect-100-continue-accepted`.
+
+**OQ-14 (resolved)**: `Transfer-Encoding: chunked`. **Decision**: accept in FastAPI port. Current reject-on-stdlib (400 Empty body) is transitional. (R55) **Tests**: `chunked-transfer-encoding-accepted`.
+
+**OQ-15 (resolved)**: DELETE on missing workspace-view. **Decision**: idempotent 200 with `{deleted: false}`. Matches M13 DELETE pattern. (R62) **Tests**: `delete-missing-workspace-view-idempotent`.
+
+**OQ-16 (resolved)**: Uncaught handler exceptions. **Decision**: FastAPI exception handler emits `{error: {code:"INTERNAL_ERROR", message:"..."}}`. Migration Contract item 22 binding. (R54) **Tests**: `uncaught-handler-exception-500-internal-error`.
+
+**OQ-17 (resolved)**: OPTIONS `Access-Control-Max-Age`. **Decision**: add `Access-Control-Max-Age: 3600`. (R56) **Tests**: `options-access-control-max-age-3600`.
+
+**OQ-18 (resolved)**: JWT missing `sub`. **Decision**: treat as 401 `MALFORMED_TOKEN` at dispatcher level; `_authenticated_user` never None when authenticated. (R58) **Tests**: `jwt-missing-sub-401-malformed-token`.
 
 ---
 

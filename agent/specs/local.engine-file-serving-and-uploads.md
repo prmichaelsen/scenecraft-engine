@@ -212,15 +212,15 @@ Same shape minus `bit_depth`; plus `mix_graph_hash` in place of `composite_hash`
 | 36 | peaks duration=0 | 200, empty body | `peaks-empty-duration` |
 | 37 | CORS headers on 304 | `Access-Control-Allow-Origin` present | `cors-on-304` |
 | 38 | client disconnect mid-response | no exception surfaces to server loop | `disconnect-during-body-swallowed` |
-| 39 | GET with suffix-range `Range: bytes=-500` | `undefined` | → [OQ-1](#open-questions) |
-| 40 | GET with multi-range `Range: bytes=0-10,50-60` | `undefined` | → [OQ-2](#open-questions) |
-| 41 | GET with invalid range syntax `Range: bytes=abc` | `undefined` (today: falls through to 200; RFC says 416) | → [OQ-3](#open-questions) |
-| 42 | GET 0-byte file | `undefined` | → [OQ-4](#open-questions) |
-| 43 | GET with `Range: bytes=1000-` beyond EOF start | `undefined` (RFC says 416) | → [OQ-5](#open-questions) |
-| 44 | Simultaneous uploads, same `composite_hash`, different bytes | `undefined` — race on `write_bytes` then validate | → [OQ-6](#open-questions) |
-| 45 | Upload >2 GiB body | `undefined` — BaseHTTPRequestHandler read limits, disk-full behavior | → [OQ-7](#open-questions) |
-| 46 | Symlink inside `pool/` pointing outside project | `undefined` — `.resolve()` + `relative_to` should reject, not tested today | → [OQ-8](#open-questions) |
-| 47 | Path-traversal via sibling-prefix dir (`/work-dir-evil/` when work_dir is `/work-dir`) | `undefined` — `startswith` leak (audit #11); not reachable in prod but refactor MUST use `relative_to` | → [OQ-9](#open-questions) |
+| 39 | GET with suffix-range `Range: bytes=-500` | 206 returning last 500 bytes (RFC 7233) | `suffix-range-returns-last-N-bytes` (covers R21, OQ-1) |
+| 40 | GET with multi-range `Range: bytes=0-10,50-60` | 206 `multipart/byteranges` with each subrange | `multi-range-returns-multipart-byteranges` (covers R21, OQ-2) |
+| 41 | GET with invalid range syntax `Range: bytes=abc` | 416 Range Not Satisfiable | `invalid-range-syntax-416` (covers R21, OQ-3) |
+| 42 | GET 0-byte file with Range | 416 Range Not Satisfiable | `zero-byte-file-range-416` (covers R21, OQ-4) |
+| 43 | GET with `Range: bytes=1000-` beyond EOF start | 416 | `range-start-beyond-eof-416` (covers R21, OQ-5) |
+| 44 | Simultaneous uploads, same `composite_hash`, different bytes | Writers use write-to-tmp + atomic rename; same-user same-project concurrent is out of scope per INV-1 | `upload-atomic-via-rename`, `no-per-upload-dest-mutex` (covers R24, OQ-6) |
+| 45 | Upload >200 MB multipart (or >1 MB JSON) | 413 Payload Too Large via FastAPI request-size middleware | `multipart-over-200mb-413`, `json-over-1mb-413` (covers R22, OQ-7) |
+| 46 | Symlink inside `pool/` pointing outside project | 403 Forbidden; `.resolve(strict=True)` + `relative_to` rejects | `pool-symlink-escape-rejected` (covers R23, OQ-8) |
+| 47 | Path-traversal via sibling-prefix dir (`/work-dir-evil/` when work_dir is `/work-dir`) | 403 Forbidden via `Path.relative_to` guard (not `startswith`) | `traversal-guard-uses-relative-to`, `sibling-prefix-dir-rejected` (covers R23, OQ-9) |
 
 ---
 
@@ -509,6 +509,124 @@ Same shape minus `bit_depth`; plus `mix_graph_hash` in place of `composite_hash`
 - **no-exception-to-loop**: server stays up; no traceback reaches the HTTPServer main loop.
 - **subsequent-request-succeeds**: immediately following request on a fresh connection returns 200.
 
+#### Test: suffix-range-returns-last-N-bytes (covers R21, OQ-1)
+
+**Given**: 1024-byte file.
+**When**: `GET` with `Range: bytes=-500`.
+**Then**:
+- **status-206**: 206.
+- **body-length-500**: body is exactly 500 bytes = source[524:1024].
+- **content-range**: `Content-Range: bytes 524-1023/1024`.
+
+#### Test: multi-range-returns-multipart-byteranges (covers R21, OQ-2)
+
+**Given**: 1024-byte file.
+**When**: `GET` with `Range: bytes=0-10,50-60`.
+**Then**:
+- **status-206**: 206.
+- **content-type**: `Content-Type: multipart/byteranges; boundary=<x>`.
+- **two-parts**: body contains two parts with `Content-Range: bytes 0-10/1024` and `Content-Range: bytes 50-60/1024`.
+- **byte-contents**: each part's bytes equal the corresponding source slice.
+
+#### Test: invalid-range-syntax-416 (covers R21, OQ-3)
+
+**Given**: any existing file.
+**When**: `GET` with `Range: bytes=abc` or `Range: bytes=5-3`.
+**Then**:
+- **status-416**: 416 Range Not Satisfiable.
+- **content-range-header**: `Content-Range: bytes */<size>` present.
+
+#### Test: zero-byte-file-range-416 (covers R21, OQ-4)
+
+**Given**: 0-byte file.
+**When**: `GET` with `Range: bytes=0-`.
+**Then**:
+- **status-416**: 416.
+
+#### Test: range-start-beyond-eof-416 (covers R21, OQ-5)
+
+**Given**: 100-byte file.
+**When**: `GET` with `Range: bytes=1000-`.
+**Then**:
+- **status-416**: 416.
+- **content-range-header**: `Content-Range: bytes */100`.
+
+#### Test: upload-atomic-via-rename (covers R24, OQ-6)
+
+**Given**: bounce-upload endpoint; a monkey-patch observing file writes under `pool/bounces/`.
+**When**: an upload for hash `H` is issued.
+**Then**:
+- **writes-to-tmp**: an intermediate file `<H>.wav.tmp` exists during write.
+- **atomic-rename**: after write completes, `<H>.wav` exists and `<H>.wav.tmp` is gone.
+- **no-partial-final**: at no point does `<H>.wav` contain partial bytes.
+
+#### Negative: no-per-upload-dest-mutex (covers INV-1, OQ-6)
+
+**Given**: the upload handler source.
+**When**: statically inspected.
+**Then**:
+- **no-lock**: no `threading.Lock` or `asyncio.Lock` is held on a `(project, dest_hash)` key. INV-1 applies: same-user same-project concurrent uploads are out of scope.
+
+#### Test: multipart-over-200mb-413 (covers R22, OQ-7)
+
+**Given**: FastAPI request-size middleware configured with 200 MB multipart cap.
+**When**: a multipart upload exceeding 200 MB is POSTed to `/bounce-upload`.
+**Then**:
+- **status-413**: 413 Payload Too Large.
+- **error-code**: `error.code == "PAYLOAD_TOO_LARGE"`.
+- **no-file-left**: no partial file under `pool/bounces/`.
+
+#### Test: json-over-1mb-413 (covers R22, OQ-7)
+
+**Given**: 1 MB JSON body cap middleware.
+**When**: a JSON body exceeding 1 MB is POSTed to any JSON endpoint.
+**Then**:
+- **status-413**: 413.
+- **error-code**: `PAYLOAD_TOO_LARGE`.
+
+#### Test: pool-symlink-escape-rejected (covers R23, OQ-8)
+
+**Given**: a symlink under `pool/` whose target is `/etc/passwd`.
+**When**: `GET /api/projects/demo/pool/<seg_id>/peaks` on a pool row whose `pool_path` is the symlink.
+**Then**:
+- **status-403-or-400**: status is 403 (path-traversal) or 400 (outside-project) depending on endpoint semantics.
+- **no-data-leaked**: body does NOT contain any bytes from the symlink target.
+
+#### Test: traversal-guard-uses-relative-to (covers R23, OQ-9)
+
+**Given**: the file-serving endpoint.
+**When**: inspecting its traversal guard implementation.
+**Then**:
+- **uses-relative-to**: code uses `resolved.relative_to(work_dir.resolve())` and catches `ValueError`/`FileNotFoundError`.
+- **no-startswith**: no `str.startswith` check on stringified paths remains in the guard.
+
+#### Test: sibling-prefix-dir-rejected (covers R23, OQ-9)
+
+**Given**: work_dir `/w`; a project whose name is `p`; a sibling directory at `/w-evil/` exists.
+**When**: `GET /api/projects/p/files/../../w-evil/secret.bin` is attempted.
+**Then**:
+- **status-403**: 403 FORBIDDEN.
+- **guard-blocks**: `relative_to` ValueError caught and rejected.
+
+#### Test: last-modified-header-still-emitted (covers R25, OQ-10)
+
+**Given**: an existing file.
+**When**: `GET` without conditional headers.
+**Then**:
+- **last-modified-present**: `Last-Modified` header present and parses as RFC 2822 GMT.
+- **etag-present**: `ETag` header also present (canonical for conditional requests).
+
+#### Test: x-peak-resolution-reflects-clamped (covers R26, OQ-11)
+
+**Given**: a pool segment; client requests `resolution=10`.
+**When**: `GET .../peaks?resolution=10`.
+**Then**:
+- **header-is-50**: `X-Peak-Resolution: 50` (clamped internal value, NOT 10).
+- **body-length-matches**: body length == `2 * ceil(duration * 50)`.
+
+Similarly with `resolution=5000`:
+- **header-is-2000**: `X-Peak-Resolution: 2000`.
+
 #### Test: peaks-404-seg (covers R15)
 **When**: `GET /api/projects/demo/pool/nope/peaks`.
 **Then**:
@@ -539,19 +657,61 @@ Same shape minus `bit_depth`; plus `mix_graph_hash` in place of `composite_hash`
 
 ---
 
+## Transitional Behavior
+
+Per INV-8, target Requirements (R21–R29 below) encode RFC-compliant behavior. Current code divergences:
+- Suffix Range (`bytes=-500`), multi-range, invalid Range syntax, 0-byte file Range, and start-beyond-EOF all fall through to 200 full body or undefined. Target: full RFC 7233 compliance (416 on malformed/unsatisfiable; `multipart/byteranges` on multi-range).
+- Path-traversal guard uses `startswith` (audit leak #11). Target: `Path.relative_to` with strict resolve.
+- No body-size cap. Target: 200 MB multipart, 1 MB JSON, 413 on exceed.
+- `X-Peak-Resolution` echoes requested value. Target: echo clamped internal value.
+
+Per INV-7: peaks cache stays project-scoped (content-addressed via file stat + pool_path, genuinely shareable across working copies). Frame and fragment cache paths migrate to working-copy-scoped under the `engine-cache-invalidation` spec; this spec does not duplicate that contract — see `local.engine-cache-invalidation.md`.
+
+Per INV-1: concurrent uploads to same `composite_hash` from the same user on the same project are undefined and out of scope. Negative-assertion test `no-per-upload-dest-mutex` below.
+
+## Requirements (additions)
+
+21. **R21 (target, OQ-1/OQ-2/OQ-3/OQ-4/OQ-5) RFC 7233 compliance**: the file-serving endpoint MUST implement RFC 7233 for Range requests:
+    - Suffix range `bytes=-N` → `206` returning last N bytes (clamped to file size).
+    - Multi-range `bytes=0-10,50-60` → `206 Content-Type: multipart/byteranges; boundary=<...>` with a body containing each subrange per RFC 7233.
+    - Invalid syntax (`bytes=abc`, `bytes=5-3`) → `416 Range Not Satisfiable`.
+    - 0-byte file + any Range → `416`.
+    - Start beyond EOF → `416`.
+22. **R22 (target, OQ-7) body-size caps**: global cap enforced via FastAPI request-size middleware:
+    - Multipart (`pool/upload`, `bounce-upload`, `mix-render-upload`, `bench/upload`, `pool/import`): 200 MB.
+    - JSON body endpoints: 1 MB.
+    - Exceed → `413 Payload Too Large` with `{error:{code:"PAYLOAD_TOO_LARGE", message:"..."}}`.
+23. **R23 (target, OQ-8, OQ-9, audit #11) path-traversal guard via `Path.relative_to`**: the guard MUST be `(project_dir / rel).resolve(strict=True)` + `resolved.relative_to(project_dir.resolve())`. `ValueError` / `FileNotFoundError` from this chain → 403 `FORBIDDEN`. Symlinks escaping via the final component MUST be rejected.
+24. **R24 (codified, INV-1, OQ-6) concurrent upload atomicity**: uploads MUST write to `<dest>.tmp` then atomic `rename` to final path. Readers see either the pre-rename full file or the post-rename full file, never a torn write. Same-hash concurrent uploads from the same user on the same project are out of scope (INV-1); the rename-atomicity contract protects readers and cross-user writers.
+25. **R25 (codified, OQ-10) `Last-Modified` header retained**: the file endpoint MUST continue to emit `Last-Modified` (RFC 2822 GMT) even though `ETag` is canonical for conditional requests; some HTTP caches rely on `Last-Modified`.
+26. **R26 (target, OQ-11) `X-Peak-Resolution` reflects clamped value**: the response header MUST echo the internal clamped value (50–2000), NOT the requested value. Frontend treats response header as authoritative for the served peak resolution.
+27. **R27 (INV-7) peaks cache scope**: peaks cache at `audio_staging/.peaks/` remains project-scoped (keyed by content-addressable stat + pool_path). Frame and fragment caches migrate to working-copy-scoped (owned by `engine-cache-invalidation.md`; referenced here without duplication).
+
 ## Open Questions
 
-- **OQ-1 (referenced by Behavior Table row 39)** — Suffix Range `bytes=-500`: does the refactor preserve today's "fall-through to 200 full body" behavior, or adopt RFC 7233's "last 500 bytes, 206"? Frontend does not send suffix ranges today (video/audio players use `bytes=N-`), so either is safe — but a decision is required.
-- **OQ-2 (row 40)** — Multi-range `bytes=0-10,50-60`: today only the first subrange is served (still 206, Content-Type not `multipart/byteranges`). FastAPI's `FileResponse` rejects or implements multipart/byteranges. Decide.
-- **OQ-3 (row 41)** — Invalid Range syntax `bytes=abc`: RFC says 416 Range Not Satisfiable. Today: 200 full body. Preserve or fix?
-- **OQ-4 (row 42)** — 0-byte file: what does `ETag` format produce (`"0-<mtime>"`), what does `Range: bytes=0-` return? Today: likely 206 with empty body and `Content-Range: bytes 0--1/0` (broken). Define behavior.
-- **OQ-5 (row 43)** — Range start beyond EOF (`bytes=1000-` on 100-byte file): RFC says 416. Today falls through with clamped end < start → undefined. Decide.
-- **OQ-6 (row 44)** — Concurrent uploads with same `composite_hash` but different bytes (impossible if clients are honest, but): race on `dest.write_bytes` → whichever finishes last wins → may pass validation while the other reader sees torn bytes. Acceptable today because hashes are content-derived; lock-free OK. Confirm.
-- **OQ-7 (row 45)** — Upload body >2 GiB: `int(Content-Length)` → `rfile.read(len)` on a single `bytes` object. Python's `bytes` can hold it but memory pressure is real; disk-full during `dest.write_bytes` raises → caught by outer `except` → 500. Define max and enforce via request-size middleware in FastAPI.
-- **OQ-8 (row 46)** — Symlink inside `pool/` pointing outside project: `_handle_pool_peaks` uses `(project_dir / pool_rel).resolve()` then `relative_to(project_dir.resolve())` → should correctly reject. Needs an explicit test to confirm across impls.
-- **OQ-9 (row 47)** — Audit leak #11 (`startswith` path-traversal guard): refactor MUST switch to `Path.relative_to`. Flag as a required behavior change (not a preserved quirk); add explicit test.
-- **OQ-10** — Does the frontend rely on `Last-Modified` being present (or only `ETag`)? If `ETag`-only is fine, refactor can simplify.
-- **OQ-11** — `X-Peak-Resolution` header: does it echo the requested value or the clamped internal value? Current code echoes requested. Confirm frontend tolerates this drift.
+### Resolved
+
+**OQ-1 (resolved)**: Suffix Range `bytes=-500`. **Decision**: adopt RFC 7233, return last 500 bytes with 206. **Tests**: `suffix-range-returns-last-N-bytes`.
+
+**OQ-2 (resolved)**: Multi-range `bytes=0-10,50-60`. **Decision**: return `multipart/byteranges` per RFC 7233. **Tests**: `multi-range-returns-multipart-byteranges`.
+
+**OQ-3 (resolved)**: Invalid Range syntax `bytes=abc`. **Decision**: 416 Range Not Satisfiable. **Tests**: `invalid-range-syntax-416`.
+
+**OQ-4 (resolved)**: 0-byte file + Range. **Decision**: 416 on any Range request against 0-byte file. **Tests**: `zero-byte-file-range-416`.
+
+**OQ-5 (resolved)**: Range start beyond EOF. **Decision**: 416. **Tests**: `range-start-beyond-eof-416`.
+
+**OQ-6 (resolved)**: Concurrent uploads with same `composite_hash`. **Decision**: close per INV-1 (same-user concurrent = out of scope). Upload atomicity enforced via write-to-tmp + rename (R24). **Tests**: `upload-atomic-via-rename`, `no-per-upload-dest-mutex`.
+
+**OQ-7 (resolved)**: Upload body > 2 GiB. **Decision**: 200 MB limit on multipart, 1 MB on JSON. `413 Payload Too Large` when exceeded via FastAPI request-size middleware. **Tests**: `multipart-over-200mb-413`, `json-over-1mb-413`.
+
+**OQ-8 (resolved)**: Symlink inside `pool/` pointing outside. **Decision**: `(project_dir / pool_rel).resolve(strict=True)` + `relative_to(project_dir.resolve())`. Symlink escape rejected. **Tests**: `pool-symlink-escape-rejected`.
+
+**OQ-9 (resolved)**: Audit leak #11 — `startswith` traversal guard. **Decision**: switch to `Path.relative_to`. Required refactor change, NOT a preserved quirk. **Tests**: `traversal-guard-uses-relative-to`, `sibling-prefix-dir-rejected`.
+
+**OQ-10 (resolved)**: `Last-Modified` frontend reliance. **Decision**: keep serving `Last-Modified` header (cheap; some HTTP caches rely on it). ETag remains canonical for conditional requests. **Tests**: `last-modified-header-still-emitted`.
+
+**OQ-11 (resolved)**: `X-Peak-Resolution` echoes requested vs clamped. **Decision**: echo **clamped** internal value. Frontend treats response header as authoritative. **Tests**: `x-peak-resolution-reflects-clamped`.
 
 ---
 

@@ -77,6 +77,20 @@
 
 **R20 — Connection object identity is stable across `get_db` calls**. Repeated `get_db` calls (same thread, same `db_path`) return the exact same `sqlite3.Connection` instance (identity comparable via `is`), not a wrapper.
 
+**R21 — `_connections` uses `threading.local()` storage** (resolves OQ-2). The per-thread connection map migrates from a module-level `dict[str, sqlite3.Connection]` keyed by `f"{db_path}:{thread.ident}"` to a `threading.local()` attribute (e.g., `_tls._connections: dict[db_path_str, sqlite3.Connection]`). Entries are automatically garbage-collected when the owning thread terminates. No manual `close_db` is required to avoid leaks on thread death. `_migrated_dbs` remains a module-level set guarded by `_conn_lock` (process-scoped, not thread-scoped).
+
+**R22 — Retry budget is the final caller-facing contract** (resolves OQ-3). `_retry_on_locked(fn, max_retries=5, delay=0.2)` is the engine's total lock-retry budget. Combined with the 60-second SQLite `busy_timeout`, the effective worst-case wall time before a caller observes `OperationalError` is `≈ 5 × (60 s + linear_backoff_sleep) ≈ 5 minutes`. Callers treat a lock error returned from the DAL as **fatal** — no caller-side retry loops. Any higher-level retry would compound the wait time without new information.
+
+**R23 — `close_db` prefix match MUST be tight** (resolves OQ-5). The resolved key match MUST be `k.startswith(f"{db_path}:")` — including the trailing colon separator. The looser current `k.startswith(db_path)` match is transitional and must not be preserved after the refactor. This prevents accidental matches against unrelated keys that happen to share the `db_path` string as a prefix (e.g., `/a/project.db-wal-sidecar:…`).
+
+**R24 — `_retry_on_locked` matches on sqlite3 error code, not substring** (resolves OQ-6). The lock-error detection MUST switch from `"locked" in str(e)` to matching on `sqlite3.OperationalError` whose `sqlite_errorcode` is in `{SQLITE_BUSY, SQLITE_LOCKED}` (constants from sqlite3 C-layer). This is locale-independent and resilient to SQLite message rewording. Substring-matching is transitional until the refactor lands.
+
+**R25 — `transaction` accepts optional `db_path`** (resolves OQ-7). Signature becomes `transaction(project_dir: Path, db_path: Path | str | None = None) -> ContextManager[sqlite3.Connection]`. When `db_path` is provided, the context manager yields the connection for that specific DB (e.g., a session working-copy DB), committing/rolling back on that conn. Default behavior (`db_path=None`) unchanged — still the main project DB.
+
+**R26 — Deferred `foreign_keys=ON` PRAGMA** (resolves OQ-8). The PRAGMA ordering on new-connection creation is: first apply `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=60000`; then run `_ensure_schema(conn)`; then apply `foreign_keys=ON` as the final step. Deferring FK enforcement until after migration prevents FK errors during ALTER chains that transiently reference not-yet-created or not-yet-fully-populated tables.
+
+**R27 — No internal lock held across DAL API calls** (INV-1 affirmation). The connection pool and `transaction` context manager hold `_conn_lock` only for the duration of `_connections` / `_migrated_dbs` mutation. No user-facing DAL API holds a lock spanning multiple statements, user input, or external I/O. Concurrent writes from the same user on the same project are undefined per INV-1; the thread-ident / threading.local keying is the enforcement mechanism preventing cross-thread connection sharing.
+
 ---
 
 ## Interfaces
@@ -128,10 +142,10 @@ Calls `fn()` up to `max_retries` times, sleeping `delay * (attempt + 1)` seconds
 | 17 | PRAGMAs not reapplied on memoized fetch | Second `get_db` does not re-issue any PRAGMA statement | `pragmas-not-reapplied-on-cached-fetch` |
 | 18 | `conn.row_factory` is `sqlite3.Row` | Query results support both index and column-name access | `rows-are-addressable-by-name` |
 | 19 | WAL allows concurrent read during write | Reader thread can SELECT while writer is mid-transaction on another conn | `wal-allows-concurrent-read-during-write` |
-| 20 | Two threads write concurrently via the SAME memoized connection | `undefined` — `check_same_thread=False` bypasses sqlite3's guard, but SQLite connection is not safe for simultaneous writes | → [OQ-1](#open-questions) |
-| 21 | Thread dies without calling `close_db` | `undefined` — connection stays in `_connections` dict indefinitely (apparent leak) | → [OQ-2](#open-questions) |
-| 22 | Retry exhaustion at 5×0.2s is the final contract? | `undefined` — callers may need higher-level retry; not documented | → [OQ-3](#open-questions) |
-| 23 | `close_db` called while another thread is mid-query on that conn | `undefined` — closes the conn the other thread holds; behavior under concurrent use unspecified | → [OQ-4](#open-questions) |
+| 20 | Two threads write concurrently via the SAME memoized connection | Undefined by INV-1 (single-writer per (user, project)); DAL callers MUST NOT share a conn across threads; pool's thread-ident keying enforces this | `dal-callers-must-not-share-conn-across-threads` |
+| 21 | Thread dies without calling `close_db` | `_connections` switches to `threading.local()`-based storage; entries GC with their thread; no manual close required | `threading-local-gcs-with-thread` |
+| 22 | Retry exhaustion at 5×0.2s is the final contract? | `_retry_on_locked` is the final retry budget (5 × linear backoff 0.2/0.4/0.6/0.8s). Combined with 60s SQLite busy_timeout, worst-case ≈ 5 min. Callers treat lock errors as fatal; no caller-side retry loops | `retry-budget-is-final-contract` |
+| 23 | `close_db` called while another thread is mid-query on that conn | Closed per INV-1 + threading.local fix: no cross-thread sharing means this cannot happen | `close-db-no-cross-thread-sharing` |
 | 24 | `transaction` body swallows exception (catches + suppresses internally) | No rollback triggered — exits cleanly, commits | `transaction-only-rolls-back-on-propagated-exception` |
 | 25 | Nested `with transaction(...)` on same thread | Both use same underlying conn; inner commit flushes outer's work (no true nesting) | `nested-transactions-share-connection` |
 | 26 | `busy_timeout=60000` honored | SQLite waits up to 60s at C layer before raising locked | `busy-timeout-configured-60s` |
@@ -422,6 +436,78 @@ Calls `fn()` up to `max_retries` times, sleeping `delay * (attempt + 1)` seconds
 
 ---
 
+#### Test: dal-callers-must-not-share-conn-across-threads (covers R27, resolves OQ-1, INV-1 negative-assertion)
+
+**Given**: The connection pool with a mock asserting no internal lock is acquired around user-facing DAL calls.
+**When**: `get_db(project_dir)` followed by any DAL write is invoked.
+**Then**:
+- **no-internal-lock-held-across-api**: No `threading.Lock` is held across the DAL API boundary (only the brief `_conn_lock` around pool mutation).
+- **contract-documented**: Spec documents "DAL callers MUST NOT share a conn across threads"; thread-ident / threading.local keying is the enforcement mechanism.
+- **concurrency-undefined**: Per INV-1, concurrent writes from the same user on the same project are undefined.
+
+#### Test: threading-local-gcs-with-thread (covers R21, resolves OQ-2)
+
+**Given**: A worker thread opens a connection via `get_db(project_dir)` and then terminates without calling `close_db`.
+**When**: After the thread has been joined, the main thread inspects the `threading.local()`-backed connection store.
+**Then**:
+- **entry-auto-removed**: No connection entry remains referring to the dead thread.
+- **no-manual-close-required**: The garbage collection happens without any explicit cleanup call.
+- **migrated-flag-preserved**: `_migrated_dbs` still contains the `db_path` (module-level, unaffected).
+
+#### Test: retry-budget-is-final-contract (covers R22, resolves OQ-3)
+
+**Given**: A DAL call that repeatedly triggers SQLite lock errors.
+**When**: `_retry_on_locked` exhausts its 5-attempt budget.
+**Then**:
+- **raises-operational-error**: `sqlite3.OperationalError` propagates to the caller.
+- **no-additional-caller-retry**: Documentation asserts callers MUST NOT add an enclosing retry loop. (Spec test enforces this via contract-doc assertion.)
+- **worst-case-documented**: Spec records `~5 min` total worst-case wall time (5 × (60s busy_timeout + backoff)).
+
+#### Test: close-db-no-cross-thread-sharing (covers R23, resolves OQ-4)
+
+**Given**: `threading.local()`-based pool; thread A holds a conn for `db_path`; thread B calls `close_db(project_dir)`.
+**When**: `close_db` executes under the threading.local model.
+**Then**:
+- **closes-only-callers-conn**: `close_db` closes only the connection belonging to the calling thread (thread B's local storage for this db_path); thread A's conn is untouched.
+- **no-close-during-use-race**: Thread A's mid-query conn is not closed by thread B.
+- **prefix-match-tight**: (See R23) The match uses `startswith(f"{db_path}:")` semantics (via the threading.local dict keyed by db_path directly, the prefix concern no longer applies; the tight-prefix rule applies during the transitional period).
+
+#### Test: close-db-tight-prefix-match (covers R23, resolves OQ-5)
+
+**Given**: `_connections` has two keys for the same thread: `"/a/project.db:1234"` and `"/a/project.db-sidecar:1234"`.
+**When**: `close_db(project_dir)` is invoked with `project_dir` resolving to `/a/project.db`.
+**Then**:
+- **only-exact-match-closed**: Only the `"/a/project.db:1234"` entry is closed and removed.
+- **sidecar-untouched**: The `"/a/project.db-sidecar:1234"` entry remains open in the pool.
+
+#### Test: retry-matches-sqlite-errorcode (covers R24, resolves OQ-6)
+
+**Given**: `fn` raises `sqlite3.OperationalError` with `sqlite_errorcode == SQLITE_BUSY` but with a non-English localized message that does NOT contain `"locked"`.
+**When**: `_retry_on_locked(fn)` is called.
+**Then**:
+- **retried**: The helper retries per the normal budget (does not fall through the substring matcher).
+- **locale-independent**: A subsequent test with an English `SQLITE_LOCKED` message also retries via the same code path.
+- **non-lock-errcode-not-retried**: An `OperationalError` with `sqlite_errorcode == SQLITE_ERROR` (e.g., "no such table") is NOT retried.
+
+#### Test: transaction-accepts-optional-db-path (covers R25, resolves OQ-7)
+
+**Given**: A session working-copy DB at `session.db` path (separate from the main project.db).
+**When**: `with transaction(project_dir, db_path=session_path) as conn: conn.execute("INSERT ...")`.
+**Then**:
+- **conn-is-session-db**: The yielded conn points at the session_path DB (not the main project DB).
+- **commits-on-session-db**: On clean exit, the session DB has the insert persisted.
+- **main-db-untouched**: The main `project.db` has no row.
+- **rolls-back-on-exception**: Raising from the body rolls back on the session DB.
+
+#### Test: pragma-order-defers-foreign-keys (covers R26, resolves OQ-8)
+
+**Given**: A fresh project DB; a spy on `conn.execute` for PRAGMA statements; a schema migration that would fail under FK enforcement (e.g., ALTER chain briefly violating FKs).
+**When**: `get_db(project_dir)` is called for the first time.
+**Then**:
+- **pragma-order**: Spy records PRAGMA executions in order: `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=60000`, then `_ensure_schema()` runs, then `foreign_keys=ON`.
+- **migration-success**: The migration that would have failed under FK enforcement completes cleanly.
+- **fks-enforced-post-migration**: After schema init, `PRAGMA foreign_keys` returns `1`.
+
 ## Non-Goals
 
 - Defining schema migration steps (handled by `_ensure_schema`, separate spec).
@@ -433,7 +519,34 @@ Calls `fn()` up to `max_retries` times, sleeping `delay * (attempt + 1)` seconds
 
 ---
 
+## Transitional Behavior (INV-8)
+
+Target-ideal behavior is captured in R21–R27. The following current code divergences are documented:
+
+- **Module-level dict vs `threading.local()`**: current code uses `_connections: dict[str, sqlite3.Connection]` keyed by `f"{db_path}:{thread.ident}"`. Target is `threading.local()`-backed per-thread storage. Until migration, entries from dead threads may linger (small bounded leak per R21 transitional).
+- **`close_db` loose prefix match**: current code uses `k.startswith(db_path)` (no trailing colon). Target is `k.startswith(f"{db_path}:")`. Transitional — loose match preserved until refactor.
+- **`_retry_on_locked` substring matcher**: current code matches `"locked" in str(e)`. Target is `sqlite_errorcode in {SQLITE_BUSY, SQLITE_LOCKED}`. Transitional — substring matcher preserved until refactor; negative-assertion tests may fail for non-English SQLite builds today.
+- **`transaction(project_dir)` signature**: current code accepts only `project_dir`. Target adds optional `db_path`. Transitional — callers working on session DBs manage `commit`/`rollback` by hand until the new parameter lands.
+- **PRAGMA order**: current code applies `foreign_keys=ON` before `_ensure_schema`. Target defers it to after. Transitional — FK-involving ALTER chains in `_ensure_schema` must tolerate FK enforcement being on until the refactor.
+
 ## Open Questions
+
+### Resolved
+
+- **OQ-1** (concurrent writes on same conn): closed per INV-1 + negative-assertion test `dal-callers-must-not-share-conn-across-threads`.
+- **OQ-2** (connections abandoned by dead threads): **fix** — switch `_connections` to `threading.local()`. R21, test `threading-local-gcs-with-thread`.
+- **OQ-3** (retry exhaustion contract): **codify** — `_retry_on_locked` is the final retry budget; callers treat lock errors as fatal. R22, test `retry-budget-is-final-contract`.
+- **OQ-4** (`close_db` while another thread holds conn): closed per INV-1 + threading.local fix. R23, test `close-db-no-cross-thread-sharing`.
+- **OQ-5** (`close_db` prefix match too loose): **fix** — tighten to `k.startswith(f"{db_path}:")`. R23, test `close-db-tight-prefix-match`.
+- **OQ-6** (substring matcher): **fix** — match on `sqlite_errorcode in {SQLITE_BUSY, SQLITE_LOCKED}`. R24, test `retry-matches-sqlite-errorcode`.
+- **OQ-7** (`transaction` project_dir-only): **fix** — accept optional `db_path`. R25, test `transaction-accepts-optional-db-path`.
+- **OQ-8** (PRAGMA order): **fix** — defer `foreign_keys=ON` until after `_ensure_schema`. R26, test `pragma-order-defers-foreign-keys`.
+
+### Deferred
+
+(None — all 8 OQs resolved.)
+
+### Historical
 
 **OQ-1 — Concurrent writes on the same connection object.** `check_same_thread=False` lets any thread call `.execute()` on a connection created by another thread, but the underlying SQLite connection object is NOT thread-safe for simultaneous writes. Today, the pool keys by thread ident so each thread gets its own conn — but if a caller stashes a conn reference and hands it to another thread, simultaneous writes are possible. Expected behavior: undefined (implementation-dependent; may corrupt state, may raise, may silently interleave). Decision needed: do we document "never share a connection across threads" as a hard rule, or add a per-conn write lock?
 
