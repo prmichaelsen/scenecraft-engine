@@ -121,71 +121,41 @@ def close_all_connections(tmp_path: Path, request):
 
 @pytest.fixture(scope="session")
 def engine_server(tmp_path_factory):
-    """Live HTTP server fixture for e2e tests.
+    """Live server fixture for e2e tests — FastAPI via TestClient.
 
-    Boots a `ThreadedHTTPServer` directly (bypassing `run_server` to avoid
-    coupling to the websocket server, plugin host, and folder watcher), binds
-    to port 0 for auto-assignment, and yields an object with:
-
-      - `.base_url`  : e.g. "http://127.0.0.1:<port>"
-      - `.work_dir`  : temp work_dir (session-scoped) — tests create per-test
-                       projects under here via POST /api/projects/create
+    Provides the same interface as the legacy HTTPServer fixture:
+      - `.base_url`  : "http://testserver" (TestClient's default)
+      - `.work_dir`  : temp work_dir (session-scoped)
       - `.request(method, path, body=None, timeout=10)`
-                     : helper returning (status, headers, body_bytes)
+                     : returns (status, headers_dict, body_bytes)
       - `.json(method, path, body=None, timeout=10)`
-                     : helper returning (status, parsed_json)
-
-    On teardown: `server.shutdown()`, joins the thread (≤5s), and removes
-    the temp work_dir.
+                     : returns (status, parsed_json)
     """
     import json as _json
-    import socket
-    import threading as _threading
-    import urllib.request
-    import urllib.error
-    from http.server import HTTPServer
-    from socketserver import ThreadingMixIn
 
     global _ENGINE_SERVER_WORK_DIR
     work_dir = tmp_path_factory.mktemp("engine_server_workdir")
     _ENGINE_SERVER_WORK_DIR = work_dir
 
-    # Lazy import so that merely collecting tests doesn't pull in the whole
-    # server module on every pytest run.
-    from scenecraft.api_server import make_handler
+    from fastapi.testclient import TestClient
+    from scenecraft.api.app import create_app
 
-    handler = make_handler(work_dir, no_auth=True)
-
-    class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-        daemon_threads = True
-        allow_reuse_address = True
-
-    server = _ThreadedHTTPServer(("127.0.0.1", 0), handler)
-    port = server.server_address[1]
-    base_url = f"http://127.0.0.1:{port}"
-
-    thread = _threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    app = create_app(work_dir=work_dir, enable_docs=True, testing=True)
+    client = TestClient(app, raise_server_exceptions=False)
 
     class _Server:
         def __init__(self):
-            self.base_url = base_url
+            self.base_url = "http://testserver"
             self.work_dir = work_dir
-            self.server = server
+            self._client = client
 
         def request(self, method: str, path: str, body=None, timeout: float = 10.0):
-            url = self.base_url + path
-            data = None
-            headers = {}
+            kwargs = {"timeout": timeout}
             if body is not None:
-                data = _json.dumps(body).encode("utf-8")
-                headers["Content-Type"] = "application/json"
-            req = urllib.request.Request(url, data=data, method=method, headers=headers)
-            try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    return resp.status, dict(resp.headers), resp.read()
-            except urllib.error.HTTPError as e:
-                return e.code, dict(e.headers or {}), e.read()
+                kwargs["json"] = body
+            resp = self._client.request(method, path, **kwargs)
+            headers = dict(resp.headers)
+            return resp.status_code, headers, resp.content
 
         def json(self, method: str, path: str, body=None, timeout: float = 10.0):
             status, _headers, raw = self.request(method, path, body=body, timeout=timeout)
@@ -196,24 +166,7 @@ def engine_server(tmp_path_factory):
             except Exception:
                 return status, raw
 
-    # Sanity-check the server is actually listening before handing out.
-    for _ in range(50):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.1)
-            s.connect(("127.0.0.1", port))
-            s.close()
-            break
-        except OSError:
-            import time as _t
-            _t.sleep(0.02)
-
-    try:
-        yield _Server()
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5.0)
+    yield _Server()
 
 
 @pytest.fixture
