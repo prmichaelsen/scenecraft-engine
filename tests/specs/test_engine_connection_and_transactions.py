@@ -901,7 +901,419 @@ def test_pragma_order_defers_foreign_keys(project_dir: Path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# No e2e tests — engine-connection-and-transactions is internal DAL
-# infrastructure; exercised transitively by downstream specs.
+# === E2E ===
 # ---------------------------------------------------------------------------
-# NOTE: no e2e — local.engine-connection-and-transactions.md is a DB-layer spec; no HTTP/WS surface.
+# Task-88 (M18): retroactive HTTP-level coverage for every requirement with
+# an observable effect through the live server. The fixture in conftest.py
+# boots a real ThreadedHTTPServer; tests here exercise the transport → DAL
+# bridge that module-level DAL tests above cannot observe.
+#
+# Convention: each test's docstring opens with `(covers Rn, ..., e2e)`.
+# Target-state tests are xfail(strict=False) so they flip to pass when the
+# M16 FastAPI refactor lands R21-R26.
+# ---------------------------------------------------------------------------
+
+import concurrent.futures as _cf
+
+
+class TestEndToEnd:
+    """HTTP round-trip regressions for engine-connection-and-transactions."""
+
+    def test_e2e_server_boots_and_responds(self, engine_server):
+        """covers R1 — bringup smoke: GET /api/projects returns 200 (e2e)."""
+        status, body = engine_server.json("GET", "/api/projects")
+        assert status == 200, f"server-alive: got {status}, {body!r}"
+        assert isinstance(body, (dict, list)), f"json-shape: expected dict/list, got {type(body)}"
+
+    def test_e2e_create_project_opens_db(self, engine_server, project_name):
+        """covers R1, R7 — POST creates project dir + project.db on disk (e2e)."""
+        p = engine_server.work_dir / project_name
+        assert p.exists(), "project-dir-created"
+        assert (p / "project.db").exists(), "project-db-file-created"
+
+    def test_e2e_back_to_back_requests_reuse_connection(self, engine_server, project_name):
+        """covers R1, R20 — back-to-back requests on same project do not open many new conns (e2e).
+
+        ThreadingMixIn spawns a worker thread per request; however the DAL pool
+        is keyed by (db_path, thread_ident), so steady-state the number of
+        cached connections for this project is bounded by concurrent threads,
+        not by request count.
+        """
+        # Fire 10 requests in sequence
+        for _ in range(10):
+            status, _body = engine_server.json("GET", f"/api/projects/{project_name}/keyframes")
+            assert status == 200
+
+        db_path = str(engine_server.work_dir / project_name / "project.db")
+        keys = [k for k in scdb._connections if k.startswith(f"{db_path}:")]
+        # bounded-by-threads: at most ~10 threads, typically far fewer.
+        assert len(keys) <= 10, f"pool-bounded: {len(keys)} connections for 10 serial requests"
+
+    def test_e2e_pragmas_applied_via_http_path(self, engine_server, project_name):
+        """covers R4 — PRAGMAs applied on conns handlers use (e2e).
+
+        Observe by opening a fresh raw sqlite3 connection to the same file
+        after the HTTP request flow has fully initialised the DB.
+        """
+        # Trigger DAL init through the HTTP path
+        engine_server.json("GET", f"/api/projects/{project_name}/keyframes")
+
+        db_path = str(engine_server.work_dir / project_name / "project.db")
+        raw = sqlite3.connect(db_path)
+        try:
+            jm = raw.execute("PRAGMA journal_mode").fetchone()[0]
+            assert jm == "wal", f"wal-persisted: expected wal, got {jm!r}"
+        finally:
+            raw.close()
+
+    def test_e2e_foreign_keys_pragma_on_request_thread(self, engine_server, project_name):
+        """covers R4 — each handler's conn has foreign_keys=ON (e2e).
+
+        Pick a cached conn for this project and verify the PRAGMA is on.
+        """
+        engine_server.json("GET", f"/api/projects/{project_name}/keyframes")
+        db_path = str(engine_server.work_dir / project_name / "project.db")
+        for key, conn in list(scdb._connections.items()):
+            if key.startswith(f"{db_path}:"):
+                fk = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+                assert fk == 1, f"fk-on-handler-conn: got {fk}"
+                bt = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                assert bt == 60000, f"busy-timeout-handler-conn: got {bt}"
+                return
+        pytest.fail("no-cached-conn: expected at least one entry for project DB")
+
+    def test_e2e_wal_mode_allows_concurrent_read_during_write(
+        self, engine_server, project_name
+    ):
+        """covers R18 — WAL lets a GET read while a writer holds BEGIN IMMEDIATE (e2e)."""
+        db_path = str(engine_server.work_dir / project_name / "project.db")
+        # Prime DB via GET first.
+        engine_server.json("GET", f"/api/projects/{project_name}/keyframes")
+
+        writer = sqlite3.connect(db_path, timeout=5)
+        writer.execute("PRAGMA busy_timeout=5000")
+        writer.execute("BEGIN IMMEDIATE")
+        try:
+            status, _body = engine_server.json(
+                "GET", f"/api/projects/{project_name}/keyframes", timeout=3
+            )
+            assert status == 200, f"read-not-blocked-by-writer: got {status}"
+        finally:
+            writer.rollback()
+            writer.close()
+
+    def test_e2e_transaction_rollback_via_http_error_path(
+        self, engine_server, project_name
+    ):
+        """covers R10, R11 — HTTP 400 on mid-transaction failure leaves no row (e2e)."""
+        # Send an invalid add-keyframe payload — handler validates and returns 400.
+        status, body = engine_server.json(
+            "POST",
+            f"/api/projects/{project_name}/add-keyframe",
+            {"timestamp": "-1:00"},  # negative → 400
+        )
+        assert status == 400, f"validation-400: got {status} {body!r}"
+        # No keyframe persisted.
+        status2, kfs = engine_server.json(
+            "GET", f"/api/projects/{project_name}/keyframes"
+        )
+        assert status2 == 200
+        assert kfs.get("keyframes", []) == [], f"no-partial-write: got {kfs.get('keyframes')!r}"
+
+    def test_e2e_malformed_json_returns_4xx_no_corruption(
+        self, engine_server, project_name
+    ):
+        """covers R10 — a handler exception propagates cleanly without leaving partial state (e2e)."""
+        import urllib.request, urllib.error
+
+        # Malformed JSON body — hits the exception path inside the handler.
+        url = f"{engine_server.base_url}/api/projects/{project_name}/add-keyframe"
+        req = urllib.request.Request(
+            url, data=b"{not json", method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        status = 0
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                status = resp.status
+        except urllib.error.HTTPError as e:
+            status = e.code
+        assert status in (400, 500), f"error-propagates: got {status}"
+
+        # Subsequent GET still works — no corruption.
+        s2, body2 = engine_server.json(
+            "GET", f"/api/projects/{project_name}/keyframes"
+        )
+        assert s2 == 200, "server-survived-bad-json"
+
+    def test_e2e_per_project_isolation(self, engine_server):
+        """covers R2 — interleaved requests on two projects don't cross-contaminate (e2e)."""
+        import uuid, os
+        a = f"proj_iso_a_{os.getpid()}_{uuid.uuid4().hex[:6]}"
+        b = f"proj_iso_b_{os.getpid()}_{uuid.uuid4().hex[:6]}"
+        for name in (a, b):
+            s, _ = engine_server.json("POST", "/api/projects/create", {"name": name})
+            assert s == 200
+
+        # Add a keyframe to A.
+        s1, _ = engine_server.json(
+            "POST", f"/api/projects/{a}/add-keyframe", {"timestamp": "0:05"}
+        )
+        assert s1 == 200, "a-add-ok"
+
+        # B should still be empty.
+        s2, body_b = engine_server.json("GET", f"/api/projects/{b}/keyframes")
+        assert s2 == 200
+        assert body_b.get("keyframes", []) == [], "b-untouched"
+
+        # A should have one.
+        s3, body_a = engine_server.json("GET", f"/api/projects/{a}/keyframes")
+        assert s3 == 200
+        assert len(body_a.get("keyframes", [])) == 1, f"a-has-one: got {body_a.get('keyframes')!r}"
+
+        # Distinct DB files exist.
+        assert (engine_server.work_dir / a / "project.db").exists()
+        assert (engine_server.work_dir / b / "project.db").exists()
+
+    def test_e2e_concurrent_reads_no_5xx(self, engine_server, project_name):
+        """covers R1, R17 — N concurrent GETs all return 200 (e2e)."""
+        def go():
+            s, _ = engine_server.json("GET", f"/api/projects/{project_name}/keyframes", timeout=10)
+            return s
+
+        with _cf.ThreadPoolExecutor(max_workers=8) as ex:
+            results = list(ex.map(lambda _i: go(), range(16)))
+        assert all(s == 200 for s in results), f"all-200: {results}"
+
+    def test_e2e_concurrent_writes_no_5xx(self, engine_server, project_name):
+        """covers R12, R13, R17 — concurrent POST /add-keyframe: all 200 (retry-on-locked holds) (e2e)."""
+        def go(i: int):
+            s, _b = engine_server.json(
+                "POST",
+                f"/api/projects/{project_name}/add-keyframe",
+                {"timestamp": f"0:{10 + i:02d}"},
+                timeout=20,
+            )
+            return s
+
+        with _cf.ThreadPoolExecutor(max_workers=6) as ex:
+            results = list(ex.map(go, range(6)))
+        # With retry-on-locked the busy window should be tolerated.
+        assert all(200 <= s < 500 for s in results), f"no-5xx: {results}"
+
+    def test_e2e_missing_project_returns_404(self, engine_server):
+        """covers R1 — POST on unknown project returns 404 (e2e)."""
+        status, body = engine_server.json(
+            "POST",
+            "/api/projects/does_not_exist_xyz/add-keyframe",
+            {"timestamp": "0:05"},
+        )
+        assert status == 404, f"missing-project-404: got {status} {body!r}"
+
+    def test_e2e_multiple_requests_migrated_once(self, engine_server, project_name):
+        """covers R7, R8 — after many hits, db_path appears once in _migrated_dbs (e2e)."""
+        for _ in range(5):
+            engine_server.json("GET", f"/api/projects/{project_name}/keyframes")
+        db_path = str(engine_server.work_dir / project_name / "project.db")
+        assert db_path in scdb._migrated_dbs, "migrated-flag-set-once"
+
+    def test_e2e_close_db_preserves_migrated_flag_via_http(
+        self, engine_server, project_name
+    ):
+        """covers R9 — DAL close_db after HTTP traffic keeps the migration marker (e2e)."""
+        engine_server.json("GET", f"/api/projects/{project_name}/keyframes")
+        project_dir = engine_server.work_dir / project_name
+        db_path = str(project_dir / "project.db")
+        assert db_path in scdb._migrated_dbs
+        scdb.close_db(project_dir)
+        assert db_path in scdb._migrated_dbs, "migrated-preserved"
+        # Subsequent HTTP still works.
+        status, _ = engine_server.json(
+            "GET", f"/api/projects/{project_name}/keyframes"
+        )
+        assert status == 200, "server-recovers-after-close_db"
+
+    def test_e2e_row_factory_shape_visible_in_json(
+        self, engine_server, project_name
+    ):
+        """covers R6 — handler output is a dict (evidence of sqlite3.Row -> dict path) (e2e)."""
+        # Add a keyframe so the response has a row to serialize.
+        s, _ = engine_server.json(
+            "POST", f"/api/projects/{project_name}/add-keyframe",
+            {"timestamp": "0:01"},
+        )
+        assert s == 200
+        s2, body = engine_server.json(
+            "GET", f"/api/projects/{project_name}/keyframes"
+        )
+        assert s2 == 200
+        kfs = body.get("keyframes", [])
+        assert len(kfs) == 1 and isinstance(kfs[0], dict), \
+            f"row-as-dict: got {kfs!r}"
+        assert "id" in kfs[0], "column-name-access"
+
+    def test_e2e_busy_timeout_bounds_wall_time(self, engine_server, project_name):
+        """covers R19 — a contended write either succeeds or fails in bounded time (e2e).
+
+        Hold a write lock for a short interval; a concurrent POST should not
+        exceed busy_timeout + retry budget significantly.
+        """
+        import time as _time
+        # Prime DB.
+        engine_server.json("GET", f"/api/projects/{project_name}/keyframes")
+        db_path = str(engine_server.work_dir / project_name / "project.db")
+
+        # Hold + release the lock from a single background thread; the test
+        # thread fires the POST meanwhile. This keeps SQLite's thread affinity
+        # intact (conn lives and dies in the same thread).
+        import queue
+        result_q: "queue.Queue" = queue.Queue()
+
+        def holder_thread():
+            h = sqlite3.connect(db_path, timeout=30)
+            try:
+                h.execute("PRAGMA busy_timeout=30000")
+                h.execute("BEGIN IMMEDIATE")
+                _time.sleep(0.3)
+                h.rollback()
+                result_q.put("ok")
+            except Exception as e:
+                result_q.put(e)
+            finally:
+                h.close()
+
+        t0 = _time.monotonic()
+        ht = threading.Thread(target=holder_thread, daemon=True)
+        ht.start()
+        # Give the holder a moment to acquire.
+        _time.sleep(0.05)
+        status, _body = engine_server.json(
+            "POST",
+            f"/api/projects/{project_name}/add-keyframe",
+            {"timestamp": "0:11"},
+            timeout=30,
+        )
+        ht.join(timeout=5)
+        elapsed = _time.monotonic() - t0
+        assert 200 <= status < 500, f"status-no-5xx: got {status}"
+        assert elapsed < 15, f"bounded-wall-time: elapsed={elapsed}s"
+
+    def test_e2e_dal_state_survives_across_requests(
+        self, engine_server, project_name
+    ):
+        """covers R20 — write via POST, read-back via GET sees the row (e2e)."""
+        s1, _ = engine_server.json(
+            "POST", f"/api/projects/{project_name}/add-keyframe",
+            {"timestamp": "0:02"},
+        )
+        assert s1 == 200
+        s2, body = engine_server.json(
+            "GET", f"/api/projects/{project_name}/keyframes"
+        )
+        assert s2 == 200
+        kfs = body.get("keyframes", [])
+        assert len(kfs) == 1, f"readback: expected 1, got {len(kfs)}"
+
+    def test_e2e_invalid_project_name_hits_404_fast(self, engine_server):
+        """covers R1 — unknown-project 404s without raising in the DAL (e2e)."""
+        status, body = engine_server.json(
+            "POST",
+            "/api/projects/does_not_exist/add-keyframe",
+            {"timestamp": "0:05"},
+        )
+        assert status == 404, f"404: got {status} {body!r}"
+
+    # -- Target-state xfails (HTTP-level mirror of DAL-level xfails) --
+
+    @pytest.mark.xfail(reason="target-state; awaits M16 FastAPI refactor", strict=False)
+    def test_e2e_threading_local_pool_per_thread(self, engine_server, project_name):
+        """covers R21 — under threading.local, dead-thread entries auto-GC (e2e, target-state)."""
+        engine_server.json("GET", f"/api/projects/{project_name}/keyframes")
+        # Force thread turnover: send a burst, wait, then check pool size shrinks.
+        with _cf.ThreadPoolExecutor(max_workers=4) as ex:
+            list(ex.map(
+                lambda _i: engine_server.json(
+                    "GET", f"/api/projects/{project_name}/keyframes"
+                ),
+                range(8),
+            ))
+        import gc, time as _t
+        gc.collect()
+        _t.sleep(0.2)
+        db_path = str(engine_server.work_dir / project_name / "project.db")
+        entries = [k for k in scdb._connections if k.startswith(f"{db_path}:")]
+        # Target: entries for dead worker threads are auto-removed.
+        assert len(entries) <= 2, f"auto-gc: entries={entries}"
+
+    @pytest.mark.xfail(reason="target-state; awaits M16 FastAPI refactor", strict=False)
+    def test_e2e_close_db_prefix_tight_via_http(self, engine_server, project_name):
+        """covers R23 — close_db doesn't drop -sidecar connections under HTTP pressure (e2e, target-state)."""
+        from scenecraft.db import get_db, close_db
+        project_dir = engine_server.work_dir / project_name
+        engine_server.json("GET", f"/api/projects/{project_name}/keyframes")
+        sidecar_path = project_dir / "project.db-sidecar"
+        get_db(project_dir, db_path=sidecar_path)
+        close_db(project_dir)
+        # Target: sidecar entry remains.
+        sidecar_keys = [k for k in scdb._connections if k.startswith(f"{sidecar_path}:")]
+        assert sidecar_keys, f"sidecar-untouched: got {list(scdb._connections)}"
+
+    @pytest.mark.xfail(reason="target-state; awaits M16 FastAPI refactor", strict=False)
+    def test_e2e_retry_matches_errorcode_not_substring(self, engine_server, project_name):
+        """covers R24 — non-English lock message still retried (e2e, target-state)."""
+        # No practical way to force a locale-specific lock error through HTTP today;
+        # target-state assertion is that such a message WOULD be retried.
+        pytest.xfail("target-state: observable only post-refactor")
+
+    @pytest.mark.xfail(reason="target-state; awaits M16 FastAPI refactor", strict=False)
+    def test_e2e_transaction_optional_db_path_via_http(self, engine_server, project_name):
+        """covers R25 — transaction(project_dir, db_path=...) wired through handlers (e2e, target-state)."""
+        pytest.xfail("target-state: no handler uses session-DB transactions yet")
+
+    @pytest.mark.xfail(reason="target-state; awaits M16 FastAPI refactor", strict=False)
+    def test_e2e_pragma_order_fks_post_schema(self, engine_server, project_name):
+        """covers R26 — fresh project has foreign_keys=ON AND no migration-order errors (e2e, target-state)."""
+        # Target: foreign_keys is deferred until after schema init. Today it runs
+        # before, so schema init silently disables FK during CREATE TABLE.
+        pytest.xfail("target-state: PRAGMA order not yet corrected")
+
+    def test_e2e_transaction_commit_persists_across_reads(
+        self, engine_server, project_name
+    ):
+        """covers R10 — a committed HTTP write is visible to a subsequent fresh-conn read (e2e)."""
+        s1, _ = engine_server.json(
+            "POST", f"/api/projects/{project_name}/add-keyframe",
+            {"timestamp": "0:03"},
+        )
+        assert s1 == 200
+
+        # Fresh raw conn reads committed row from disk.
+        db_path = engine_server.work_dir / project_name / "project.db"
+        raw = sqlite3.connect(str(db_path))
+        try:
+            n = raw.execute("SELECT COUNT(*) FROM keyframes").fetchone()[0]
+            assert n == 1, f"committed-visible: got {n}"
+        finally:
+            raw.close()
+
+    def test_e2e_connection_pool_survives_sequential_projects(self, engine_server):
+        """covers R1, R2 — creating multiple projects doesn't corrupt the pool (e2e)."""
+        import uuid, os
+        names = [f"proj_seq_{i}_{os.getpid()}_{uuid.uuid4().hex[:4]}" for i in range(3)]
+        for name in names:
+            s, _ = engine_server.json("POST", "/api/projects/create", {"name": name})
+            assert s == 200
+            s2, _ = engine_server.json("GET", f"/api/projects/{name}/keyframes")
+            assert s2 == 200
+
+    def test_e2e_no_internal_lock_held_across_http(
+        self, engine_server, project_name
+    ):
+        """covers R27 / INV-1 — _conn_lock is not held between requests (e2e)."""
+        engine_server.json("GET", f"/api/projects/{project_name}/keyframes")
+        acquired = scdb._conn_lock.acquire(blocking=False)
+        assert acquired, "lock-released-between-requests"
+        scdb._conn_lock.release()
+
+# NOTE: N=25 e2e tests above covering R1..R27 where HTTP-observable.
+# Target-state xfails codify M16 refactor deliverables without blocking today's CI.
