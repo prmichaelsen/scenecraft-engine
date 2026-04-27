@@ -140,4 +140,38 @@ async def plugin_dispatch(
     return result
 
 
+@router.get(
+    "/{name}/plugins/{plugin}/{rest:path}",
+    operation_id="plugin_dispatch_get",
+    summary="Dispatch a plugin-registered GET route",
+    include_in_schema=False,
+)
+async def plugin_dispatch_get(
+    name: str,
+    plugin: str,
+    rest: str,
+    request: Request,
+    pd: Path = Depends(project_dir),
+) -> dict:
+    full_path = request.url.path
+    from scenecraft.plugin_host import PluginHost
+    try:
+        result = PluginHost.dispatch_rest(full_path, pd, name, {})
+    except ApiError:
+        raise
+    except Exception as exc:
+        raise ApiError(
+            "PLUGIN_ERROR",
+            str(exc),
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        ) from exc
+    if result is None:
+        raise ApiError(
+            "NOT_FOUND",
+            f"No route: GET {full_path}",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+    return result
+
+
 __all__ = ["router"]
