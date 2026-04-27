@@ -1314,13 +1314,22 @@ def server(port: int, host: str, work_dir: str | None, no_auth: bool):
     _ws_mod.folder_watcher = FolderWatcher(wd)
     start_ws_server(host, ws_port, work_dir=wd)
 
-    # Plugin host — static registry for MVP
+    # Plugin host — static registry
     from scenecraft.plugin_host import PluginHost
     from scenecraft.plugins import isolate_vocals
     from scenecraft.plugins import transcribe
+    from scenecraft.plugins import generate_music
+    from scenecraft.plugins import light_show
 
     PluginHost.register(isolate_vocals)
     PluginHost.register(transcribe)
+    PluginHost.register(generate_music)
+    PluginHost.register(light_show)
+    try:
+        from scenecraft.plugins import generate_foley
+        PluginHost.register(generate_foley)
+    except Exception:
+        pass
     _api_log(
         f"  Plugins: {len(PluginHost._registered)} registered, "
         f"{len(PluginHost._operations)} operations, "
