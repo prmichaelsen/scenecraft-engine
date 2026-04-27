@@ -376,8 +376,18 @@ class TestBounceHandler:
         import wave as _wave
         original = _wave.open
 
+        # Only fail the handler's READ path ("rb"); the uploader helper writes
+        # the WAV via wave.open(..., "wb") and must keep working so the
+        # render-event delivers a real file for the soundfile fallback to read.
         def _broken_wave_open(*a, **kw):
-            raise RuntimeError("simulated 32-bit-float WAV unsupported by stdlib")
+            mode = kw.get("mode")
+            if mode is None and len(a) >= 2:
+                mode = a[1]
+            if mode == "rb":
+                raise RuntimeError(
+                    "simulated 32-bit-float WAV unsupported by stdlib"
+                )
+            return original(*a, **kw)
 
         monkeypatch.setattr(_wave, "open", _broken_wave_open)
         result = await chat_mod._exec_bounce_audio(
