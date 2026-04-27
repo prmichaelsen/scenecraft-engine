@@ -5347,6 +5347,48 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                 _log(f"bounce-upload: {project_name} {composite_hash[:12]}… "
                      f"({bytes_written // 1024}KB, {wav_duration:.2f}s, {wav_sample_rate}Hz, {wav_channels}ch, {bit_depth_i}-bit)")
 
+                # ── Upsert audio_bounces DAL row keyed on composite_hash ──
+                # The WS-driven _exec_bounce_audio chat flow inserts a row
+                # *before* the upload arrives (with rendered_path=None), then
+                # calls update_bounce_rendered once this handler returns. A
+                # direct HTTP upload that bypasses chat has no pre-existing
+                # row; without an upsert here, the WAV is orphaned on disk
+                # and GET /bounces/<id>.wav 404s. (See task-90.) Mirror the
+                # chat-path semantics: existing row → update rendered_path;
+                # missing row → create_bounce + update_bounce_rendered.
+                bounce_id: str | None = None
+                try:
+                    from scenecraft.db_bounces import (
+                        create_bounce,
+                        get_bounce_by_hash,
+                        update_bounce_rendered,
+                    )
+                    existing = get_bounce_by_hash(project_dir, composite_hash)
+                    if existing is None:
+                        # HTTP-only upload (no preceding chat-flow row).
+                        # mode="full" + empty selection is the conservative
+                        # default; the form fields don't carry track/clip ids.
+                        new_row = create_bounce(
+                            project_dir,
+                            composite_hash=composite_hash,
+                            start_time_s=start_time_f,
+                            end_time_s=end_time_f,
+                            mode="full",
+                            selection={},
+                            sample_rate=sample_rate_i,
+                            bit_depth=bit_depth_i,
+                            channels=channels_i,
+                        )
+                        bounce_id = new_row.id
+                    else:
+                        bounce_id = existing.id
+                    update_bounce_rendered(
+                        project_dir, bounce_id, rel_path,
+                        bytes_written, float(wav_duration),
+                    )
+                except Exception as de:
+                    _log(f"bounce-upload: audio_bounces upsert failed: {de}")
+
                 # Release the chat tool waiting on this request, if any.
                 released = False
                 if request_id:
@@ -5357,6 +5399,7 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                         _log(f"bounce-upload: set_bounce_render_event raised: {se}")
 
                 return self._json_response({
+                    "bounce_id": bounce_id,
                     "rendered_path": rel_path,
                     "bytes": bytes_written,
                     "channels": wav_channels,

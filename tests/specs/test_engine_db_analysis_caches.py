@@ -844,16 +844,10 @@ class TestEndToEnd:
     ):
         """covers R31 — POST /bounce-upload is content-addressable: two
         uploads with the same composite_hash write the same file path and
-        return the same file bytes. The DB row side of the bounce cache
-        (audio_bounces) is populated by the WS chat flow (_exec_bounce_audio),
-        not by this HTTP endpoint — see surfaced-bug note below.
-
-        **Surfaced bug**: the bounce-upload endpoint writes the on-disk WAV
-        but does NOT insert or update the corresponding audio_bounces row.
-        The row is only created by the WS-driven chat flow. A direct HTTP
-        upload (bypassing chat) leaves a file on disk with no DAL row —
-        the download endpoint /bounces/<id>.wav will 404. Logged for
-        triage; this test asserts the observable file-side behavior only.
+        return the same file bytes. Also covers task-90 regression: the
+        upload handler upserts an ``audio_bounces`` DAL row keyed on
+        composite_hash so a direct HTTP upload (bypassing the WS chat flow)
+        is retrievable via GET /bounces/<id>.wav.
         """
         import urllib.request
 
@@ -891,6 +885,7 @@ class TestEndToEnd:
             parts.append(f"--{boundary}--\r\n".encode())
             return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
+        import json as _json
         url = f"{engine_server.base_url}/api/projects/{project_name}/bounce-upload"
 
         body, ct = _multipart(composite_hash)
@@ -898,20 +893,41 @@ class TestEndToEnd:
                                      headers={"Content-Type": ct})
         with urllib.request.urlopen(req, timeout=15) as resp:
             assert resp.status in (200, 201), f"first-upload: {resp.status}"
+            resp1_json = _json.loads(resp.read().decode("utf-8"))
 
         # File landed at the content-addressable path
         expected_wav = project_dir / "pool" / "bounces" / f"{composite_hash}.wav"
         assert expected_wav.exists(), "content-addressable-path: pool/bounces/<hash>.wav"
         first_bytes = expected_wav.read_bytes()
 
-        # Second upload with same composite_hash — same file, idempotent
+        # task-90: upload handler upserts an audio_bounces DAL row
+        bounce_id = resp1_json.get("bounce_id")
+        assert bounce_id, "task-90: response includes bounce_id"
+        row = dbc.get_bounce_by_hash(project_dir, composite_hash)
+        assert row is not None, "task-90: audio_bounces row exists for upload"
+        assert row.id == bounce_id, "task-90: response bounce_id matches DAL row"
+        assert row.rendered_path == f"pool/bounces/{composite_hash}.wav", \
+            "task-90: rendered_path populated"
+
+        # task-90: GET /bounces/<id>.wav round-trips the uploaded bytes
+        dl_status, _dh, dl_bytes = engine_server.request(
+            "GET", f"/api/projects/{project_name}/bounces/{bounce_id}.wav",
+        )
+        assert dl_status == 200, f"task-90: download status {dl_status}"
+        assert dl_bytes == first_bytes, "task-90: downloaded bytes match upload"
+
+        # Second upload with same composite_hash — same file, idempotent;
+        # row is upserted (no duplicate) and bounce_id is stable.
         body2, ct2 = _multipart(composite_hash)
         req2 = urllib.request.Request(url, data=body2, method="POST",
                                       headers={"Content-Type": ct2})
         with urllib.request.urlopen(req2, timeout=15) as resp2:
             assert resp2.status in (200, 201), f"second-upload: {resp2.status}"
+            resp2_json = _json.loads(resp2.read().decode("utf-8"))
         assert expected_wav.read_bytes() == first_bytes, \
             "content-addressable-idempotent: same hash writes same bytes"
+        assert resp2_json.get("bounce_id") == bounce_id, \
+            "task-90: re-upload returns same bounce_id (upsert by composite_hash)"
 
     # ---- Target-state HTTP endpoints (not in engine today) ----
 
