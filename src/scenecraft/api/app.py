@@ -18,17 +18,31 @@ from fastapi import FastAPI
 from scenecraft.api.deps import install_cors
 from scenecraft.api.errors import install_exception_handlers
 from scenecraft.api.routers import (
+    audio_clips,
+    audio_intelligence,
+    audio_tracks,
     auth,
     bench,
+    candidates,
+    chat,
+    checkpoints,
     config as config_router,
+    effect_curves,
+    effects,
     files,
     ingredients,
+    keyframes,
     markers,
     misc,
+    mix_render,
     oauth,
+    plugins,
+    pool,
     projects,
     prompt_roster,
+    rendering,
     settings as settings_router,
+    transitions,
     workspace,
 )
 
@@ -76,6 +90,25 @@ def create_app(
     app.include_router(markers.router)
     app.include_router(prompt_roster.router)
     app.include_router(config_router.router)
+    # M16 T61 — keyframes + transitions routers.
+    app.include_router(keyframes.router)
+    app.include_router(transitions.router)
+    # M16 T62 — audio routers.
+    app.include_router(audio_tracks.router)
+    app.include_router(audio_clips.router)
+    app.include_router(effect_curves.router)
+    app.include_router(mix_render.router)
+    app.include_router(audio_intelligence.router)
+    # M16 T63 — rendering, files, pool, candidates.
+    app.include_router(rendering.router)
+    app.include_router(pool.router)
+    app.include_router(candidates.router)
+    app.include_router(effects.router)
+    # M16 T64 — checkpoints, chat, plugins.
+    app.include_router(checkpoints.router)
+    app.include_router(chat.router)
+    # Plugin catch-all MUST be last (after all built-in routes).
+    app.include_router(plugins.router)
     app.state.work_dir = Path(work_dir) if work_dir is not None else None
     app.state.testing = bool(testing)
     if app.state.testing:

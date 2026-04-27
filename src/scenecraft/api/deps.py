@@ -193,10 +193,67 @@ def project_dir(
     return candidate
 
 
+# ---------------------------------------------------------------------------
+# Per-project structural-mutation lock (M16 T59).
+# ---------------------------------------------------------------------------
+
+
+def project_lock(name: str, request: Request):
+    """Acquire the per-project lock before a structural handler runs.
+
+    Mirrors ``api_server.py::do_POST``'s ``_use_lock`` block (lines
+    710-750). Applied as ``dependencies=[Depends(project_lock)]`` on
+    structural routes only — see ``structural.STRUCTURAL_ROUTES``.
+
+    After the handler returns, runs the timeline validator and
+    broadcasts warnings via WS (non-fatal on exception).
+    """
+    from scenecraft.locks import _get_project_lock
+    from scenecraft.api.structural import _route_is_structural, _route_name
+
+    lock = _get_project_lock(name)
+    lock.acquire()
+    try:
+        yield
+    finally:
+        if _route_is_structural(request):
+            try:
+                _run_timeline_validator(request, name)
+            except Exception as ve:
+                import sys
+                print(f"  Validation error: {ve}", file=sys.stderr)
+        lock.release()
+
+
+def _run_timeline_validator(request: Request, project_name: str) -> None:
+    import sys
+    work_dir = getattr(request.app.state, "work_dir", None)
+    if work_dir is None:
+        return
+    project_dir_path = work_dir / project_name
+    if not (project_dir_path / "project.db").exists():
+        return
+    from scenecraft.db import validate_timeline
+    warnings = validate_timeline(project_dir_path)
+    if not warnings:
+        return
+    from scenecraft.api.structural import _route_name
+    rname = _route_name(request)
+    print(f"⚠ Timeline validation ({rname}): {len(warnings)} issues", file=sys.stderr)
+    for w in warnings[:10]:
+        print(f"  - {w}", file=sys.stderr)
+    try:
+        from scenecraft.ws_server import job_manager as _jm
+        _jm._broadcast({"type": "timeline_warning", "route": rname, "warnings": warnings})
+    except Exception:
+        pass
+
+
 __all__ = [
     "PUBLIC_ROUTES",
     "User",
     "current_user",
     "install_cors",
     "project_dir",
+    "project_lock",
 ]
