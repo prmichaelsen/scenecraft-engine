@@ -6,16 +6,12 @@ shape: request body → handler → DB writes → response.
 """
 
 import json
-import socket
-import threading
-import time
-import urllib.request
-from http.server import HTTPServer
 from pathlib import Path
 
 import pytest
 
-from scenecraft.api_server import make_handler
+from fastapi.testclient import TestClient
+from scenecraft.api.app import create_app
 from scenecraft.db import add_pool_segment, add_transition
 
 
@@ -24,45 +20,26 @@ def server(tmp_path):
     work_dir = tmp_path / "work"
     work_dir.mkdir()
 
-    # Free port
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
+    app = create_app(work_dir=work_dir)
+    client = TestClient(app, raise_server_exceptions=False)
 
-    Handler = make_handler(work_dir)
-    httpd = HTTPServer(("127.0.0.1", port), Handler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    time.sleep(0.05)
-
-    yield {"port": port, "work_dir": work_dir, "base": f"http://127.0.0.1:{port}"}
-
-    httpd.shutdown()
-    httpd.server_close()
+    yield {"work_dir": work_dir, "client": client}
 
 
-def _post(base: str, path: str, body: dict) -> tuple[int, dict]:
-    req = urllib.request.Request(
-        f"{base}{path}",
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+def _post(srv, path: str, body: dict) -> tuple[int, dict]:
+    resp = srv["client"].post(path, json=body)
     try:
-        with urllib.request.urlopen(req, timeout=5) as r:
-            return r.status, json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read().decode())
+        return resp.status_code, resp.json()
+    except Exception:
+        return resp.status_code, {"error": resp.text}
 
 
-def _get(base: str, path: str) -> tuple[int, dict]:
-    req = urllib.request.Request(f"{base}{path}", method="GET")
+def _get(srv, path: str) -> tuple[int, dict]:
+    resp = srv["client"].get(path)
     try:
-        with urllib.request.urlopen(req, timeout=5) as r:
-            return r.status, json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read().decode())
+        return resp.status_code, resp.json()
+    except Exception:
+        return resp.status_code, {"error": resp.text}
 
 
 def _make_project(work_dir: Path, name: str = "myproj") -> Path:
@@ -94,7 +71,7 @@ def test_import_creates_pool_segments_row(server):
     src = server["work_dir"] / "external_drone.mov"
     _make_fake_video(src, 4096)
 
-    status, resp = _post(server["base"], "/api/projects/imp/pool/import", {
+    status, resp = _post(server, "/api/projects/imp/pool/import", {
         "sourcePath": str(src),
         "label": "opening drone",
     })
@@ -117,34 +94,17 @@ def test_upload_multipart_creates_pool_segment(server):
     """Browser-style multipart upload lands as a pool_segments row (kind='imported')."""
     project = _make_project(server["work_dir"], "upl")
 
-    # Build a multipart/form-data body manually (urllib doesn't help here)
-    boundary = "----testboundary1234"
+    import io
     file_bytes = b"\x00" * 2048
-    body = (
-        f"--{boundary}\r\n"
-        'Content-Disposition: form-data; name="file"; filename="my_clip.mp4"\r\n'
-        "Content-Type: video/mp4\r\n"
-        "\r\n"
-    ).encode() + file_bytes + (
-        f"\r\n--{boundary}\r\n"
-        'Content-Disposition: form-data; name="label"\r\n'
-        "\r\n"
-        "opening shot"
-        f"\r\n--{boundary}\r\n"
-        'Content-Disposition: form-data; name="originalFilepath"\r\n'
-        "\r\n"
-        "/home/user/Footage/my_clip.mp4"
-        f"\r\n--{boundary}--\r\n"
-    ).encode()
-
-    req = urllib.request.Request(
-        f"{server['base']}/api/projects/upl/pool/upload",
-        data=body,
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        method="POST",
+    r = server["client"].post(
+        "/api/projects/upl/pool/upload",
+        files={"file": ("my_clip.mp4", io.BytesIO(file_bytes), "video/mp4")},
+        data={
+            "label": "opening shot",
+            "originalFilepath": "/home/user/Footage/my_clip.mp4",
+        },
     )
-    with urllib.request.urlopen(req, timeout=5) as r:
-        resp = json.loads(r.read().decode())
+    resp = r.json()
 
     assert resp["success"] is True
     seg_id = resp["poolSegmentId"]
@@ -160,7 +120,7 @@ def test_upload_multipart_creates_pool_segment(server):
     assert dest.stat().st_size == 2048
 
     # DB row surfaces in /pool listing with the right metadata
-    _, listing = _get(server["base"], "/api/projects/upl/pool")
+    _, listing = _get(server, "/api/projects/upl/pool")
     seg = next(s for s in listing["segments"] if s["id"] == seg_id)
     assert seg["kind"] == "imported"
     assert seg["label"] == "opening shot"
@@ -170,7 +130,7 @@ def test_upload_multipart_creates_pool_segment(server):
 
 def test_import_missing_source(server):
     _make_project(server["work_dir"], "imp")
-    status, resp = _post(server["base"], "/api/projects/imp/pool/import", {
+    status, resp = _post(server, "/api/projects/imp/pool/import", {
         "sourcePath": "/nonexistent/path.mp4",
     })
     assert status == 404
@@ -192,7 +152,7 @@ def test_get_pool_returns_segments_with_metadata(server):
                         original_filepath="/src/drone.mov",
                         label="drone.mov")
 
-    status, resp = _get(server["base"], "/api/projects/lst/pool")
+    status, resp = _get(server, "/api/projects/lst/pool")
     assert status == 200
     segs = resp["segments"]
     by_id = {s["id"]: s for s in segs}
@@ -213,11 +173,11 @@ def test_get_pool_filter_by_kind(server):
                         pool_path="pool/segments/import_1.mp4",
                         original_filename="x.mp4")
 
-    status, resp = _get(server["base"], "/api/projects/flt/pool?kind=generated")
+    status, resp = _get(server, "/api/projects/flt/pool?kind=generated")
     ids = {s["id"] for s in resp["segments"]}
     assert ids == {g}
 
-    status, resp = _get(server["base"], "/api/projects/flt/pool?kind=imported")
+    status, resp = _get(server, "/api/projects/flt/pool?kind=imported")
     ids = {s["id"] for s in resp["segments"]}
     assert ids == {i}
 
@@ -231,12 +191,12 @@ def test_rename_updates_label_preserves_attribution(server):
                           original_filename="raw.mov",
                           label="raw.mov")
 
-    status, resp = _post(server["base"], "/api/projects/ren/pool/rename", {
+    status, resp = _post(server, "/api/projects/ren/pool/rename", {
         "poolSegmentId": seg, "label": "opening drone shot",
     })
     assert status == 200 and resp["success"]
 
-    status, resp = _get(server["base"], "/api/projects/ren/pool")
+    status, resp = _get(server, "/api/projects/ren/pool")
     seg_row = next(s for s in resp["segments"] if s["id"] == seg)
     assert seg_row["label"] == "opening drone shot"
     # Attribution and original filename are not touched
@@ -246,7 +206,7 @@ def test_rename_updates_label_preserves_attribution(server):
 
 def test_rename_missing_segment_404(server):
     _make_project(server["work_dir"], "ren2")
-    status, resp = _post(server["base"], "/api/projects/ren2/pool/rename", {
+    status, resp = _post(server, "/api/projects/ren2/pool/rename", {
         "poolSegmentId": "bogus", "label": "whatever",
     })
     assert status == 404
@@ -259,30 +219,30 @@ def test_tag_and_untag(server):
     seg = add_pool_segment(project, kind="generated", created_by="a",
                           pool_path="pool/segments/cand_1.mp4")
 
-    status, _ = _post(server["base"], "/api/projects/tag/pool/tag", {
+    status, _ = _post(server, "/api/projects/tag/pool/tag", {
         "poolSegmentId": seg, "tag": "keeper",
     })
     assert status == 200
-    status, _ = _post(server["base"], "/api/projects/tag/pool/tag", {
+    status, _ = _post(server, "/api/projects/tag/pool/tag", {
         "poolSegmentId": seg, "tag": "sunset",
     })
     assert status == 200
 
-    status, resp = _get(server["base"], "/api/projects/tag/pool?tag=keeper")
+    status, resp = _get(server, "/api/projects/tag/pool?tag=keeper")
     assert {s["id"] for s in resp["segments"]} == {seg}
-    status, resp = _get(server["base"], "/api/projects/tag/pool?tag=sunset")
+    status, resp = _get(server, "/api/projects/tag/pool?tag=sunset")
     assert {s["id"] for s in resp["segments"]} == {seg}
-    status, resp = _get(server["base"], "/api/projects/tag/pool?tag=nonexistent")
+    status, resp = _get(server, "/api/projects/tag/pool?tag=nonexistent")
     assert resp["segments"] == []
 
     # Untag one
-    status, _ = _post(server["base"], "/api/projects/tag/pool/untag", {
+    status, _ = _post(server, "/api/projects/tag/pool/untag", {
         "poolSegmentId": seg, "tag": "sunset",
     })
     assert status == 200
-    status, resp = _get(server["base"], "/api/projects/tag/pool?tag=sunset")
+    status, resp = _get(server, "/api/projects/tag/pool?tag=sunset")
     assert resp["segments"] == []
-    status, resp = _get(server["base"], "/api/projects/tag/pool?tag=keeper")
+    status, resp = _get(server, "/api/projects/tag/pool?tag=keeper")
     assert {s["id"] for s in resp["segments"]} == {seg}
 
 
@@ -295,11 +255,11 @@ def test_list_all_tags_with_counts(server):
 
     for seg_id, tags in [(s1, ["keeper", "sunset"]), (s2, ["keeper"])]:
         for t in tags:
-            _post(server["base"], "/api/projects/tags/pool/tag", {
+            _post(server, "/api/projects/tags/pool/tag", {
                 "poolSegmentId": seg_id, "tag": t,
             })
 
-    status, resp = _get(server["base"], "/api/projects/tags/pool/tags")
+    status, resp = _get(server, "/api/projects/tags/pool/tags")
     by_name = {t["tag"]: t["count"] for t in resp["tags"]}
     assert by_name["keeper"] == 2
     assert by_name["sunset"] == 1
@@ -332,7 +292,7 @@ def test_gc_preview_shows_only_orphaned_generated(server):
                                    pool_path="pool/segments/import_stays.mp4",
                                    original_filename="asset.mov")
 
-    status, resp = _get(server["base"], "/api/projects/gc/pool/gc-preview")
+    status, resp = _get(server, "/api/projects/gc/pool/gc-preview")
     ids = {s["id"] for s in resp["segments"]}
     assert ids == {s_orphan}
     assert resp["wouldDelete"] == 1
@@ -345,12 +305,12 @@ def test_gc_deletes_files_and_rows(server):
     disk = project / "pool/segments/cand_orphan.mp4"
     _make_fake_video(disk, 4096)
 
-    status, resp = _post(server["base"], "/api/projects/gcd/pool/gc", {})
+    status, resp = _post(server, "/api/projects/gcd/pool/gc", {})
     assert status == 200
     assert resp["deleted"] == 1
     assert resp["freedBytes"] == 4096
     assert not disk.exists()
 
     # DB row gone
-    status, resp = _get(server["base"], "/api/projects/gcd/pool")
+    status, resp = _get(server, "/api/projects/gcd/pool")
     assert s_orphan not in {s["id"] for s in resp["segments"]}

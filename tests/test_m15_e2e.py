@@ -21,13 +21,7 @@ from __future__ import annotations
 
 import io
 import json
-import socket
-import threading
-import time
-import urllib.error
-import urllib.request
 import wave
-from http.server import HTTPServer
 from pathlib import Path
 
 import numpy as np
@@ -35,7 +29,8 @@ import pytest
 
 import asyncio
 
-from scenecraft.api_server import make_handler
+from fastapi.testclient import TestClient
+from scenecraft.api.app import create_app
 from scenecraft.chat import _exec_analyze_master_bus as _exec_analyze_master_bus_async
 
 
@@ -69,77 +64,35 @@ from scenecraft.mix_graph_hash import compute_mix_graph_hash
 
 @pytest.fixture
 def server(tmp_path):
-    """Spawn api_server on a random port; yield {port, work_dir, base}."""
+    """Create FastAPI TestClient; yield {work_dir, client}."""
     work_dir = tmp_path / "work"
     work_dir.mkdir()
 
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
+    app = create_app(work_dir=work_dir)
+    client = TestClient(app, raise_server_exceptions=False)
 
-    Handler = make_handler(work_dir)
-    httpd = HTTPServer(("127.0.0.1", port), Handler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    time.sleep(0.05)
-
-    yield {"port": port, "work_dir": work_dir, "base": f"http://127.0.0.1:{port}"}
-
-    httpd.shutdown()
-    httpd.server_close()
+    yield {"work_dir": work_dir, "client": client}
 
 
-def _build_multipart(*, audio: bytes, mix_graph_hash: str,
-                     start_time_s: float, end_time_s: float,
-                     sample_rate: int, channels: int,
-                     boundary: str = "----e2eboundary9999") -> tuple[bytes, str]:
-    chunks: list[bytes] = []
-    chunks.append(
-        (f"--{boundary}\r\n"
-         f'Content-Disposition: form-data; name="audio"; filename="mix.wav"\r\n'
-         "Content-Type: audio/wav\r\n"
-         "\r\n").encode()
-    )
-    chunks.append(audio)
-    chunks.append(b"\r\n")
-
-    def _text_field(name: str, value: str):
-        chunks.append(
-            (f"--{boundary}\r\n"
-             f'Content-Disposition: form-data; name="{name}"\r\n'
-             "\r\n"
-             f"{value}"
-             "\r\n").encode()
-        )
-
-    _text_field("mix_graph_hash", mix_graph_hash)
-    _text_field("start_time_s", str(start_time_s))
-    _text_field("end_time_s", str(end_time_s))
-    _text_field("sample_rate", str(sample_rate))
-    _text_field("channels", str(channels))
-
-    chunks.append(f"--{boundary}--\r\n".encode())
-    return b"".join(chunks), boundary
-
-
-def _post_multipart(base: str, path: str, body: bytes,
-                    boundary: str) -> tuple[int, dict]:
-    req = urllib.request.Request(
-        f"{base}{path}",
-        data=body,
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        method="POST",
+def _post_multipart(server: dict, path: str, *,
+                    audio: bytes, mix_graph_hash: str,
+                    start_time_s: float, end_time_s: float,
+                    sample_rate: int, channels: int) -> tuple[int, dict]:
+    resp = server["client"].post(
+        path,
+        files={"audio": ("mix.wav", io.BytesIO(audio), "audio/wav")},
+        data={
+            "mix_graph_hash": mix_graph_hash,
+            "start_time_s": str(start_time_s),
+            "end_time_s": str(end_time_s),
+            "sample_rate": str(sample_rate),
+            "channels": str(channels),
+        },
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return r.status, json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode()
-        try:
-            return e.code, json.loads(raw)
-        except Exception:
-            return e.code, {"raw": raw}
+        return resp.status_code, resp.json()
+    except Exception:
+        return resp.status_code, {"raw": resp.text}
 
 
 # ── WAV helpers ────────────────────────────────────────────────────────────
@@ -185,15 +138,12 @@ def _upload_wav(server: dict, project_name: str, y: np.ndarray, *,
                 channels: int = 2) -> dict:
     """Post a synthesized WAV to the endpoint; assert 201 and return resp."""
     wav_bytes = _float_to_pcm16_wav_bytes(y, sr)
-    body, boundary = _build_multipart(
+    status, resp = _post_multipart(
+        server,
+        f"/api/projects/{project_name}/mix-render-upload",
         audio=wav_bytes, mix_graph_hash=mix_graph_hash,
         start_time_s=0.0, end_time_s=duration_s,
         sample_rate=sr, channels=channels,
-    )
-    status, resp = _post_multipart(
-        server["base"],
-        f"/api/projects/{project_name}/mix-render-upload",
-        body, boundary,
     )
     assert status == 201, f"upload failed {status} {resp}"
     return resp

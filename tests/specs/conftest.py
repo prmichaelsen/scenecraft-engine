@@ -121,57 +121,64 @@ def close_all_connections(tmp_path: Path, request):
 
 @pytest.fixture(scope="session")
 def engine_server(tmp_path_factory):
-    """Live HTTP server fixture for e2e tests.
+    """Live HTTP server fixture for e2e tests — FastAPI via uvicorn on a real port.
 
-    Boots a `ThreadedHTTPServer` directly (bypassing `run_server` to avoid
-    coupling to the websocket server, plugin host, and folder watcher), binds
-    to port 0 for auto-assignment, and yields an object with:
+    Tests use raw ``urllib.request.urlopen`` against ``base_url``, so the server
+    must bind a real socket. We run uvicorn in a background thread on port 0
+    (auto-assigned) and provide the same interface as the legacy HTTPServer fixture:
 
-      - `.base_url`  : e.g. "http://127.0.0.1:<port>"
-      - `.work_dir`  : temp work_dir (session-scoped) — tests create per-test
-                       projects under here via POST /api/projects/create
-      - `.request(method, path, body=None, timeout=10)`
-                     : helper returning (status, headers, body_bytes)
-      - `.json(method, path, body=None, timeout=10)`
-                     : helper returning (status, parsed_json)
-
-    On teardown: `server.shutdown()`, joins the thread (≤5s), and removes
-    the temp work_dir.
+      - ``.base_url``  : e.g. ``http://127.0.0.1:<port>``
+      - ``.work_dir``  : temp work_dir (session-scoped)
+      - ``.request(method, path, body=None, timeout=10)``
+                       : helper returning (status, headers_dict, body_bytes)
+      - ``.json(method, path, body=None, timeout=10)``
+                       : helper returning (status, parsed_json)
     """
     import json as _json
     import socket
     import threading as _threading
     import urllib.request
     import urllib.error
-    from http.server import HTTPServer
-    from socketserver import ThreadingMixIn
 
     global _ENGINE_SERVER_WORK_DIR
     work_dir = tmp_path_factory.mktemp("engine_server_workdir")
     _ENGINE_SERVER_WORK_DIR = work_dir
 
-    # Lazy import so that merely collecting tests doesn't pull in the whole
-    # server module on every pytest run.
-    from scenecraft.api_server import make_handler
+    from scenecraft.api.app import create_app
+    import uvicorn
 
-    handler = make_handler(work_dir, no_auth=True)
+    app = create_app(work_dir=work_dir, enable_docs=True, testing=True)
 
-    class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-        daemon_threads = True
-        allow_reuse_address = True
+    # Find a free port.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
 
-    server = _ThreadedHTTPServer(("127.0.0.1", 0), handler)
-    port = server.server_address[1]
-    base_url = f"http://127.0.0.1:{port}"
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    server = uvicorn.Server(config)
 
-    thread = _threading.Thread(target=server.serve_forever, daemon=True)
+    thread = _threading.Thread(target=server.run, daemon=True)
     thread.start()
+
+    # Wait for the server to be ready.
+    for _ in range(100):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.1)
+            s.connect(("127.0.0.1", port))
+            s.close()
+            break
+        except OSError:
+            import time as _t
+            _t.sleep(0.05)
+
+    base_url = f"http://127.0.0.1:{port}"
 
     class _Server:
         def __init__(self):
             self.base_url = base_url
             self.work_dir = work_dir
-            self.server = server
 
         def request(self, method: str, path: str, body=None, timeout: float = 10.0):
             url = self.base_url + path
@@ -196,23 +203,10 @@ def engine_server(tmp_path_factory):
             except Exception:
                 return status, raw
 
-    # Sanity-check the server is actually listening before handing out.
-    for _ in range(50):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.1)
-            s.connect(("127.0.0.1", port))
-            s.close()
-            break
-        except OSError:
-            import time as _t
-            _t.sleep(0.02)
-
     try:
         yield _Server()
     finally:
-        server.shutdown()
-        server.server_close()
+        server.should_exit = True
         thread.join(timeout=5.0)
 
 

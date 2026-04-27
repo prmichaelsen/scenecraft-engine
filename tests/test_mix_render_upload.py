@@ -11,18 +11,13 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-import socket
-import threading
-import time
-import urllib.error
-import urllib.request
 import wave
-from http.server import HTTPServer
 from pathlib import Path
 
 import pytest
 
-from scenecraft.api_server import make_handler
+from fastapi.testclient import TestClient
+from scenecraft.api.app import create_app
 
 
 # ── Fixtures ────────────────────────────────────────────────────────
@@ -33,21 +28,10 @@ def server(tmp_path):
     work_dir = tmp_path / "work"
     work_dir.mkdir()
 
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
+    app = create_app(work_dir=work_dir)
+    client = TestClient(app, raise_server_exceptions=False)
 
-    Handler = make_handler(work_dir)
-    httpd = HTTPServer(("127.0.0.1", port), Handler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    time.sleep(0.05)
-
-    yield {"port": port, "work_dir": work_dir, "base": f"http://127.0.0.1:{port}"}
-
-    httpd.shutdown()
-    httpd.server_close()
+    yield {"work_dir": work_dir, "client": client}
 
 
 def _make_project(work_dir: Path, name: str = "mixproj") -> Path:
@@ -125,23 +109,17 @@ def _build_multipart(*, audio: bytes | None, mix_graph_hash: str | None,
     return b"".join(chunks), boundary
 
 
-def _post_multipart(base: str, path: str, body: bytes,
+def _post_multipart(srv, path: str, body: bytes,
                     boundary: str) -> tuple[int, dict]:
-    req = urllib.request.Request(
-        f"{base}{path}",
-        data=body,
+    resp = srv["client"].post(
+        path,
+        content=body,
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=5) as r:
-            return r.status, json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode()
-        try:
-            return e.code, json.loads(raw)
-        except Exception:
-            return e.code, {"raw": raw}
+        return resp.status_code, resp.json()
+    except Exception:
+        return resp.status_code, {"raw": resp.text}
 
 
 # ── Tests ───────────────────────────────────────────────────────────
@@ -160,7 +138,7 @@ def test_valid_upload_writes_file_and_returns_201(server):
         sample_rate=sr, channels=ch,
     )
     status, resp = _post_multipart(
-        server["base"], "/api/projects/p1/mix-render-upload", body, boundary,
+        server, "/api/projects/p1/mix-render-upload", body, boundary,
     )
 
     assert status == 201, resp
@@ -185,7 +163,7 @@ def test_missing_mix_graph_hash_returns_400(server):
         sample_rate=48000, channels=2,
     )
     status, resp = _post_multipart(
-        server["base"], "/api/projects/p2/mix-render-upload", body, boundary,
+        server, "/api/projects/p2/mix-render-upload", body, boundary,
     )
     assert status == 400, resp
     assert "mix_graph_hash" in resp.get("error", "").lower()
@@ -202,7 +180,7 @@ def test_bad_hex_hash_returns_400(server):
         sample_rate=48000, channels=2,
     )
     status, resp = _post_multipart(
-        server["base"], "/api/projects/p3/mix-render-upload", body, boundary,
+        server, "/api/projects/p3/mix-render-upload", body, boundary,
     )
     assert status == 400, resp
     assert "64 hex" in resp.get("error", "")
@@ -215,7 +193,7 @@ def test_bad_hex_hash_returns_400(server):
         sample_rate=48000, channels=2,
     )
     status, resp = _post_multipart(
-        server["base"], "/api/projects/p3/mix-render-upload", body, boundary,
+        server, "/api/projects/p3/mix-render-upload", body, boundary,
     )
     assert status == 400, resp
 
@@ -232,7 +210,7 @@ def test_duration_mismatch_rejects_and_deletes(server):
         sample_rate=48000, channels=2,
     )
     status, resp = _post_multipart(
-        server["base"], "/api/projects/p4/mix-render-upload", body, boundary,
+        server, "/api/projects/p4/mix-render-upload", body, boundary,
     )
     assert status == 400, resp
     assert "duration" in resp.get("error", "").lower()
@@ -255,7 +233,7 @@ def test_overwrite_same_hash_is_idempotent(server):
             sample_rate=sr, channels=ch,
         )
         status, resp = _post_multipart(
-            server["base"], "/api/projects/p5/mix-render-upload", body, boundary,
+            server, "/api/projects/p5/mix-render-upload", body, boundary,
         )
         assert status == 201, resp
 
@@ -279,7 +257,7 @@ def test_creates_mixes_dir_on_first_upload(server):
         sample_rate=sr, channels=ch,
     )
     status, resp = _post_multipart(
-        server["base"], "/api/projects/p6/mix-render-upload", body, boundary,
+        server, "/api/projects/p6/mix-render-upload", body, boundary,
     )
     assert status == 201, resp
     assert (project / "pool" / "mixes").is_dir()
@@ -297,7 +275,7 @@ def test_sample_rate_mismatch_rejects(server):
         sample_rate=44100, channels=2,
     )
     status, resp = _post_multipart(
-        server["base"], "/api/projects/p7/mix-render-upload", body, boundary,
+        server, "/api/projects/p7/mix-render-upload", body, boundary,
     )
     assert status == 400, resp
     assert "sample_rate" in resp.get("error", "").lower()

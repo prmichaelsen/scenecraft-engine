@@ -18,17 +18,8 @@ from __future__ import annotations
 from scenecraft.plugin_host import PluginContext, PluginHost
 
 from .handlers import (
-    GET_TRANSCRIPTION_INPUT_SCHEMA,
-    GET_TRANSCRIPTION_TOOL_DESCRIPTION,
-    LIST_TRANSCRIPTIONS_INPUT_SCHEMA,
-    LIST_TRANSCRIPTIONS_TOOL_DESCRIPTION,
     TRANSCRIBE_CLIP_INPUT_SCHEMA,
     TRANSCRIBE_CLIP_TOOL_DESCRIPTION,
-    handle_get_transcription,
-    handle_list_transcriptions,
-    handle_rest_get_run,
-    handle_rest_list_runs,
-    handle_rest_run,
     handle_transcribe_clip,
     handle_transcribe_operation,
 )
@@ -36,17 +27,8 @@ from .handlers import (
 # Re-exports so the manifest's ``handler: "backend:<attr>"`` refs can find
 # these at the plugin module root via getattr().
 __all__ = [
-    "GET_TRANSCRIPTION_INPUT_SCHEMA",
-    "GET_TRANSCRIPTION_TOOL_DESCRIPTION",
-    "LIST_TRANSCRIPTIONS_INPUT_SCHEMA",
-    "LIST_TRANSCRIPTIONS_TOOL_DESCRIPTION",
     "TRANSCRIBE_CLIP_INPUT_SCHEMA",
     "TRANSCRIBE_CLIP_TOOL_DESCRIPTION",
-    "handle_get_transcription",
-    "handle_list_transcriptions",
-    "handle_rest_get_run",
-    "handle_rest_list_runs",
-    "handle_rest_run",
     "handle_transcribe_clip",
     "handle_transcribe_operation",
 ]

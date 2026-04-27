@@ -1,20 +1,18 @@
 """Integration tests for the REST API server.
 
-Spins up the API server on a random port against a temp project directory,
-then exercises the key REST endpoints end-to-end through the DB layer.
+Exercises the key REST endpoints end-to-end through the DB layer
+using FastAPI's TestClient (T65 cutover from legacy HTTPServer).
 """
 
 import json
 import shutil
 import tempfile
-import threading
-from http.server import HTTPServer
 from pathlib import Path
-from urllib.request import Request, urlopen
 
 import pytest
 
-from scenecraft.api_server import make_handler
+from fastapi.testclient import TestClient
+from scenecraft.api.app import create_app
 from scenecraft.db import (
     close_db, get_keyframes, get_transitions, set_meta,
     _migrated_dbs,
@@ -26,7 +24,7 @@ from scenecraft.db import (
 
 @pytest.fixture
 def project_env():
-    """Create a temp work dir with a single project and start the API server."""
+    """Create a temp work dir with a single project and a TestClient."""
     work_dir = Path(tempfile.mkdtemp())
     project_name = "test_project"
     project_dir = work_dir / project_name
@@ -36,20 +34,16 @@ def project_env():
     set_meta(project_dir, "title", "Test Project")
     set_meta(project_dir, "fps", 24)
 
-    Handler = make_handler(work_dir)
-    server = HTTPServer(("127.0.0.1", 0), Handler)
-    port = server.server_address[1]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    app = create_app(work_dir=work_dir)
+    client = TestClient(app, raise_server_exceptions=False)
 
     yield {
         "work_dir": work_dir,
         "project_dir": project_dir,
         "project_name": project_name,
-        "base_url": f"http://127.0.0.1:{port}",
+        "client": client,
     }
 
-    server.shutdown()
     close_db(project_dir)
     # Clear migration cache so next test gets a fresh DB
     db_path = str(project_dir / "project.db")
@@ -58,19 +52,19 @@ def project_env():
 
 
 def api(env, method, path, body=None):
-    """Helper: send a JSON request to the test server."""
-    from urllib.error import HTTPError
-    url = f"{env['base_url']}{path}"
-    data = json.dumps(body).encode() if body is not None else None
-    req = Request(url, data=data, method=method)
-    if data:
-        req.add_header("Content-Type", "application/json")
-    try:
-        resp = urlopen(req)
-        return json.loads(resp.read())
-    except HTTPError as e:
-        error_body = e.read().decode()
-        raise AssertionError(f"HTTP {e.code} on {method} {path}: {error_body}") from e
+    """Helper: send a JSON request to the TestClient."""
+    client = env["client"]
+    if method == "GET":
+        resp = client.get(path)
+    elif method == "POST":
+        resp = client.post(path, json=body)
+    elif method == "DELETE":
+        resp = client.delete(path, json=body)
+    else:
+        resp = client.request(method, path, json=body)
+    if resp.status_code >= 400:
+        raise AssertionError(f"HTTP {resp.status_code} on {method} {path}: {resp.text}")
+    return resp.json()
 
 
 def get_editor_data(env):

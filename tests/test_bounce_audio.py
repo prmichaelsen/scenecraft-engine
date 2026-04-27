@@ -23,20 +23,15 @@ import asyncio
 import hashlib
 import io
 import json
-import socket
-import threading
-import time
-import urllib.error
-import urllib.request
 import wave
-from http.server import HTTPServer
 from pathlib import Path
 
 import numpy as np
 import pytest
 import soundfile as sf
 
-from scenecraft.api_server import make_handler
+from fastapi.testclient import TestClient
+from scenecraft.api.app import create_app
 from scenecraft.bounce_hash import compute_bounce_hash
 from scenecraft.chat import (
     BOUNCE_AUDIO_TOOL,
@@ -106,21 +101,10 @@ def http_server(tmp_path):
     work_dir = tmp_path / "work"
     work_dir.mkdir()
 
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
+    app = create_app(work_dir=work_dir)
+    client = TestClient(app, raise_server_exceptions=False)
 
-    Handler = make_handler(work_dir)
-    httpd = HTTPServer(("127.0.0.1", port), Handler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    time.sleep(0.05)
-
-    yield {"port": port, "work_dir": work_dir, "base": f"http://127.0.0.1:{port}"}
-
-    httpd.shutdown()
-    httpd.server_close()
+    yield {"work_dir": work_dir, "client": client}
 
 
 def _make_http_project(work_dir: Path, name: str) -> Path:
@@ -196,33 +180,23 @@ def _build_multipart(*, audio: bytes, composite_hash: str,
     return b"".join(chunks), boundary
 
 
-def _post_multipart(base: str, path: str, body: bytes,
+def _post_multipart(srv, path: str, body: bytes,
                     boundary: str) -> tuple[int, dict]:
-    req = urllib.request.Request(
-        f"{base}{path}",
-        data=body,
+    resp = srv["client"].post(
+        path,
+        content=body,
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=5) as r:
-            return r.status, json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode()
-        try:
-            return e.code, json.loads(raw)
-        except Exception:
-            return e.code, {"raw": raw}
+        return resp.status_code, resp.json()
+    except Exception:
+        return resp.status_code, {"raw": resp.text}
 
 
-def _get_raw(base: str, path: str) -> tuple[int, bytes, dict]:
+def _get_raw(srv, path: str) -> tuple[int, bytes, dict]:
     """GET returning (status, body_bytes, headers)."""
-    req = urllib.request.Request(f"{base}{path}", method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=5) as r:
-            return r.status, r.read(), dict(r.headers)
-    except urllib.error.HTTPError as e:
-        return e.code, e.read(), dict(e.headers)
+    resp = srv["client"].get(path)
+    return resp.status_code, resp.content, dict(resp.headers)
 
 
 # ── 1. Registration ─────────────────────────────────────────────────
@@ -540,7 +514,7 @@ def test_download_returns_wav_with_correct_headers(http_server):
     close_db(project)
 
     status, body, headers = _get_raw(
-        http_server["base"], f"/api/projects/dl/bounces/{bounce.id}.wav",
+        http_server, f"/api/projects/dl/bounces/{bounce.id}.wav",
     )
     assert status == 200
     assert headers.get("Content-Type") == "audio/wav"
@@ -558,7 +532,7 @@ def test_download_returns_wav_with_correct_headers(http_server):
 def test_download_bogus_id_returns_404(http_server):
     _make_http_project(http_server["work_dir"], "dl2")
     status, body, _ = _get_raw(
-        http_server["base"], "/api/projects/dl2/bounces/bounce_nosuch.wav",
+        http_server, "/api/projects/dl2/bounces/bounce_nosuch.wav",
     )
     assert status == 404
 
@@ -579,7 +553,7 @@ def test_download_missing_file_returns_404(http_server):
     # Note: we intentionally did NOT write the WAV to pool/bounces/.
 
     status, body, _ = _get_raw(
-        http_server["base"], f"/api/projects/dl3/bounces/{bounce.id}.wav",
+        http_server, f"/api/projects/dl3/bounces/{bounce.id}.wav",
     )
     assert status == 404
 
@@ -600,7 +574,7 @@ def test_upload_endpoint_writes_wav_and_returns_201(http_server):
         sample_rate=sr, bit_depth=16, channels=ch,
     )
     status, resp = _post_multipart(
-        http_server["base"], "/api/projects/up1/bounce-upload", body, boundary,
+        http_server, "/api/projects/up1/bounce-upload", body, boundary,
     )
     assert status == 201, resp
     assert resp["rendered_path"] == f"pool/bounces/{h}.wav"
