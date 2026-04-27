@@ -801,25 +801,32 @@ def test_transition_dangling_from_kf_allowed(project_dir: Path, db_conn):
         f"track-id-fallback: from_kf missing → track_1, got {tr['track_id']!r}"
 
 
-@pytest.mark.xfail(
-    reason="target-state; spec documents 'FK off, orphan accepted' but current code sets PRAGMA foreign_keys=ON (engine-connection spec R4), so orphan inserts are actually rejected. Spec R28 needs update.",
-    strict=False,
-)
-def test_audio_candidate_orphan_insert_succeeds(project_dir: Path, db_conn):
-    """covers R28."""
+def test_audio_candidate_orphan_insert_rejects(project_dir: Path, db_conn):
+    """covers R28.
+
+    PRAGMA foreign_keys=ON is applied post-schema-init per engine-connection-and-transactions
+    R4+R26. An audio_candidate insert referencing a non-existent audio_clip_id must raise
+    sqlite3.IntegrityError at runtime and must not persist a row.
+    """
+    import sqlite3 as _sqlite3
+
     # Given: no audio_clips row with id 'missing-clip'
     seg = _seed_pool_segment(project_dir, "p/s1.wav")
 
-    # When
-    scdb.add_audio_candidate(project_dir, audio_clip_id="missing-clip",
-                             pool_segment_id=seg, source="imported")
+    # When / Then
+    with pytest.raises(_sqlite3.IntegrityError):
+        scdb.add_audio_candidate(
+            project_dir,
+            audio_clip_id="missing-clip",
+            pool_segment_id=seg,
+            source="imported",
+        )
 
-    # Then
     rows = db_conn.execute(
         "SELECT * FROM audio_candidates WHERE audio_clip_id='missing-clip'"
     ).fetchall()
-    assert len(rows) == 1, f"insert-succeeds + row-present: expected 1 row, got {len(rows)}"
-    # documents-the-gap: witness of R28 (spec-stated behavior)
+    assert len(rows) == 0, f"row-absent: expected 0 rows after IntegrityError, got {len(rows)}"
+    # matches-connection-spec: behavior aligns with engine-connection-and-transactions R4+R26
 
 
 def test_unlink_transition_returns_ids(project_dir: Path, db_conn):

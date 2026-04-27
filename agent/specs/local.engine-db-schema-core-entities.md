@@ -96,7 +96,7 @@ Codify the per-project SQLite schema + DAL (Data Access Layer) contract for the 
 ### Schema — audio_candidates
 
 - **R27.** `audio_candidates` table: `audio_clip_id TEXT NOT NULL REFERENCES audio_clips(id)`, `pool_segment_id TEXT NOT NULL REFERENCES pool_segments(id)`, `added_at TEXT NOT NULL`, `source TEXT NOT NULL`. PK `(audio_clip_id, pool_segment_id)`. Indexes: `idx_audio_cand_clip`, `idx_audio_cand_seg`.
-- **R28.** FK constraints are **declared** in DDL but SQLite FK enforcement is OFF unless `PRAGMA foreign_keys=ON` is set. The engine does NOT set this PRAGMA globally; FK rejection of orphan inserts is therefore **not** enforced at runtime even though the DDL suggests it.
+- **R28.** FK constraints are **declared** in DDL. Per `engine-connection-and-transactions.md` R4+R26, the engine applies `PRAGMA foreign_keys=ON` as the final step of new-connection creation (post-schema-init). **Target state**: FK violations on `audio_candidates.audio_clip_id` / `audio_candidates.pool_segment_id` reject orphan inserts with `sqlite3.IntegrityError` at runtime. (Earlier drafts of this spec said FK enforcement was off — that was pre-OQ-8-resolution text and is no longer the contract.)
 - **R29.** `add_audio_candidate(audio_clip_id, pool_segment_id, source, added_at=None)` uses `INSERT OR IGNORE` (idempotent on PK). `source` MUST be in `('generated', 'imported', 'chat_generation', 'plugin')` — assertion raises otherwise.
 - **R30.** `get_audio_candidates(audio_clip_id)` joins `pool_segments`, returns ordered `ORDER BY added_at DESC` (newest first) with per-row `addedAt` and `junctionSource` fields appended.
 - **R31.** `assign_audio_candidate(audio_clip_id, pool_segment_id_or_None)` sets `audio_clips.selected`; None reverts to the original `source_path`.
@@ -285,7 +285,7 @@ set_sections(project_dir, sections: list[dict]) -> None   # full replace
 | 41 | remap.target_duration < 0 | CHECK constraint rejects at DB layer | `remap-negative-target-duration-rejected` |
 | 42 | transitions.from_kf references a nonexistent keyframe | Insert/update succeeds (no FK); get_transition returns the row; _row_to_transition emits it with the dangling id | `transition-dangling-from-kf-allowed` |
 | 43 | Legacy DB with `audio_clips.track_id NOT NULL` after master-bus migration | Target: table-rebuild migration via `register_migration` + `rebuild_table` helper re-creates audio_clips with nullable track_id. Transitional: column-existence check leaves NOT NULL in place | `audio-clips-legacy-nullable-track-id-rebuild` |
-| 44 | FK declared on audio_candidates.audio_clip_id but PRAGMA foreign_keys unset | Orphan insert succeeds at runtime | `audio-candidate-orphan-insert-succeeds` |
+| 44 | FK declared on audio_candidates.audio_clip_id with PRAGMA foreign_keys=ON | Orphan insert raises `sqlite3.IntegrityError` at runtime | `audio-candidate-orphan-insert-rejects` |
 | 45 | delete_keyframe with already-deleted_at | deleted_at overwritten with new value | `delete-keyframe-already-deleted-overwrites` |
 | 46 | update_transition with no fields | No-op; returns without executing UPDATE | `update-transition-noop-empty` |
 | 47 | _parse_kf_timestamp on unparseable input | Returns 0.0; propagation is a no-op | `parse-kf-timestamp-fallback` |
@@ -307,7 +307,7 @@ set_sections(project_dir, sections: list[dict]) -> None   # full replace
    - `audio_clips.track_id`: no FK.
    - `audio_clip_links` columns: no FKs.
    - `tr_candidates.transition_id`: no FK (`pool_segment_id` declares one).
-   - `audio_candidates` declares FKs but `PRAGMA foreign_keys` is not enabled, so they are informational (R28 / test #44).
+   - `audio_candidates` declares FKs and `PRAGMA foreign_keys=ON` is applied post-schema-init per R28 and the connection spec; orphan inserts are rejected at runtime.
 5. **Ordering contracts**:
    - `tr_candidates`: ASCENDING by `added_at` (oldest first — rank v1 = oldest).
    - `audio_candidates`: DESCENDING by `added_at` (newest first).
@@ -592,13 +592,13 @@ set_sections(project_dir, sections: list[dict]) -> None   # full replace
 - **row-readable**: `get_transition('T')` returns a dict with `from == 'ghost-kf'`
 - **track-id-fallback**: derived `track_id` == `'track_1'` (from_kf not found)
 
-#### Test: audio-candidate-orphan-insert-succeeds (covers R28)
-**Given**: No `audio_clips` row with id `'missing-clip'`.
+#### Test: audio-candidate-orphan-insert-rejects (covers R28)
+**Given**: No `audio_clips` row with id `'missing-clip'`. Connection created via `get_db` which applies `PRAGMA foreign_keys=ON` post-schema-init.
 **When**: `add_audio_candidate(project_dir, audio_clip_id='missing-clip', pool_segment_id=<real>, source='imported')`.
 **Then**:
-- **insert-succeeds**: No FK violation at runtime (PRAGMA foreign_keys not enabled)
-- **row-present**: row exists in `audio_candidates`
-- **documents-the-gap**: This test serves as the documented witness of R28
+- **insert-rejects**: `sqlite3.IntegrityError` raised (FK violation; PRAGMA foreign_keys=ON)
+- **row-absent**: No row in `audio_candidates` for the attempted insert
+- **matches-connection-spec**: Behavior aligns with `engine-connection-and-transactions.md` R4+R26
 
 #### Test: unlink-transition-returns-ids (covers R40)
 **Given**: 3 link rows for T.id.
