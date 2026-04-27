@@ -1126,6 +1126,24 @@ class TestEndToEnd:
             f"error-envelope: got {body!r}"
         )
 
+    def test_e2e_post_settings_missing_project_returns_404(self, engine_server):
+        """covers R17/R18 (task-91 amend) — POST /settings on unknown project returns 404 (e2e).
+
+        Companion to GET /settings: the POST update-settings handler had the
+        same gap (no _require_project_dir guard). Without the guard a POST
+        would silently create the settings.json under a path that has no
+        project. Both handlers now use the canonical missing-project 404.
+        """
+        status, body = engine_server.json(
+            "POST",
+            "/api/projects/does_not_exist_xyz/settings",
+            {"preview_quality": 75},
+        )
+        assert status == 404, f"missing-project-404: got {status} {body!r}"
+        assert isinstance(body, dict) and "error" in body, (
+            f"error-envelope: got {body!r}"
+        )
+
     def test_e2e_multiple_requests_migrated_once(self, engine_server, project_name):
         """covers R7, R8 — after many hits, db_path appears once in _migrated_dbs (e2e)."""
         for _ in range(5):

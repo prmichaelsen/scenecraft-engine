@@ -8605,6 +8605,8 @@ def make_handler(work_dir: Path, no_auth: bool = False):
 
         def _handle_update_settings(self, project_name: str):
             """POST /api/projects/:name/settings — update project settings."""
+            if self._require_project_dir(project_name) is None:
+                return
             body = self._read_json_body()
             if body is None:
                 return
