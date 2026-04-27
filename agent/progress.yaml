@@ -1051,6 +1051,19 @@ milestones:
           - task-85
         notes: "M18's highest-stakes task — locks every invariant the M16 FastAPI replacement must preserve (164 routes, auth, plugin catch-all, unknown-route 404, CORS, structural lock)."
 
+unassigned:
+  tasks:
+    - id: task-88
+      name: "Fix audio_clip linked-derivations SQL — bogus double-quoted from/to"
+      status: not_started
+      started: null
+      file: agent/tasks/unassigned/task-88-fix-audio-clip-linked-derivations-sql.md
+      estimated_hours: 0.5
+      actual_hours: null
+      completed_date: null
+      dependencies: []
+      notes: "Production bug surfaced by M18 task-71 regression tests: get_audio_clips SELECT uses `\"from\"`/`\"to\"` double-quoted identifiers that SQLite silently treats as string literals, breaking R25 playback_rate + effective_source_offset derivations for linked clips. One-line SQL fix; flips xfailed witness test to pass."
+
 documentation:
   design_documents: 8
   spec_documents: 21
