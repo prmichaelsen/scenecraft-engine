@@ -289,6 +289,48 @@ class TestUpdateTimestamp:
         kf = next(k for k in data["keyframes"] if k["id"] == kf_id)
         assert kf["timestamp"] == "0:08.00"
 
+    def test_update_timestamp_canonical_key(self, project_env):
+        """task-92: handler accepts canonical 'timestamp' body key (not just 'newTimestamp')."""
+        env = project_env
+        r = api(env, "POST", f"/api/projects/{env['project_name']}/add-keyframe", {"timestamp": "0:05.00"})
+        kf_id = r["keyframe"]["id"]
+
+        api(env, "POST", f"/api/projects/{env['project_name']}/update-timestamp", {
+            "keyframeId": kf_id,
+            "timestamp": "0:09.00",
+        })
+
+        data = get_editor_data(env)
+        kf = next(k for k in data["keyframes"] if k["id"] == kf_id)
+        assert kf["timestamp"] == "0:09.00"
+
+    def test_update_timestamp_both_keys_prefers_new_timestamp(self, project_env):
+        """task-92: when both keys present, 'newTimestamp' wins (legacy precedence preserved)."""
+        env = project_env
+        r = api(env, "POST", f"/api/projects/{env['project_name']}/add-keyframe", {"timestamp": "0:05.00"})
+        kf_id = r["keyframe"]["id"]
+
+        api(env, "POST", f"/api/projects/{env['project_name']}/update-timestamp", {
+            "keyframeId": kf_id,
+            "newTimestamp": "0:11.00",
+            "timestamp": "0:99.00",  # ignored — 'newTimestamp' wins
+        })
+
+        data = get_editor_data(env)
+        kf = next(k for k in data["keyframes"] if k["id"] == kf_id)
+        assert kf["timestamp"] == "0:11.00"
+
+    def test_update_timestamp_missing_both_returns_400(self, project_env):
+        """task-92: handler returns 400 when neither 'timestamp' nor 'newTimestamp' is present."""
+        env = project_env
+        r = api(env, "POST", f"/api/projects/{env['project_name']}/add-keyframe", {"timestamp": "0:05.00"})
+        kf_id = r["keyframe"]["id"]
+
+        with pytest.raises(AssertionError, match="HTTP 400"):
+            api(env, "POST", f"/api/projects/{env['project_name']}/update-timestamp", {
+                "keyframeId": kf_id,
+            })
+
 
 # ── Track Operations ────────────────────────────────────────────────
 
