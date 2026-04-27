@@ -3,7 +3,7 @@
 **Milestone**: [M18 — Engine Regression Test Suite](../../milestones/milestone-18-engine-regression-test-suite.md)
 **Spec**: [`local.engine-generation-pipelines`](../../specs/local.engine-generation-pipelines.md)
 **Design Reference**: [`local.engine-generation-pipelines`](../../specs/local.engine-generation-pipelines.md)
-**Estimated Time**: 6-10 hours
+**Estimated Time**: 14 hours
 **Dependencies**: task-70, task-79
 **Status**: Not Started
 **Repository**: `scenecraft-engine`
@@ -12,7 +12,7 @@
 
 ## Objective
 
-Write unit + e2e tests for `local.engine-generation-pipelines.md`. Lock in: provider dispatch, candidate-pattern output (candidate on the existing entity, not a new sibling), job tracking, WS broadcast, and the "generation survives WS disconnect" invariant. Target-state tests use `@pytest.mark.xfail(reason="target-state; awaits M16 FastAPI refactor", strict=False)`.
+Write comprehensive unit AND e2e tests. E2E coverage MUST match unit coverage in breadth — every requirement's observable effect has an HTTP/WS-level test. Unit tests may mock; e2e MUST NOT. Lock in: provider dispatch, candidate-pattern output (candidate on the existing entity, not a new sibling), job tracking, WS broadcast, and the "generation survives WS disconnect" invariant. Target-state tests use `@pytest.mark.xfail(reason="target-state; awaits M16 FastAPI refactor", strict=False)`.
 
 ---
 
@@ -47,19 +47,34 @@ Target-ideal behaviors (e.g., cancel API, priority queue, concurrent job limits)
 
 ### 4. Cover every Behavior Table row
 
-### 5. Add e2e section
+### 5. E2E coverage checklist (comprehensive)
+
+Every documented generation endpoint + every documented WS event must have a live-server test with a stubbed provider. Walk the spec's Behavior Table — every row has an HTTP or WS boundary.
+
+Endpoints / WS events:
+
+- `POST /api/projects/:name/generate-keyframes` (Imagen) → candidate lands on keyframe via GET
+- `POST .../generate-transitions` (Veo, Kling) → candidate lands on transition
+- `POST .../generate-music` (Musicful) → audio_clip candidate (or track) lands
+- `POST .../generate-foley` — candidate pattern on audio_clip
+- Job tracking via `GET /api/jobs/:id` — state transitions `pending → running → succeeded`/`failed`
+- WS: subscriber receives `generation_started`, `generation_progress`, `generation_completed` / `generation_failed` in order
+- Survives-disconnect: open WS, submit job, close WS mid-run, reopen WS, assert final state via `GET /api/jobs/:id` + candidate reachable via GET (memory'd load-bearing invariant)
+- Error path: provider raises → job marked failed; WS emits failure event; legacy envelope
+- Candidate pattern: assert output is a candidate on the existing entity, NOT a new sibling track/keyframe (via entity GET)
+- Multiple concurrent jobs: each tracked independently; WS events distinguishable
+- Auth enforced on generation endpoints (401 without auth)
+- Destructive (if any) gated per spec
+- Target-state xfails: cancel API `POST /api/jobs/:id/cancel`, priority queue ordering, concurrent job limits → HTTP 429
+
+Each e2e test annotated `(covers Rn, row #N)`.
 
 ```python
 # === E2E ===
 
 class TestEndToEnd:
-    def test_generation_candidate_lands_on_entity(self, engine_server):
-        """covers Rn (e2e)"""
-        # POST a generation job with a stubbed provider; assert candidate appears on the correct entity.
-
-    def test_generation_survives_ws_disconnect(self, engine_server):
-        """covers Rn (e2e)"""
-        # Connect WS; submit job; disconnect; reconnect; assert final state reachable.
+    """Comprehensive e2e — every generation endpoint + WS event with stubbed provider."""
+    # ... tests per checklist
 ```
 
 ### 6. Run + verify + commit
@@ -78,7 +93,8 @@ git commit -m "test(M18-80): engine-generation-pipelines regression tests — <N
 - [ ] Every `Rn` has ≥1 covering test
 - [ ] Every Behavior Table row covered
 - [ ] Target-state tests use `xfail(..., strict=False)`
-- [ ] E2E section present
+- [ ] E2E section present with comprehensive endpoint + WS coverage
+- [ ] Every spec requirement has ≥1 e2e test (not just unit)
 - [ ] `pytest ... -v` passes
 
 ---

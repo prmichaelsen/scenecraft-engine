@@ -3,7 +3,7 @@
 **Milestone**: [M18 — Engine Regression Test Suite](../../milestones/milestone-18-engine-regression-test-suite.md)
 **Spec**: [`local.engine-migrations-framework`](../../specs/local.engine-migrations-framework.md)
 **Design Reference**: [`local.engine-migrations-framework`](../../specs/local.engine-migrations-framework.md)
-**Estimated Time**: 4-6 hours
+**Estimated Time**: 9 hours
 **Dependencies**: task-70
 **Status**: Not Started
 **Repository**: `scenecraft-engine`
@@ -12,7 +12,7 @@
 
 ## Objective
 
-Write unit + minimal e2e tests for `local.engine-migrations-framework.md`. Lock in the forward-only migration order, PRAGMA-detected in-place column adds, idempotence on re-run, and schema-version tracking. Target-state tests use `@pytest.mark.xfail(reason="target-state; awaits M16 FastAPI refactor", strict=False)`.
+Write comprehensive unit AND e2e tests. E2E coverage MUST match unit coverage in breadth — every requirement's observable effect has an HTTP/WS-level test. Lock in the forward-only migration order, PRAGMA-detected in-place column adds, idempotence on re-run, and schema-version tracking. Target-state tests use `@pytest.mark.xfail(reason="target-state; awaits M16 FastAPI refactor", strict=False)`.
 
 ---
 
@@ -48,23 +48,33 @@ Target-ideal behaviors (e.g., rollback recording, dry-run mode, checksum-based i
 
 ### 4. Cover every Behavior Table row
 
-### 5. Add e2e section
+### 5. E2E coverage checklist (comprehensive)
+
+Migrations are observable through the live engine boot + subsequent HTTP behavior. E2E MUST verify schema convergence through real server boot and reachable endpoints.
+
+Scenarios to exercise:
+
+- Boot engine against a **clean work_dir** via `engine_server` fixture → GET `/api/admin/schema` (or equivalent) → assert schema_migrations rows present for every shipped migration
+- Boot against a **partially-migrated work_dir** (fixture DB missing one migration) → assert only the missing migration runs; PRAGMA reports converged schema via a diagnostic endpoint
+- Boot against a **fresh (empty) project DB** → assert full schema bootstrap; subsequent `POST /api/projects/:name/keyframes` succeeds
+- Boot against a **fully-migrated DB** → assert idempotent (no migrations run; no altered rows); observable via stable schema_version row
+- Boot against a DB with an **unknown future migration version** → assert legible error and graceful bail (no partial writes)
+- Forward-only guard: if a future injection attempts a version lower than applied → reject (via admin endpoint if exposed, or boot-time log)
+- PRAGMA-detected in-place ALTER idempotence: boot twice; assert no duplicate columns, no errors
+- Migration isolation: inject a failing migration fixture; boot; assert rollback; subsequent healthy migration applies after fix
+- Legacy NOT NULL `audio_clips.track_id` rebuild path (OQ-8 target) → xfail until `register_migration` + `rebuild_table` land
+
+Each e2e test annotated `(covers Rn, row #N)`.
 
 ```python
 # === E2E ===
 
 class TestEndToEnd:
-    """Minimal e2e — boot the engine against a pre-migration DB fixture and assert schema converges."""
-
-    def test_engine_boots_against_pre_migration_db(self, tmp_path):
-        """covers Rn (e2e)"""
-        # Copy a fixture DB from tests/specs/fixtures/pre-migration.db into tmp_path.
-        # Call scenecraft.db.get_db(tmp_path). Assert no error.
-        # Assert PRAGMA user_version or schema-version table reflects the latest.
-        ...
+    """Comprehensive e2e — boot engine against varied DB fixtures; verify schema convergence via HTTP."""
+    # ... tests per checklist
 ```
 
-Keep the e2e small — one scenario.
+Fixture DBs live in `tests/specs/fixtures/` — keep each under 20 KB.
 
 ### 6. Run + verify + commit
 
@@ -82,7 +92,8 @@ git commit -m "test(M18-75): engine-migrations-framework regression tests — <N
 - [ ] Every `Rn` has ≥1 covering test
 - [ ] Every Behavior Table row covered
 - [ ] Target-state tests use `xfail(..., strict=False)`
-- [ ] E2E section present
+- [ ] E2E section present with comprehensive boot + schema-convergence coverage
+- [ ] Every spec requirement has ≥1 e2e test (not just unit)
 - [ ] `pytest ... -v` passes
 - [ ] Collect count matches spec
 

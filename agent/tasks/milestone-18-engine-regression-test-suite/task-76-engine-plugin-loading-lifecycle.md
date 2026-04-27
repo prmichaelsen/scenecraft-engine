@@ -3,7 +3,7 @@
 **Milestone**: [M18 — Engine Regression Test Suite](../../milestones/milestone-18-engine-regression-test-suite.md)
 **Spec**: [`local.engine-plugin-loading-lifecycle`](../../specs/local.engine-plugin-loading-lifecycle.md)
 **Design Reference**: [`local.engine-plugin-loading-lifecycle`](../../specs/local.engine-plugin-loading-lifecycle.md)
-**Estimated Time**: 4-6 hours
+**Estimated Time**: 9 hours
 **Dependencies**: task-70
 **Status**: Not Started
 **Repository**: `scenecraft-engine`
@@ -12,7 +12,7 @@
 
 ## Objective
 
-Write unit + e2e tests for `local.engine-plugin-loading-lifecycle.md`. Lock in: `plugin.yaml` manifest loading, plugin registration, sidecar-table creation (`<plugin_id>__<table>` prefix), route registration ordering (built-ins before plugin catch-all), and plugin lifecycle hooks. Target-state tests use `@pytest.mark.xfail(reason="target-state; awaits M16 FastAPI refactor", strict=False)`.
+Write comprehensive unit AND e2e tests. E2E coverage MUST match unit coverage in breadth — every requirement's observable effect has an HTTP/WS-level test. Lock in: `plugin.yaml` manifest loading, plugin registration, sidecar-table creation (`<plugin_id>__<table>` prefix), route registration ordering (built-ins before plugin catch-all), and plugin lifecycle hooks. Target-state tests use `@pytest.mark.xfail(reason="target-state; awaits M16 FastAPI refactor", strict=False)`.
 
 ---
 
@@ -48,22 +48,34 @@ Target-ideal behaviors (e.g., hot-reload, sandboxed exec, version pinning) → `
 
 ### 4. Cover every Behavior Table row
 
-### 5. Add e2e section
+### 5. E2E coverage checklist (comprehensive)
+
+Plugin loading has a large HTTP surface. E2E MUST exercise every plugin lifecycle + route registration + catch-all ordering behavior through the live server, per the spec's Behavior Table.
+
+Scenarios/endpoints:
+
+- Scaffold minimal plugin (plugin.yaml + handler.py); boot engine; `GET /plugin/<id>/<route>` → 200 + body
+- Plugin with multiple routes: all reachable; method parity per route
+- Plugin POST route: `POST /plugin/<id>/<route>` → sidecar table row created (verified via subsequent GET)
+- Malformed plugin.yaml: boot emits error; other plugins load; `GET /plugin/<bad_id>/...` → 404
+- Missing required field in manifest: boot rejects; `GET /api/plugins` omits it
+- Duplicate plugin_id: only first registers; second's routes unreachable (404)
+- Sidecar table prefix enforcement: plugin declaring unprefixed table → boot rejects; server fails to come up OR plugin marked disabled via `GET /api/plugins`
+- Route ordering: built-in `/api/...` wins over plugin catch-all even when plugin declares a colliding path — hit the collision URL, assert built-in response
+- Lifecycle hooks `on_load` / `on_unload`: observable via plugin-emitted log line or sidecar-table row
+- Plugin unload via admin endpoint (if exposed): sidecar tables preserved; routes unregister → 404
+- `GET /api/plugins` list reflects loaded state
+- WS: plugin emits WS event; subscriber receives with correct topic
+- Target-state xfails: hot-reload, sandboxed exec, version pinning at HTTP level
+
+Each e2e test annotated `(covers Rn, row #N)`.
 
 ```python
 # === E2E ===
 
 class TestEndToEnd:
-    """E2E — boot engine with a fake plugin on disk."""
-
-    def test_plugin_routes_reachable(self, engine_server, tmp_path):
-        """covers Rn (e2e)"""
-        # Scaffold a minimal plugin on disk (plugin.yaml + handler.py) before server boot.
-        # Hit /plugin/<id>/<route> via httpx; assert 200 and expected body.
-
-    def test_plugin_sidecar_tables_exist(self, engine_server, tmp_path):
-        """covers Rn (e2e)"""
-        # After boot, PRAGMA table_info for each declared sidecar table.
+    """Comprehensive e2e — plugin routes, sidecar tables, catch-all ordering, lifecycle."""
+    # ... tests per checklist
 ```
 
 ### 6. Run + verify + commit
@@ -82,7 +94,8 @@ git commit -m "test(M18-76): engine-plugin-loading-lifecycle regression tests �
 - [ ] Every `Rn` has ≥1 covering test
 - [ ] Every Behavior Table row covered
 - [ ] Target-state tests use `xfail(..., strict=False)`
-- [ ] E2E section present
+- [ ] E2E section present with comprehensive HTTP coverage
+- [ ] Every spec requirement has ≥1 e2e test (not just unit)
 - [ ] `pytest ... -v` passes
 - [ ] Collect count matches spec
 

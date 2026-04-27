@@ -3,7 +3,7 @@
 **Milestone**: [M18 — Engine Regression Test Suite](../../milestones/milestone-18-engine-regression-test-suite.md)
 **Spec**: [`local.engine-mcp-bridge`](../../specs/local.engine-mcp-bridge.md)
 **Design Reference**: [`local.engine-mcp-bridge`](../../specs/local.engine-mcp-bridge.md)
-**Estimated Time**: 4-6 hours
+**Estimated Time**: 9 hours
 **Dependencies**: task-70, task-76
 **Status**: Not Started
 **Repository**: `scenecraft-engine`
@@ -12,7 +12,7 @@
 
 ## Objective
 
-Write unit + e2e tests for `local.engine-mcp-bridge.md`. Lock in the MCP bridge's tool-dispatch parity with the direct-call path, auth preservation through the bridge, and request/response envelope. Target-state tests use `@pytest.mark.xfail(reason="target-state; awaits M16 FastAPI refactor", strict=False)`.
+Write comprehensive unit AND e2e tests. E2E coverage MUST match unit coverage in breadth — every requirement's observable effect has an HTTP/WS-level test. Lock in the MCP bridge's tool-dispatch parity with the direct-call path, auth preservation through the bridge, and request/response envelope. Target-state tests use `@pytest.mark.xfail(reason="target-state; awaits M16 FastAPI refactor", strict=False)`.
 
 ---
 
@@ -46,19 +46,32 @@ Target-ideal behaviors (e.g., request tracing IDs, per-tool timeouts, streaming 
 
 ### 4. Cover every Behavior Table row
 
-### 5. Add e2e section
+### 5. E2E coverage checklist (comprehensive)
+
+MCP bridge is itself a transport. E2E MUST exercise every documented MCP surface (stdio or SSE) against the live engine.
+
+Scenarios:
+
+- MCP `tools/list` → every registered chat tool present, names verbatim
+- MCP `tools/call <name>` for each tool category (creation, read, mutation, destructive) → parity with direct `POST /api/chat` tool invocation (same DB state, same WS events)
+- Unauthenticated MCP call → error envelope; authenticated (bearer / cookie) → success
+- Auth preservation across bridge: bearer in MCP request propagates to engine auth check
+- Error envelope: DAO raises → MCP returns `{error, message}` with legacy shape
+- Stream events: tool emits multiple WS events → MCP surfaces each (ordered)
+- Destructive flag honored: destructive tool via MCP without confirmation → rejected per spec
+- Concurrent MCP + REST calls on same project: MCP request doesn't bypass structural lock
+- Target-state xfails: request tracing IDs, per-tool timeouts, streaming progress events over MCP
+- Malformed MCP payload → legible error, no crash
+- Round-trip via MCP for undo/redo: mutate via MCP, undo via REST, verify MCP reads reflect the rollback
+
+Each e2e test annotated `(covers Rn, row #N)`.
 
 ```python
 # === E2E ===
 
 class TestEndToEnd:
-    def test_mcp_tool_round_trip(self, engine_server):
-        """covers Rn (e2e)"""
-        # Stand up the MCP bridge against the engine; call one tool; assert parity with direct-call.
-
-    def test_mcp_auth_enforced(self, engine_server):
-        """covers Rn (e2e)"""
-        # Unauthenticated MCP call → error envelope; authenticated → success.
+    """Comprehensive e2e — MCP parity, auth, error envelope, streaming, concurrency."""
+    # ... tests per checklist
 ```
 
 ### 6. Run + verify + commit
@@ -77,7 +90,8 @@ git commit -m "test(M18-77): engine-mcp-bridge regression tests — <N> unit + <
 - [ ] Every `Rn` has ≥1 covering test
 - [ ] Every Behavior Table row covered
 - [ ] Target-state tests use `xfail(..., strict=False)`
-- [ ] E2E section present
+- [ ] E2E section present with comprehensive MCP + parity coverage
+- [ ] Every spec requirement has ≥1 e2e test (not just unit)
 - [ ] `pytest ... -v` passes
 
 ---

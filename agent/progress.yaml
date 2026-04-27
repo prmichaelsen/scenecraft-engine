@@ -869,7 +869,7 @@ milestones:
         title: "engine-db-effects-and-curves regression tests"
         file: agent/tasks/milestone-18-engine-regression-test-suite/task-72-engine-db-effects-and-curves.md
         status: not_started
-        estimated_hours: 3.5
+        estimated_hours: 6
         started: null
         actual_hours: null
         completed_date: null
@@ -881,7 +881,7 @@ milestones:
         title: "engine-db-undo-redo regression tests"
         file: agent/tasks/milestone-18-engine-regression-test-suite/task-73-engine-db-undo-redo.md
         status: not_started
-        estimated_hours: 5
+        estimated_hours: 9
         started: null
         actual_hours: null
         completed_date: null
@@ -893,7 +893,7 @@ milestones:
         title: "engine-db-analysis-caches regression tests"
         file: agent/tasks/milestone-18-engine-regression-test-suite/task-74-engine-db-analysis-caches.md
         status: not_started
-        estimated_hours: 5
+        estimated_hours: 9
         started: null
         actual_hours: null
         completed_date: null
@@ -905,7 +905,7 @@ milestones:
         title: "engine-migrations-framework regression tests"
         file: agent/tasks/milestone-18-engine-regression-test-suite/task-75-engine-migrations-framework.md
         status: not_started
-        estimated_hours: 5
+        estimated_hours: 9
         started: null
         actual_hours: null
         completed_date: null
@@ -916,7 +916,7 @@ milestones:
         title: "engine-plugin-loading-lifecycle regression tests"
         file: agent/tasks/milestone-18-engine-regression-test-suite/task-76-engine-plugin-loading-lifecycle.md
         status: not_started
-        estimated_hours: 5
+        estimated_hours: 9
         started: null
         actual_hours: null
         completed_date: null
@@ -927,7 +927,7 @@ milestones:
         title: "engine-mcp-bridge regression tests"
         file: agent/tasks/milestone-18-engine-regression-test-suite/task-77-engine-mcp-bridge.md
         status: not_started
-        estimated_hours: 5
+        estimated_hours: 9
         started: null
         actual_hours: null
         completed_date: null
@@ -939,7 +939,7 @@ milestones:
         title: "engine-cache-invalidation regression tests"
         file: agent/tasks/milestone-18-engine-regression-test-suite/task-78-engine-cache-invalidation.md
         status: not_started
-        estimated_hours: 5
+        estimated_hours: 9
         started: null
         actual_hours: null
         completed_date: null
@@ -950,7 +950,7 @@ milestones:
         title: "engine-providers-typed-and-legacy regression tests"
         file: agent/tasks/milestone-18-engine-regression-test-suite/task-79-engine-providers-typed-and-legacy.md
         status: not_started
-        estimated_hours: 7
+        estimated_hours: 12
         started: null
         actual_hours: null
         completed_date: null
@@ -961,7 +961,7 @@ milestones:
         title: "engine-generation-pipelines regression tests"
         file: agent/tasks/milestone-18-engine-regression-test-suite/task-80-engine-generation-pipelines.md
         status: not_started
-        estimated_hours: 8
+        estimated_hours: 14
         started: null
         actual_hours: null
         completed_date: null
@@ -973,7 +973,7 @@ milestones:
         title: "engine-render-pipeline regression tests"
         file: agent/tasks/milestone-18-engine-regression-test-suite/task-81-engine-render-pipeline.md
         status: not_started
-        estimated_hours: 8
+        estimated_hours: 14
         started: null
         actual_hours: null
         completed_date: null
@@ -984,7 +984,7 @@ milestones:
         title: "engine-analysis-handlers regression tests"
         file: agent/tasks/milestone-18-engine-regression-test-suite/task-82-engine-analysis-handlers.md
         status: not_started
-        estimated_hours: 7
+        estimated_hours: 12
         started: null
         actual_hours: null
         completed_date: null
@@ -996,7 +996,7 @@ milestones:
         title: "engine-chat-pipeline regression tests"
         file: agent/tasks/milestone-18-engine-regression-test-suite/task-83-engine-chat-pipeline.md
         status: not_started
-        estimated_hours: 8
+        estimated_hours: 14
         started: null
         actual_hours: null
         completed_date: null
@@ -1008,7 +1008,7 @@ milestones:
         title: "engine-file-serving-and-uploads regression tests"
         file: agent/tasks/milestone-18-engine-regression-test-suite/task-84-engine-file-serving-and-uploads.md
         status: not_started
-        estimated_hours: 7
+        estimated_hours: 12
         started: null
         actual_hours: null
         completed_date: null
@@ -1019,7 +1019,7 @@ milestones:
         title: "engine-server-bootstrap regression tests"
         file: agent/tasks/milestone-18-engine-regression-test-suite/task-85-engine-server-bootstrap.md
         status: not_started
-        estimated_hours: 7
+        estimated_hours: 12
         started: null
         actual_hours: null
         completed_date: null
@@ -1030,7 +1030,7 @@ milestones:
         title: "engine-cli-admin-commands regression tests"
         file: agent/tasks/milestone-18-engine-regression-test-suite/task-86-engine-cli-admin-commands.md
         status: not_started
-        estimated_hours: 7
+        estimated_hours: 12
         started: null
         actual_hours: null
         completed_date: null
@@ -1041,7 +1041,7 @@ milestones:
         title: "engine-rest-api-dispatcher regression tests"
         file: agent/tasks/milestone-18-engine-regression-test-suite/task-87-engine-rest-api-dispatcher.md
         status: not_started
-        estimated_hours: 9
+        estimated_hours: 16
         started: null
         actual_hours: null
         completed_date: null
@@ -1050,14 +1050,26 @@ milestones:
           - task-84
           - task-85
         notes: "M18's highest-stakes task — locks every invariant the M16 FastAPI replacement must preserve (164 routes, auth, plugin catch-all, unknown-route 404, CORS, structural lock)."
+      - id: task-88
+        title: "Retroactive e2e coverage for task-70 + task-71"
+        file: agent/tasks/milestone-18-engine-regression-test-suite/task-88-retroactive-e2e-for-task-70-71.md
+        status: not_started
+        estimated_hours: 8
+        started: null
+        actual_hours: null
+        completed_date: null
+        dependencies:
+          - task-70
+          - task-71
+        notes: "Mid-flight reversal (2026-04-27): tasks 70+71 were originally briefed 'no e2e — internal DAL'; user reversed that after realizing the M16 FastAPI refactor can silently break DAL↔handler boundaries if only the two tiers are tested. Task-88 retroactively adds ~25 e2e for task-70 domain + ~40 e2e for task-71 domain against a live engine_server fixture. Does NOT modify task-70 (done) or task-71 (in progress) task docs."
 
 unassigned:
   tasks:
-    - id: task-88
+    - id: task-89
       name: "Fix audio_clip linked-derivations SQL — bogus double-quoted from/to"
       status: not_started
       started: null
-      file: agent/tasks/unassigned/task-88-fix-audio-clip-linked-derivations-sql.md
+      file: agent/tasks/unassigned/task-89-fix-audio-clip-linked-derivations-sql.md
       estimated_hours: 0.5
       actual_hours: null
       completed_date: null
@@ -1136,7 +1148,8 @@ notes:
   - "M1-M3, M5-M13 tracked. M11 still open (task-35, task-36 not started). M4 (Resolve integration) deferred."
   - "M14 + M15 work exists in git commits (mix-graph-hash, M15 mix analysis cache, analyze_master_bus chat tool, master-bus effects backend) but is NOT tracked in progress.yaml. Commit messages use per-milestone internal numbering (task 7, task 8) rather than the global scheme. Backfill is a separate concern."
   - "M16 task IDs 57-68 (12 planned, T66-T68 cancelled). Phase A (T57-T64) done in worktrees. T65 partial. Phase B (T66-T68 codegen) cancelled — tools ≠ routes."
-  - "M18 task IDs 70-87 (18 tasks). Note: user plan asked for task IDs 69-86 but task-69 is already owned by M17 (Voice agent feature-matrix). Renumbered to 70-87 to preserve the global task-id invariant."
+  - "M18 task IDs 70-88 (19 tasks). Note: user plan asked for task IDs 69-86 but task-69 is already owned by M17 (Voice agent feature-matrix). Renumbered to 70-87 to preserve the global task-id invariant. Task-88 added 2026-04-27 as retroactive e2e supplement for task-70 + task-71."
+  - "M18 comprehensive-e2e reversal (2026-04-27): original plan had tasks 70-74 as DAL-only with no e2e. User reversed this mid-flight after recognizing that the upcoming M16 FastAPI refactor can silently break the DAL↔handler transport bridge if only DAL and dispatcher are tested. All tasks 72-87 now require comprehensive e2e matching unit-test breadth; hours scaled 1.75x. Task-88 retroactively covers tasks 70+71 (which were committed or in progress under the old plan). Total M18 estimate: ~193 dev hours (was ~100h). The unassigned task-88 fix-audio-clip-linked-derivations-sql was renamed to task-89 to avoid ID collision."
   - "M11 task IDs 32-36 (30/31/37/38 are unassigned one-offs in agent/tasks/unassigned/)"
   - "M12 task IDs 39-44; 37 (unified WS) is a prereq for task-43's live UI push; task-44 (chunked proxies) extends task-39"
   - "M13 task IDs 45-56 (12 tasks); source: clarification-7 → design/local.effect-curves-macro-panel.md → specs/local.effect-curves-macro-panel.md (54 requirements, 29 tests)"

@@ -3,7 +3,7 @@
 **Milestone**: [M18 — Engine Regression Test Suite](../../milestones/milestone-18-engine-regression-test-suite.md)
 **Spec**: [`local.engine-file-serving-and-uploads`](../../specs/local.engine-file-serving-and-uploads.md)
 **Design Reference**: [`local.engine-file-serving-and-uploads`](../../specs/local.engine-file-serving-and-uploads.md)
-**Estimated Time**: 6-8 hours
+**Estimated Time**: 12 hours
 **Dependencies**: task-70
 **Status**: Not Started
 **Repository**: `scenecraft-engine`
@@ -12,7 +12,7 @@
 
 ## Objective
 
-Write unit + e2e tests for `local.engine-file-serving-and-uploads.md`. Lock in: Range-aware GET, HEAD, multipart upload, path-traversal rejection, MIME detection, and the exact headers (`Content-Range`, `Accept-Ranges`, `Content-Length`). Target-state tests use `@pytest.mark.xfail(reason="target-state; awaits M16 FastAPI refactor", strict=False)`.
+Write comprehensive unit AND e2e tests. E2E coverage MUST match unit coverage in breadth — every requirement's observable effect has an HTTP/WS-level test. Unit tests may mock; e2e MUST NOT. Lock in: Range-aware GET, HEAD, multipart upload, path-traversal rejection, MIME detection, and the exact headers (`Content-Range`, `Accept-Ranges`, `Content-Length`). Target-state tests use `@pytest.mark.xfail(reason="target-state; awaits M16 FastAPI refactor", strict=False)`.
 
 ---
 
@@ -50,19 +50,40 @@ Target-ideal behaviors (e.g., `If-Range`, conditional `ETag`) → `xfail`.
 
 ### 4. Cover every Behavior Table row
 
-### 5. Add e2e section (primary for this spec)
+### 5. E2E coverage checklist (comprehensive)
+
+File serving IS an HTTP surface. E2E is primary and MUST cover every row in the spec's Behavior Table.
+
+Endpoints / scenarios:
+
+- `GET /files/<path>` without Range → 200, `Accept-Ranges: bytes`, full body, correct `Content-Length`
+- `GET` with `Range: bytes=0-99` → 206, `Content-Range: bytes 0-99/<total>`, body exactly those bytes
+- `GET` with `Range: bytes=100-` (open-ended) → 206, correct slice
+- `GET` with invalid Range (start > size) → 416, `Content-Range: bytes */<total>`
+- `GET` with suffix Range `bytes=-10` → per-spec (likely 416)
+- `GET` with multiple Range specs `bytes=0-10,20-30` → per-spec (likely 416 or multipart)
+- `HEAD /files/<path>` → 200, `Content-Length`, `Accept-Ranges: bytes`, empty body
+- Path traversal `GET /files/../../etc/passwd` → 404 (not 500, not 200)
+- URL-encoded traversal `GET /files/%2e%2e%2fetc%2fpasswd` → 404
+- MIME: `.mp4` → `video/mp4`; `.jpg` → `image/jpeg`; `.wav` → `audio/wav`; `.json` → `application/json`; unknown ext → octet-stream
+- `POST /files/upload` multipart/form-data → file lands at expected project-scoped path; verifiable via subsequent GET
+- Upload with path-traversal name → rejected
+- Large file upload (10MB+) — streaming verified (memory stays bounded; response succeeds)
+- Large file GET — streaming verified
+- Concurrent GETs on the same file — both succeed
+- Auth enforced on upload (401 without cookie)
+- Auth NOT required on public files per spec (or enforced — follow spec)
+- `POST /bounce-upload` and `POST /mix-render-upload` — project-scoped content-addressable paths
+- Target-state xfails: `If-Range`, conditional `ETag`, gzip content-encoding
+
+Each e2e test annotated `(covers Rn, row #N)`.
 
 ```python
 # === E2E ===
 
 class TestEndToEnd:
-    """E2E is primary for this spec — file serving IS an HTTP surface."""
-
-    def test_get_range_206(self, engine_server, project_dir): ...
-    def test_get_range_416_invalid(self, engine_server, project_dir): ...
-    def test_head_metadata_only(self, engine_server, project_dir): ...
-    def test_path_traversal_rejected(self, engine_server, project_dir): ...
-    def test_multipart_upload(self, engine_server, project_dir): ...
+    """Comprehensive e2e — every Range + HEAD + upload + traversal + MIME case."""
+    # ... tests per checklist
 ```
 
 ### 6. Run + verify + commit
@@ -81,7 +102,8 @@ git commit -m "test(M18-84): engine-file-serving-and-uploads regression tests �
 - [ ] Every `Rn` has ≥1 covering test
 - [ ] Every Behavior Table row covered
 - [ ] Target-state tests use `xfail(..., strict=False)`
-- [ ] E2E section present (primary for this spec)
+- [ ] E2E section present with comprehensive Range + HEAD + upload + traversal + MIME coverage
+- [ ] Every spec requirement has ≥1 e2e test (not just unit)
 - [ ] `pytest ... -v` passes
 
 ---

@@ -3,7 +3,7 @@
 **Milestone**: [M18 — Engine Regression Test Suite](../../milestones/milestone-18-engine-regression-test-suite.md)
 **Spec**: [`local.engine-rest-api-dispatcher`](../../specs/local.engine-rest-api-dispatcher.md)
 **Design Reference**: [`local.engine-rest-api-dispatcher`](../../specs/local.engine-rest-api-dispatcher.md)
-**Estimated Time**: 8-10 hours
+**Estimated Time**: 16 hours
 **Dependencies**: task-70, task-84, task-85
 **Status**: Not Started
 **Repository**: `scenecraft-engine`
@@ -12,7 +12,7 @@
 
 ## Objective
 
-Write unit + e2e tests for `local.engine-rest-api-dispatcher.md`. Lock in every invariant the M16 replacement must preserve: 164 routes + path/method parity, auth ordering, plugin catch-all last, unknown-route 404, error-envelope shape, CORS on every response, structural-lock serialization. Target-state tests use `@pytest.mark.xfail(reason="target-state; awaits M16 FastAPI refactor", strict=False)`.
+Write comprehensive unit AND e2e tests. E2E coverage MUST match unit coverage in breadth — every requirement's observable effect has an HTTP/WS-level test. Unit tests may mock; e2e MUST NOT. Lock in every invariant the M16 replacement must preserve: 164 routes + path/method parity, auth ordering, plugin catch-all last, unknown-route 404, error-envelope shape, CORS on every response, structural-lock serialization. Target-state tests use `@pytest.mark.xfail(reason="target-state; awaits M16 FastAPI refactor", strict=False)`.
 
 **This is M18's highest-stakes task — literally the contract M16 is replacing.**
 
@@ -52,31 +52,40 @@ Target-ideal behaviors (e.g., 422 vs 400 for new endpoints, HEAD on /render-fram
 
 ### 4. Cover every Behavior Table row
 
-### 5. Add e2e section (primary for this spec)
+### 5. E2E coverage checklist (comprehensive — primary for this spec)
+
+Dispatcher behavior only exists end-to-end. E2E MUST cover every of the 164 documented routes + every dispatcher invariant.
+
+Scenarios:
+
+- **Route parity crawl**: every GET route in the spec's enumerated list resolves with status != 404 for valid inputs; every POST/PATCH/DELETE route returns != 404 on OPTIONS preflight
+- **Method parity**: for each route, wrong method → 405 per spec
+- **Auth ordering**: for an authenticated route — bearer token, session cookie, anonymous each tested; correct precedence
+- **Unauthenticated**: `GET /api/projects` without auth → 401 + legacy envelope
+- **Unknown route**: `GET /api/doesnt-exist` → 404 + `{"error": "NOT_FOUND", ...}` envelope
+- **Plugin catch-all ordering**: built-in `/api/...` wins over plugin path collision (register a plugin that tries to claim a core path; fire request; assert core response)
+- **Plugin catch-all reachable**: `/plugin/<id>/...` routes reach plugin handler (not built-in)
+- **CORS on every response**: sample 20+ routes (including error paths); every response has `Access-Control-Allow-Origin`
+- **OPTIONS preflight**: CORS preflight returns correct headers
+- **Error envelope shape**: every 4xx + 5xx returns `{"error": CODE, "message": ...}` — sample across routes
+- **Structural lock**: fire two concurrent structural mutations (POST keyframe, POST audio_track) on same project → serialize (observable via timing OR via a racy-test fixture)
+- **Structural lock doesn't block reads**: fire a long GET concurrent with a structural mutation; both succeed
+- **Timeline validator post-hook**: after a structural mutation, validator runs; deliberate invalid state → validator failure emitted as WS event, not fatal
+- **Content-Type negotiation**: POST with wrong content-type → 415 or parsed defensively per spec
+- **Malformed JSON body**: → 400 + envelope
+- **Request size limit**: body > limit → 413 per spec
+- **Slow-client handling**: partial body read → timeout + envelope
+- **WS upgrade on dispatcher**: if WS is mounted on same port, upgrade succeeds on the right path
+- Target-state xfails: 422 vs 400 for validation errors (FastAPI style), HEAD support on all GET routes, OpenAPI `/docs` endpoint
+
+Each e2e test annotated `(covers Rn, row #N)`.
 
 ```python
 # === E2E ===
 
 class TestEndToEnd:
-    """E2E is THE point for this spec — dispatcher behavior only exists end-to-end."""
-
-    def test_get_route_parity_crawl(self, engine_server):
-        """covers Rn (e2e)"""
-        # Crawl every GET route from the spec's list; assert none return 404.
-
-    def test_unknown_route_returns_envelope(self, engine_server):
-        """covers Rn (e2e)"""
-
-    def test_plugin_catchall_loses_to_builtin(self, engine_server):
-        """covers Rn (e2e)"""
-
-    def test_structural_lock_serializes(self, engine_server):
-        """covers Rn (e2e)"""
-        # Fire two concurrent structural mutations; assert serial execution.
-
-    def test_cors_on_every_response(self, engine_server):
-        """covers Rn (e2e)"""
-        # Sample 20 routes; assert allow-origin header on each.
+    """Comprehensive e2e — full 164-route parity, auth, CORS, error envelopes, structural lock."""
+    # ... tests per checklist
 ```
 
 ### 6. Run + verify + commit
@@ -95,7 +104,8 @@ git commit -m "test(M18-87): engine-rest-api-dispatcher regression tests — <N>
 - [ ] Every `Rn` has ≥1 covering test
 - [ ] Every Behavior Table row covered
 - [ ] Target-state tests use `xfail(..., strict=False)`
-- [ ] E2E section present (primary for this spec)
+- [ ] E2E section present with comprehensive 164-route + auth + CORS + envelope + lock coverage
+- [ ] Every spec requirement has ≥1 e2e test (not just unit)
 - [ ] Route-parity crawl covers every route in the spec's list
 - [ ] `pytest ... -v` passes
 

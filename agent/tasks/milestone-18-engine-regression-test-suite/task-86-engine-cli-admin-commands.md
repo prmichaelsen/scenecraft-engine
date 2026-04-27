@@ -3,7 +3,7 @@
 **Milestone**: [M18 — Engine Regression Test Suite](../../milestones/milestone-18-engine-regression-test-suite.md)
 **Spec**: [`local.engine-cli-admin-commands`](../../specs/local.engine-cli-admin-commands.md)
 **Design Reference**: [`local.engine-cli-admin-commands`](../../specs/local.engine-cli-admin-commands.md)
-**Estimated Time**: 6-8 hours
+**Estimated Time**: 12 hours
 **Dependencies**: task-70
 **Status**: Not Started
 **Repository**: `scenecraft-engine`
@@ -12,7 +12,7 @@
 
 ## Objective
 
-Write unit + e2e tests for `local.engine-cli-admin-commands.md`. Lock in: the `scenecraft` CLI surface — `--help`, `start/stop/status`, project management, chat, admin subcommands, exit codes, and stdout shapes. Target-state tests use `@pytest.mark.xfail(reason="target-state; awaits M16 FastAPI refactor", strict=False)`.
+Write comprehensive unit AND e2e tests. E2E coverage MUST match unit coverage in breadth — every requirement's observable effect has an HTTP/WS-level test (or subprocess surface for CLI-specific rows). Unit tests may mock; e2e MUST NOT. Lock in: the `scenecraft` CLI surface — `--help`, `start/stop/status`, project management, chat, admin subcommands, exit codes, and stdout shapes. Target-state tests use `@pytest.mark.xfail(reason="target-state; awaits M16 FastAPI refactor", strict=False)`.
 
 ---
 
@@ -51,22 +51,37 @@ Target-ideal behaviors (e.g., JSON output mode, shell completion) → `xfail`.
 
 ### 4. Cover every Behavior Table row
 
-### 5. Add e2e section
+### 5. E2E coverage checklist (comprehensive)
+
+CLI is a subprocess surface, but every admin command has an HTTP-observable effect (CLI → engine → DB). E2E MUST exercise each subcommand end-to-end.
+
+Scenarios (subprocess-invoked for realism):
+
+- `scenecraft --help` → exit 0, lists every documented subcommand
+- `scenecraft <subcmd> --help` for each subcommand → exit 0, lists documented flags
+- `scenecraft start` → server boots → `GET /api/health` succeeds → `scenecraft stop` → exit 0
+- `scenecraft status` running → exit 0, stdout contains "running"
+- `scenecraft status` not running → exit 0 (or 1 per spec), stdout contains "not running"
+- `scenecraft project list` → stdout lists known projects (JSON or text per spec)
+- `scenecraft project create <name>` → subsequent `GET /api/projects` shows it; DB initialized
+- `scenecraft project delete <name>` → subsequent `GET /api/projects` excludes it
+- `scenecraft chat "<prompt>"` → output streams; exit 0 on success
+- `scenecraft admin migrate` (if exists) → schema_migrations rows updated
+- Exit codes: success=0, user error=2, server error=1 (per spec)
+- stdout vs stderr: logs on stderr, structured output on stdout — verify via capture
+- `--json` flag (if spec) → machine-parseable output on stdout
+- Invalid subcommand → exit 2, helpful message
+- Missing required arg → exit 2, helpful message
+- Target-state xfails: shell completion, interactive prompts, JSON output mode
+
+Each e2e test annotated `(covers Rn, row #N)`.
 
 ```python
 # === E2E ===
 
 class TestEndToEnd:
-    def test_cli_help_subprocess(self):
-        """covers Rn (e2e via subprocess)"""
-        import subprocess
-        r = subprocess.run(["scenecraft", "--help"], capture_output=True, text=True)
-        assert r.returncode == 0
-        assert "Commands:" in r.stdout
-
-    def test_cli_start_stop(self, tmp_path):
-        """covers Rn (e2e)"""
-        # Spawn scenecraft start as subprocess; poll status; scenecraft stop; assert exit code.
+    """Comprehensive e2e — every subcommand via subprocess + HTTP verification."""
+    # ... tests per checklist
 ```
 
 ### 6. Run + verify + commit
@@ -85,7 +100,8 @@ git commit -m "test(M18-86): engine-cli-admin-commands regression tests — <N> 
 - [ ] Every `Rn` has ≥1 covering test
 - [ ] Every Behavior Table row covered
 - [ ] Target-state tests use `xfail(..., strict=False)`
-- [ ] E2E section present
+- [ ] E2E section present with comprehensive subcommand + HTTP coverage
+- [ ] Every spec requirement has ≥1 e2e test (not just unit)
 - [ ] `pytest ... -v` passes
 
 ---
