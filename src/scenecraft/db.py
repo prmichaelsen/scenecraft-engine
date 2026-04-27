@@ -65,6 +65,21 @@ def get_db(project_dir: Path, db_path: Path | str | None = None) -> sqlite3.Conn
             conn.execute("PRAGMA busy_timeout=60000")
             if db_path not in _migrated_dbs:
                 _ensure_schema(conn)
+                # Task-93: purge undo_log rows under undo_group=0. These come
+                # from seed inserts in `_ensure_schema` (default audio_track,
+                # send buses, etc.) that fire the per-table undo triggers
+                # before any explicit `undo_begin`. R10's orphan sweep in
+                # `undo_begin` only deletes rows whose undo_group is in the
+                # pruned-groups set, so group-0 rows would otherwise grow
+                # unbounded across boots. They have no recovery value: the
+                # rows correspond to schema-seeded defaults that re-seed on
+                # next bootstrap if missing.
+                try:
+                    conn.execute("DELETE FROM undo_log WHERE undo_group = 0")
+                    conn.commit()
+                except sqlite3.OperationalError:
+                    # Very-fresh DB where undo_log doesn't exist yet — fine.
+                    pass
                 _migrated_dbs.add(db_path)
             _connections[thread_key] = conn
         return _connections[thread_key]

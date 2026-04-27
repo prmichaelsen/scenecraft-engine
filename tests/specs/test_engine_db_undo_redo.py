@@ -819,6 +819,88 @@ def test_is_undo_capturing_semantics_transitional(project_dir: Path, db_conn):
 
 
 # ---------------------------------------------------------------------------
+# Task-93 — get_db bootstrap sweeps undo_log group=0 orphans
+# ---------------------------------------------------------------------------
+
+
+def test_get_db_bootstrap_sweeps_undo_group_zero(tmp_path: Path):
+    """covers task-93 — `get_db` bootstrap purges `undo_log` rows under
+    `undo_group=0` (seed-insert orphans) so they don't accumulate forever
+    across engine reboots.
+
+    Witness path:
+      1. First `get_db(project_dir)` runs `_ensure_schema`, which seeds the
+         default audio_track + 4 send buses. The per-table undo triggers
+         fire under `current_group=0` and write rows to `undo_log` with
+         `undo_group=0`. After bootstrap our sweep removes them, so the
+         post-`get_db` count must be 0.
+      2. Simulating a reboot (`close_db` + clear the process-level
+         `_migrated_dbs` cache) and calling `get_db` again must keep the
+         group-0 count at 0 (idempotent + sweeps any prior session's junk
+         that landed before this fix shipped).
+      3. A normal `undo_begin` + tracked mutation captures rows under a
+         group_id > 0; the bootstrap sweep must not touch them.
+    """
+    project = tmp_path / "task93"
+    project.mkdir()
+
+    # --- (1) First bootstrap: schema + seeds run, sweep should clear group-0.
+    conn = scdb.get_db(project)
+    group_zero_after_first = conn.execute(
+        "SELECT COUNT(*) FROM undo_log WHERE undo_group = 0"
+    ).fetchone()[0]
+    assert group_zero_after_first == 0, (
+        f"first-bootstrap-sweeps-group-zero: got {group_zero_after_first}"
+    )
+
+    # --- Inject prior-session junk to verify the sweep handles pre-existing
+    # group-0 rows on the next bootstrap (i.e., a DB created by older code
+    # before this fix shipped).
+    conn.execute(
+        "INSERT INTO undo_log (undo_group, sql_text) VALUES (0, 'DELETE FROM keyframes WHERE id=42')"
+    )
+    conn.execute(
+        "INSERT INTO undo_log (undo_group, sql_text) VALUES (0, 'DELETE FROM keyframes WHERE id=43')"
+    )
+    conn.commit()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM undo_log WHERE undo_group = 0"
+    ).fetchone()[0] == 2, "junk-injected"
+
+    # --- (2) Simulate reboot: close conn, drop migration-cache marker.
+    scdb.close_db(project)
+    scdb._migrated_dbs.discard(str(project / "project.db"))
+
+    conn2 = scdb.get_db(project)
+    group_zero_after_reboot = conn2.execute(
+        "SELECT COUNT(*) FROM undo_log WHERE undo_group = 0"
+    ).fetchone()[0]
+    assert group_zero_after_reboot == 0, (
+        f"reboot-sweeps-prior-junk: got {group_zero_after_reboot}"
+    )
+
+    # --- (3) Normal undo_begin + tracked mutation: rows captured under
+    # group_id > 0 must survive. The bootstrap sweep ran already; no new
+    # bootstrap is triggered by undo_begin.
+    g = scdb.undo_begin(project, "task93 op")
+    assert g > 0, f"group-id-positive: got {g}"
+    undo_seed_keyframe(project, "k_task93", timestamp="0:01")
+
+    captured = conn2.execute(
+        "SELECT COUNT(*) FROM undo_log WHERE undo_group = ?", (g,)
+    ).fetchone()[0]
+    assert captured >= 1, f"group-N-rows-captured: got {captured}"
+
+    # And group-0 still empty — capture under group g doesn't leak to group 0.
+    assert conn2.execute(
+        "SELECT COUNT(*) FROM undo_log WHERE undo_group = 0"
+    ).fetchone()[0] == 0, "group-zero-still-empty-after-tracked-mutation"
+
+    scdb.close_db(project)
+    scdb._migrated_dbs.discard(str(project / "project.db"))
+
+
+# ---------------------------------------------------------------------------
 # E2E — HTTP round-trip through live api_server
 # ---------------------------------------------------------------------------
 
