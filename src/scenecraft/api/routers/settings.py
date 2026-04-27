@@ -43,6 +43,8 @@ def _work_dir(request: Request) -> Path:
 async def get_settings(name: str, request: Request) -> dict:
     _log(f"get-settings: {name}")
     wd = _work_dir(request)
+    if not (wd / name).is_dir():
+        raise ApiError("NOT_FOUND", f"Project not found: {name}", status_code=404)
     settings_path = wd / name / "settings.json"
     defaults = {
         "preview_quality": 50,
@@ -65,6 +67,8 @@ async def update_settings(
     name: str, body: SettingsBody, request: Request
 ) -> dict:
     wd = _work_dir(request)
+    if not (wd / name).is_dir():
+        raise ApiError("NOT_FOUND", f"Project not found: {name}", status_code=404)
     _log("update-settings: settings updated")
     settings_path = wd / name / "settings.json"
     existing: dict = {}

@@ -252,6 +252,44 @@ async def bounce_upload(
         )
 
     bytes_written = dest.stat().st_size
+    _log(f"bounce-upload: {name} {composite_hash[:12]}… "
+         f"({bytes_written // 1024}KB, {wav_duration:.2f}s, {wav_sample_rate}Hz, {wav_channels}ch, {bit_depth}-bit)")
+
+    # Upsert audio_bounces row (task-90 fix): direct HTTP uploads that bypass
+    # the chat flow have no pre-existing row; without this the WAV is orphaned
+    # on disk and GET /bounces/<id>.wav 404s.
+    try:
+        from scenecraft.db_bounces import (
+            create_bounce,
+            get_bounce_by_hash,
+            update_bounce_rendered,
+        )
+        existing = get_bounce_by_hash(pd, composite_hash)
+        if existing is None:
+            new_row = create_bounce(
+                pd,
+                composite_hash=composite_hash,
+                start_time_s=start_time_s,
+                end_time_s=end_time_s,
+                mode="full",
+                selected_track_ids=[],
+                selected_clip_ids=[],
+            )
+            bounce_id_val = new_row["id"]
+        else:
+            bounce_id_val = existing["id"]
+        update_bounce_rendered(
+            pd,
+            bounce_id_val,
+            rendered_path=rel_path,
+            duration_s=wav_duration,
+            sample_rate=wav_sample_rate,
+            channels=wav_channels,
+            bit_depth=bit_depth,
+            file_size_bytes=bytes_written,
+        )
+    except Exception as e:
+        _log(f"bounce-upload: audio_bounces upsert failed: {e}")
 
     released = False
     if request_id:

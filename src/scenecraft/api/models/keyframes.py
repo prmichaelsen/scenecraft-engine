@@ -45,7 +45,8 @@ class SelectSlotKeyframesBody(_KfBody):
 
 class UpdateTimestampBody(_KfBody):
     keyframeId: str = Field(...)
-    newTimestamp: str | float | int = Field(...)
+    newTimestamp: str | float | int | None = Field(default=None)
+    timestamp: str | float | int | None = Field(default=None)
 
 
 class UpdatePromptBody(_KfBody):

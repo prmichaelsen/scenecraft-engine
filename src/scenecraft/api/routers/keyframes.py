@@ -175,9 +175,9 @@ def update_timestamp(
     name: str, request: Request, body: UpdateTimestampBody
 ) -> dict:
     kf_id = body.keyframeId
-    new_timestamp = body.newTimestamp
+    new_timestamp = body.newTimestamp if body.newTimestamp is not None else body.timestamp
     if not kf_id or new_timestamp is None:
-        raise ApiError("BAD_REQUEST", "Missing 'keyframeId' or 'newTimestamp'", status_code=400)
+        raise ApiError("BAD_REQUEST", "Missing 'keyframeId' or 'timestamp' (alias: 'newTimestamp')", status_code=400)
 
     pdir = _work_dir(request) / name
 
