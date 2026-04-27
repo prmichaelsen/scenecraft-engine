@@ -192,7 +192,8 @@ def build_schedule(
             "transform_y": tr.get("transform_y"),
             "transform_x_curve": _parse_curve(tr.get("transform_x_curve")),
             "transform_y_curve": _parse_curve(tr.get("transform_y_curve")),
-            "transform_z_curve": _parse_curve(tr.get("transform_z_curve")),
+            "transform_scale_x_curve": _parse_curve(tr.get("transform_scale_x_curve")),
+            "transform_scale_y_curve": _parse_curve(tr.get("transform_scale_y_curve")),
             "anchor_x": tr.get("anchor_x"),
             "anchor_y": tr.get("anchor_y"),
             "is_adjustment": tr.get("is_adjustment", False),
@@ -201,7 +202,8 @@ def build_schedule(
             transform_data.get(k)
             for k in (
                 "transform_x", "transform_y",
-                "transform_x_curve", "transform_y_curve", "transform_z_curve",
+                "transform_x_curve", "transform_y_curve",
+                "transform_scale_x_curve", "transform_scale_y_curve",
             )
         )
 
@@ -315,7 +317,8 @@ def build_schedule(
                 "transform_x": tr.get("transform_x"), "transform_y": tr.get("transform_y"),
                 "transform_x_curve": tr.get("transform_x_curve"),
                 "transform_y_curve": tr.get("transform_y_curve"),
-                "transform_z_curve": tr.get("transform_z_curve"),
+                "transform_scale_x_curve": tr.get("transform_scale_x_curve"),
+                "transform_scale_y_curve": tr.get("transform_scale_y_curve"),
                 "remap_method": tr.get("remap", {}).get("method", "linear") if isinstance(tr.get("remap"), dict) else "linear",
                 "curve_points": tr.get("remap", {}).get("curve_points") if isinstance(tr.get("remap"), dict) else None,
             }

@@ -1005,6 +1005,44 @@ def _ensure_schema(conn: sqlite3.Connection):
             if ty != 0:
                 conn.execute("UPDATE transitions SET transform_y_curve = ? WHERE id = ?", (json.dumps([[0, ty], [1, ty]]), row[0]))
 
+    # Split transform_z_curve (uniform scale) into transform_scale_x_curve +
+    # transform_scale_y_curve (independent non-uniform scale). Copy the z
+    # curve into both new columns so existing projects render identically
+    # — the only change is that users CAN now animate x and y independently
+    # going forward. See agent/design/local.split-z-into-scalex-scaley.md.
+    # Idempotent: driven by column presence, safe to re-run.
+    tr_cols4 = {row[1] for row in conn.execute("PRAGMA table_info(transitions)").fetchall()}
+    if "transform_scale_x_curve" not in tr_cols4:
+        conn.execute("ALTER TABLE transitions ADD COLUMN transform_scale_x_curve TEXT")
+    if "transform_scale_y_curve" not in tr_cols4:
+        conn.execute("ALTER TABLE transitions ADD COLUMN transform_scale_y_curve TEXT")
+    # Copy existing z curves into both new columns. Only populate where the
+    # new columns are still null, so re-running the migration doesn't
+    # clobber user edits made after the initial migration.
+    if "transform_z_curve" in tr_cols4:
+        conn.execute(
+            "UPDATE transitions "
+            "SET transform_scale_x_curve = transform_z_curve, "
+            "    transform_scale_y_curve = transform_z_curve "
+            "WHERE transform_z_curve IS NOT NULL "
+            "  AND transform_scale_x_curve IS NULL "
+            "  AND transform_scale_y_curve IS NULL"
+        )
+        # Drop the old uniform-scale column. SQLite DROP COLUMN is available
+        # in 3.35+ (2021). Wrap in try/except for two known failure modes:
+        #   1. Older SQLite without DROP COLUMN support.
+        #   2. Triggers on this table (e.g. transitions_update_undo) that
+        #      reference OLD.transform_z_curve — SQLite rejects the drop
+        #      rather than silently invalidating the trigger.
+        # In both cases the column stays (inert — no code path reads it
+        # after this migration) and the migration completes successfully.
+        # Rebuilding history triggers to drop the column cleanly is
+        # deferred until a broader schema-cleanup pass.
+        try:
+            conn.execute("ALTER TABLE transitions DROP COLUMN transform_z_curve")
+        except sqlite3.OperationalError:
+            pass
+
     # Add layer_effect_types to suppressions if missing
     sup_cols = {row[1] for row in conn.execute("PRAGMA table_info(suppressions)").fetchall()}
     if "layer_effect_types" not in sup_cols:
@@ -1601,7 +1639,8 @@ def _row_to_transition(row: sqlite3.Row) -> dict:
         "transform_y": row["transform_y"] if "transform_y" in row.keys() else None,
         "transform_x_curve": json.loads(row["transform_x_curve"]) if "transform_x_curve" in row.keys() and row["transform_x_curve"] else None,
         "transform_y_curve": json.loads(row["transform_y_curve"]) if "transform_y_curve" in row.keys() and row["transform_y_curve"] else None,
-        "transform_z_curve": json.loads(row["transform_z_curve"]) if "transform_z_curve" in row.keys() and row["transform_z_curve"] else None,
+        "transform_scale_x_curve": json.loads(row["transform_scale_x_curve"]) if "transform_scale_x_curve" in row.keys() and row["transform_scale_x_curve"] else None,
+        "transform_scale_y_curve": json.loads(row["transform_scale_y_curve"]) if "transform_scale_y_curve" in row.keys() and row["transform_scale_y_curve"] else None,
         "anchor_x": row["anchor_x"] if "anchor_x" in row.keys() else None,
         "anchor_y": row["anchor_y"] if "anchor_y" in row.keys() else None,
         "deleted_at": row["deleted_at"],
@@ -1658,8 +1697,8 @@ def add_transition(project_dir: Path, tr: dict):
 
     def _do_insert():
         conn.execute(
-            """INSERT OR REPLACE INTO transitions (id, from_kf, to_kf, duration_seconds, slots, action, use_global_prompt, selected, remap, deleted_at, track_id, label, label_color, tags, blend_mode, opacity, opacity_curve, red_curve, green_curve, blue_curve, black_curve, hue_shift_curve, saturation_curve, invert_curve, is_adjustment, mask_center_x, mask_center_y, mask_radius, mask_feather, transform_x, transform_y, transform_x_curve, transform_y_curve, transform_z_curve, hidden, anchor_x, anchor_y)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT OR REPLACE INTO transitions (id, from_kf, to_kf, duration_seconds, slots, action, use_global_prompt, selected, remap, deleted_at, track_id, label, label_color, tags, blend_mode, opacity, opacity_curve, red_curve, green_curve, blue_curve, black_curve, hue_shift_curve, saturation_curve, invert_curve, is_adjustment, mask_center_x, mask_center_y, mask_radius, mask_feather, transform_x, transform_y, transform_x_curve, transform_y_curve, transform_scale_x_curve, transform_scale_y_curve, hidden, anchor_x, anchor_y)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (tr["id"], tr.get("from", ""), tr.get("to", ""), tr.get("duration_seconds", 0),
              tr.get("slots", 1), tr.get("action", ""), int(tr.get("use_global_prompt", False)),
              json.dumps(selected), json.dumps(tr.get("remap", {"method": "linear", "target_duration": 0})),
@@ -1680,7 +1719,8 @@ def add_transition(project_dir: Path, tr: dict):
              tr.get("transform_x"), tr.get("transform_y"),
              _json_or_none(tr.get("transform_x_curve")),
              _json_or_none(tr.get("transform_y_curve")),
-             _json_or_none(tr.get("transform_z_curve")),
+             _json_or_none(tr.get("transform_scale_x_curve")),
+             _json_or_none(tr.get("transform_scale_y_curve")),
              int(tr.get("hidden", False)),
              tr.get("anchor_x"), tr.get("anchor_y")),
         )
@@ -1717,7 +1757,7 @@ def update_transition(project_dir: Path, tr_id: str, **fields):
             val = int(val or 0)
         elif key == "tags":
             val = json.dumps(val) if isinstance(val, list) else val
-        elif key in ("opacity_curve", "red_curve", "green_curve", "blue_curve", "black_curve", "hue_shift_curve", "saturation_curve", "invert_curve", "brightness_curve", "contrast_curve", "exposure_curve", "transform_x_curve", "transform_y_curve", "transform_z_curve"):
+        elif key in ("opacity_curve", "red_curve", "green_curve", "blue_curve", "black_curve", "hue_shift_curve", "saturation_curve", "invert_curve", "brightness_curve", "contrast_curve", "exposure_curve", "transform_x_curve", "transform_y_curve", "transform_scale_x_curve", "transform_scale_y_curve"):
             val = json.dumps(val) if isinstance(val, list) else val
         elif key == "chroma_key":
             val = json.dumps(val) if isinstance(val, (dict, list)) else val

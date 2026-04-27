@@ -1881,7 +1881,10 @@ _COLOR_CURVE_COLUMNS: dict[str, str] = {
 _TRANSFORM_CURVE_COLUMNS: dict[str, str] = {
     "x": "transform_x_curve",
     "y": "transform_y_curve",
-    "z": "transform_z_curve",
+    # The old single "z" key (uniform scale) is gone; chat callers now
+    # address the two independent scale axes by explicit short keys.
+    "scale_x": "transform_scale_x_curve",
+    "scale_y": "transform_scale_y_curve",
 }
 
 

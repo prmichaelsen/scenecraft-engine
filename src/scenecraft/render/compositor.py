@@ -272,34 +272,44 @@ def _apply_transform(img, clip_data: dict, progress: float = 0):
 
     tx_curve = clip_data.get("transform_x_curve")
     ty_curve = clip_data.get("transform_y_curve")
-    tz_curve = clip_data.get("transform_z_curve")
+    # Independent scale X / scale Y (replaced the single uniform transform_z_curve
+    # in 0.25.x). Each defaults to 1.0 when its curve is absent. Uniform zoom is
+    # still expressible by setting both curves identical; migration from the old
+    # z curve does exactly that for pre-existing projects, preserving renders.
+    sx_curve = clip_data.get("transform_scale_x_curve")
+    sy_curve = clip_data.get("transform_scale_y_curve")
     tx = _evaluate_curve(tx_curve, progress) if tx_curve else (clip_data.get("transform_x") or 0)
     ty = _evaluate_curve(ty_curve, progress) if ty_curve else (clip_data.get("transform_y") or 0)
-    scale = _evaluate_curve(tz_curve, progress) if tz_curve else 1.0
+    scale_x = _evaluate_curve(sx_curve, progress) if sx_curve else 1.0
+    scale_y = _evaluate_curve(sy_curve, progress) if sy_curve else 1.0
     anchor_x = clip_data.get("anchor_x") or 0.5
     anchor_y = clip_data.get("anchor_y") or 0.5
     h, w = img.shape[:2]
-    if abs(scale - 1.0) > 0.001:
+    if abs(scale_x - 1.0) > 0.001 or abs(scale_y - 1.0) > 0.001:
         ax, ay = int(anchor_x * w), int(anchor_y * h)
-        new_w, new_h = int(w * scale), int(h * scale)
+        new_w, new_h = int(w * scale_x), int(h * scale_y)
         if new_w > 0 and new_h > 0:
             scaled = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             x0 = int(anchor_x * new_w) - ax
             y0 = int(anchor_y * new_h) - ay
-            if scale > 1.0:
-                img = scaled[y0:y0 + h, x0:x0 + w]
-            else:
-                result = np.zeros_like(img)
-                paste_x = max(0, -x0)
-                paste_y = max(0, -y0)
-                src_x = max(0, x0)
-                src_y = max(0, y0)
-                copy_w = min(new_w - src_x, w - paste_x)
-                copy_h = min(new_h - src_y, h - paste_y)
-                if copy_w > 0 and copy_h > 0:
-                    result[paste_y:paste_y + copy_h, paste_x:paste_x + copy_w] = \
-                        scaled[src_y:src_y + copy_h, src_x:src_x + copy_w]
-                img = result
+            # Horizontal branch: crop when enlarged, pad when reduced. Same
+            # for vertical. When the two axes scale in opposite directions
+            # (x > 1, y < 1, or vice versa) we need mixed logic — do the
+            # general pad-or-crop dance that handles both cases safely.
+            result = np.zeros_like(img)
+            # Source region within `scaled` we want to read from.
+            src_x = max(0, x0)
+            src_y = max(0, y0)
+            # Destination region within `result` (original-size) where it goes.
+            paste_x = max(0, -x0)
+            paste_y = max(0, -y0)
+            # Size to copy — bounded by both source and destination extents.
+            copy_w = max(0, min(new_w - src_x, w - paste_x))
+            copy_h = max(0, min(new_h - src_y, h - paste_y))
+            if copy_w > 0 and copy_h > 0:
+                result[paste_y:paste_y + copy_h, paste_x:paste_x + copy_w] = \
+                    scaled[src_y:src_y + copy_h, src_x:src_x + copy_w]
+            img = result
     is_adjustment = clip_data.get("is_adjustment", False)
     if tx or ty:
         dx = int(tx * w)
@@ -914,10 +924,11 @@ def render_frame_at(
                     frame = np.zeros_like(frame)
         _tick(timing, "effects", _phase_t); _phase_t = time.monotonic()
 
-        # Base track transform (X/Y/Z)
+        # Base track transform (translate X/Y, scale X/Y).
         if any(seg.get(k) for k in (
             "transform_x", "transform_y",
-            "transform_x_curve", "transform_y_curve", "transform_z_curve",
+            "transform_x_curve", "transform_y_curve",
+            "transform_scale_x_curve", "transform_scale_y_curve",
         )):
             frame = _apply_transform(frame, seg, raw_progress)
         _tick(timing, "transform", _phase_t); _phase_t = time.monotonic()

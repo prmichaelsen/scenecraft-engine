@@ -1842,7 +1842,7 @@ def make_handler(work_dir: Path, no_auth: bool = False):
 
                 # Copy style fields
                 style_fields = {}
-                for key in ("blend_mode", "opacity", "opacity_curve", "red_curve", "green_curve", "blue_curve", "black_curve", "hue_shift_curve", "saturation_curve", "invert_curve", "brightness_curve", "contrast_curve", "exposure_curve", "chroma_key", "is_adjustment", "hidden", "mask_center_x", "mask_center_y", "mask_radius", "mask_feather", "transform_x", "transform_y", "transform_x_curve", "transform_y_curve", "transform_z_curve", "anchor_x", "anchor_y"):
+                for key in ("blend_mode", "opacity", "opacity_curve", "red_curve", "green_curve", "blue_curve", "black_curve", "hue_shift_curve", "saturation_curve", "invert_curve", "brightness_curve", "contrast_curve", "exposure_curve", "chroma_key", "is_adjustment", "hidden", "mask_center_x", "mask_center_y", "mask_radius", "mask_feather", "transform_x", "transform_y", "transform_x_curve", "transform_y_curve", "transform_scale_x_curve", "transform_scale_y_curve", "anchor_x", "anchor_y"):
                     # Copy all style fields including None (clears target's old values)
                     style_fields[key] = src.get(key)
                 if style_fields:
@@ -2024,8 +2024,10 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     fields["transform_x_curve"] = body["transformXCurve"]
                 if "transformYCurve" in body:
                     fields["transform_y_curve"] = body["transformYCurve"]
-                if "transformZCurve" in body:
-                    fields["transform_z_curve"] = body["transformZCurve"]
+                if "transformScaleXCurve" in body:
+                    fields["transform_scale_x_curve"] = body["transformScaleXCurve"]
+                if "transformScaleYCurve" in body:
+                    fields["transform_scale_y_curve"] = body["transformScaleYCurve"]
                 if "chromaKey" in body:
                     fields["chroma_key"] = body["chromaKey"]
                 if "isAdjustment" in body:
@@ -2906,7 +2908,8 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                     "transformY": tr.get("transform_y"),
                     "transformXCurve": tr.get("transform_x_curve"),
                     "transformYCurve": tr.get("transform_y_curve"),
-                    "transformZCurve": tr.get("transform_z_curve"),
+                    "transformScaleXCurve": tr.get("transform_scale_x_curve"),
+                    "transformScaleYCurve": tr.get("transform_scale_y_curve"),
                     "anchorX": tr.get("anchor_x"),
                     "anchorY": tr.get("anchor_y"),
                     "chromaKey": tr.get("chroma_key"),
@@ -4206,7 +4209,8 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                         "transform_y": src_tr.get("transform_y"),
                         "transform_x_curve": src_tr.get("transform_x_curve"),
                         "transform_y_curve": src_tr.get("transform_y_curve"),
-                        "transform_z_curve": src_tr.get("transform_z_curve"),
+                        "transform_scale_x_curve": src_tr.get("transform_scale_x_curve"),
+                        "transform_scale_y_curve": src_tr.get("transform_scale_y_curve"),
                         "hidden": src_tr.get("hidden", False),
                         "anchor_x": src_tr.get("anchor_x"),
                         "anchor_y": src_tr.get("anchor_y"),
@@ -6072,7 +6076,8 @@ def make_handler(work_dir: Path, no_auth: bool = False):
                         "transform_y": src_tr.get("transform_y"),
                         "transform_x_curve": src_tr.get("transform_x_curve"),
                         "transform_y_curve": src_tr.get("transform_y_curve"),
-                        "transform_z_curve": src_tr.get("transform_z_curve"),
+                        "transform_scale_x_curve": src_tr.get("transform_scale_x_curve"),
+                        "transform_scale_y_curve": src_tr.get("transform_scale_y_curve"),
                         "anchor_x": src_tr.get("anchor_x"),
                         "anchor_y": src_tr.get("anchor_y"),
                         "label": src_tr.get("label", ""),
