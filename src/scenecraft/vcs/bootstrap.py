@@ -23,8 +23,12 @@ CREATE TABLE IF NOT EXISTS users (
     pubkey TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'editor',
-    must_change_password INTEGER NOT NULL DEFAULT 0
+    must_change_password INTEGER NOT NULL DEFAULT 0,
+    email TEXT,
+    password_hash TEXT,
+    disabled INTEGER NOT NULL DEFAULT 0
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email);
 
 CREATE TABLE IF NOT EXISTS orgs (
     name TEXT PRIMARY KEY,
@@ -82,6 +86,18 @@ CREATE TABLE IF NOT EXISTS api_keys (
 );
 CREATE INDEX IF NOT EXISTS idx_api_keys_username ON api_keys(username);
 CREATE INDEX IF NOT EXISTS idx_api_keys_expires  ON api_keys(expires_at);
+
+-- Email/password auth: extra columns on users + opaque session tokens.
+-- email + password_hash are nullable so existing SSH-key users still work.
+
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    token TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at);
 """
 
 ORG_DB_SCHEMA = """
@@ -139,6 +155,15 @@ def get_server_db(root: Path) -> sqlite3.Connection:
         conn.execute("SELECT must_change_password FROM users LIMIT 1")
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    # Add email/password auth columns to users if missing.
+    try:
+        conn.execute("SELECT email FROM users LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE users ADD COLUMN email TEXT")
+        conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+        conn.execute("ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
         conn.commit()
     return conn
 

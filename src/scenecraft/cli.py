@@ -1281,6 +1281,43 @@ def destroy_gpu(destroy_all: bool):
         _log("No kept-alive instances found.")
 
 
+def _bootstrap_admin_from_env(work_dir: Path, log_fn=None):
+    """If no email/password users exist and SCENECRAFT_BOOTSTRAP_ADMIN_* env vars are set,
+    create the bootstrap admin user automatically."""
+    import os as _os
+    email = _os.environ.get("SCENECRAFT_BOOTSTRAP_ADMIN_EMAIL", "").strip()
+    password = _os.environ.get("SCENECRAFT_BOOTSTRAP_ADMIN_PASSWORD", "").strip()
+    if not email or not password:
+        return
+
+    from scenecraft.vcs.bootstrap import find_root, get_server_db
+    sc_root = find_root(work_dir)
+    if sc_root is None:
+        return
+
+    conn = get_server_db(sc_root)
+    row = conn.execute("SELECT COUNT(*) as cnt FROM users WHERE email IS NOT NULL AND email != ''").fetchone()
+    if row and row["cnt"] > 0:
+        conn.close()
+        return
+
+    from scenecraft.auth import hash_password, new_id
+
+    user_id = new_id()
+    pw_hash = hash_password(password)
+    now = datetime.now().astimezone().isoformat()
+
+    conn.execute(
+        "INSERT INTO users (username, email, password_hash, created_at, role) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (user_id, email.lower(), pw_hash, now, "admin"),
+    )
+    conn.commit()
+    conn.close()
+    if log_fn:
+        log_fn(f"  Bootstrap: created admin user {email}")
+
+
 @main.command()
 @click.option("--port", default=8890, type=int, help="Server port (default: 8890)")
 @click.option("--host", default="0.0.0.0", type=str, help="Bind address (default: 0.0.0.0)")
@@ -1341,6 +1378,9 @@ def server(port: int, host: str, work_dir: str | None, no_auth: bool):
     _api_log(f"  Work dir: {wd}")
     _api_log(f"  Projects: {len([d for d in wd.iterdir() if d.is_dir()])}")
     _api_log("")
+
+    # Bootstrap admin user from env if users table has no email/password users.
+    _bootstrap_admin_from_env(wd, _api_log)
 
     # Interactive console (TTY only)
     from scenecraft.interactive_console import start_if_tty as _start_console

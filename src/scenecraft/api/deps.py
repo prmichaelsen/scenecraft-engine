@@ -69,6 +69,9 @@ def install_cors(app: FastAPI) -> None:
 PUBLIC_ROUTES: set[str] = {
     "/auth/login",
     "/auth/logout",  # POST is logout; clearing a cookie must not require auth.
+    "/api/auth/login",
+    "/api/auth/logout",
+    "/api/auth/me",
     "/oauth/callback",
     "/openapi.json",
     "/docs",
@@ -105,39 +108,40 @@ def _raise_unauthorized() -> None:
 
 
 async def current_user(request: Request) -> User:
-    """Authenticate the request via Authorization bearer or session cookie.
+    """Authenticate the request via session cookie, bearer token, or JWT cookie.
 
-    Mirrors ``api_server.py::_authenticate``:
+    Order:
       0. If ``--no-auth`` was passed (app.state.no_auth), skip auth entirely.
-      1. If ``.scenecraft`` is absent, auth is disabled and a synthetic
-         "local" user is returned.
-      2. Try ``Authorization: Bearer <token>`` first.
-      3. Fall back to the ``scenecraft_jwt`` cookie.
-      4. Validate via ``scenecraft.vcs.auth.validate_token``.
-      5. Raise 401 on any failure.
+      1. If ``.scenecraft`` is absent, auth is disabled → synthetic "local" user.
+      2. Try ``scenecraft_session`` cookie (email/password session) first.
+      3. Fall back to ``Authorization: Bearer <token>`` (JWT).
+      4. Fall back to ``scenecraft_jwt`` cookie (legacy code-based login).
+      5. Validate via the appropriate mechanism.
+      6. Raise 401 on any failure.
     """
     if getattr(request.app.state, "no_auth", False):
         return User(id="local")
 
+    from scenecraft.vcs.bootstrap import find_root
+
+    work_dir: Path | None = getattr(request.app.state, "work_dir", None)
+    sc_root = find_root(work_dir) if work_dir is not None else find_root()
+
+    if sc_root is None:
+        return User(id="local")
+
+    # Step 2 — try email/password session cookie first.
+    user = _try_session_cookie(request, sc_root)
+    if user is not None:
+        return user
+
+    # Step 3-4 — fall back to bearer token / JWT cookie.
     from scenecraft.vcs.auth import (
         extract_bearer_token,
         extract_cookie_token,
         validate_token,
     )
-    from scenecraft.vcs.bootstrap import find_root
 
-    # Step 1 — detect the .scenecraft root. Use the app's work_dir as the
-    # walk-start so ``find_root`` resolves the same way the legacy server
-    # does (``make_handler`` calls ``find_root(work_dir)``).
-    work_dir: Path | None = getattr(request.app.state, "work_dir", None)
-    sc_root = find_root(work_dir) if work_dir is not None else find_root()
-
-    if sc_root is None:
-        # Auth disabled: return a canonical "local" user so downstream
-        # handlers can still key per-user state.
-        return User(id="local")
-
-    # Step 2-3 — extract token.
     token = extract_bearer_token(request.headers.get("Authorization"))
     if not token:
         token = extract_cookie_token(request.headers.get("Cookie"))
@@ -146,7 +150,6 @@ async def current_user(request: Request) -> User:
         _raise_unauthorized()
         raise AssertionError("unreachable")  # for type-checker
 
-    # Step 4-5 — validate.
     try:
         payload = validate_token(sc_root, token)
     except Exception:
@@ -157,6 +160,48 @@ async def current_user(request: Request) -> User:
         id=payload.get("sub", "unknown"),
         fingerprint=payload.get("fingerprint", ""),
         role=payload.get("role", "editor"),
+    )
+
+
+def _try_session_cookie(request: Request, sc_root: Path) -> User | None:
+    """Check for a valid ``scenecraft_session`` cookie and return User or None."""
+    import time
+
+    from scenecraft.auth import SESSION_COOKIE
+    from scenecraft.vcs.bootstrap import get_server_db
+
+    cookie_header = request.headers.get("cookie")
+    if not cookie_header:
+        return None
+
+    token = None
+    for part in cookie_header.split(";"):
+        part = part.strip()
+        if "=" in part:
+            name, value = part.split("=", 1)
+            if name.strip() == SESSION_COOKIE:
+                token = value.strip()
+                break
+    if not token:
+        return None
+
+    conn = get_server_db(sc_root)
+    row = conn.execute(
+        "SELECT u.username, u.email, u.role, s.expires_at "
+        "FROM auth_sessions s JOIN users u ON u.username = s.user_id "
+        "WHERE s.token = ?",
+        (token,),
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return None
+    if row["expires_at"] < int(time.time()):
+        return None
+
+    return User(
+        id=row["username"],
+        role=row["role"],
     )
 
 

@@ -264,6 +264,115 @@ def user_set_password(username: str, root_override: str | None):
     click.echo(f"Cleared must_change_password for user: {username}")
 
 
+# ── users (email/password auth management) ──────────────────────────
+
+@click.group("users")
+def users_group():
+    """Manage email/password users."""
+    pass
+
+
+@users_group.command("create")
+@click.argument("email")
+@click.option("--password", required=True, help="Initial password")
+@click.option("--role", default="editor", type=click.Choice(["admin", "editor", "viewer"]))
+@_root_option()
+def users_create(email: str, password: str, role: str, root_override: str | None):
+    """Create a new email/password user."""
+    from scenecraft.auth import hash_password, new_id
+
+    root = _require_root(root_override)
+    conn = get_server_db(root)
+
+    email = email.strip().lower()
+    existing = conn.execute("SELECT username FROM users WHERE email = ?", (email,)).fetchone()
+    if existing:
+        click.echo(f"Error: a user with email '{email}' already exists.", err=True)
+        conn.close()
+        raise SystemExit(1)
+
+    user_id = new_id()
+    pw_hash = hash_password(password)
+    from datetime import datetime, timezone
+    now = datetime.now(tz=timezone.utc).isoformat()
+
+    conn.execute(
+        "INSERT INTO users (username, email, password_hash, created_at, role) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (user_id, email, pw_hash, now, role),
+    )
+    conn.commit()
+    conn.close()
+    click.echo(f"Created user: {email}  role={role}  id={user_id}")
+
+
+@users_group.command("list")
+@_root_option()
+def users_list(root_override: str | None):
+    """List all users with email/password auth."""
+    root = _require_root(root_override)
+    conn = get_server_db(root)
+    rows = conn.execute(
+        "SELECT username, email, role, disabled, created_at FROM users "
+        "WHERE email IS NOT NULL ORDER BY created_at",
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        click.echo("No email/password users found.")
+        return
+
+    for r in rows:
+        status = "disabled" if r["disabled"] else "active"
+        click.echo(f"  {r['email']}  role={r['role']}  status={status}  id={r['username']}")
+
+
+@users_group.command("set-password")
+@click.argument("email")
+@click.option("--password", required=True, help="New password")
+@_root_option()
+def users_set_password(email: str, password: str, root_override: str | None):
+    """Set a new password for an email/password user."""
+    from scenecraft.auth import hash_password
+
+    root = _require_root(root_override)
+    conn = get_server_db(root)
+
+    email = email.strip().lower()
+    row = conn.execute("SELECT username FROM users WHERE email = ?", (email,)).fetchone()
+    if not row:
+        click.echo(f"Error: no user with email '{email}'.", err=True)
+        conn.close()
+        raise SystemExit(1)
+
+    pw_hash = hash_password(password)
+    conn.execute("UPDATE users SET password_hash = ? WHERE email = ?", (pw_hash, email))
+    conn.commit()
+    conn.close()
+    click.echo(f"Password updated for: {email}")
+
+
+@users_group.command("disable")
+@click.argument("email")
+@_root_option()
+def users_disable(email: str, root_override: str | None):
+    """Disable an email/password user (prevents login)."""
+    root = _require_root(root_override)
+    conn = get_server_db(root)
+
+    email = email.strip().lower()
+    row = conn.execute("SELECT username FROM users WHERE email = ?", (email,)).fetchone()
+    if not row:
+        click.echo(f"Error: no user with email '{email}'.", err=True)
+        conn.close()
+        raise SystemExit(1)
+
+    conn.execute("UPDATE users SET disabled = 1 WHERE email = ?", (email,))
+    conn.commit()
+    conn.close()
+    click.echo(f"Disabled user: {email}")
+
+
 # ── session ──────────────────────────────────────────────────────
 
 @click.group("session")
@@ -423,3 +532,4 @@ def register_commands(main_group: click.Group) -> None:
     main_group.add_command(user_group)
     main_group.add_command(session_group)
     main_group.add_command(auth_group)
+    main_group.add_command(users_group)
