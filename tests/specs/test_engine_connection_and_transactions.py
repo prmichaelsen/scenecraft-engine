@@ -900,6 +900,39 @@ def test_pragma_order_defers_foreign_keys(project_dir: Path, monkeypatch):
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1, "fks-enforced-post-migration"
 
 
+def test_check_same_thread_false_allows_cross_thread_reuse(project_dir: Path, thread_factory):
+    """covers R5 — connection opened on thread A is usable from thread B without ProgrammingError.
+
+    sqlite3 raises ProgrammingError when a connection created with the default
+    check_same_thread=True is used from a thread other than its creator. We open
+    a conn on the main thread, then run a SELECT on a worker thread and assert
+    no exception is raised — this proves check_same_thread=False is in effect.
+    """
+    # Given: a connection created on the main (test) thread
+    conn = scdb.get_db(project_dir)
+    conn.execute("CREATE TABLE IF NOT EXISTS probe(id INTEGER)")
+    conn.execute("INSERT INTO probe VALUES (42)")
+    conn.commit()
+
+    errors: list = []
+    results: list = []
+
+    def worker():
+        try:
+            # When: another thread reads from the same conn instance
+            row = conn.execute("SELECT id FROM probe").fetchone()
+            results.append(row[0])
+        except Exception as e:  # pragma: no cover - error path
+            errors.append(e)
+
+    t = thread_factory(worker)
+    t.join()
+
+    # Then: no ProgrammingError, read succeeded
+    assert errors == [], f"no-cross-thread-programming-error: got {errors!r}"
+    assert results == [42], f"read-succeeded: got {results!r}"
+
+
 # ---------------------------------------------------------------------------
 # === E2E ===
 # ---------------------------------------------------------------------------

@@ -219,7 +219,7 @@ class TestBaseCases:
     def test_activate_2arg_called_with_context(
         self, plugins_reset_host, plugins_fake_module
     ):
-        """covers R7 — activate(plugin_api, context) gets both args, manifest pre-set."""
+        """covers R6, R7 — activate(plugin_api, context) gets both args; manifest cached on ctx BEFORE activate runs."""
         valid = textwrap.dedent("""\
             name: ctxplugin
             version: 1.0.0

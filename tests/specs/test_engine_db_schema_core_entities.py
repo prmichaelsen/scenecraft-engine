@@ -76,7 +76,7 @@ def _seed_pool_segment(project_dir: Path, pool_path: str = "pool/x.wav",
 
 
 def test_add_then_get_keyframe(project_dir: Path, db_conn):
-    """covers R1, R2."""
+    """covers R1, R2, R44, R45."""
     # Given
     kf = {
         "id": "kf1", "timestamp": "0:01.000",
@@ -237,7 +237,7 @@ def test_restore_transition_partial(project_dir: Path, db_conn):
 
 
 def test_transition_selected_flatten(project_dir: Path, db_conn):
-    """covers R12."""
+    """covers R12, R48."""
     # Given: insert transition row with explicit selected='[null]'
     _seed_keyframe(project_dir, "K1", "0:00")
     _seed_keyframe(project_dir, "K2", "0:01")
@@ -1027,13 +1027,282 @@ def test_remap_negative_target_duration_rejected(project_dir: Path, db_conn):
     assert after == before, f"row-unchanged: remap preserved, before={before!r} after={after!r}"
 
 
+# ---------------------------------------------------------------------------
+# Schema-shape tests (PRAGMA witness): codify column lists + indexes per spec.
+# These guard against accidental column drift in future migrations.
+# ---------------------------------------------------------------------------
+
+
+def _table_cols(db_conn, table: str) -> dict:
+    """Return {col_name: pragma_row_dict} for the given table."""
+    rows = db_conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {r["name"]: {k: r[k] for k in r.keys()} for r in rows}
+
+
+def _index_names(db_conn, table: str) -> set:
+    rows = db_conn.execute(f"PRAGMA index_list({table})").fetchall()
+    return {r["name"] for r in rows}
+
+
+def test_keyframes_schema_shape(project_dir: Path, db_conn):
+    """covers R2, R3 — keyframes migration-added columns + indexes present."""
+    cols = _table_cols(db_conn, "keyframes")
+    # R1 baseline columns (sanity)
+    for c in ("id", "timestamp", "section", "source", "prompt", "selected",
+              "candidates", "context", "deleted_at"):
+        assert c in cols, f"r1-col-present: {c} missing from keyframes"
+    # R2 migration-added columns
+    for c in ("track_id", "label", "label_color", "blend_mode", "opacity",
+              "refinement_prompt"):
+        assert c in cols, f"r2-col-present: {c} missing from keyframes"
+    # R3 indexes
+    idx = _index_names(db_conn, "keyframes")
+    assert "idx_keyframes_timestamp" in idx, f"r3-idx-timestamp: got {idx}"
+    assert "idx_keyframes_deleted" in idx, f"r3-idx-deleted: got {idx}"
+
+
+def test_transitions_schema_shape(project_dir: Path, db_conn):
+    """covers R8, R9 — transitions migration-added columns + indexes."""
+    cols = _table_cols(db_conn, "transitions")
+    # R8 migration-added columns (sample subset; all 11 *_curve + key fields)
+    for c in ("track_id", "label", "label_color", "tags", "blend_mode", "opacity",
+              "is_adjustment", "chroma_key", "hidden", "ingredients",
+              "negative_prompt", "seed", "trim_in", "trim_out",
+              "source_video_duration", "mask_center_x", "mask_center_y",
+              "mask_radius", "mask_feather",
+              "transform_x", "transform_y", "anchor_x", "anchor_y"):
+        assert c in cols, f"r8-col-present: {c} missing from transitions"
+    # 11 *_curve columns
+    for c in ("opacity_curve", "red_curve", "green_curve", "blue_curve",
+              "black_curve", "hue_shift_curve", "saturation_curve",
+              "invert_curve", "brightness_curve", "contrast_curve",
+              "exposure_curve"):
+        assert c in cols, f"r8-curve-col-present: {c} missing from transitions"
+    # R9 indexes
+    idx = _index_names(db_conn, "transitions")
+    assert "idx_transitions_from" in idx, f"r9-idx-from: got {idx}"
+    assert "idx_transitions_to" in idx, f"r9-idx-to: got {idx}"
+    assert "idx_transitions_deleted" in idx, f"r9-idx-deleted: got {idx}"
+
+
+def test_transition_effects_schema_shape(project_dir: Path, db_conn):
+    """covers R14 — transition_effects table shape + idx_tr_effects index."""
+    cols = _table_cols(db_conn, "transition_effects")
+    expected_pragma = {
+        "id": ("TEXT", 0),
+        "transition_id": ("TEXT", 1),
+        "type": ("TEXT", 1),
+        "params": ("TEXT", 1),
+        "enabled": ("INTEGER", 1),
+        "z_order": ("INTEGER", 1),
+    }
+    for name, (typ, notnull) in expected_pragma.items():
+        assert name in cols, f"r14-col-present: {name} missing"
+        assert cols[name]["type"].upper() == typ.upper(), \
+            f"r14-type: {name} type {cols[name]['type']!r} != {typ!r}"
+    idx = _index_names(db_conn, "transition_effects")
+    assert "idx_tr_effects" in idx, f"r14-idx-tr-effects: got {idx}"
+
+
+def test_audio_clips_schema_shape(project_dir: Path, db_conn):
+    """covers R21, R23 — audio_clips columns + indexes."""
+    cols = _table_cols(db_conn, "audio_clips")
+    for c in ("id", "track_id", "source_path", "start_time", "end_time",
+              "source_offset", "volume_curve", "muted", "remap", "label",
+              "deleted_at", "selected"):
+        assert c in cols, f"r21-col-present: {c} missing from audio_clips"
+    idx = _index_names(db_conn, "audio_clips")
+    assert "idx_audio_clips_track" in idx, f"r23-idx-track: got {idx}"
+    assert "idx_audio_clips_deleted" in idx, f"r23-idx-deleted: got {idx}"
+
+
+def test_audio_candidates_schema_shape(project_dir: Path, db_conn):
+    """covers R27 — audio_candidates table + indexes + composite PK."""
+    cols = _table_cols(db_conn, "audio_candidates")
+    for c in ("audio_clip_id", "pool_segment_id", "added_at", "source"):
+        assert c in cols, f"r27-col-present: {c} missing"
+    # Composite PK on (audio_clip_id, pool_segment_id) — both pk>0
+    assert cols["audio_clip_id"]["pk"] > 0, \
+        f"r27-pk-clip-id: expected pk>0, got {cols['audio_clip_id']['pk']}"
+    assert cols["pool_segment_id"]["pk"] > 0, \
+        f"r27-pk-seg-id: expected pk>0, got {cols['pool_segment_id']['pk']}"
+    idx = _index_names(db_conn, "audio_candidates")
+    assert "idx_audio_cand_clip" in idx, f"r27-idx-clip: got {idx}"
+    assert "idx_audio_cand_seg" in idx, f"r27-idx-seg: got {idx}"
+
+
+def test_tr_candidates_schema_shape(project_dir: Path, db_conn):
+    """covers R33 — tr_candidates table + indexes + composite PK."""
+    cols = _table_cols(db_conn, "tr_candidates")
+    for c in ("transition_id", "slot", "pool_segment_id", "added_at", "source"):
+        assert c in cols, f"r33-col-present: {c} missing"
+    # Composite PK on (transition_id, slot, pool_segment_id)
+    pk_cols = {n for n, v in cols.items() if v["pk"] > 0}
+    assert pk_cols == {"transition_id", "slot", "pool_segment_id"}, \
+        f"r33-composite-pk: expected 3-col PK, got {pk_cols}"
+    idx = _index_names(db_conn, "tr_candidates")
+    assert "idx_tr_candidates_tr" in idx, f"r33-idx-tr: got {idx}"
+    assert "idx_tr_candidates_segment" in idx, f"r33-idx-seg: got {idx}"
+    assert "idx_tr_candidates_order" in idx, f"r33-idx-order: got {idx}"
+
+
+def test_audio_clip_links_schema_shape(project_dir: Path, db_conn):
+    """covers R38 — audio_clip_links table + indexes; no FK on either column."""
+    cols = _table_cols(db_conn, "audio_clip_links")
+    for c in ("audio_clip_id", "transition_id", "offset"):
+        assert c in cols, f"r38-col-present: {c} missing"
+    pk_cols = {n for n, v in cols.items() if v["pk"] > 0}
+    assert pk_cols == {"audio_clip_id", "transition_id"}, \
+        f"r38-composite-pk: expected 2-col PK, got {pk_cols}"
+    idx = _index_names(db_conn, "audio_clip_links")
+    assert "idx_acl_transition" in idx, f"r38-idx-tr: got {idx}"
+    assert "idx_acl_audio_clip" in idx, f"r38-idx-clip: got {idx}"
+    fks = db_conn.execute("PRAGMA foreign_key_list(audio_clip_links)").fetchall()
+    assert len(fks) == 0, f"r38-no-fk: expected zero FKs declared, got {len(fks)}"
+
+
+def test_sections_schema_shape(project_dir: Path, db_conn):
+    """covers R41 — sections table columns including double-quoted 'end'."""
+    cols = _table_cols(db_conn, "sections")
+    for c in ("id", "label", "start", "end", "mood", "energy",
+              "instruments", "motifs", "events", "visual_direction",
+              "notes", "sort_order"):
+        assert c in cols, f"r41-col-present: {c} missing from sections"
+    # 'end' is the SQLite-keyword column; it's nullable (no default forces NOT NULL)
+    assert cols["end"]["notnull"] == 0, \
+        f"r41-end-nullable: expected nullable end column, got notnull={cols['end']['notnull']}"
+
+
+def test_get_transitions_filters_deleted_no_order(project_dir: Path, db_conn):
+    """covers R13 — get_transitions excludes soft-deleted; involving filters by kf."""
+    _seed_keyframe(project_dir, "K1", "0:00")
+    _seed_keyframe(project_dir, "K2", "0:01")
+    _seed_keyframe(project_dir, "K3", "0:02")
+    _seed_transition(project_dir, "T1", "K1", "K2")
+    _seed_transition(project_dir, "T2", "K2", "K3")
+    _seed_transition(project_dir, "T3", "K1", "K3")
+    scdb.delete_transition(project_dir, "T2", "2026-04-27T00:00:00Z")
+
+    # When
+    live = scdb.get_transitions(project_dir)
+    live_ids = {t["id"] for t in live}
+
+    # Then
+    assert live_ids == {"T1", "T3"}, f"excludes-soft-deleted: got {live_ids}"
+    # involving filter
+    inv = scdb.get_transitions_involving(project_dir, "K1")
+    inv_ids = {t["id"] for t in inv}
+    assert inv_ids == {"T1", "T3"}, f"involving-filter: got {inv_ids}"
+    # T2 references K2 but is soft-deleted → excluded
+    inv_k2 = scdb.get_transitions_involving(project_dir, "K2")
+    inv_k2_ids = {t["id"] for t in inv_k2}
+    assert "T2" not in inv_k2_ids, f"involving-excludes-deleted: got {inv_k2_ids}"
+
+
+def test_tr_candidates_no_fk_on_transition_id(project_dir: Path, db_conn):
+    """covers R34 — tr_candidates.transition_id has no FK; orphan inserts allowed."""
+    fks = db_conn.execute("PRAGMA foreign_key_list(tr_candidates)").fetchall()
+    fk_cols = {r["from"] for r in fks}
+    assert "transition_id" not in fk_cols, \
+        f"r34-no-fk-on-transition-id: got FKs from columns {fk_cols}"
+    # And: orphan insert succeeds
+    seg = _seed_pool_segment(project_dir, "p/s.wav")
+    scdb.add_tr_candidate(project_dir, transition_id="ghost-tr", slot=0,
+                          pool_segment_id=seg, source="generated", added_at="t1")
+    rows = db_conn.execute(
+        "SELECT * FROM tr_candidates WHERE transition_id='ghost-tr'"
+    ).fetchall()
+    assert len(rows) == 1, f"orphan-insert-succeeds: expected 1 row, got {len(rows)}"
+
+
+def test_volume_curve_default_shape(project_dir: Path, db_conn):
+    """covers R46 — volume_curve defaults to JSON [[0,0],[1,0]] on tracks + clips."""
+    _seed_audio_track(project_dir, "T")
+    _seed_audio_clip(project_dir, "C", "T")
+
+    track_curve = db_conn.execute(
+        "SELECT volume_curve FROM audio_tracks WHERE id='T'"
+    ).fetchone()["volume_curve"]
+    clip_curve = db_conn.execute(
+        "SELECT volume_curve FROM audio_clips WHERE id='C'"
+    ).fetchone()["volume_curve"]
+
+    assert json.loads(track_curve) == [[0, 0], [1, 0]], \
+        f"track-default-curve: got {track_curve!r}"
+    assert json.loads(clip_curve) == [[0, 0], [1, 0]], \
+        f"clip-default-curve: got {clip_curve!r}"
+
+
+def test_remap_default_shape(project_dir: Path, db_conn):
+    """covers R47 — remap defaults to {method:linear, target_duration:0} on transitions + clips."""
+    _seed_audio_track(project_dir, "T")
+    _seed_audio_clip(project_dir, "C", "T")
+    _seed_keyframe(project_dir, "K1", "0:00")
+    _seed_keyframe(project_dir, "K2", "0:01")
+    _seed_transition(project_dir, "Tr", "K1", "K2")
+
+    tr_remap = db_conn.execute(
+        "SELECT remap FROM transitions WHERE id='Tr'"
+    ).fetchone()["remap"]
+    clip_remap = db_conn.execute(
+        "SELECT remap FROM audio_clips WHERE id='C'"
+    ).fetchone()["remap"]
+
+    assert json.loads(tr_remap) == {"method": "linear", "target_duration": 0}, \
+        f"tr-default-remap: got {tr_remap!r}"
+    assert json.loads(clip_remap) == {"method": "linear", "target_duration": 0}, \
+        f"clip-default-remap: got {clip_remap!r}"
+
+
+def test_transition_tags_ingredients_default_arrays(project_dir: Path, db_conn):
+    """covers R49 — transitions.tags and transitions.ingredients default to '[]' JSON."""
+    _seed_keyframe(project_dir, "K1", "0:00")
+    _seed_keyframe(project_dir, "K2", "0:01")
+    _seed_transition(project_dir, "T", "K1", "K2")
+
+    row = db_conn.execute(
+        "SELECT tags, ingredients FROM transitions WHERE id='T'"
+    ).fetchone()
+    # Both default-empty array
+    assert json.loads(row["tags"]) == [], f"tags-default-array: got {row['tags']!r}"
+    assert json.loads(row["ingredients"]) == [], \
+        f"ingredients-default-array: got {row['ingredients']!r}"
+
+
+def test_transition_curve_columns_nullable(project_dir: Path, db_conn):
+    """covers R50 — *_curve columns on transitions are nullable JSON arrays."""
+    _seed_keyframe(project_dir, "K1", "0:00")
+    _seed_keyframe(project_dir, "K2", "0:01")
+    _seed_transition(project_dir, "T", "K1", "K2")
+
+    cols = _table_cols(db_conn, "transitions")
+    for curve in ("opacity_curve", "red_curve", "green_curve", "blue_curve",
+                  "black_curve", "hue_shift_curve", "saturation_curve",
+                  "invert_curve", "brightness_curve", "contrast_curve",
+                  "exposure_curve"):
+        assert cols[curve]["notnull"] == 0, \
+            f"r50-{curve}-nullable: expected notnull=0, got {cols[curve]['notnull']}"
+
+    # A non-null curve round-trips as JSON list
+    db_conn.execute(
+        "UPDATE transitions SET opacity_curve=? WHERE id='T'",
+        (json.dumps([[0, 0], [1, 1]]),)
+    )
+    db_conn.commit()
+    raw = db_conn.execute(
+        "SELECT opacity_curve FROM transitions WHERE id='T'"
+    ).fetchone()["opacity_curve"]
+    assert json.loads(raw) == [[0, 0], [1, 1]], \
+        f"r50-curve-roundtrip: got {raw!r}"
+
+
 @pytest.mark.xfail(
-    reason="target-state; awaits register_migration + rebuild_table helper (R_transitional, OQ-8). "
+    reason="target-state; awaits register_migration + rebuild_table helper (R22, OQ-8). "
            "Current schema bootstrap is additive ALTER only; no mechanism to rewrite NOT NULL to NULL on legacy audio_clips.track_id.",
     strict=False,
 )
 def test_audio_clips_legacy_nullable_track_id_rebuild(project_dir: Path, db_conn):
-    """covers R_transitional, OQ-8."""
+    """covers R22, OQ-8."""
     # Given: a legacy DB where audio_clips.track_id was created NOT NULL.
     # Current bootstrap creates audio_clips.track_id as NOT NULL already; target
     # migration would rebuild the table to make it nullable.

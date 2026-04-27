@@ -920,6 +920,64 @@ def test_delete_curve_after_effect_delete_idempotent(project_dir: Path, db_conn)
 
 
 # ---------------------------------------------------------------------------
+# Schema-shape tests (PRAGMA witness): codify table layouts for the spec's
+# R5 (project_send_buses) and R6 (track_sends).
+# ---------------------------------------------------------------------------
+
+
+def test_project_send_buses_schema_shape(project_dir: Path, db_conn):
+    """covers R5 — project_send_buses table shape via PRAGMA table_info."""
+    rows = db_conn.execute("PRAGMA table_info(project_send_buses)").fetchall()
+    cols = {r["name"]: r for r in rows}
+    # All columns present with expected types and notnull bits
+    expected = {
+        "id": ("TEXT", 0, 1),               # name → (type, notnull, pk)
+        "bus_type": ("TEXT", 1, 0),
+        "label": ("TEXT", 1, 0),
+        "order_index": ("INTEGER", 1, 0),
+        "static_params": ("TEXT", 1, 0),
+    }
+    for name, (typ, notnull, pk) in expected.items():
+        assert name in cols, f"r5-col-present: {name} missing from project_send_buses"
+        assert cols[name]["type"].upper() == typ.upper(), \
+            f"r5-{name}-type: got {cols[name]['type']!r}, want {typ!r}"
+        assert cols[name]["notnull"] == notnull, \
+            f"r5-{name}-notnull: got {cols[name]['notnull']}, want {notnull}"
+        assert cols[name]["pk"] == pk, \
+            f"r5-{name}-pk: got {cols[name]['pk']}, want {pk}"
+
+
+def test_track_sends_schema_shape(project_dir: Path, db_conn):
+    """covers R6 — track_sends table shape, composite PK, FKs with ON DELETE CASCADE."""
+    rows = db_conn.execute("PRAGMA table_info(track_sends)").fetchall()
+    cols = {r["name"]: r for r in rows}
+    # All columns present
+    for c in ("track_id", "bus_id", "level"):
+        assert c in cols, f"r6-col-present: {c} missing from track_sends"
+    # Composite PK on (track_id, bus_id)
+    pk_cols = {n for n, r in cols.items() if r["pk"] > 0}
+    assert pk_cols == {"track_id", "bus_id"}, \
+        f"r6-composite-pk: expected {{track_id, bus_id}}, got {pk_cols}"
+    # level default
+    level_default = cols["level"]["dflt_value"]
+    assert level_default is not None and float(level_default) == 0.0, \
+        f"r6-level-default: expected 0.0, got {level_default!r}"
+    # FK constraints: both columns reference parent tables w/ ON DELETE CASCADE
+    fks = db_conn.execute("PRAGMA foreign_key_list(track_sends)").fetchall()
+    fk_map = {r["from"]: r for r in fks}
+    assert "track_id" in fk_map, f"r6-fk-track: missing FK from track_id, got {list(fk_map)}"
+    assert fk_map["track_id"]["table"] == "audio_tracks", \
+        f"r6-fk-track-table: got {fk_map['track_id']['table']!r}"
+    assert fk_map["track_id"]["on_delete"].upper() == "CASCADE", \
+        f"r6-fk-track-cascade: got {fk_map['track_id']['on_delete']!r}"
+    assert "bus_id" in fk_map, f"r6-fk-bus: missing FK from bus_id, got {list(fk_map)}"
+    assert fk_map["bus_id"]["table"] == "project_send_buses", \
+        f"r6-fk-bus-table: got {fk_map['bus_id']['table']!r}"
+    assert fk_map["bus_id"]["on_delete"].upper() == "CASCADE", \
+        f"r6-fk-bus-cascade: got {fk_map['bus_id']['on_delete']!r}"
+
+
+# ---------------------------------------------------------------------------
 # === E2E ===
 # ---------------------------------------------------------------------------
 # Comprehensive HTTP-level coverage for every requirement with an observable

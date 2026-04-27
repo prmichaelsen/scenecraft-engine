@@ -178,7 +178,7 @@ class TestConnectHappyPath:
 
     @pytest.mark.asyncio
     async def test_connect_remember_keeps_names(self, monkeypatch):
-        """covers R2, R6, R7 — connect-remember-keeps-names."""
+        """covers R2, R5, R6, R7 — connect-remember-keeps-names; OAuth token from get_valid_access_token flows to sse_client as Bearer header."""
         _install_oauth_stubs(monkeypatch)
         tools = [_FakeTool("remember_a"), _FakeTool("remember_b"), _FakeTool("other")]
         _install_fake_mcp(monkeypatch, lambda: _FakeClientSession(tools=tools))

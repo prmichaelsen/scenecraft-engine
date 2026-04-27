@@ -386,6 +386,97 @@ def test_exception_leaves_dbs_unmarked_for_retry(project_dir: Path, monkeypatch)
     assert db_path not in scdb._migrated_dbs, "memo-not-set on failure"
 
 
+def test_concurrent_get_db_runs_ensure_schema_once(project_dir: Path, monkeypatch):
+    """covers R3 — _migrated_dbs guard consulted under _conn_lock; concurrent
+    get_db from multiple threads runs _ensure_schema exactly once.
+
+    Codifies the transitional concurrency contract: today the lock + memo set
+    serialize first-time schema init across racing threads. (Mirrors the
+    connection-spec R7+R8 witness; here from the migrations-framework angle.)
+    """
+    # Reset memo so this is a "first-time" init for the test's db_path.
+    db_path = str(project_dir / "project.db")
+    scdb._migrated_dbs.discard(db_path)
+    # Ensure no stale conns exist for this path
+    for k in [k for k in list(scdb._connections) if k.startswith(f"{db_path}:")]:
+        try:
+            scdb._connections[k].close()
+        except Exception:
+            pass
+        del scdb._connections[k]
+
+    calls: list[int] = []
+    real_ensure = scdb._ensure_schema
+    barrier = threading.Barrier(4)
+
+    def spy(conn):
+        calls.append(1)
+        return real_ensure(conn)
+
+    monkeypatch.setattr(scdb, "_ensure_schema", spy)
+
+    results: list = []
+    errors: list = []
+
+    def worker():
+        try:
+            barrier.wait(timeout=10)
+            results.append(scdb.get_db(project_dir))
+        except Exception as e:  # pragma: no cover - error path
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert errors == [], f"no-thread-errors: got {errors!r}"
+    assert len(results) == 4, f"all-threads-got-conn: got {len(results)}"
+    assert len(calls) == 1, \
+        f"ensure-schema-once-under-race: expected 1 call, got {len(calls)}"
+
+
+def test_ensure_schema_runs_with_pragmas_in_effect(project_dir: Path):
+    """covers R4 — by the time _ensure_schema runs, the conn already has
+    foreign_keys=ON, journal_mode=WAL, synchronous=NORMAL, busy_timeout=60000.
+
+    Today get_db sets PRAGMAs *before* invoking _ensure_schema (per the
+    connection spec R4+R26). This test witnesses that ordering: when
+    _ensure_schema is invoked by get_db, the PRAGMAs are already in effect.
+    """
+    captured = {}
+    real_ensure = scdb._ensure_schema
+
+    def spy(conn):
+        captured["journal_mode"] = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        captured["synchronous"] = conn.execute("PRAGMA synchronous").fetchone()[0]
+        captured["foreign_keys"] = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+        captured["busy_timeout"] = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        return real_ensure(conn)
+
+    # Reset memo so init really runs
+    db_path = str(project_dir / "project.db")
+    scdb._migrated_dbs.discard(db_path)
+    scdb._ensure_schema = spy  # type: ignore[assignment]
+    try:
+        scdb.get_db(project_dir)
+    finally:
+        scdb._ensure_schema = real_ensure  # type: ignore[assignment]
+
+    assert captured["journal_mode"] == "wal", \
+        f"r4-wal-mode-pre-ddl: got {captured['journal_mode']!r}"
+    assert captured["synchronous"] == 1, \
+        f"r4-sync-normal-pre-ddl: got {captured['synchronous']!r}"
+    assert captured["busy_timeout"] == 60000, \
+        f"r4-busy-timeout-pre-ddl: got {captured['busy_timeout']!r}"
+    # foreign_keys: spec R4 lists it among the four PRAGMAs; per
+    # connection-spec R26 today's ordering applies it before DDL. Codify the
+    # observed transitional state — FKs ON during _ensure_schema.
+    assert captured["foreign_keys"] == 1, \
+        f"r4-fk-on-during-ddl: foreign_keys=ON when _ensure_schema runs, got {captured['foreign_keys']!r}"
+
+
 # ---------------------------------------------------------------------------
 # === Target-state (xfail) ===
 # OQ-1..OQ-7 resolved as TARGET; not implemented today.
