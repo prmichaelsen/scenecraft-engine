@@ -28,7 +28,6 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT,
     disabled INTEGER NOT NULL DEFAULT 0
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email);
 
 CREATE TABLE IF NOT EXISTS orgs (
     name TEXT PRIMARY KEY,
@@ -163,8 +162,10 @@ def get_server_db(root: Path) -> sqlite3.Connection:
         conn.execute("ALTER TABLE users ADD COLUMN email TEXT")
         conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
         conn.execute("ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0")
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
         conn.commit()
+    # Index created unconditionally — safe on fresh and migrated DBs.
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+    conn.commit()
     return conn
 
 
